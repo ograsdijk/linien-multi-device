@@ -1,0 +1,212 @@
+:root {
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  color-scheme: light;
+  --bg-1: #f6f2eb;
+  --bg-2: #efe7dc;
+  --panel: #ffffff;
+  --panel-border: #e3d8cc;
+  --accent: #c4472d;
+  --accent-2: #1c6e8c;
+  --ink: #1d1b16;
+  --bg-gradient: radial-gradient(circle at 10% 10%, #f7efe2 0%, var(--bg-1) 40%, var(--bg-2) 100%);
+  --panel-shadow: 0 10px 30px rgba(39, 28, 18, 0.08);
+  --grid: rgba(29, 27, 22, 0.15);
+  --tick: rgba(29, 27, 22, 0.35);
+  --tag-bg: #f0e4d4;
+  --tag-border: #e0d3c1;
+  --tag-text: #4b4036;
+  --tag-green-bg: #dff5e5;
+  --tag-green-border: #bfe7ca;
+  --tag-green-text: #1f6a39;
+  --tag-red-bg: #fde6e6;
+  --tag-red-border: #f4c5c5;
+  --tag-red-text: #9b2c2c;
+  --tag-amber-bg: #fff1da;
+  --tag-amber-border: #f4d6a6;
+  --tag-amber-text: #8a5a10;
+}
+
+:root[data-mantine-color-scheme='dark'] {
+  --bg-1: #141414;
+  --bg-2: #0e0f10;
+  --panel: #1b1c1f;
+  --panel-border: #2a2c31;
+  --accent: #e07a5f;
+  --accent-2: #4c9bb5;
+  --ink: #f5f2ec;
+  --bg-gradient: radial-gradient(circle at 10% 10%, #1b1b1e 0%, var(--bg-1) 40%, var(--bg-2) 100%);
+  --panel-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  --grid: rgba(245, 242, 236, 0.12);
+  --tick: rgba(245, 242, 236, 0.3);
+  --tag-bg: #2a2c31;
+  --tag-border: #3a3d44;
+  --tag-text: #f5f2ec;
+  --tag-green-bg: #1f3b2a;
+  --tag-green-border: #2f5a3f;
+  --tag-green-text: #b8eac8;
+  --tag-red-bg: #3b1f22;
+  --tag-red-border: #5f2f35;
+  --tag-red-text: #f1b4b8;
+  --tag-amber-bg: #3d2c18;
+  --tag-amber-border: #644324;
+  --tag-amber-text: #f3d39b;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--bg-gradient);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 16px;
+  box-shadow: var(--panel-shadow);
+  min-width: 0;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 16px;
+  align-items: start;
+  min-width: 0;
+  max-width: 100%;
+}
+
+@media (max-width: 1200px) {
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+}
+
+.plot-stack {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.uplot {
+  width: 100% !important;
+  color: var(--ink);
+  max-width: 100%;
+  position: relative;
+}
+
+.uplot canvas {
+  max-width: 100%;
+}
+
+.uplot .u-axis,
+.uplot .u-legend,
+.uplot .u-title {
+  color: var(--ink);
+}
+
+.uplot .u-axis .u-grid {
+  stroke: var(--grid);
+}
+
+.uplot .u-axis .u-tick {
+  stroke: var(--tick);
+}
+
+.status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  font-size: 14px;
+  color: var(--ink);
+}
+
+.device-tag {
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--tag-bg);
+  border: 1px solid var(--tag-border);
+  color: var(--tag-text);
+}
+
+.device-tag.status-connected {
+  background: var(--tag-green-bg);
+  border-color: var(--tag-green-border);
+  color: var(--tag-green-text);
+}
+
+.device-tag.status-disconnected,
+.device-tag.status-error {
+  background: var(--tag-red-bg);
+  border-color: var(--tag-red-border);
+  color: var(--tag-red-text);
+}
+
+.device-tag.status-connecting {
+  background: var(--tag-amber-bg);
+  border-color: var(--tag-amber-border);
+  color: var(--tag-amber-text);
+}
+
+.u-legend .u-series.legend-hidden {
+  display: none;
+}
+
+.plot-panel {
+  position: relative;
+}
+
+.plot-panel .u-legend {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  background: var(--panel);
+  padding: 2px 6px;
+  border-radius: 6px;
+  box-shadow: var(--panel-shadow);
+}
+
+.group-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(760px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.overview-grid {
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+}
+
+.group-grid.drop-active {
+  outline: 2px dashed var(--accent);
+  outline-offset: 6px;
+  border-radius: 16px;
+  background: rgba(196, 71, 45, 0.08);
+  padding: 8px;
+}
+
+.device-card {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 16px;
+  box-shadow: var(--panel-shadow);
+  padding: 12px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.empty-group {
+  padding: 24px;
+  border: 1px dashed var(--panel-border);
+  border-radius: 12px;
+  color: var(--tick);
+  text-align: center;
+}
+
+.sweep-range-bar {
+  cursor: grab;
+}

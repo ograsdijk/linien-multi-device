@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+*.whl
+.build/
+.dist/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.pytype/
+.pyre/
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+.env/
+.env.*
+
+# Node
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.yarn-cache/
+.yarn-unplugged/
+.pnp.*
+
+# Vite / React
+linien-web/dist/
+linien-web/.vite/
+
+# Gateway build artifacts
+linien-gateway/build/
+linien-gateway/*.egg-info/
+
+# Logs
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

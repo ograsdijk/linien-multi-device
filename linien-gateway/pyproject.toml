@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linien-gateway"
+version = "0.1.0"
+description = "FastAPI gateway for multi-device Linien control"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "pydantic>=2.6",
+  "linien-client==2.1.0",
+  "linien-common==2.1.0",
+]
+
+[project.scripts]
+linien-gateway = "app.main:main"
+
+[tool.setuptools.packages.find]
+namespaces = false
+

@@ -1,0 +1,101 @@
+import { useCallback, useRef } from 'react';
+import { Button, Group, Text } from '@mantine/core';
+import type { Device, DeviceStatus, PlotFrame, StreamMessage } from '../types';
+import { api } from '../api';
+import { useDeviceStream } from '../hooks/useDeviceStream';
+import { PlotPanel } from './PlotPanel';
+import { StatusRow } from './StatusRow';
+
+type DeviceOverviewCardProps = {
+  device: Device;
+  state: {
+    params: Record<string, any>;
+    plotFrame?: PlotFrame | null;
+    status?: DeviceStatus | null;
+  };
+  active: boolean;
+  onOpenInGroup?: () => void;
+  maxFps?: number;
+  onStateUpdate: (deviceKey: string, message: StreamMessage) => void;
+};
+
+export function DeviceOverviewCard({
+  device,
+  state,
+  active,
+  onOpenInGroup,
+  maxFps,
+  onStateUpdate,
+}: DeviceOverviewCardProps) {
+  const connected = Boolean(state.status?.connected);
+  const lockState = typeof state.params.lock === 'boolean' ? state.params.lock : undefined;
+  const sweepCenterRaw = state.params.sweep_center;
+  const sweepCenterNum = sweepCenterRaw == null ? NaN : Number(sweepCenterRaw);
+  const sweepCenter = Number.isFinite(sweepCenterNum) ? sweepCenterNum : undefined;
+  const sweepAmplitudeRaw = state.params.sweep_amplitude;
+  const sweepAmplitudeNum = sweepAmplitudeRaw == null ? NaN : Number(sweepAmplitudeRaw);
+  const sweepAmplitude = Number.isFinite(sweepAmplitudeNum) ? sweepAmplitudeNum : undefined;
+  const statusLabel = connected ? (lockState ? 'Locked' : 'Unlocked') : 'Disconnected';
+
+  const lastPlotRef = useRef(0);
+  const plotThrottleMs = maxFps && maxFps > 0 ? 1000 / maxFps : 0;
+  const onMessage = useCallback(
+    (msg: StreamMessage) => {
+      if (plotThrottleMs > 0 && msg.type === 'plot_frame') {
+        const now = performance.now();
+        if (now - lastPlotRef.current < plotThrottleMs) {
+          return;
+        }
+        lastPlotRef.current = now;
+      }
+      onStateUpdate(device.key, msg);
+    },
+    [device.key, onStateUpdate, plotThrottleMs]
+  );
+
+  useDeviceStream(device.key, active, onMessage, { maxFps });
+
+  return (
+    <div className="overview-card">
+      <Group justify="space-between" align="center" mb="xs">
+        <div>
+          <Text fw={600}>{device.name || 'Unnamed device'}</Text>
+          <Text size="xs" c="dimmed">
+            {device.host}:{device.port}
+          </Text>
+        </div>
+        <Group gap="xs" align="center">
+          <Text size="xs" c="dimmed">
+            {statusLabel}
+          </Text>
+          {connected ? (
+            <Button size="xs" variant="light" color="red" onClick={() => api.disconnectDevice(device.key).catch(() => null)}>
+              Disconnect
+            </Button>
+          ) : (
+            <Button size="xs" variant="light" color="green" onClick={() => api.connectDevice(device.key).catch(() => null)}>
+              Connect
+            </Button>
+          )}
+          <Button
+            size="xs"
+            variant="default"
+            onClick={() => onOpenInGroup?.()}
+            disabled={!onOpenInGroup}
+          >
+            Open in group
+          </Button>
+        </Group>
+      </Group>
+      <PlotPanel
+        plotFrame={state.plotFrame}
+        selectionMode={null}
+        lockState={lockState}
+        sweepCenter={sweepCenter}
+        sweepAmplitude={sweepAmplitude}
+        showManualTarget={false}
+      />
+      <StatusRow plotFrame={state.plotFrame} />
+    </div>
+  );
+}
