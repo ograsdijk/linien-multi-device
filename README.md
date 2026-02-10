@@ -49,6 +49,15 @@ python -m uvicorn app.main:app --reload
 
 Open http://localhost:8000 to view the UI, and the API remains under /api.
 
+To allow other PCs on your network to access the same pre-built UI, bind FastAPI to all interfaces:
+
+```powershell
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Then open `http://<your-pc-lan-ip>:8000` from another PC (for example, `http://192.168.1.10:8000`).
+If needed, allow inbound TCP on port `8000` in your firewall.
+
 ## Docker packaging (example)
 You can package the gateway + prebuilt UI in a single image using a multi-stage build.
 

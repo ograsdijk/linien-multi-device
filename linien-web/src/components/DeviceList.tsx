@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
-import { Button, Card, Group, Modal, Stack, Text, TextInput } from '@mantine/core';
+import { ActionIcon, Button, Card, Group, Modal, Stack, Text, TextInput } from '@mantine/core';
+import { IconDevices, IconPencil, IconTrash } from '@tabler/icons-react';
 import type { Device, DeviceStatus } from '../types';
 
 const emptyForm = {
@@ -41,6 +42,10 @@ export function DeviceList({
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [form, setForm] = useState({ ...emptyForm });
   const activeSet = useMemo(() => new Set(activeKeys), [activeKeys]);
+  const connectedDeviceCount = useMemo(
+    () => devices.reduce((count, device) => count + (statuses[device.key]?.connected ? 1 : 0), 0),
+    [devices, statuses]
+  );
 
   const openCreate = () => {
     setEditingKey(null);
@@ -76,11 +81,22 @@ export function DeviceList({
 
   return (
     <Stack gap="sm">
-      <Group justify="space-between">
-        <Text fw={600}>Devices</Text>
-        <Button size="xs" color="orange" variant="light" onClick={openCreate}>
-          Add
-        </Button>
+      <Group justify="space-between" align="center">
+        <Group gap="xs" align="center">
+          <Text fw={600}>Devices</Text>
+          <Button size="xs" color="orange" variant="light" onClick={openCreate}>
+            Add
+          </Button>
+        </Group>
+        <Group gap={4} align="center" title="Connected (total devices)">
+          <IconDevices size={16} />
+          <Text size="sm" fw={700} c={connectedDeviceCount === 0 ? 'red' : 'green'}>
+            {connectedDeviceCount}
+          </Text>
+          <Text size="sm" c="dimmed">
+            ({devices.length})
+          </Text>
+        </Group>
       </Group>
       <Stack gap="xs">
         {devices.map((device) => {
@@ -117,11 +133,23 @@ export function DeviceList({
               }}
               style={{
                 borderColor: inActiveGroup ? 'var(--tag-green-border)' : undefined,
+                position: 'relative',
               }}
             >
               <Group justify="space-between" align="center">
                 <div>
-                  <Text fw={600}>{device.name || 'Unnamed device'}</Text>
+                  <Group gap={4} align="center" wrap="nowrap">
+                    <Text fw={600}>{device.name || 'Unnamed device'}</Text>
+                    <ActionIcon
+                      size="xs"
+                      variant="subtle"
+                      color="orange"
+                      aria-label={`Edit ${device.name || 'device'}`}
+                      onClick={() => openEdit(device)}
+                    >
+                      <IconPencil size={12} />
+                    </ActionIcon>
+                  </Group>
                   <Text size="xs" c="dimmed">
                     {device.host}:{device.port}
                   </Text>
@@ -131,7 +159,7 @@ export function DeviceList({
                 </div>
                 <div className={`device-tag status-${state}`}>{tagLabel}</div>
               </Group>
-              <Group mt="sm" gap="xs">
+              <Group mt="sm" gap="xs" style={{ paddingRight: 34 }}>
                 <Button
                   size="xs"
                   variant="light"
@@ -159,14 +187,16 @@ export function DeviceList({
                   </Button>
                 )}
               </Group>
-              <Group mt={6} gap="xs">
-                <Button size="xs" variant="default" onClick={() => openEdit(device)}>
-                  Edit
-                </Button>
-                <Button size="xs" color="red" variant="outline" onClick={() => onDelete(device.key)}>
-                  Remove
-                </Button>
-              </Group>
+              <ActionIcon
+                size="sm"
+                color="red"
+                variant="subtle"
+                aria-label={`Remove ${device.name || 'device'}`}
+                onClick={() => onDelete(device.key)}
+                style={{ position: 'absolute', right: 8, bottom: 8 }}
+              >
+                <IconTrash size={14} />
+              </ActionIcon>
             </Card>
           );
         })}
