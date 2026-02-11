@@ -13,6 +13,7 @@ dependencies = [
   "pydantic>=2.6",
   "linien-client==2.1.0",
   "linien-common==2.1.0",
+  "numpy>=2.0",
 ]
 
 [project.scripts]
@@ -20,4 +21,9 @@ linien-gateway = "app.main:main"
 
 [tool.setuptools.packages.find]
 namespaces = false
+
+[tool.uv]
+override-dependencies = [
+  "numpy>=2",
+]
 

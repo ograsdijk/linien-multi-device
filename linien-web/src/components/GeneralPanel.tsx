@@ -26,7 +26,8 @@ type GeneralPanelProps = {
 export function GeneralPanel({ params, onSetParam }: GeneralPanelProps) {
   const dual = Boolean(params.dual_channel);
   const pidOnly = Boolean(params.pid_only_mode);
-  const channelMix = typeof params.channel_mixing === 'number' ? params.channel_mixing : 0;
+  const rawChannelMix = typeof params.channel_mixing === 'number' ? params.channel_mixing : 0;
+  const channelMix = Math.max(-128, Math.min(127, Math.round(rawChannelMix)));
 
   return (
     <Stack gap="md">
@@ -46,7 +47,7 @@ export function GeneralPanel({ params, onSetParam }: GeneralPanelProps) {
         </Text>
         <Slider
           min={-128}
-          max={128}
+          max={127}
           value={channelMix}
           onChange={(value) => onSetParam('channel_mixing', value, true)}
           disabled={!dual}

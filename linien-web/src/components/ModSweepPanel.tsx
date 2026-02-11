@@ -130,7 +130,7 @@ export function ModSweepPanel({ params, onSetParam }: ModSweepPanelProps) {
           label="Automatic filtering"
           checked={filterAutomatic}
           onChange={(event) =>
-            onSetParam(`filter_automatic${suffix}`, event.currentTarget.checked, true)
+            onSetParam(`filter_automatic${suffix}`, event.currentTarget.checked ? 2 : 0, true)
           }
           disabled={channelDisabled}
         />

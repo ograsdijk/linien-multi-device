@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import math
 import pickle
 import threading
 import time
@@ -34,6 +35,18 @@ IGNORED_PARAMS = {
     "ping",
 }
 
+FILTER_AUTOMATIC_PARAMS = {
+    "filter_automatic_a",
+    "filter_automatic_b",
+}
+
+NORMALIZED_PARAMS_ON_CONNECT = (
+    "filter_automatic_a",
+    "filter_automatic_b",
+    "channel_mixing",
+    "modulation_frequency",
+)
+
 
 class DeviceSession:
     def __init__(self, device: Device, manager: WebsocketManager) -> None:
@@ -54,6 +67,61 @@ class DeviceSession:
         self.param_cache: Dict[str, Any] = {}
         self.param_cache_serialized: Dict[str, Any] = {}
         self.plot_state = PlotState()
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        return numeric
+
+    def _normalize_param_value(self, name: str, value: Any) -> Any:
+        if name in FILTER_AUTOMATIC_PARAMS:
+            numeric = self._coerce_float(value)
+            return 2 if numeric is not None and numeric > 0 else 0
+
+        if name == "channel_mixing":
+            numeric = self._coerce_float(value)
+            if numeric is None:
+                return 0
+            clamped = int(round(numeric))
+            return max(-128, min(127, clamped))
+
+        if name == "modulation_frequency":
+            numeric = self._coerce_float(value)
+            if numeric is None:
+                return 0
+            if numeric < 0:
+                numeric = 0
+            return int(round(numeric))
+
+        return value
+
+    @staticmethod
+    def _value_needs_normalization(current: Any, normalized: Any) -> bool:
+        return current != normalized or type(current) is not type(normalized)
+
+    def _sanitize_parameters_on_connect(self) -> None:
+        if self.parameters is None:
+            return
+        changed = False
+        for name in NORMALIZED_PARAMS_ON_CONNECT:
+            try:
+                param = getattr(self.parameters, name)
+                current = param.value
+            except Exception:
+                continue
+            normalized = self._normalize_param_value(name, current)
+            if self._value_needs_normalization(current, normalized):
+                param.value = normalized
+                changed = True
+        if changed and self.control is not None:
+            self.control.exposed_write_registers()
 
     def connect_async(self, autostart_server: bool = False) -> None:
         if self.connected or self.connecting:
@@ -80,6 +148,8 @@ class DeviceSession:
             self.param_cache = {}
             self.param_cache_serialized = {}
             self.plot_state = PlotState()
+            with self._rpyc_lock:
+                self._sanitize_parameters_on_connect()
             self.connected = True
             self.connecting = False
             self.last_error = None
@@ -244,7 +314,7 @@ class DeviceSession:
             raise RuntimeError("Device not connected")
         with self._rpyc_lock:
             param = getattr(self.parameters, name)
-            param.value = value
+            param.value = self._normalize_param_value(name, value)
             if write_registers:
                 self.control.exposed_write_registers()
 
