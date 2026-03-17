@@ -10,6 +10,11 @@ type LockingPanelProps = {
   onStopLock: () => void;
   lockMode?: 'manual' | 'autolock';
   onLockModeChange?: (mode: 'manual' | 'autolock') => void;
+  autolockSelectionActive?: boolean;
+  selectionError?: string | null;
+  selectionSubmitting?: boolean;
+  autolockTemporarilyDisabled?: boolean;
+  disableReason?: string;
 };
 
 export function LockingPanel({
@@ -21,6 +26,11 @@ export function LockingPanel({
   onStopLock,
   lockMode,
   onLockModeChange,
+  autolockSelectionActive,
+  selectionError,
+  selectionSubmitting,
+  autolockTemporarilyDisabled,
+  disableReason,
 }: LockingPanelProps) {
   const slopeParam = params.target_slope_rising;
   const slopeValue =
@@ -31,6 +41,9 @@ export function LockingPanel({
   const autolockModePreference = params.autolock_mode_preference ?? 0;
   const determineOffset = Boolean(params.autolock_determine_offset);
   const mode = lockMode ?? 'manual';
+  const selectionArmed = Boolean(autolockSelectionActive);
+  const disabledReasonText =
+    disableReason ?? 'Temporarily disabled due to compatibility issue.';
 
 
   return (
@@ -103,6 +116,7 @@ export function LockingPanel({
                 if (value == null) return;
                 onSetParam('autolock_mode_preference', Number(value), false);
               }}
+              disabled={autolockTemporarilyDisabled}
             />
             <Switch
               label="Determine signal offset"
@@ -110,15 +124,41 @@ export function LockingPanel({
               onChange={(event) =>
                 onSetParam('autolock_determine_offset', event.currentTarget.checked, false)
               }
+              disabled={autolockTemporarilyDisabled}
             />
-            <Group grow>
-              <Button variant="light" color="orange" onClick={onStartAutolockSelection}>
-                Select line to lock
+            {autolockTemporarilyDisabled ? (
+              <Text size="xs" c="red">
+                {disabledReasonText}
+              </Text>
+            ) : null}
+            {!selectionArmed ? (
+              <Button
+                variant="light"
+                color="orange"
+                onClick={onStartAutolockSelection}
+                disabled={selectionSubmitting || autolockTemporarilyDisabled}
+              >
+                Select target line
               </Button>
-              <Button variant="default" onClick={onAbortAutolockSelection}>
-                Cancel selection
-              </Button>
-            </Group>
+            ) : (
+              <Stack gap="xs">
+                <Text size="sm" fw={500}>
+                  Click and drag over the line you want to lock to.
+                </Text>
+                {selectionError ? (
+                  <Text size="xs" c="red">
+                    {selectionError}
+                  </Text>
+                ) : null}
+                <Button
+                  variant="default"
+                  onClick={onAbortAutolockSelection}
+                  disabled={selectionSubmitting || autolockTemporarilyDisabled}
+                >
+                  Abort
+                </Button>
+              </Stack>
+            )}
           </Stack>
         </Tabs.Panel>
       </Tabs>

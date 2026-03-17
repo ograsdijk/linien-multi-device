@@ -18,6 +18,12 @@ type RightPanelProps = {
   onShutdownServer: () => void;
   lockMode?: 'manual' | 'autolock';
   onLockModeChange?: (mode: 'manual' | 'autolock') => void;
+  selectionMode?: 'autolock' | 'optimization' | null;
+  selectionError?: string | null;
+  selectionSubmitting?: boolean;
+  autolockTemporarilyDisabled?: boolean;
+  optimizationTemporarilyDisabled?: boolean;
+  automationDisableReason?: string;
 };
 
 export function RightPanel(props: RightPanelProps) {
@@ -45,6 +51,13 @@ export function RightPanel(props: RightPanelProps) {
               onStartSelection={props.onStartOptimizationSelection}
               onAbortSelection={props.onAbortOptimizationSelection}
               onStopTask={props.onStopTask}
+              selectionActive={props.selectionMode === 'optimization'}
+              selectionError={
+                props.selectionMode === 'optimization' ? props.selectionError : null
+              }
+              selectionSubmitting={props.selectionSubmitting}
+              optimizationTemporarilyDisabled={props.optimizationTemporarilyDisabled}
+              disableReason={props.automationDisableReason}
             />
           </Accordion.Panel>
         </Accordion.Item>
@@ -60,6 +73,11 @@ export function RightPanel(props: RightPanelProps) {
               onStopLock={props.onStopLock}
               lockMode={props.lockMode}
               onLockModeChange={props.onLockModeChange}
+              autolockSelectionActive={props.selectionMode === 'autolock'}
+              selectionError={props.selectionMode === 'autolock' ? props.selectionError : null}
+              selectionSubmitting={props.selectionSubmitting}
+              autolockTemporarilyDisabled={props.autolockTemporarilyDisabled}
+              disableReason={props.automationDisableReason}
             />
           </Accordion.Panel>
         </Accordion.Item>

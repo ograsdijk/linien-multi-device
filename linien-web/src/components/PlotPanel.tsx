@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { PlotFrame } from '../types';
@@ -7,10 +7,12 @@ const N_POINTS = 2048;
 const DECIMATION = 8;
 const ADC_SAMPLE_RATE = 125e6;
 
+type SelectionMode = 'autolock' | 'optimization' | null;
+
 type PlotPanelProps = {
   plotFrame?: PlotFrame | null;
-  selectionMode: 'autolock' | 'optimization' | null;
-  onSelectRange?: (x0: number, x1: number) => void;
+  selectionMode: SelectionMode;
+  onSelectRange?: (x0: number, x1: number) => void | Promise<void>;
   lockState?: boolean;
   sweepCenter?: number;
   sweepAmplitude?: number;
@@ -145,6 +147,31 @@ const getAxisTheme = () => {
   return { axis, grid, tick };
 };
 
+const getSelectionWidth = (mode: SelectionMode) => (mode === 'optimization' ? 0.75 : 0.99);
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const getSelectionBounds = (mode: Exclude<SelectionMode, null>, pointCount: number) => {
+  const selectableWidth = getSelectionWidth(mode);
+  const maxIndex = Math.max(pointCount - 1, 1);
+  const boundary = ((maxIndex + 1) * (1 - selectableWidth)) / 2;
+  return {
+    minVal: boundary,
+    maxVal: Math.max(boundary, maxIndex - boundary),
+  };
+};
+
+const getSelectionThreshold = (bounds: { minVal: number; maxVal: number }) =>
+  Math.max(1, (bounds.maxVal - bounds.minVal) * 0.01);
+
+const getAccentColor = () => {
+  if (typeof window === 'undefined') {
+    return '#c4472d';
+  }
+  const styles = getComputedStyle(document.documentElement);
+  return styles.getPropertyValue('--accent').trim() || '#c4472d';
+};
+
 export function PlotPanel({
   plotFrame,
   selectionMode,
@@ -154,28 +181,38 @@ export function PlotPanel({
   sweepAmplitude,
   showManualTarget,
 }: PlotPanelProps) {
+  const [frozenFrame, setFrozenFrame] = useState<PlotFrame | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const uplotRef = useRef<uPlot | null>(null);
   const sizeRef = useRef({ width: 800, height: 420 });
   const userShowRef = useRef<Record<number, boolean>>({});
   const suppressSeriesEventRef = useRef(false);
+  const pointCountRef = useRef(N_POINTS);
   const manualTargetRef = useRef<{ enabled: boolean; xVal: number | null }>({
     enabled: false,
     xVal: null,
   });
+  const lockTargetRef = useRef<number | null>(null);
   const selectionRef = useRef<{
-    mode: PlotPanelProps['selectionMode'];
+    mode: SelectionMode;
     onSelectRange?: PlotPanelProps['onSelectRange'];
   }>({ mode: selectionMode, onSelectRange });
 
-  const lockAxis = typeof lockState === 'boolean' ? lockState : plotFrame?.lock ?? false;
+  useEffect(() => {
+    if (selectionMode === null) {
+      setFrozenFrame(null);
+      return;
+    }
+    setFrozenFrame((current) => current ?? plotFrame ?? null);
+  }, [selectionMode, plotFrame]);
+
+  const activePlotFrame = selectionMode === null ? plotFrame ?? null : frozenFrame ?? plotFrame ?? null;
+  const lockAxis = typeof lockState === 'boolean' ? lockState : activePlotFrame?.lock ?? false;
   const sweepCenterValue = toFinite(sweepCenter) ?? 0;
   const sweepAmplitudeValue = toFinite(sweepAmplitude) ?? 1;
 
   const { data, pointCount } = useMemo(() => {
-    const seriesRaw = SERIES_KEYS.map((key) =>
-      normalizeSeries(plotFrame?.series?.[key])
-    );
+    const seriesRaw = SERIES_KEYS.map((key) => normalizeSeries(activePlotFrame?.series?.[key]));
     if (!lockAxis) {
       const combinedIdx = SERIES_KEYS.indexOf('combined_error');
       const errIdx = SERIES_KEYS.indexOf('error_signal_1');
@@ -183,10 +220,7 @@ export function PlotPanel({
         seriesRaw[combinedIdx] = seriesRaw[errIdx];
       }
     }
-    const maxLen = Math.max(
-      ...seriesRaw.map((series) => series.length),
-      0
-    );
+    const maxLen = Math.max(...seriesRaw.map((series) => series.length), 0);
     const count = maxLen > 0 ? maxLen : N_POINTS;
     const x = Array.from({ length: count }, (_, i) => i);
     const seriesData = seriesRaw.map((series) => {
@@ -199,7 +233,11 @@ export function PlotPanel({
       return Array(count).fill(null);
     });
     return { data: [x, ...seriesData] as Array<Array<number | null>>, pointCount: count };
-  }, [plotFrame, lockAxis]);
+  }, [activePlotFrame, lockAxis]);
+
+  useEffect(() => {
+    pointCountRef.current = pointCount;
+  }, [pointCount]);
 
   const axisValues = useMemo(() => {
     const dtMicroSeconds = (DECIMATION / ADC_SAMPLE_RATE) * 1e6;
@@ -229,6 +267,7 @@ export function PlotPanel({
   }, [lockAxis, sweepCenterValue, sweepAmplitudeValue, pointCount]);
 
   const axisLabel = lockAxis ? 'time (us)' : 'sweep voltage (V)';
+
   useEffect(() => {
     selectionRef.current = { mode: selectionMode, onSelectRange };
   }, [selectionMode, onSelectRange]);
@@ -247,6 +286,11 @@ export function PlotPanel({
     manualTargetRef.current = { enabled: true, xVal };
     uplotRef.current?.redraw();
   }, [showManualTarget, lockAxis, sweepCenterValue, sweepAmplitudeValue, pointCount]);
+
+  useEffect(() => {
+    lockTargetRef.current = toFinite(activePlotFrame?.lock_target);
+    uplotRef.current?.redraw();
+  }, [activePlotFrame?.lock_target]);
 
   useEffect(() => {
     let observer: ResizeObserver | null = null;
@@ -339,23 +383,43 @@ export function PlotPanel({
         ],
         draw: [
           (u) => {
-            const target = manualTargetRef.current;
-            if (!target.enabled || target.xVal == null) return;
-            const xPos = u.valToPos(target.xVal, 'x', true);
-            if (!Number.isFinite(xPos)) return;
             const { top, height } = u.bbox;
             const ctx = u.ctx;
-            ctx.save();
             const theme = getAxisTheme();
-            ctx.strokeStyle = theme.axis;
-            ctx.globalAlpha = 0.55;
-            ctx.lineWidth = 1;
-            ctx.setLineDash([4, 4]);
-            ctx.beginPath();
-            ctx.moveTo(xPos, top);
-            ctx.lineTo(xPos, top + height);
-            ctx.stroke();
-            ctx.restore();
+
+            const manualTarget = manualTargetRef.current;
+            if (manualTarget.enabled && manualTarget.xVal != null) {
+              const xPos = u.valToPos(manualTarget.xVal, 'x', true);
+              if (Number.isFinite(xPos)) {
+                ctx.save();
+                ctx.strokeStyle = theme.axis;
+                ctx.globalAlpha = 0.55;
+                ctx.lineWidth = 1;
+                ctx.setLineDash([4, 4]);
+                ctx.beginPath();
+                ctx.moveTo(xPos, top);
+                ctx.lineTo(xPos, top + height);
+                ctx.stroke();
+                ctx.restore();
+              }
+            }
+
+            const lockTarget = lockTargetRef.current;
+            if (lockTarget != null) {
+              const xPos = u.valToPos(lockTarget, 'x', true);
+              if (Number.isFinite(xPos)) {
+                ctx.save();
+                ctx.strokeStyle = getAccentColor();
+                ctx.globalAlpha = 0.8;
+                ctx.lineWidth = 1.5;
+                ctx.setLineDash([7, 5]);
+                ctx.beginPath();
+                ctx.moveTo(xPos, top);
+                ctx.lineTo(xPos, top + height);
+                ctx.stroke();
+                ctx.restore();
+              }
+            }
           },
         ],
         setSelect: [
@@ -363,10 +427,35 @@ export function PlotPanel({
             const current = selectionRef.current;
             if (!current.mode || !current.onSelectRange) return;
             const { left, width } = u.select;
-            if (width < 2) return;
-            const x0 = Math.round(u.posToVal(left, 'x'));
-            const x1 = Math.round(u.posToVal(left + width, 'x'));
-            current.onSelectRange(Math.min(x0, x1), Math.max(x0, x1));
+            if (width < 2) {
+              u.setSelect({ left: 0, width: 0, height: 0, top: 0 }, false);
+              return;
+            }
+
+            const bounds = getSelectionBounds(current.mode, pointCountRef.current);
+            const minPos = u.valToPos(bounds.minVal, 'x');
+            const maxPos = u.valToPos(bounds.maxVal, 'x');
+            const xStart = clamp(left, Math.min(minPos, maxPos), Math.max(minPos, maxPos));
+            const xEnd = clamp(
+              left + width,
+              Math.min(minPos, maxPos),
+              Math.max(minPos, maxPos)
+            );
+            if (Math.abs(xEnd - xStart) < 2) {
+              u.setSelect({ left: 0, width: 0, height: 0, top: 0 }, false);
+              return;
+            }
+
+            const x0 = u.posToVal(xStart, 'x');
+            const x1 = u.posToVal(xEnd, 'x');
+            if (Math.abs(x1 - x0) < getSelectionThreshold(bounds)) {
+              u.setSelect({ left: 0, width: 0, height: 0, top: 0 }, false);
+              return;
+            }
+
+            Promise.resolve(
+              current.onSelectRange(Math.min(Math.round(x0), Math.round(x1)), Math.max(Math.round(x0), Math.round(x1)))
+            ).catch(() => null);
             u.setSelect({ left: 0, width: 0, height: 0, top: 0 }, false);
           },
         ],
@@ -420,7 +509,7 @@ export function PlotPanel({
       return acc;
     }, {} as Record<SeriesKey, boolean>);
 
-    const dual = Boolean(plotFrame?.dual_channel);
+    const dual = Boolean(activePlotFrame?.dual_channel);
     const desiredVisibility: Record<SeriesKey, boolean> = {
       combined_error: false,
       control_signal: false,
@@ -489,14 +578,11 @@ export function PlotPanel({
         if (rowIdx === 0) return;
         const key = SERIES_KEYS[rowIdx - 1];
         if (!key) return;
-        const hide =
-          SERIES_STYLE[key].legendHidden ||
-          !desiredVisibility[key] ||
-          !hasDataByKey[key];
+        const hide = SERIES_STYLE[key].legendHidden || !desiredVisibility[key] || !hasDataByKey[key];
         row.classList.toggle('legend-hidden', hide);
       });
     });
-  }, [data, pointCount, lockAxis, plotFrame?.dual_channel]);
+  }, [data, pointCount, lockAxis, activePlotFrame?.dual_channel]);
 
   useEffect(() => {
     if (!uplotRef.current) return;
@@ -524,7 +610,16 @@ export function PlotPanel({
     }
 
     const previousTouchAction = over.style.touchAction;
+    const previousCursor = over.style.cursor;
     over.style.touchAction = 'none';
+    over.style.cursor = 'crosshair';
+
+    const bounds = getSelectionBounds(selectionMode, pointCount);
+    const minPos = u.valToPos(bounds.minVal, 'x');
+    const maxPos = u.valToPos(bounds.maxVal, 'x');
+    const lowerPos = Math.min(minPos, maxPos);
+    const upperPos = Math.max(minPos, maxPos);
+    const threshold = getSelectionThreshold(bounds);
 
     let startX: number | null = null;
     let currentX: number | null = null;
@@ -535,7 +630,8 @@ export function PlotPanel({
 
     const clampToPlotX = (clientX: number) => {
       const rect = over.getBoundingClientRect();
-      return Math.max(0, Math.min(rect.width, clientX - rect.left));
+      const raw = clientX - rect.left;
+      return clamp(raw, lowerPos, upperPos);
     };
 
     const drawSelection = (x0: number, x1: number) => {
@@ -561,12 +657,19 @@ export function PlotPanel({
       }
       const left = Math.min(startX, currentX);
       const right = Math.max(startX, currentX);
-      if (right - left >= 2) {
-        const x0 = Math.round(u.posToVal(left, 'x'));
-        const x1 = Math.round(u.posToVal(right, 'x'));
-        const current = selectionRef.current;
-        if (current.mode && current.onSelectRange) {
-          current.onSelectRange(Math.min(x0, x1), Math.max(x0, x1));
+      if (Math.abs(right - left) >= 2) {
+        const x0 = u.posToVal(left, 'x');
+        const x1 = u.posToVal(right, 'x');
+        if (Math.abs(x1 - x0) >= threshold) {
+          const current = selectionRef.current;
+          if (current.mode && current.onSelectRange) {
+            Promise.resolve(
+              current.onSelectRange(
+                Math.min(Math.round(x0), Math.round(x1)),
+                Math.max(Math.round(x0), Math.round(x1))
+              )
+            ).catch(() => null);
+          }
         }
       }
       clearSelection();
@@ -620,25 +723,43 @@ export function PlotPanel({
       over.removeEventListener('touchend', onTouchEnd);
       over.removeEventListener('touchcancel', onTouchCancel);
       over.style.touchAction = previousTouchAction;
+      over.style.cursor = previousCursor;
       clearSelection();
     };
-  }, [selectionMode]);
+  }, [selectionMode, pointCount]);
 
-  const resetView = () => {
-    if (!uplotRef.current) return;
-    uplotRef.current.setScale('x', { min: 0, max: Math.max(pointCount - 1, 1) });
-    uplotRef.current.setScale('y', { auto: true });
-  };
-
+  const boundaryPercent =
+    selectionMode === null ? 0 : ((1 - getSelectionWidth(selectionMode)) / 2) * 100;
 
   return (
     <div className="panel plot-panel" style={{ padding: 12 }}>
-      {(!plotFrame || !plotFrame.series || Object.keys(plotFrame.series).length === 0) && (
+      {(!activePlotFrame ||
+        !activePlotFrame.series ||
+        Object.keys(activePlotFrame.series).length === 0) && (
         <div style={{ color: '#7a6a58', fontSize: 13, marginBottom: 8 }}>
           Waiting for data...
         </div>
       )}
-      <div ref={containerRef} style={{ width: '100%', height: 420, position: 'relative' }} />
+      <div ref={containerRef} style={{ width: '100%', height: 420, position: 'relative' }}>
+        {selectionMode !== null ? (
+          <>
+            <div className="plot-selection-banner">
+              {selectionMode === 'autolock'
+                ? 'Autolock selection armed: drag over the target line.'
+                : 'Optimization selection armed: drag over the target region.'}
+            </div>
+            {boundaryPercent > 0 ? (
+              <>
+                <div className="plot-selection-mask" style={{ left: 0, width: `${boundaryPercent}%` }} />
+                <div
+                  className="plot-selection-mask"
+                  style={{ right: 0, width: `${boundaryPercent}%` }}
+                />
+              </>
+            ) : null}
+          </>
+        ) : null}
+      </div>
     </div>
   );
 }

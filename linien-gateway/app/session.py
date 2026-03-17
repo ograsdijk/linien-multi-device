@@ -47,6 +47,13 @@ NORMALIZED_PARAMS_ON_CONNECT = (
     "modulation_frequency",
 )
 
+# Temporary compatibility switch.
+# Set to False to re-enable the original autolock/optimization implementations below.
+AUTOMATION_TEMP_DISABLED = True
+AUTOMATION_TEMP_DISABLED_REASON = (
+    "temporarily disabled due to NumPy pickle compatibility between gateway and server."
+)
+
 
 class DeviceSession:
     def __init__(self, device: Device, manager: WebsocketManager) -> None:
@@ -337,6 +344,10 @@ class DeviceSession:
             self.control.exposed_start_sweep()
 
     def start_autolock(self, x0: int, x1: int) -> None:
+        if AUTOMATION_TEMP_DISABLED:
+            raise RuntimeError(
+                f"Autolock is {AUTOMATION_TEMP_DISABLED_REASON}"
+            )
         if self.control is None:
             raise RuntimeError("Device not connected")
         if self.plot_state.last_plot_data is None:
@@ -351,7 +362,14 @@ class DeviceSession:
                 additional_spectra=pickle.dumps(additional),
             )
         try:
-            mean_signal, target_slope_rising, target_zoom, rolled_error_signal, line_width, peak_idxs = get_lock_point(
+            (
+                mean_signal,
+                target_slope_rising,
+                target_zoom,
+                rolled_error_signal,
+                line_width,
+                peak_idxs,
+            ) = get_lock_point(
                 combined_error,
                 *sorted([x0, x1]),
             )
@@ -360,6 +378,10 @@ class DeviceSession:
             self.plot_state.autolock_ref_spectrum = None
 
     def start_optimization(self, x0: int, x1: int) -> None:
+        if AUTOMATION_TEMP_DISABLED:
+            raise RuntimeError(
+                f"Optimization is {AUTOMATION_TEMP_DISABLED_REASON}"
+            )
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
         if self.plot_state.last_plot_data is None:

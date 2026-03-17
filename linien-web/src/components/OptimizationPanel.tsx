@@ -20,6 +20,11 @@ type OptimizationPanelProps = {
   onStartSelection: () => void;
   onAbortSelection: () => void;
   onStopTask: (useNew: boolean) => void;
+  selectionActive?: boolean;
+  selectionError?: string | null;
+  selectionSubmitting?: boolean;
+  optimizationTemporarilyDisabled?: boolean;
+  disableReason?: string;
 };
 
 export function OptimizationPanel({
@@ -28,13 +33,20 @@ export function OptimizationPanel({
   onStartSelection,
   onAbortSelection,
   onStopTask,
+  selectionActive,
+  selectionError,
+  selectionSubmitting,
+  optimizationTemporarilyDisabled,
+  disableReason,
 }: OptimizationPanelProps) {
   const running = Boolean(params.optimization_running);
   const approaching = Boolean(params.optimization_approaching);
-  const selecting = Boolean(params.optimization_selection);
+  const selecting = Boolean(selectionActive ?? params.optimization_selection);
   const failed = Boolean(params.optimization_failed);
   const improvement = toNumber(params.optimization_improvement, 0);
-  const disabled = Boolean(params.pid_only_mode);
+  const disabled = Boolean(params.pid_only_mode) || Boolean(optimizationTemporarilyDisabled);
+  const disabledReasonText =
+    disableReason ?? 'Temporarily disabled due to compatibility issue.';
 
   const modFreqEnabled = Boolean(params.optimization_mod_freq_enabled);
   const modFreqMin = toNumber(params.optimization_mod_freq_min, 0);
@@ -73,6 +85,11 @@ export function OptimizationPanel({
   return (
     <Stack gap="sm">
       <Text size="sm">Status: {statusText}</Text>
+      {optimizationTemporarilyDisabled ? (
+        <Text size="xs" c="red">
+          {disabledReasonText}
+        </Text>
+      ) : null}
       <Text size="sm">Improvement: {(improvement * 100).toFixed(1)}%</Text>
       {optimized && (
         <Text size="xs" c="dimmed">
@@ -159,19 +176,49 @@ export function OptimizationPanel({
       )}
 
       <Divider my="xs" />
-      <Group grow>
-        <Button variant="light" color="orange" onClick={onStartSelection} disabled={disabled}>
+      {!selecting ? (
+        <Button
+          variant="light"
+          color="orange"
+          onClick={onStartSelection}
+          disabled={disabled || selectionSubmitting}
+        >
           Select region
         </Button>
-        <Button variant="default" onClick={onAbortSelection} disabled={disabled}>
-          Cancel selection
-        </Button>
-      </Group>
+      ) : (
+        <Stack gap="xs">
+          <Text size="sm" fw={500}>
+            Click and drag over the region to optimize.
+          </Text>
+          {selectionError ? (
+            <Text size="xs" c="red">
+              {selectionError}
+            </Text>
+          ) : null}
+          <Button
+            variant="default"
+            onClick={onAbortSelection}
+            disabled={disabled || selectionSubmitting}
+          >
+            Abort
+          </Button>
+        </Stack>
+      )}
       <Group grow>
-        <Button color="red" variant="light" onClick={() => onStopTask(false)} disabled={disabled}>
+        <Button
+          color="red"
+          variant="light"
+          onClick={() => onStopTask(false)}
+          disabled={disabled || Boolean(optimizationTemporarilyDisabled)}
+        >
           Abort
         </Button>
-        <Button color="green" variant="light" onClick={() => onStopTask(true)} disabled={disabled}>
+        <Button
+          color="green"
+          variant="light"
+          onClick={() => onStopTask(true)}
+          disabled={disabled || Boolean(optimizationTemporarilyDisabled)}
+        >
           Use optimized
         </Button>
       </Group>
