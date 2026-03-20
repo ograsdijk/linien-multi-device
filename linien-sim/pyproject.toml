@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linien-sim"
+version = "0.1.0"
+description = "Virtual Linien device simulator with physics-based PDH traces"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26,<2.0",
+  "rpyc>=6.0",
+  "linien-common==2.1.0",
+  "textual>=0.79",
+  "typing_extensions>=4.0",
+]
+
+[project.scripts]
+linien-sim = "linien_sim.main:main"
+
+[tool.setuptools.packages.find]
+namespaces = false
