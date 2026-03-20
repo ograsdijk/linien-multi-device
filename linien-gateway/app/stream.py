@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Dict
 
 from fastapi import WebSocket
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,6 +38,8 @@ class WebsocketManager:
     async def unregister(self, device_key: str, websocket: WebSocket) -> None:
         if device_key in self._connections:
             self._connections[device_key].pop(websocket, None)
+            if not self._connections[device_key]:
+                self._connections.pop(device_key, None)
 
     async def broadcast(self, device_key: str, message: Dict[str, Any]) -> None:
         if device_key not in self._connections:
@@ -57,6 +62,25 @@ class WebsocketManager:
     def publish(self, device_key: str, message: Dict[str, Any]) -> None:
         if self._loop is None:
             return
-        asyncio.run_coroutine_threadsafe(
+        future = asyncio.run_coroutine_threadsafe(
             self.broadcast(device_key, message), self._loop
         )
+        future.add_done_callback(
+            lambda fut: self._handle_publish_result(device_key, message, fut)
+        )
+
+    def _handle_publish_result(
+        self,
+        device_key: str,
+        message: Dict[str, Any],
+        future: asyncio.Future,
+    ) -> None:
+        try:
+            future.result()
+        except Exception:  # noqa: BLE001 - log and continue, publish must stay best effort
+            logger.warning(
+                "Websocket publish failed for device=%s type=%s",
+                device_key,
+                message.get("type"),
+                exc_info=True,
+            )

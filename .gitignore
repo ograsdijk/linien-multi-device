@@ -48,6 +48,7 @@ linien-gateway/*.egg-info/
 
 # Logs
 *.log
+device_settings.json
 
 # OS / Editor
 .DS_Store

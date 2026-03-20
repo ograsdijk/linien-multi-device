@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from math import log10
 from typing import Any, Dict, List, Optional, Tuple
+import time
 
 import numpy as np
 from linien_common.common import (
@@ -34,6 +35,7 @@ class PlotState:
     control_std_history: List[float] = field(default_factory=list)
     combined_error_cache: List[np.ndarray] = field(default_factory=list)
     last_plot_data: Optional[List[np.ndarray]] = None
+    last_unlocked_trace_at: float | None = None
     autolock_ref_spectrum: Optional[np.ndarray] = None
     last_lock_state: Optional[bool] = None
 
@@ -147,8 +149,9 @@ def build_plot_frame(
         error_signal = to_plot.get("error_signal")
         control_signal = to_plot.get("control_signal")
         if error_signal is not None and control_signal is not None:
-            state.error_std_history.append(float(np.std(error_signal)))
-            state.control_std_history.append(float(np.std(control_signal)))
+            # Store lock stats in volts to match UI thresholds and other scaled traces.
+            state.error_std_history.append(float(np.std(error_signal) / V))
+            state.control_std_history.append(float(np.std(control_signal) / V))
             state.error_std_history = state.error_std_history[-10:]
             state.control_std_history = state.control_std_history[-10:]
             error_std_mean = float(np.mean(state.error_std_history))
@@ -209,6 +212,7 @@ def build_plot_frame(
             monitor_or_error_signal_2,
             combined_error,
         ]
+        state.last_unlocked_trace_at = time.time()
 
         state.combined_error_cache.append(combined_error)
         state.combined_error_cache = state.combined_error_cache[-20:]

@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import List
 from uuid import uuid4
 
 from linien_common.config import USER_DATA_PATH
 
 GROUPS_PATH = USER_DATA_PATH / "groups.json"
+logger = logging.getLogger(__name__)
 
 
 def _generate_key() -> str:
     return uuid4().hex[:10]
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(f"{path.suffix}.tmp")
+    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path.replace(path)
 
 
 @dataclass
@@ -24,16 +34,47 @@ class Group:
 
 def load_groups(path=GROUPS_PATH) -> List[Group]:
     try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        return [Group(**value) for _, value in data.items()]
+        raw = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
         return []
+    except OSError:
+        logger.warning("Failed reading groups file at %s", path, exc_info=True)
+        return []
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Malformed groups file at %s; ignoring.", path, exc_info=True)
+        return []
+
+    if isinstance(data, list):
+        candidates = data
+    elif isinstance(data, dict):
+        candidates = list(data.values())
+    else:
+        logger.warning("Invalid groups payload type at %s: %s", path, type(data).__name__)
+        return []
+
+    groups: list[Group] = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        if not isinstance(item.get("key"), str):
+            logger.warning("Skipping group entry without valid key in %s: %r", path, item)
+            continue
+        if not isinstance(item.get("name"), str):
+            logger.warning("Skipping group entry without valid name in %s: %r", path, item)
+            continue
+        try:
+            groups.append(Group(**item))
+        except TypeError:
+            logger.warning("Skipping invalid group entry in %s: %r", path, item)
+    return groups
 
 
 def save_groups(groups: List[Group], path=GROUPS_PATH) -> None:
-    with open(path, "w") as f:
-        json.dump({i: asdict(group) for i, group in enumerate(groups)}, f, indent=2)
+    payload = {i: asdict(group) for i, group in enumerate(groups)}
+    _atomic_write_json(Path(path), payload)
 
 
 def list_groups(device_keys: List[str]) -> List[Group]:

@@ -4,12 +4,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .path_utils import find_repo_root
+
 DEFAULT_API_PORT = 8000
 DEFAULT_API_HOST = "127.0.0.1"
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return find_repo_root(Path(__file__)) or Path(__file__).resolve().parents[2]
 
 
 def _load_config() -> dict[str, Any]:
