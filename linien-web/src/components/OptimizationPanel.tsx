@@ -21,7 +21,6 @@ type OptimizationPanelProps = {
   onAbortSelection: () => void;
   onStopTask: (useNew: boolean) => void;
   selectionActive?: boolean;
-  selectionError?: string | null;
   selectionSubmitting?: boolean;
   optimizationTemporarilyDisabled?: boolean;
   disableReason?: string;
@@ -34,7 +33,6 @@ export function OptimizationPanel({
   onAbortSelection,
   onStopTask,
   selectionActive,
-  selectionError,
   selectionSubmitting,
   optimizationTemporarilyDisabled,
   disableReason,
@@ -190,11 +188,6 @@ export function OptimizationPanel({
           <Text size="sm" fw={500}>
             Click and drag over the region to optimize.
           </Text>
-          {selectionError ? (
-            <Text size="xs" c="red">
-              {selectionError}
-            </Text>
-          ) : null}
           <Button
             variant="default"
             onClick={onAbortSelection}

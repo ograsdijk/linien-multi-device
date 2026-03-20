@@ -1,7 +1,13 @@
 import { useMemo, useState } from 'react';
 import { ActionIcon, Button, Card, Group, Modal, Stack, Text, TextInput } from '@mantine/core';
-import { IconDevices, IconPencil, IconTrash } from '@tabler/icons-react';
-import type { Device, DeviceStatus } from '../types';
+import { IconChevronLeft, IconDevices, IconPencil, IconTrash } from '@tabler/icons-react';
+import type {
+  AutoRelockStatus,
+  Device,
+  DeviceStatus,
+  LockIndicatorSnapshot,
+} from '../types';
+import { resolveLockDisplay, resolveRelockTag } from '../features/locks/lockState';
 
 const emptyForm = {
   name: '',
@@ -14,9 +20,14 @@ const emptyForm = {
 type DeviceListProps = {
   devices: Device[];
   statuses: Record<string, DeviceStatus | undefined>;
+  lockIndicators: Record<string, LockIndicatorSnapshot | undefined>;
+  autoRelockStates: Record<string, AutoRelockStatus | undefined>;
+  autoRelockBusyKeys?: Record<string, boolean>;
   activeKeys: string[];
   canAddToGroup: boolean;
+  onCollapse: () => void;
   onAddToGroup: (key: string) => void;
+  onToggleAutoRelock: (key: string, enabled: boolean) => void;
   onAdd: (payload: Partial<Device>) => Promise<void>;
   onEdit: (key: string, payload: Partial<Device>) => Promise<void>;
   onDelete: (key: string) => Promise<void>;
@@ -28,9 +39,14 @@ type DeviceListProps = {
 export function DeviceList({
   devices,
   statuses,
+  lockIndicators,
+  autoRelockStates,
+  autoRelockBusyKeys,
   activeKeys,
   canAddToGroup,
+  onCollapse,
   onAddToGroup,
+  onToggleAutoRelock,
   onAdd,
   onEdit,
   onDelete,
@@ -88,19 +104,32 @@ export function DeviceList({
             Add
           </Button>
         </Group>
-        <Group gap={4} align="center" title="Connected (total devices)">
-          <IconDevices size={16} />
-          <Text size="sm" fw={700} c={connectedDeviceCount === 0 ? 'red' : 'green'}>
-            {connectedDeviceCount}
-          </Text>
-          <Text size="sm" c="dimmed">
-            ({devices.length})
-          </Text>
+        <Group gap="xs" align="center">
+          <Group gap={4} align="center" title="Connected (total devices)">
+            <IconDevices size={16} />
+            <Text size="sm" fw={700} c={connectedDeviceCount === 0 ? 'red' : 'green'}>
+              {connectedDeviceCount}
+            </Text>
+            <Text size="sm" c="dimmed">
+              ({devices.length})
+            </Text>
+          </Group>
+          <ActionIcon
+            size="sm"
+            variant="subtle"
+            color="gray"
+            aria-label="Collapse devices panel"
+            title="Collapse devices panel"
+            onClick={onCollapse}
+          >
+            <IconChevronLeft size={14} />
+          </ActionIcon>
         </Group>
       </Group>
       <Stack gap="xs">
         {devices.map((device) => {
           const status = statuses[device.key];
+          const indicator = lockIndicators[device.key];
           const connected = status?.connected;
           const connecting = status?.connecting;
           const hasError = Boolean(status?.last_error);
@@ -119,6 +148,14 @@ export function DeviceList({
                 : state === 'connected'
                   ? 'Connected'
                   : 'Disconnected';
+          const lockDisplay = resolveLockDisplay({
+            connected: Boolean(connected),
+            lockEnabled: status?.lock,
+            indicator: indicator ?? null,
+          });
+          const autoRelock = autoRelockStates[device.key] ?? status?.auto_relock ?? undefined;
+          const autoRelockDisplay = resolveRelockTag(autoRelock);
+          const autoRelockBusy = Boolean(autoRelockBusyKeys?.[device.key]);
           const inActiveGroup = activeSet.has(device.key);
           return (
             <Card
@@ -157,7 +194,25 @@ export function DeviceList({
                     <Text size="xs" c="red">{status.last_error}</Text>
                   ) : null}
                 </div>
-                <div className={`device-tag status-${state}`}>{tagLabel}</div>
+                <Group gap={6} align="center">
+                  <div className={`device-tag status-${state}`}>{tagLabel}</div>
+                  <div className={`device-tag status-lock-${lockDisplay.uiState}`}>
+                    {lockDisplay.label}
+                  </div>
+                  <button
+                    type="button"
+                    className={`device-tag device-tag-button status-lock-${autoRelockDisplay.uiState}`}
+                    onClick={() => onToggleAutoRelock(device.key, !autoRelockDisplay.enabled)}
+                    disabled={autoRelockBusy}
+                    style={{
+                      cursor: autoRelockBusy ? 'default' : 'pointer',
+                      opacity: autoRelockBusy ? 0.6 : 1,
+                    }}
+                    title="Toggle auto relock"
+                  >
+                    {autoRelockDisplay.label}
+                  </button>
+                </Group>
               </Group>
               <Group mt="sm" gap="xs" style={{ paddingRight: 34 }}>
                 <Button

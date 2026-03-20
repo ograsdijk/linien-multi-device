@@ -1,5 +1,6 @@
 import { apiBase } from './api';
-import type { StreamMessage } from './types';
+import type { LogsStreamMessage, StreamMessage } from './types';
+import { parseLogsStreamMessage, parseStreamMessage } from './features/runtime/messageGuards';
 
 type StreamOptions = {
   maxFps?: number;
@@ -23,10 +24,36 @@ export function openDeviceStream(
 
   socket.onmessage = (event) => {
     try {
-      const parsed = JSON.parse(event.data);
-      onMessage(parsed as StreamMessage);
+      const parsed = JSON.parse(event.data) as unknown;
+      const message = parseStreamMessage(parsed);
+      if (!message) {
+        console.warn('Bad WS message shape', parsed);
+        return;
+      }
+      onMessage(message);
     } catch (err) {
       console.warn('Bad WS message', err);
+    }
+  };
+
+  return socket;
+}
+
+export function openLogsStream(onMessage: (msg: LogsStreamMessage) => void) {
+  const wsBase = apiBase.replace(/^http/, 'ws');
+  const socket = new WebSocket(`${wsBase}/logs/stream`);
+
+  socket.onmessage = (event) => {
+    try {
+      const parsed = JSON.parse(event.data) as unknown;
+      const message = parseLogsStreamMessage(parsed);
+      if (!message) {
+        console.warn('Bad logs WS message shape', parsed);
+        return;
+      }
+      onMessage(message);
+    } catch (err) {
+      console.warn('Bad logs WS message', err);
     }
   };
 

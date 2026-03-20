@@ -5,6 +5,7 @@ import { api } from '../api';
 import { useDeviceStream } from '../hooks/useDeviceStream';
 import { PlotPanel } from './PlotPanel';
 import { StatusRow } from './StatusRow';
+import { resolveLockDisplay } from '../features/locks/lockState';
 
 type DeviceOverviewCardProps = {
   device: Device;
@@ -28,7 +29,9 @@ export function DeviceOverviewCard({
   onStateUpdate,
 }: DeviceOverviewCardProps) {
   const connected = Boolean(state.status?.connected);
-  const lockState = typeof state.params.lock === 'boolean' ? state.params.lock : undefined;
+  const lockStateFromParams = typeof state.params.lock === 'boolean' ? state.params.lock : undefined;
+  const lockStateFromStatus = typeof state.status?.lock === 'boolean' ? state.status.lock : undefined;
+  const lockState = lockStateFromParams ?? lockStateFromStatus;
   const sweepCenterRaw = state.params.sweep_center;
   const sweepCenterNum = sweepCenterRaw == null ? NaN : Number(sweepCenterRaw);
   const sweepCenter = Number.isFinite(sweepCenterNum) ? sweepCenterNum : undefined;
@@ -36,6 +39,12 @@ export function DeviceOverviewCard({
   const sweepAmplitudeNum = sweepAmplitudeRaw == null ? NaN : Number(sweepAmplitudeRaw);
   const sweepAmplitude = Number.isFinite(sweepAmplitudeNum) ? sweepAmplitudeNum : undefined;
   const statusLabel = connected ? (lockState ? 'Locked' : 'Unlocked') : 'Disconnected';
+  const lockIndicator = state.plotFrame?.lock_indicator ?? null;
+  const lockDisplay = resolveLockDisplay({
+    connected,
+    lockEnabled: lockState,
+    indicator: lockIndicator,
+  });
 
   const lastPlotRef = useRef(0);
   const plotThrottleMs = maxFps && maxFps > 0 ? 1000 / maxFps : 0;
@@ -68,6 +77,7 @@ export function DeviceOverviewCard({
           <Text size="xs" c="dimmed">
             {statusLabel}
           </Text>
+          <div className={`device-tag status-lock-${lockDisplay.uiState}`}>{lockDisplay.label}</div>
           {connected ? (
             <Button size="xs" variant="light" color="red" onClick={() => api.disconnectDevice(device.key).catch(() => null)}>
               Disconnect
@@ -95,7 +105,12 @@ export function DeviceOverviewCard({
         sweepAmplitude={sweepAmplitude}
         showManualTarget={false}
       />
-      <StatusRow plotFrame={state.plotFrame} />
+      <StatusRow
+        plotFrame={state.plotFrame}
+        lockIndicator={lockIndicator}
+        connected={connected}
+        lockEnabled={lockState}
+      />
     </div>
   );
 }

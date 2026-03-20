@@ -1,238 +1,377 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import type { DragEvent } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import {
   ActionIcon,
   AppShell,
   Button,
   Group,
   Modal,
-  SegmentedControl,
   Select,
   Tabs,
   Text,
   TextInput,
 } from '@mantine/core';
-import { IconMoonStars, IconPencil, IconPlus, IconSun, IconX } from '@tabler/icons-react';
+import {
+  IconChevronRight,
+  IconDevices,
+  IconPencil,
+  IconPlus,
+  IconX,
+} from '@tabler/icons-react';
 import { useMantineColorScheme } from '@mantine/core';
 import { api } from './api';
-import type { Device, DeviceGroup, DeviceStatus, StreamMessage } from './types';
 import { DeviceList } from './components/DeviceList';
 import { DeviceWorkspace, DeviceState } from './components/DeviceWorkspace';
 import { DeviceOverviewCard } from './components/DeviceOverviewCard';
+import { AppHeaderControls } from './components/AppHeaderControls';
+import { ToastStack } from './components/ToastStack';
+import { useLogsController } from './features/logs/useLogsController';
+import { useLockSummary } from './features/locks/useLockSummary';
+import { usePostgresController } from './features/integrations/usePostgresController';
+import { useInfluxController } from './features/integrations/useInfluxController';
+import { useLockActions } from './features/locks/useLockActions';
+import { OVERVIEW_KEY, useDeviceCatalog } from './features/devices/useDeviceCatalog';
+import { useDeviceStatusPolling } from './features/devices/useDeviceStatusPolling';
+import { useDeviceStateUpdater } from './features/devices/useDeviceStateUpdater';
 
-const OVERVIEW_KEY = '__overview__';
+const DEVICE_BAR_COLLAPSED_KEY = 'linien.deviceBarCollapsed';
+const LogsModal = lazy(async () => {
+  const module = await import('./components/LogsModal');
+  return { default: module.LogsModal };
+});
 
 export function App() {
-  const [devices, setDevices] = useState<Device[]>([]);
-  const [groups, setGroups] = useState<DeviceGroup[]>([]);
-  const [activeTabKey, setActiveTabKey] = useState<string | null>(OVERVIEW_KEY);
   const [deviceStates, setDeviceStates] = useState<Record<string, DeviceState>>({});
-  const [groupModalOpen, setGroupModalOpen] = useState(false);
-  const [groupNameDraft, setGroupNameDraft] = useState('');
-  const [editingGroupKey, setEditingGroupKey] = useState<string | null>(null);
-  const [dragOverGroupKey, setDragOverGroupKey] = useState<string | null>(null);
   const [overviewFps, setOverviewFps] = useState<number>(0);
+  const [lockPopoverOpen, setLockPopoverOpen] = useState(false);
+  const [deviceBarCollapsed, setDeviceBarCollapsed] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem(DEVICE_BAR_COLLAPSED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
   const { colorScheme, setColorScheme } = useMantineColorScheme();
+  const {
+    devices,
+    groups,
+    activeTabKey,
+    setActiveTabKey,
+    isOverview,
+    activeGroup,
+    activeDeviceKeys,
+    loadDevices,
+    loadGroups,
+    groupModalOpen,
+    setGroupModalOpen,
+    groupNameDraft,
+    setGroupNameDraft,
+    editingGroupKey,
+    dragOverGroupKey,
+    setDragOverGroupKey,
+    openCreateGroup,
+    openRenameGroup,
+    saveGroup,
+    addDeviceToGroup,
+    removeDeviceFromGroup,
+    openDeviceGroup,
+    handleDrop,
+    groupDevicesMap,
+  } = useDeviceCatalog();
+  const {
+    logsOpen,
+    setLogsOpen,
+    logsWsConnected,
+    logsLoading,
+    logsErrorLatched,
+    logRows,
+    filteredLogRows,
+    logLevelFilter,
+    setLogLevelFilter,
+    logSourceFilter,
+    setLogSourceFilter,
+    logDeviceFilter,
+    setLogDeviceFilter,
+    logSearchText,
+    setLogSearchText,
+    logAutoScroll,
+    setLogAutoScroll,
+    toasts,
+    dismissToast,
+    loadLogsTail,
+    clearLogs,
+    copyLogMessage,
+    copyLogJson,
+    logScrollRef,
+    appendUiErrorLog,
+  } = useLogsController(devices);
+  const {
+    lockBusyKeys,
+    autoLockBusyKeys,
+    autoRelockBusyKeys,
+    toggleAutoRelock,
+    disableLock,
+    startAutoLockFromHeader,
+  } = useLockActions({
+    setDeviceStates,
+    appendUiErrorLog,
+  });
 
-  const loadDevices = useCallback(async () => {
-    const list = await api.listDevices();
-    setDevices(list);
-  }, []);
-
-  const loadGroups = useCallback(async () => {
-    const list = await api.listGroups();
-    setGroups(list);
-    if (list.length === 0) {
-      setActiveTabKey(OVERVIEW_KEY);
-      return;
-    }
-    if (!activeTabKey) {
-      setActiveTabKey(OVERVIEW_KEY);
-      return;
-    }
-    if (activeTabKey !== OVERVIEW_KEY && !list.find((group) => group.key === activeTabKey)) {
-      setActiveTabKey(OVERVIEW_KEY);
-    }
-  }, [activeTabKey]);
-
-  useEffect(() => {
-    loadDevices();
-    loadGroups();
-  }, [loadDevices, loadGroups]);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      devices.forEach((device) => {
-        api.getStatus(device.key)
-          .then((status) => {
-            setDeviceStates((prev) => {
-              const next = { ...prev };
-              const current = next[device.key] || { params: {} };
-              next[device.key] = { ...current, status };
-              return next;
-            });
-          })
-          .catch(() => null);
-      });
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [devices]);
-
-  const updateState = useCallback((deviceKey: string, message: StreamMessage) => {
+  const updateLoggingState = useCallback((deviceKey: string, loggingActive: boolean) => {
     setDeviceStates((prev) => {
       const current = prev[deviceKey] || { params: {} };
-      if (message.type === 'param_update') {
-        return {
-          ...prev,
-          [deviceKey]: {
-            ...current,
-            params: { ...current.params, [message.name]: message.value },
+      return {
+        ...prev,
+        [deviceKey]: {
+          ...current,
+          status: {
+            ...(current.status ?? {
+              connected: true,
+              connecting: false,
+            }),
+            logging_active: loggingActive,
           },
-        };
-      }
-      if (message.type === 'plot_frame') {
-        return {
-          ...prev,
-          [deviceKey]: {
-            ...current,
-            plotFrame: message,
-          },
-        };
-      }
-      if (message.type === 'status') {
-        return {
-          ...prev,
-          [deviceKey]: {
-            ...current,
-            status: message as DeviceStatus,
-          },
-        };
-      }
-      return prev;
+        },
+      };
     });
   }, []);
 
-  const deviceStatusMap = useMemo(() => {
-    const map: Record<string, DeviceStatus | undefined> = {};
-    devices.forEach((device) => {
-      map[device.key] = deviceStates[device.key]?.status;
-    });
-    return map;
-  }, [devices, deviceStates]);
-
-  const isOverview = activeTabKey === OVERVIEW_KEY;
-  const activeGroup = !isOverview
-    ? groups.find((group) => group.key === activeTabKey) || null
-    : null;
-  const activeDeviceKeys = activeGroup?.device_keys ?? [];
-
-  const openCreateGroup = () => {
-    setEditingGroupKey(null);
-    setGroupNameDraft('');
-    setGroupModalOpen(true);
-  };
-
-  const openRenameGroup = (group: DeviceGroup) => {
-    setEditingGroupKey(group.key);
-    setGroupNameDraft(group.name);
-    setGroupModalOpen(true);
-  };
-
-  const saveGroup = async () => {
-    const trimmed = groupNameDraft.trim();
-    if (!trimmed) return;
-    if (editingGroupKey) {
-      const updated = await api.updateGroup(editingGroupKey, { name: trimmed });
-      setGroups((prev) => prev.map((group) => (group.key === updated.key ? updated : group)));
-    } else {
-      const created = await api.createGroup({ name: trimmed, device_keys: [] });
-      setGroups((prev) => [...prev, created]);
-      setActiveGroupKey(created.key);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(DEVICE_BAR_COLLAPSED_KEY, deviceBarCollapsed ? '1' : '0');
+    } catch {
+      // Ignore persistence failures; UI state still works for current session.
     }
-    setGroupModalOpen(false);
-  };
+  }, [deviceBarCollapsed]);
+  useDeviceStatusPolling({ devices, setDeviceStates });
+  const updateState = useDeviceStateUpdater(setDeviceStates);
 
-  const addDeviceToGroup = async (group: DeviceGroup, deviceKey: string) => {
-    if (group.device_keys.includes(deviceKey)) return;
-    const nextKeys = [...group.device_keys, deviceKey];
-    const updated = await api.updateGroup(group.key, { device_keys: nextKeys });
-    setGroups((prev) => prev.map((item) => (item.key === updated.key ? updated : item)));
-  };
 
-  const openDeviceGroup = (deviceKey: string) => {
-    const match = groups.find((group) => group.device_keys.includes(deviceKey));
-    if (match) {
-      setActiveTabKey(match.key);
-    }
-  };
-
-  const removeDeviceFromGroup = async (group: DeviceGroup, deviceKey: string) => {
-    if (!group.device_keys.includes(deviceKey)) return;
-    const nextKeys = group.device_keys.filter((key) => key !== deviceKey);
-    const updated = await api.updateGroup(group.key, { device_keys: nextKeys });
-    setGroups((prev) => prev.map((item) => (item.key === updated.key ? updated : item)));
-  };
-
-  const handleDrop = async (group: DeviceGroup, event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setDragOverGroupKey(null);
-    const deviceKey = event.dataTransfer.getData('text/linien-device-key');
-    if (!deviceKey) return;
-    await addDeviceToGroup(group, deviceKey);
-  };
+  const {
+    deviceStatusMap,
+    lockIndicatorMap,
+    autoRelockMap,
+    lockStateMap,
+    lockHealthSummary,
+    connectedDeviceCount,
+    lockedDeviceCount,
+    connectedRelockEnabledCount,
+  } = useLockSummary(devices, deviceStates);
+  const {
+    influxPopoverOpen,
+    setInfluxPopoverOpen,
+    influxDeviceKey,
+    setInfluxDeviceKey,
+    influxCredentials,
+    influxParams,
+    influxInterval,
+    setInfluxInterval,
+    influxBusy,
+    influxMessage,
+    influxMessageError,
+    influxDeviceOptions,
+    influxSelectedDevice,
+    influxDeviceConnected,
+    influxLoggingActive,
+    influxChipColor,
+    influxLabel,
+    selectedInfluxParamNames,
+    updateInfluxCredential,
+    saveInfluxCredentials,
+    startInfluxLogging,
+    stopInfluxLogging,
+    updateInfluxParamSelection,
+    setInfluxMessage,
+    setInfluxMessageError,
+  } = useInfluxController({
+    devices,
+    activeDeviceKeys,
+    deviceStatusMap,
+    onLoggingStateChange: updateLoggingState,
+  });
+  const {
+    postgresDraft,
+    postgresPopoverOpen,
+    setPostgresPopoverOpen,
+    postgresBusy,
+    postgresMessage,
+    postgresConfig,
+    postgresStatus,
+    postgresChipColor,
+    postgresLabel,
+    updatePostgresDraft,
+    savePostgresConfig,
+    testPostgresConnection,
+  } = usePostgresController();
+  const lockChipTone =
+    connectedDeviceCount === 0
+      ? 'gray'
+      : lockHealthSummary.lost > 0
+      ? 'red'
+      : lockHealthSummary.considered === 0
+      ? 'gray'
+      : lockHealthSummary.marginalOrUnknown > 0
+      ? 'yellow'
+      : 'green';
+  const lockLabel =
+    devices.length === 0
+      ? 'No devices'
+      : `${lockedDeviceCount}/${connectedDeviceCount} locked | ${connectedRelockEnabledCount}/${connectedDeviceCount} relock`;
+  const logsChipColor = logsErrorLatched ? 'red' : 'gray';
 
   return (
-    <AppShell padding="md" navbar={{ width: 320, breakpoint: 'sm' }} header={{ height: 60 }}>
+    <AppShell
+      padding="md"
+      navbar={{ width: deviceBarCollapsed ? 64 : 320, breakpoint: 'sm' }}
+      header={{ height: 60 }}
+    >
       <AppShell.Header>
         <Group h="100%" px="md" justify="space-between">
           <Text fw={700}>Linien Multi-Device</Text>
-          <SegmentedControl
-            size="xs"
-            value={colorScheme}
-            onChange={(value) => setColorScheme(value as 'light' | 'dark' | 'auto')}
-            data={[
-              { value: 'light', label: <IconSun size={14} /> },
-              { value: 'dark', label: <IconMoonStars size={14} /> },
-              { value: 'auto', label: 'Auto' },
-            ]}
+          <AppHeaderControls
+            logsChipColor={logsChipColor}
+            onOpenLogs={() => setLogsOpen(true)}
+            influxPopoverOpen={influxPopoverOpen}
+            setInfluxPopoverOpen={setInfluxPopoverOpen}
+            influxChipColor={influxChipColor}
+            influxLabel={influxLabel}
+            influxDeviceOptions={influxDeviceOptions}
+            influxDeviceKey={influxDeviceKey}
+            onInfluxDeviceChange={(value) => {
+              setInfluxDeviceKey(value);
+              setInfluxMessage(null);
+              setInfluxMessageError(false);
+            }}
+            influxBusy={influxBusy}
+            influxDeviceConnected={influxDeviceConnected}
+            influxLoggingActive={influxLoggingActive}
+            influxSelectedDevice={influxSelectedDevice}
+            influxCredentials={influxCredentials}
+            onInfluxCredentialChange={updateInfluxCredential}
+            influxInterval={influxInterval}
+            setInfluxInterval={setInfluxInterval}
+            startInfluxLogging={startInfluxLogging}
+            stopInfluxLogging={stopInfluxLogging}
+            saveInfluxCredentials={saveInfluxCredentials}
+            influxParams={influxParams}
+            selectedInfluxParamNames={selectedInfluxParamNames}
+            onInfluxParamSelection={(values) => {
+              updateInfluxParamSelection(values).catch(() => null);
+            }}
+            influxMessage={influxMessage}
+            influxMessageError={influxMessageError}
+            lockPopoverOpen={lockPopoverOpen}
+            setLockPopoverOpen={setLockPopoverOpen}
+            lockChipTone={lockChipTone}
+            lockLabel={lockLabel}
+            devices={devices}
+            deviceStatusMap={deviceStatusMap}
+            lockStateMap={lockStateMap}
+            lockIndicatorMap={lockIndicatorMap}
+            autoRelockMap={autoRelockMap}
+            lockBusyKeys={lockBusyKeys}
+            autoLockBusyKeys={autoLockBusyKeys}
+            autoRelockBusyKeys={autoRelockBusyKeys}
+            onStartAutoLock={(deviceKey) => {
+              startAutoLockFromHeader(deviceKey).catch(() => null);
+            }}
+            onDisableLock={(deviceKey) => {
+              disableLock(deviceKey).catch(() => null);
+            }}
+            onToggleAutoRelock={(deviceKey, enabled) => {
+              toggleAutoRelock(deviceKey, enabled).catch(() => null);
+            }}
+            lockedDeviceCount={lockedDeviceCount}
+            connectedDeviceCount={connectedDeviceCount}
+            connectedRelockEnabledCount={connectedRelockEnabledCount}
+            postgresPopoverOpen={postgresPopoverOpen}
+            setPostgresPopoverOpen={setPostgresPopoverOpen}
+            postgresChipColor={postgresChipColor}
+            postgresLabel={postgresLabel}
+            postgresStatus={postgresStatus}
+            postgresConfig={postgresConfig}
+            postgresDraft={postgresDraft}
+            updatePostgresDraft={updatePostgresDraft}
+            postgresBusy={postgresBusy}
+            postgresMessage={postgresMessage}
+            testPostgresConnection={testPostgresConnection}
+            savePostgresConfig={savePostgresConfig}
+            colorScheme={colorScheme}
+            setColorScheme={(value) => setColorScheme(value)}
           />
         </Group>
       </AppShell.Header>
-      <AppShell.Navbar p="md">
-        <DeviceList
-          devices={devices}
-          statuses={deviceStatusMap}
-          activeKeys={activeDeviceKeys}
-          canAddToGroup={!isOverview && Boolean(activeGroup)}
-          onAddToGroup={(key) => {
-            if (!activeGroup) return;
-            addDeviceToGroup(activeGroup, key).catch(() => null);
-          }}
-          onAdd={async (payload) => {
-            await api.createDevice(payload);
-            await loadDevices();
-            await loadGroups();
-          }}
-          onEdit={async (key, payload) => {
-            await api.updateDevice(key, payload);
-            await loadDevices();
-            await loadGroups();
-          }}
-          onDelete={async (key) => {
-            await api.deleteDevice(key);
-            await loadDevices();
-            await loadGroups();
-          }}
-          onStartServer={async (key) => {
-            await api.startServer(key);
-          }}
-          onConnect={async (key) => {
-            await api.connectDevice(key);
-          }}
-          onDisconnect={async (key) => {
-            await api.disconnectDevice(key);
-          }}
-        />
+      <AppShell.Navbar p={deviceBarCollapsed ? 'xs' : 'md'} className="device-navbar">
+        {deviceBarCollapsed ? (
+          <div className="device-navbar-rail">
+            <button
+              type="button"
+              className="device-navbar-toggle"
+              onClick={() => setDeviceBarCollapsed(false)}
+              title="Expand devices panel"
+              aria-label="Expand devices panel"
+            >
+              <IconDevices size={16} />
+              <span
+                className="device-navbar-toggle-count"
+                style={
+                  connectedDeviceCount === 0
+                    ? {
+                        color: 'var(--tag-red-text)',
+                        background: 'var(--tag-red-bg)',
+                        borderColor: 'var(--tag-red-border)',
+                      }
+                    : undefined
+                }
+              >
+                {connectedDeviceCount}/{devices.length}
+              </span>
+              <span className="device-navbar-toggle-label">Devices</span>
+              <IconChevronRight size={14} className="device-navbar-toggle-chevron" />
+            </button>
+          </div>
+        ) : (
+          <DeviceList
+            devices={devices}
+            statuses={deviceStatusMap}
+            lockIndicators={lockIndicatorMap}
+            autoRelockStates={autoRelockMap}
+            autoRelockBusyKeys={autoRelockBusyKeys}
+            activeKeys={activeDeviceKeys}
+            canAddToGroup={!isOverview && Boolean(activeGroup)}
+            onCollapse={() => setDeviceBarCollapsed(true)}
+            onAddToGroup={(key) => {
+              if (!activeGroup) return;
+              addDeviceToGroup(activeGroup, key).catch(() => null);
+            }}
+            onToggleAutoRelock={(key, enabled) => {
+              toggleAutoRelock(key, enabled).catch(() => null);
+            }}
+            onAdd={async (payload) => {
+              await api.createDevice(payload);
+              await loadDevices();
+              await loadGroups();
+            }}
+            onEdit={async (key, payload) => {
+              await api.updateDevice(key, payload);
+              await loadDevices();
+              await loadGroups();
+            }}
+            onDelete={async (key) => {
+              await api.deleteDevice(key);
+              await loadDevices();
+              await loadGroups();
+            }}
+            onStartServer={async (key) => {
+              await api.startServer(key);
+            }}
+            onConnect={async (key) => {
+              await api.connectDevice(key);
+            }}
+            onDisconnect={async (key) => {
+              await api.disconnectDevice(key);
+            }}
+          />
+        )}
       </AppShell.Navbar>
       <AppShell.Main>
         <Tabs value={activeTabKey ?? OVERVIEW_KEY} onChange={(value) => setActiveTabKey(value)}>
@@ -302,9 +441,7 @@ export function App() {
             </div>
           </Tabs.Panel>
           {groups.map((group) => {
-            const groupDevices = group.device_keys
-              .map((key) => devices.find((device) => device.key === key))
-              .filter((device): device is Device => Boolean(device));
+            const groupDevices = groupDevicesMap.get(group.key) ?? [];
             const dropActive = dragOverGroupKey === group.key;
             return (
               <Tabs.Panel key={group.key} value={group.key}>
@@ -381,6 +518,37 @@ export function App() {
           </Button>
         </Group>
       </Modal>
+      <Suspense fallback={null}>
+        <LogsModal
+          opened={logsOpen}
+          onClose={() => setLogsOpen(false)}
+          connected={logsWsConnected}
+          loading={logsLoading}
+          logs={logRows}
+          filteredLogs={filteredLogRows}
+          devices={devices}
+          levelFilter={logLevelFilter}
+          onLevelFilterChange={setLogLevelFilter}
+          sourceFilter={logSourceFilter}
+          onSourceFilterChange={setLogSourceFilter}
+          deviceFilter={logDeviceFilter}
+          onDeviceFilterChange={setLogDeviceFilter}
+          searchText={logSearchText}
+          onSearchTextChange={setLogSearchText}
+          autoScroll={logAutoScroll}
+          onAutoScrollChange={setLogAutoScroll}
+          onReload={() => {
+            loadLogsTail().catch(() => null);
+          }}
+          onClear={() => {
+            clearLogs().catch(() => null);
+          }}
+          onCopyMessage={copyLogMessage}
+          onCopyJson={copyLogJson}
+          viewportRef={logScrollRef}
+        />
+      </Suspense>
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </AppShell>
   );
 }

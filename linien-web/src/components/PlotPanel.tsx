@@ -19,6 +19,8 @@ type PlotPanelProps = {
   showManualTarget?: boolean;
 };
 
+type PlotData = [number[], ...Array<Array<number | null>>];
+
 const SERIES_KEYS = [
   'combined_error',
   'control_signal',
@@ -89,7 +91,7 @@ const SERIES_STYLE: Record<
   signal_strength_b_lower: { color: PALETTE.error2, strokeAlpha: 0.4, legendHidden: true },
 };
 
-const POINT_STYLE: uPlot.Points = { show: false };
+const POINT_STYLE: uPlot.Series.Points = { show: false };
 
 const toFinite = (value: unknown): number | null => {
   if (value == null) return null;
@@ -102,7 +104,11 @@ const normalizeSeries = (value: unknown): Array<number | null> => {
     return value.map((v) => toFinite(v));
   }
   if (ArrayBuffer.isView(value)) {
-    return Array.from(value as ArrayLike<number>, (v) => toFinite(v));
+    if ('length' in value) {
+      const typed = value as unknown as ArrayLike<number>;
+      return Array.from(typed, (v) => toFinite(v));
+    }
+    return [];
   }
   if (value && typeof value === 'object') {
     const entries = Object.entries(value as Record<string, unknown>)
@@ -211,7 +217,7 @@ export function PlotPanel({
   const sweepCenterValue = toFinite(sweepCenter) ?? 0;
   const sweepAmplitudeValue = toFinite(sweepAmplitude) ?? 1;
 
-  const { data, pointCount } = useMemo(() => {
+  const { data, pointCount } = useMemo<{ data: PlotData; pointCount: number }>(() => {
     const seriesRaw = SERIES_KEYS.map((key) => normalizeSeries(activePlotFrame?.series?.[key]));
     if (!lockAxis) {
       const combinedIdx = SERIES_KEYS.indexOf('combined_error');
@@ -232,7 +238,7 @@ export function PlotPanel({
       }
       return Array(count).fill(null);
     });
-    return { data: [x, ...seriesData] as Array<Array<number | null>>, pointCount: count };
+    return { data: [x, ...seriesData], pointCount: count };
   }, [activePlotFrame, lockAxis]);
 
   useEffect(() => {
@@ -329,7 +335,7 @@ export function PlotPanel({
       cursor: {
         drag: { setScale: false },
       },
-      select: { show: true },
+      select: { show: true, left: 0, top: 0, width: 0, height: 0 },
       axes: [
         {
           label: axisLabel,
@@ -358,7 +364,6 @@ export function PlotPanel({
             label: LABELS[key],
             stroke,
             width: key.includes('signal_strength') ? 1 : 2,
-            paths: uPlot.paths.linear(),
             points: POINT_STYLE,
             spanGaps: true,
             class: style.legendHidden ? 'legend-hidden' : undefined,
@@ -369,12 +374,13 @@ export function PlotPanel({
       hooks: {
         setSeries: [
           (u, idx) => {
+            if (idx == null) return;
             if (suppressSeriesEventRef.current) return;
-            userShowRef.current[idx] = u.series[idx].show;
+            userShowRef.current[idx] = u.series[idx].show ?? false;
             const link = bandLinks.find((item) => item.controllerIdx === idx);
             if (!link) return;
             suppressSeriesEventRef.current = true;
-            const show = u.series[idx].show;
+            const show = u.series[idx].show ?? false;
             link.memberIdxs.forEach((memberIdx) => {
               u.setSeries(memberIdx, { show }, false);
             });
@@ -553,7 +559,7 @@ export function PlotPanel({
       hasDataByKey.error_signal_2 &&
       (userShowRef.current[error2Idx] ?? true);
 
-    uplotRef.current.batch((u) => {
+    uplotRef.current.batch((u: uPlot) => {
       suppressSeriesEventRef.current = true;
       SERIES_KEYS.forEach((key, idx) => {
         const seriesIdx = idx + 1;
@@ -570,11 +576,10 @@ export function PlotPanel({
         u.setSeries(seriesIdx, { show }, false);
       });
       suppressSeriesEventRef.current = false;
-      u.setData(data, false);
+      u.setData(data, true);
       u.setScale('x', { min: 0, max: Math.max(pointCount - 1, 1) });
-      u.setScale('y', { auto: true });
-      const rows = u.root.querySelectorAll('.u-legend .u-series');
-      rows.forEach((row, rowIdx) => {
+      const rows = u.root.querySelectorAll<HTMLElement>('.u-legend .u-series');
+      rows.forEach((row: HTMLElement, rowIdx: number) => {
         if (rowIdx === 0) return;
         const key = SERIES_KEYS[rowIdx - 1];
         if (!key) return;
@@ -589,9 +594,10 @@ export function PlotPanel({
     const u = uplotRef.current;
     u.axes[0].label = axisLabel;
     u.axes[0].values = axisValues;
+    u.series[0].value = xValueFormatter;
     // Force uPlot to recalculate axis ticks even when x-scale min/max did not change.
     u.redraw(false, true);
-  }, [axisLabel, axisValues]);
+  }, [axisLabel, axisValues, xValueFormatter]);
 
   useEffect(() => {
     if (!uplotRef.current) return;
