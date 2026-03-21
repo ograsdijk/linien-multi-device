@@ -1,6 +1,32 @@
 # Docker Notes
 
-This folder contains optional local infrastructure for Linien Multi-Device.
+This folder contains optional local Docker stacks for Linien Multi-Device.
+
+## Gateway + Web UI Stack
+
+Compose file:
+
+- `docker/linien-multi-device/docker-compose.yml`
+
+Start:
+
+```powershell
+docker compose -f docker/linien-multi-device/docker-compose.yml up -d --build
+```
+
+Stop:
+
+```powershell
+docker compose -f docker/linien-multi-device/docker-compose.yml down
+```
+
+Service:
+
+- Linien Multi-Device UI + API: `http://localhost:8000`
+
+Details:
+
+- See `docker/linien-multi-device/README.md`
 
 ## Postgres + pgAdmin Stack
 

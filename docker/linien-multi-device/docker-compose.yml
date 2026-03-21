@@ -1,0 +1,21 @@
+services:
+  linien-multi-device:
+    build:
+      context: ../..
+      dockerfile: docker/linien-multi-device/Dockerfile
+    container_name: linien-multi-device
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/config.json:/opt/linien-multi-device/config.json
+      - ./data/device_settings.json:/opt/linien-multi-device/device_settings.json
+      - linien_user_data:/root/.local/share/linien
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/devices').read()\""]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  linien_user_data:
