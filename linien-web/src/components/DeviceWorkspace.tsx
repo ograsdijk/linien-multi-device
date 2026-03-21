@@ -32,6 +32,10 @@ type DeviceWorkspaceProps = {
   onStateUpdate: (deviceKey: string, message: StreamMessage) => void;
 };
 
+type SetParamOptions = {
+  optimistic?: boolean;
+};
+
 export function DeviceWorkspace({ device, state, active, onStateUpdate }: DeviceWorkspaceProps) {
   const [selectionMode, setSelectionMode] = useState<'autolock' | 'optimization' | null>(null);
   const [, setSelectionError] = useState<string | null>(null);
@@ -157,9 +161,16 @@ export function DeviceWorkspace({ device, state, active, onStateUpdate }: Device
     state.params.optimization_selection,
   ]);
 
-  const setParam = (name: string, value: any, writeRegisters = true) => {
+  const setParam = (
+    name: string,
+    value: any,
+    writeRegisters = true,
+    options?: SetParamOptions
+  ) => {
     if (!connected) return;
-    onStateUpdate(device.key, { type: 'param_update', name, value });
+    if (options?.optimistic !== false) {
+      onStateUpdate(device.key, { type: 'param_update', name, value });
+    }
     api.setParam(device.key, name, value, writeRegisters).catch(() => null);
   };
 

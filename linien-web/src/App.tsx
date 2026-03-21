@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useState, type CSSProperties } from 'react';
 import {
   ActionIcon,
   AppShell,
@@ -11,7 +11,6 @@ import {
   TextInput,
 } from '@mantine/core';
 import {
-  IconChevronRight,
   IconDevices,
   IconPencil,
   IconPlus,
@@ -34,6 +33,13 @@ import { useDeviceStatusPolling } from './features/devices/useDeviceStatusPollin
 import { useDeviceStateUpdater } from './features/devices/useDeviceStateUpdater';
 
 const DEVICE_BAR_COLLAPSED_KEY = 'linien.deviceBarCollapsed';
+const GRID_COLUMNS_KEY = 'linien.gridColumns';
+
+type GridColumnsMode = 'auto' | '1' | '2' | '3' | '4';
+
+const normalizeGridColumnsMode = (value: string | null): GridColumnsMode =>
+  value === '1' || value === '2' || value === '3' || value === '4' ? value : 'auto';
+
 const LogsModal = lazy(async () => {
   const module = await import('./components/LogsModal');
   return { default: module.LogsModal };
@@ -48,6 +54,13 @@ export function App() {
       return window.localStorage.getItem(DEVICE_BAR_COLLAPSED_KEY) === '1';
     } catch {
       return false;
+    }
+  });
+  const [gridColumnsMode, setGridColumnsMode] = useState<GridColumnsMode>(() => {
+    try {
+      return normalizeGridColumnsMode(window.localStorage.getItem(GRID_COLUMNS_KEY));
+    } catch {
+      return 'auto';
     }
   });
   const { colorScheme, setColorScheme } = useMantineColorScheme();
@@ -142,6 +155,13 @@ export function App() {
       // Ignore persistence failures; UI state still works for current session.
     }
   }, [deviceBarCollapsed]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(GRID_COLUMNS_KEY, gridColumnsMode);
+    } catch {
+      // Ignore persistence failures; UI state still works for current session.
+    }
+  }, [gridColumnsMode]);
   useDeviceStatusPolling({ devices, setDeviceStates });
   const updateState = useDeviceStateUpdater(setDeviceStates);
 
@@ -182,6 +202,7 @@ export function App() {
     updateInfluxParamSelection,
     setInfluxMessage,
     setInfluxMessageError,
+    applyInfluxToAll,
   } = useInfluxController({
     devices,
     activeDeviceKeys,
@@ -217,11 +238,21 @@ export function App() {
       ? 'No devices'
       : `${lockedDeviceCount}/${connectedDeviceCount} locked | ${connectedRelockEnabledCount}/${connectedDeviceCount} relock`;
   const logsChipColor = logsErrorLatched ? 'red' : 'gray';
+  const gridColumns =
+    gridColumnsMode === 'auto' ? null : Number.parseInt(gridColumnsMode, 10);
+  const fixedGridClassName = gridColumns ? ' group-grid-fixed' : '';
+  const fixedGridStyle = gridColumns
+    ? ({ ['--grid-columns' as const]: String(gridColumns) } as CSSProperties)
+    : undefined;
 
   return (
     <AppShell
       padding="md"
-      navbar={{ width: deviceBarCollapsed ? 64 : 320, breakpoint: 'sm' }}
+      navbar={{
+        width: 320,
+        breakpoint: 'sm',
+        collapsed: { mobile: deviceBarCollapsed, desktop: deviceBarCollapsed },
+      }}
       header={{ height: 60 }}
     >
       <AppShell.Header>
@@ -257,6 +288,7 @@ export function App() {
             onInfluxParamSelection={(values) => {
               updateInfluxParamSelection(values).catch(() => null);
             }}
+            applyInfluxToAll={applyInfluxToAll}
             influxMessage={influxMessage}
             influxMessageError={influxMessageError}
             lockPopoverOpen={lockPopoverOpen}
@@ -300,36 +332,8 @@ export function App() {
           />
         </Group>
       </AppShell.Header>
-      <AppShell.Navbar p={deviceBarCollapsed ? 'xs' : 'md'} className="device-navbar">
-        {deviceBarCollapsed ? (
-          <div className="device-navbar-rail">
-            <button
-              type="button"
-              className="device-navbar-toggle"
-              onClick={() => setDeviceBarCollapsed(false)}
-              title="Expand devices panel"
-              aria-label="Expand devices panel"
-            >
-              <IconDevices size={16} />
-              <span
-                className="device-navbar-toggle-count"
-                style={
-                  connectedDeviceCount === 0
-                    ? {
-                        color: 'var(--tag-red-text)',
-                        background: 'var(--tag-red-bg)',
-                        borderColor: 'var(--tag-red-border)',
-                      }
-                    : undefined
-                }
-              >
-                {connectedDeviceCount}/{devices.length}
-              </span>
-              <span className="device-navbar-toggle-label">Devices</span>
-              <IconChevronRight size={14} className="device-navbar-toggle-chevron" />
-            </button>
-          </div>
-        ) : (
+      {!deviceBarCollapsed ? (
+        <AppShell.Navbar p="md" className="device-navbar">
           <DeviceList
             devices={devices}
             statuses={deviceStatusMap}
@@ -371,9 +375,27 @@ export function App() {
               await api.disconnectDevice(key);
             }}
           />
-        )}
-      </AppShell.Navbar>
+        </AppShell.Navbar>
+      ) : null}
       <AppShell.Main>
+        {deviceBarCollapsed ? (
+          <div className="main-sticky-devices-toggle">
+            <button
+              type="button"
+              className="floating-devices-toggle"
+              data-empty={connectedDeviceCount === 0 ? 'true' : undefined}
+              onClick={() => setDeviceBarCollapsed(false)}
+              title="Expand devices panel"
+              aria-label="Expand devices panel"
+            >
+              <IconDevices size={15} />
+              <span className="floating-devices-toggle-label">Devices</span>
+              <span className="floating-devices-toggle-count">
+                {connectedDeviceCount}/{devices.length}
+              </span>
+            </button>
+          </div>
+        ) : null}
         <Tabs value={activeTabKey ?? OVERVIEW_KEY} onChange={(value) => setActiveTabKey(value)}>
           <Group justify="space-between" align="center" mb="sm">
             <Tabs.List>
@@ -416,13 +438,26 @@ export function App() {
                   ]}
                 />
               ) : null}
+              <Select
+                size="xs"
+                w={100}
+                value={gridColumnsMode}
+                onChange={(value) => setGridColumnsMode(normalizeGridColumnsMode(value))}
+                data={[
+                  { value: 'auto', label: 'Cols: Auto' },
+                  { value: '1', label: 'Cols: 1' },
+                  { value: '2', label: 'Cols: 2' },
+                  { value: '3', label: 'Cols: 3' },
+                  { value: '4', label: 'Cols: 4' },
+                ]}
+              />
               <Button size="xs" variant="light" leftSection={<IconPlus size={14} />} onClick={openCreateGroup}>
                 New group
               </Button>
             </Group>
           </Group>
           <Tabs.Panel value={OVERVIEW_KEY}>
-            <div className="group-grid overview-grid">
+            <div className={`group-grid overview-grid${fixedGridClassName}`} style={fixedGridStyle}>
               {devices.length === 0 ? (
                 <div className="empty-group">No devices configured.</div>
               ) : null}
@@ -446,7 +481,8 @@ export function App() {
             return (
               <Tabs.Panel key={group.key} value={group.key}>
                 <div
-                  className={dropActive ? 'group-grid drop-active' : 'group-grid'}
+                  className={`group-grid${fixedGridClassName}${dropActive ? ' drop-active' : ''}`}
+                  style={fixedGridStyle}
                   onDragOver={(event) => {
                     event.preventDefault();
                     setDragOverGroupKey(group.key);

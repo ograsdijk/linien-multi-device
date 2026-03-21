@@ -16,7 +16,12 @@ const rangesEqual = (a: [number, number], b: [number, number]) =>
 
 type SweepControlsProps = {
   params: Record<string, any>;
-  onSetParam: (name: string, value: any, writeRegisters?: boolean) => void;
+  onSetParam: (
+    name: string,
+    value: any,
+    writeRegisters?: boolean,
+    options?: { optimistic?: boolean }
+  ) => void;
 };
 
 export function SweepControls({ params, onSetParam }: SweepControlsProps) {
@@ -105,7 +110,7 @@ export function SweepControls({ params, onSetParam }: SweepControlsProps) {
       ) {
         return;
       }
-      onSetParam('sweep_center', newCenter, true);
+      onSetParam('sweep_center', newCenter, true, force ? undefined : { optimistic: false });
       lastSentCenterRef.current = newCenter;
       return;
     }
@@ -119,8 +124,8 @@ export function SweepControls({ params, onSetParam }: SweepControlsProps) {
     if (!force && !centerChanged && !ampChanged) {
       return;
     }
-    onSetParam('sweep_center', newCenter, false);
-    onSetParam('sweep_amplitude', newAmplitude, true);
+    onSetParam('sweep_center', newCenter, false, force ? undefined : { optimistic: false });
+    onSetParam('sweep_amplitude', newAmplitude, true, force ? undefined : { optimistic: false });
     lastSentCenterRef.current = newCenter;
     lastSentAmplitudeRef.current = newAmplitude;
   };

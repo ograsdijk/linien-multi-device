@@ -19,6 +19,7 @@ import {
   IconMoonStars,
   IconSun,
 } from '@tabler/icons-react';
+import { useState } from 'react';
 import type {
   AutoRelockStatus,
   Device,
@@ -30,6 +31,10 @@ import type {
   PostgresManualLockStatus,
 } from '../types';
 import { resolveLockDisplay } from '../features/locks/lockState';
+import type {
+  InfluxApplyAllOptions,
+  InfluxApplyAllResult,
+} from '../features/integrations/useInfluxController';
 import { toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
 
 const formatTimestamp = (value: number | null | undefined) => {
@@ -61,6 +66,7 @@ type AppHeaderControlsProps = {
   influxParams: ParamMeta[];
   selectedInfluxParamNames: string[];
   onInfluxParamSelection: (values: string[]) => void;
+  applyInfluxToAll: (options: InfluxApplyAllOptions) => Promise<InfluxApplyAllResult>;
   influxMessage: string | null;
   influxMessageError: boolean;
   lockPopoverOpen: boolean;
@@ -98,6 +104,12 @@ type AppHeaderControlsProps = {
 };
 
 export function AppHeaderControls(props: AppHeaderControlsProps) {
+  const [applyAllCredentials, setApplyAllCredentials] = useState(true);
+  const [applyAllParams, setApplyAllParams] = useState(false);
+  const [applyAllInterval, setApplyAllInterval] = useState(false);
+  const [applyAllLoggingState, setApplyAllLoggingState] = useState(false);
+  const [applyAllResult, setApplyAllResult] = useState<InfluxApplyAllResult | null>(null);
+
   return (
     <Group gap="xs" align="center">
       <div style={{ order: 98 }}>
@@ -136,6 +148,7 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
               <Text fw={600}>InfluxDB logging</Text>
               <Select
                 label="Device"
+                comboboxProps={{ withinPortal: false }}
                 data={props.influxDeviceOptions}
                 value={props.influxDeviceKey}
                 onChange={(value) => {
@@ -271,6 +284,82 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
                 <Text size="xs" c={props.influxMessageError ? 'red' : 'dimmed'}>
                   {props.influxMessage}
                 </Text>
+              ) : null}
+              <Text fw={500} size="sm" mt={4}>
+                Apply to all devices
+              </Text>
+              <Stack gap={4}>
+                <Switch
+                  label="Credentials"
+                  checked={applyAllCredentials}
+                  onChange={(event) => setApplyAllCredentials(event.currentTarget.checked)}
+                  disabled={props.influxBusy}
+                />
+                <Switch
+                  label="Logged parameters"
+                  checked={applyAllParams}
+                  onChange={(event) => setApplyAllParams(event.currentTarget.checked)}
+                  disabled={props.influxBusy}
+                />
+                <Switch
+                  label="Interval"
+                  checked={applyAllInterval}
+                  onChange={(event) => setApplyAllInterval(event.currentTarget.checked)}
+                  disabled={props.influxBusy}
+                />
+                <Switch
+                  label="Logging state (start/stop)"
+                  checked={applyAllLoggingState}
+                  onChange={(event) => setApplyAllLoggingState(event.currentTarget.checked)}
+                  disabled={props.influxBusy}
+                />
+              </Stack>
+              <Button
+                size="xs"
+                variant="default"
+                disabled={
+                  props.influxBusy ||
+                  (!applyAllCredentials &&
+                    !applyAllParams &&
+                    !applyAllInterval &&
+                    !applyAllLoggingState)
+                }
+                loading={props.influxBusy}
+                onClick={() => {
+                  props
+                    .applyInfluxToAll({
+                      applyCredentials: applyAllCredentials,
+                      applyParams: applyAllParams,
+                      applyInterval: applyAllInterval,
+                      applyLoggingState: applyAllLoggingState,
+                    })
+                    .then((result) => setApplyAllResult(result))
+                    .catch(() => setApplyAllResult(null));
+                }}
+              >
+                Apply to all devices
+              </Button>
+              {applyAllResult ? (
+                <Text size="xs" c={applyAllResult.failed > 0 ? 'red' : 'dimmed'}>
+                  {applyAllResult.succeeded}/{applyAllResult.total} succeeded
+                  {applyAllResult.failed > 0 ? ` (${applyAllResult.failed} failed)` : ''}
+                </Text>
+              ) : null}
+              {applyAllResult && applyAllResult.failures.length > 0 ? (
+                <details>
+                  <summary>
+                    <Text span size="xs" c="dimmed">
+                      Failed devices
+                    </Text>
+                  </summary>
+                  <Stack gap={2} mt={4}>
+                    {applyAllResult.failures.map((item) => (
+                      <Text key={item.deviceKey} size="xs" c="red">
+                        {item.deviceKey}: {item.message}
+                      </Text>
+                    ))}
+                  </Stack>
+                </details>
               ) : null}
             </Stack>
           </Popover.Dropdown>
