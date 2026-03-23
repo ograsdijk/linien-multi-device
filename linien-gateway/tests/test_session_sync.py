@@ -86,3 +86,40 @@ def test_sync_config_applies_when_device_config_changed():
 
     assert lock_spy.set_calls == 1
     assert relock_spy.set_calls == 1
+
+
+def test_influx_logging_state_normalizes_params_from_device():
+    session = _make_session(
+        {
+            "influx_logging_state": {
+                "enabled": True,
+                "interval_s": "2.5",
+                "params": ["p", "i", "p", "", None],
+            }
+        }
+    )
+
+    assert session.influx_logging_state == {
+        "enabled": True,
+        "interval_s": 2.5,
+        "params": ["p", "i"],
+        "params_configured": True,
+    }
+
+
+def test_set_influx_logging_state_updates_params():
+    session = _make_session({})
+
+    state = session.set_influx_logging_state(
+        enabled=True,
+        interval_s=0.05,
+        params=["d", "p", "d", ""],
+        params_configured=True,
+    )
+
+    assert state == {
+        "enabled": True,
+        "interval_s": 0.1,
+        "params": ["d", "p"],
+        "params_configured": True,
+    }

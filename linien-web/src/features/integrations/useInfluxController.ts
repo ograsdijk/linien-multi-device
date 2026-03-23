@@ -183,21 +183,22 @@ export const useInfluxController = ({
   const updateInfluxParamSelection = async (selectedNames: string[]) => {
     if (!influxDeviceKey || !influxDeviceConnected || influxBusy) return;
     const previousSelected = selectedInfluxParamNames;
-    const previousSet = new Set(previousSelected);
+    const previousSorted = [...previousSelected].sort();
+    const nextSorted = [...selectedNames].sort();
+    if (
+      previousSorted.length === nextSorted.length &&
+      previousSorted.every((value, index) => value === nextSorted[index])
+    ) {
+      return;
+    }
     const nextSet = new Set(selectedNames);
-    const toEnable = selectedNames.filter((name) => !previousSet.has(name));
-    const toDisable = previousSelected.filter((name) => !nextSet.has(name));
-    if (toEnable.length === 0 && toDisable.length === 0) return;
 
     setInfluxParams((prev) =>
       prev.map((param) => ({ ...param, log: nextSet.has(param.name) }))
     );
     setInfluxBusy(true);
     try {
-      await Promise.all([
-        ...toEnable.map((name) => api.loggingSetParam(influxDeviceKey, name, true)),
-        ...toDisable.map((name) => api.loggingSetParam(influxDeviceKey, name, false)),
-      ]);
+      await api.loggingSetParams(influxDeviceKey, selectedNames);
       setInfluxMessage(null);
       setInfluxMessageError(false);
     } catch (error) {
@@ -263,22 +264,9 @@ export const useInfluxController = ({
               throw new Error('Device disconnected; cannot apply parameter selection.');
             }
             const metadata = await api.getParamMeta(deviceKey);
-            const currentEnabled = new Set(
-              metadata.filter((item) => item.loggable && item.log).map((item) => item.name)
-            );
             const loggable = metadata.filter((item) => item.loggable).map((item) => item.name);
-            const toEnable = loggable.filter(
-              (name) => targetSelectedSet.has(name) && !currentEnabled.has(name)
-            );
-            const toDisable = loggable.filter(
-              (name) => !targetSelectedSet.has(name) && currentEnabled.has(name)
-            );
-            if (toEnable.length > 0 || toDisable.length > 0) {
-              await Promise.all([
-                ...toEnable.map((name) => api.loggingSetParam(deviceKey, name, true)),
-                ...toDisable.map((name) => api.loggingSetParam(deviceKey, name, false)),
-              ]);
-            }
+            const selectedForDevice = loggable.filter((name) => targetSelectedSet.has(name));
+            await api.loggingSetParams(deviceKey, selectedForDevice);
           }
 
           if (options.applyInterval && options.applyLoggingState) {

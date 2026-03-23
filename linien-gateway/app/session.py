@@ -64,6 +64,22 @@ logger = logging.getLogger(__name__)
 
 
 class DeviceSession:
+    @staticmethod
+    def _normalize_influx_param_names(value: Any) -> list[str]:
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            candidate = item.strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            names.append(candidate)
+        return names
+
     def __init__(
         self,
         device: Device,
@@ -362,15 +378,30 @@ class DeviceSession:
     def _normalize_influx_logging_state(self, payload: Any) -> dict[str, Any]:
         interval = DEFAULT_INFLUX_LOGGING_INTERVAL_S
         enabled = False
+        params: list[str] = []
+        params_configured = False
         if isinstance(payload, bool):
             enabled = bool(payload)
-            return {"enabled": enabled, "interval_s": interval}
+            return {
+                "enabled": enabled,
+                "interval_s": interval,
+                "params": params,
+                "params_configured": params_configured,
+            }
         if isinstance(payload, dict):
             enabled = bool(payload.get("enabled", False))
             interval_raw = self._coerce_float(payload.get("interval_s"))
             if interval_raw is not None and interval_raw > 0:
                 interval = max(0.1, float(interval_raw))
-        return {"enabled": enabled, "interval_s": interval}
+            if "params" in payload:
+                params_configured = True
+                params = self._normalize_influx_param_names(payload.get("params"))
+        return {
+            "enabled": enabled,
+            "interval_s": interval,
+            "params": params,
+            "params_configured": params_configured,
+        }
 
     def _initial_influx_logging_state(self) -> dict[str, Any]:
         parameters = getattr(self.device, "parameters", None)
@@ -451,12 +482,20 @@ class DeviceSession:
         *,
         enabled: bool | None = None,
         interval_s: float | None = None,
+        params: list[str] | tuple[str, ...] | set[str] | None = None,
+        params_configured: bool | None = None,
     ) -> dict[str, Any]:
         current = dict(self.influx_logging_state)
         if enabled is not None:
             current["enabled"] = bool(enabled)
         if interval_s is not None and math.isfinite(float(interval_s)) and float(interval_s) > 0:
             current["interval_s"] = max(0.1, float(interval_s))
+        if params is not None:
+            current["params"] = self._normalize_influx_param_names(params)
+            if params_configured is None:
+                current["params_configured"] = True
+        if params_configured is not None:
+            current["params_configured"] = bool(params_configured)
         self.influx_logging_state = self._normalize_influx_logging_state(current)
         return self.get_influx_logging_state()
 
@@ -493,6 +532,22 @@ class DeviceSession:
             return int(round(numeric))
 
         return value
+
+    def _apply_influx_logging_params_locked(self) -> None:
+        if self.control is None or self.parameters is None:
+            return
+        if not bool(self.influx_logging_state.get("params_configured", False)):
+            return
+        selected = set(
+            self._normalize_influx_param_names(self.influx_logging_state.get("params"))
+        )
+        for name, param in self.parameters:
+            if not bool(getattr(param, "loggable", False)):
+                continue
+            should_log = name in selected
+            self.control.exposed_set_parameter_log(name, should_log)
+            if hasattr(param, "log"):
+                param.log = should_log
 
     @staticmethod
     def _value_needs_normalization(current: Any, normalized: Any) -> bool:
@@ -581,6 +636,14 @@ class DeviceSession:
             self.plot_state = PlotState()
             with self._rpyc_lock:
                 self._sanitize_parameters_on_connect()
+                try:
+                    self._apply_influx_logging_params_locked()
+                except Exception:  # noqa: BLE001 - optional logging setup path
+                    logger.warning(
+                        "Failed to apply influx logging parameter state for device=%s",
+                        self.device.key,
+                        exc_info=True,
+                    )
                 should_resume_logging = bool(self.influx_logging_state.get("enabled", False))
                 resume_interval = max(
                     0.1,
@@ -1141,6 +1204,7 @@ class DeviceSession:
             raise RuntimeError("Device not connected")
         safe_interval = max(0.1, float(interval))
         with self._rpyc_lock:
+            self._apply_influx_logging_params_locked()
             self.control.exposed_start_logging(safe_interval)
         return self.set_influx_logging_state(enabled=True, interval_s=safe_interval)
 
@@ -1151,11 +1215,68 @@ class DeviceSession:
             self.control.exposed_stop_logging()
         return self.set_influx_logging_state(enabled=False)
 
-    def logging_set_param(self, name: str, enabled: bool) -> None:
+    def logging_set_param(self, name: str, enabled: bool) -> dict[str, Any]:
         if self.control is None:
             raise RuntimeError("Device not connected")
+        enabled_flag = bool(enabled)
         with self._rpyc_lock:
-            self.control.exposed_set_parameter_log(name, enabled)
+            self.control.exposed_set_parameter_log(name, enabled_flag)
+            if self.parameters is not None:
+                try:
+                    getattr(self.parameters, name).log = enabled_flag
+                except Exception:
+                    logger.debug(
+                        "Failed to mirror log flag for parameter=%s device=%s",
+                        name,
+                        self.device.key,
+                        exc_info=True,
+                    )
+        current_params = self._normalize_influx_param_names(
+            self.influx_logging_state.get("params")
+        )
+        if enabled_flag:
+            if name not in current_params:
+                current_params.append(name)
+        else:
+            current_params = [item for item in current_params if item != name]
+        return self.set_influx_logging_state(
+            params=current_params,
+            params_configured=True,
+        )
+
+    def logging_set_params(self, names: list[str] | tuple[str, ...] | set[str]) -> dict[str, Any]:
+        if self.control is None or self.parameters is None:
+            raise RuntimeError("Device not connected")
+        selected = set(self._normalize_influx_param_names(names))
+        with self._rpyc_lock:
+            loggable_names: list[str] = []
+            for param_name, param in self.parameters:
+                if bool(getattr(param, "loggable", False)):
+                    loggable_names.append(param_name)
+            loggable_set = set(loggable_names)
+            unknown = sorted(name for name in selected if name not in loggable_set)
+            if unknown:
+                raise ValueError(f"Unknown or non-loggable parameters: {', '.join(unknown)}")
+
+            applied_names: list[str] = []
+            for param_name in loggable_names:
+                should_log = param_name in selected
+                self.control.exposed_set_parameter_log(param_name, should_log)
+                try:
+                    getattr(self.parameters, param_name).log = should_log
+                except Exception:
+                    logger.debug(
+                        "Failed to mirror log flag for parameter=%s device=%s",
+                        param_name,
+                        self.device.key,
+                        exc_info=True,
+                    )
+                if should_log:
+                    applied_names.append(param_name)
+        return self.set_influx_logging_state(
+            params=applied_names,
+            params_configured=True,
+        )
 
     def logging_get_credentials(self) -> InfluxDBCredentials:
         if self.control is None:

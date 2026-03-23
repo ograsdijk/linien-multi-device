@@ -134,6 +134,11 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ enabled }),
     }),
+  loggingSetParams: (key: string, names: string[]) =>
+    request(`/devices/${key}/logging/params`, {
+      method: 'PUT',
+      body: JSON.stringify({ names }),
+    }),
   loggingGetCredentials: (key: string) =>
     request<InfluxCredentials>(`/devices/${key}/logging/credentials`),
   loggingUpdateCredentials: (key: string, payload: InfluxCredentials) =>

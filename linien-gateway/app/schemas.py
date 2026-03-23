@@ -147,6 +147,11 @@ class LoggingParamUpdate(BaseModel):
     enabled: bool
 
 
+class LoggingParamsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    names: list[str] = Field(default_factory=list)
+
+
 class InfluxCredentials(BaseModel):
     model_config = ConfigDict(extra="forbid")
     url: str

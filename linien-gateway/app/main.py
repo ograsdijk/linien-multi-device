@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from typing import Any, List
@@ -37,6 +38,7 @@ from .schemas import (
     InfluxCredentials,
     LogTailResponse,
     LoggingParamUpdate,
+    LoggingParamsUpdate,
     LoggingStart,
     LockIndicatorConfig,
     ParamUpdate,
@@ -200,10 +202,38 @@ def _persist_config_block(device: Device, config_name: str, value: dict) -> None
 
 
 def _persist_influx_logging_state(device: Device, value: dict) -> None:
-    parameters = device.parameters if isinstance(device.parameters, dict) else {}
-    parameters["influx_logging_state"] = {
-        "enabled": bool(value.get("enabled", False))
+    interval_s = value.get("interval_s")
+    interval_numeric: float | None
+    try:
+        interval_numeric = float(interval_s)
+    except (TypeError, ValueError):
+        interval_numeric = None
+    if interval_numeric is not None and not math.isfinite(interval_numeric):
+        interval_numeric = None
+
+    params: list[str] = []
+    seen: set[str] = set()
+    raw_params = value.get("params")
+    if isinstance(raw_params, (list, tuple, set)):
+        for item in raw_params:
+            if not isinstance(item, str):
+                continue
+            name = item.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            params.append(name)
+
+    state_payload: dict[str, Any] = {
+        "enabled": bool(value.get("enabled", False)),
     }
+    if interval_numeric is not None and interval_numeric > 0:
+        state_payload["interval_s"] = max(0.1, interval_numeric)
+    if bool(value.get("params_configured", False)):
+        state_payload["params"] = params
+
+    parameters = device.parameters if isinstance(device.parameters, dict) else {}
+    parameters["influx_logging_state"] = state_payload
     device.parameters = parameters
     device_store.save_device(device)
 
@@ -758,11 +788,27 @@ def stop_logging(key: str) -> dict:
 
 @app.patch("/api/devices/{key}/logging/param/{name}")
 def update_logging_param(key: str, name: str, payload: LoggingParamUpdate) -> dict:
-    session = _get_session(key)
+    device = _get_device_or_404(key)
+    session = _session_for_device(device)
     try:
-        session.logging_set_param(name, payload.enabled)
+        state = session.logging_set_param(name, payload.enabled)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    _persist_influx_logging_state(device, state)
+    return {"ok": True}
+
+
+@app.put("/api/devices/{key}/logging/params")
+def update_logging_params(key: str, payload: LoggingParamsUpdate) -> dict:
+    device = _get_device_or_404(key)
+    session = _session_for_device(device)
+    try:
+        state = session.logging_set_params(payload.names)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    _persist_influx_logging_state(device, state)
     return {"ok": True}
 
 
