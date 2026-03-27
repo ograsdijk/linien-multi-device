@@ -18,6 +18,10 @@ Monorepo with a FastAPI gateway and a React (Vite) web UI for controlling multip
   - visual updates via `requestAnimationFrame`,
   - throttled backend parameter writes during drag,
   - final exact commit on drag end.
+- Device card drag-and-drop:
+  - live reorder preview while dragging in the device list,
+  - reorder finalizes on release,
+  - drop a card into a group panel to add that device to the group.
 
 ## Repo Structure
 

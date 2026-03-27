@@ -1,4 +1,6 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type CSSProperties } from 'react';
+import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import { ActionIcon, Button, Card, Group, Modal, Stack, Text, TextInput } from '@mantine/core';
 import { IconChevronLeft, IconDevices, IconPencil, IconTrash } from '@tabler/icons-react';
 import type {
@@ -35,6 +37,205 @@ type DeviceListProps = {
   onConnect: (key: string) => Promise<void>;
   onDisconnect: (key: string) => Promise<void>;
 };
+
+type SortableDeviceCardProps = {
+  device: Device;
+  status?: DeviceStatus;
+  indicator?: LockIndicatorSnapshot;
+  autoRelock?: AutoRelockStatus;
+  autoRelockBusy: boolean;
+  inActiveGroup: boolean;
+  canAddToGroup: boolean;
+  onEdit: (device: Device) => void;
+  onDelete: (key: string) => Promise<void>;
+  onAddToGroup: (key: string) => void;
+  onToggleAutoRelock: (key: string, enabled: boolean) => void;
+  onStartServer: (key: string) => Promise<void>;
+  onConnect: (key: string) => Promise<void>;
+  onDisconnect: (key: string) => Promise<void>;
+};
+
+function SortableDeviceCard({
+  device,
+  status,
+  indicator,
+  autoRelock,
+  autoRelockBusy,
+  inActiveGroup,
+  canAddToGroup,
+  onEdit,
+  onDelete,
+  onAddToGroup,
+  onToggleAutoRelock,
+  onStartServer,
+  onConnect,
+  onDisconnect,
+}: SortableDeviceCardProps) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({
+    id: device.key,
+    transition: {
+      duration: 180,
+      easing: 'cubic-bezier(0.2, 0, 0, 1)',
+    },
+  });
+  const connected = status?.connected;
+  const connecting = status?.connecting;
+  const hasError = Boolean(status?.last_error);
+  const state = hasError
+    ? 'error'
+    : connecting
+      ? 'connecting'
+      : connected
+        ? 'connected'
+        : 'disconnected';
+  const tagLabel =
+    state === 'error'
+      ? 'Error'
+      : state === 'connecting'
+        ? 'Connecting'
+        : state === 'connected'
+          ? 'Connected'
+          : 'Disconnected';
+  const lockDisplay = resolveLockDisplay({
+    connected: Boolean(connected),
+    lockEnabled: status?.lock,
+    indicator: indicator ?? null,
+  });
+  const autoRelockDisplay = resolveRelockTag(autoRelock);
+  const wrapperStyle: CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+  const cardStyle: CSSProperties = {
+    borderColor: inActiveGroup ? 'var(--tag-green-border)' : undefined,
+    position: 'relative',
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={wrapperStyle}
+      className="device-card-sortable-wrapper"
+      data-dragging={isDragging ? 'true' : undefined}
+    >
+      <Card
+        padding="sm"
+        radius="md"
+        withBorder
+        style={cardStyle}
+        className="device-card-sortable"
+        data-dragging={isDragging ? 'true' : undefined}
+        {...attributes}
+        {...listeners}
+      >
+        <Group justify="space-between" align="center">
+          <div>
+            <Group gap={4} align="center" wrap="nowrap">
+              <Text fw={600}>{device.name || 'Unnamed device'}</Text>
+              <ActionIcon
+                size="xs"
+                variant="subtle"
+                color="orange"
+                aria-label={`Edit ${device.name || 'device'}`}
+                onClick={() => onEdit(device)}
+              >
+                <IconPencil size={12} />
+              </ActionIcon>
+            </Group>
+            <Text size="xs" c="dimmed">
+              {device.host}:{device.port}
+            </Text>
+            {status?.last_error ? (
+              <Text size="xs" c="red">{status.last_error}</Text>
+            ) : null}
+          </div>
+          <Group gap={6} align="center">
+            <div className={`device-tag status-${state}`}>{tagLabel}</div>
+            <div className={`device-tag status-lock-${lockDisplay.uiState}`}>
+              {lockDisplay.label}
+            </div>
+            <button
+              type="button"
+              className={`device-tag device-tag-button status-lock-${autoRelockDisplay.uiState}`}
+              onClick={() => onToggleAutoRelock(device.key, !autoRelockDisplay.enabled)}
+              disabled={autoRelockBusy}
+              style={{
+                cursor: autoRelockBusy ? 'default' : 'pointer',
+                opacity: autoRelockBusy ? 0.6 : 1,
+              }}
+              title="Toggle auto relock"
+            >
+              {autoRelockDisplay.label}
+            </button>
+          </Group>
+        </Group>
+        <Group mt="sm" gap="xs" style={{ paddingRight: 34 }}>
+          <Button
+            size="xs"
+            variant="light"
+            onClick={() => onAddToGroup(device.key)}
+            disabled={!canAddToGroup || inActiveGroup}
+          >
+            {inActiveGroup ? 'In group' : 'Add to group'}
+          </Button>
+          <Button
+            size="xs"
+            variant="light"
+            color="blue"
+            onClick={() => {
+              void onStartServer(device.key);
+            }}
+            disabled={connected}
+          >
+            Start server
+          </Button>
+          {connected ? (
+            <Button
+              size="xs"
+              color="red"
+              variant="light"
+              onClick={() => {
+                void onDisconnect(device.key);
+              }}
+            >
+              Disconnect
+            </Button>
+          ) : (
+            <Button
+              size="xs"
+              color="green"
+              variant="light"
+              onClick={() => {
+                void onConnect(device.key);
+              }}
+            >
+              Connect
+            </Button>
+          )}
+        </Group>
+        <ActionIcon
+          size="sm"
+          color="red"
+          variant="subtle"
+          aria-label={`Remove ${device.name || 'device'}`}
+          onClick={() => {
+            void onDelete(device.key);
+          }}
+          style={{ position: 'absolute', right: 8, bottom: 8 }}
+        >
+          <IconTrash size={14} />
+        </ActionIcon>
+      </Card>
+    </div>
+  );
+}
 
 export function DeviceList({
   devices,
@@ -96,7 +297,7 @@ export function DeviceList({
   };
 
   return (
-    <Stack gap="sm">
+    <Stack gap="sm" className="device-list-shell">
       <Group justify="space-between" align="center">
         <Group gap="xs" align="center">
           <Text fw={600}>Devices</Text>
@@ -126,135 +327,28 @@ export function DeviceList({
           </ActionIcon>
         </Group>
       </Group>
-      <Stack gap="xs">
-        {devices.map((device) => {
-          const status = statuses[device.key];
-          const indicator = lockIndicators[device.key];
-          const connected = status?.connected;
-          const connecting = status?.connecting;
-          const hasError = Boolean(status?.last_error);
-          const state = hasError
-            ? 'error'
-            : connecting
-              ? 'connecting'
-              : connected
-                ? 'connected'
-                : 'disconnected';
-          const tagLabel =
-            state === 'error'
-              ? 'Error'
-              : state === 'connecting'
-                ? 'Connecting'
-                : state === 'connected'
-                  ? 'Connected'
-                  : 'Disconnected';
-          const lockDisplay = resolveLockDisplay({
-            connected: Boolean(connected),
-            lockEnabled: status?.lock,
-            indicator: indicator ?? null,
-          });
-          const autoRelock = autoRelockStates[device.key] ?? status?.auto_relock ?? undefined;
-          const autoRelockDisplay = resolveRelockTag(autoRelock);
-          const autoRelockBusy = Boolean(autoRelockBusyKeys?.[device.key]);
-          const inActiveGroup = activeSet.has(device.key);
-          return (
-            <Card
+      <Stack gap="xs" className="device-list-scroll">
+        <SortableContext items={devices.map((device) => device.key)} strategy={verticalListSortingStrategy}>
+          {devices.map((device) => (
+            <SortableDeviceCard
               key={device.key}
-              padding="sm"
-              radius="md"
-              withBorder
-              draggable
-              onDragStart={(event) => {
-                event.dataTransfer.setData('text/linien-device-key', device.key);
-                event.dataTransfer.effectAllowed = 'copy';
-              }}
-              style={{
-                borderColor: inActiveGroup ? 'var(--tag-green-border)' : undefined,
-                position: 'relative',
-              }}
-            >
-              <Group justify="space-between" align="center">
-                <div>
-                  <Group gap={4} align="center" wrap="nowrap">
-                    <Text fw={600}>{device.name || 'Unnamed device'}</Text>
-                    <ActionIcon
-                      size="xs"
-                      variant="subtle"
-                      color="orange"
-                      aria-label={`Edit ${device.name || 'device'}`}
-                      onClick={() => openEdit(device)}
-                    >
-                      <IconPencil size={12} />
-                    </ActionIcon>
-                  </Group>
-                  <Text size="xs" c="dimmed">
-                    {device.host}:{device.port}
-                  </Text>
-                  {status?.last_error ? (
-                    <Text size="xs" c="red">{status.last_error}</Text>
-                  ) : null}
-                </div>
-                <Group gap={6} align="center">
-                  <div className={`device-tag status-${state}`}>{tagLabel}</div>
-                  <div className={`device-tag status-lock-${lockDisplay.uiState}`}>
-                    {lockDisplay.label}
-                  </div>
-                  <button
-                    type="button"
-                    className={`device-tag device-tag-button status-lock-${autoRelockDisplay.uiState}`}
-                    onClick={() => onToggleAutoRelock(device.key, !autoRelockDisplay.enabled)}
-                    disabled={autoRelockBusy}
-                    style={{
-                      cursor: autoRelockBusy ? 'default' : 'pointer',
-                      opacity: autoRelockBusy ? 0.6 : 1,
-                    }}
-                    title="Toggle auto relock"
-                  >
-                    {autoRelockDisplay.label}
-                  </button>
-                </Group>
-              </Group>
-              <Group mt="sm" gap="xs" style={{ paddingRight: 34 }}>
-                <Button
-                  size="xs"
-                  variant="light"
-                  onClick={() => onAddToGroup(device.key)}
-                  disabled={!canAddToGroup || inActiveGroup}
-                >
-                  {inActiveGroup ? 'In group' : 'Add to group'}
-                </Button>
-                <Button
-                  size="xs"
-                  variant="light"
-                  color="blue"
-                  onClick={() => onStartServer(device.key)}
-                  disabled={connected}
-                >
-                  Start server
-                </Button>
-                {connected ? (
-                  <Button size="xs" color="red" variant="light" onClick={() => onDisconnect(device.key)}>
-                    Disconnect
-                  </Button>
-                ) : (
-                  <Button size="xs" color="green" variant="light" onClick={() => onConnect(device.key)}>
-                    Connect
-                  </Button>
-                )}
-              </Group>
-              <ActionIcon
-                size="sm"
-                color="red"
-                variant="subtle"
-                aria-label={`Remove ${device.name || 'device'}`}
-                onClick={() => onDelete(device.key)}
-                style={{ position: 'absolute', right: 8, bottom: 8 }}
-              >
-                <IconTrash size={14} />
-              </ActionIcon>
-            </Card>
-          );
-        })}
+              device={device}
+              status={statuses[device.key]}
+              indicator={lockIndicators[device.key]}
+              autoRelock={autoRelockStates[device.key] ?? statuses[device.key]?.auto_relock ?? undefined}
+              autoRelockBusy={Boolean(autoRelockBusyKeys?.[device.key])}
+              inActiveGroup={activeSet.has(device.key)}
+              canAddToGroup={canAddToGroup}
+              onEdit={openEdit}
+              onDelete={onDelete}
+              onAddToGroup={onAddToGroup}
+              onToggleAutoRelock={onToggleAutoRelock}
+              onStartServer={onStartServer}
+              onConnect={onConnect}
+              onDisconnect={onDisconnect}
+            />
+          ))}
+        </SortableContext>
       </Stack>
 
       <Modal opened={opened} onClose={() => setOpened(false)} title={editingKey ? 'Edit device' : 'Add device'}>

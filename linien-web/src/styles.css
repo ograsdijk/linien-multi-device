@@ -64,6 +64,48 @@ body {
 
 .device-navbar {
   transition: width 160ms ease;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.device-list-shell {
+  height: 100%;
+  min-height: 0;
+}
+
+.device-list-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+.device-card-sortable-wrapper {
+  transform-origin: center center;
+  will-change: transform;
+}
+
+.device-card-sortable {
+  cursor: grab;
+  transition: box-shadow 160ms ease, filter 160ms ease;
+}
+
+.device-card-sortable:active {
+  cursor: grabbing;
+}
+
+.device-card-sortable[data-dragging='true'] {
+  opacity: 0.22;
+}
+
+.device-card-drag-overlay {
+  pointer-events: none;
+  box-shadow: 0 18px 38px rgba(39, 28, 18, 0.22);
+  border-color: var(--accent);
+  transform: rotate(-1.6deg) scale(1.01);
 }
 
 .main-sticky-devices-toggle {

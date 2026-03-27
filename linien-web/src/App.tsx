@@ -1,4 +1,17 @@
-import { lazy, Suspense, useCallback, useEffect, useState, type CSSProperties } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
+import {
+  DndContext,
+  DragOverlay,
+  PointerSensor,
+  pointerWithin,
+  useDroppable,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragOverEvent,
+  type DragStartEvent,
+} from '@dnd-kit/core';
+import { arrayMove } from '@dnd-kit/sortable';
 import {
   ActionIcon,
   AppShell,
@@ -39,6 +52,37 @@ type GridColumnsMode = 'auto' | '1' | '2' | '3' | '4';
 
 const normalizeGridColumnsMode = (value: string | null): GridColumnsMode =>
   value === '1' || value === '2' || value === '3' || value === '4' ? value : 'auto';
+const EMPTY_DEVICE_STATE: DeviceState = { params: {} };
+const GROUP_DROP_ID_PREFIX = 'group:';
+
+const toGroupDropId = (groupKey: string) => `${GROUP_DROP_ID_PREFIX}${groupKey}`;
+const parseGroupDropId = (id: string): string | null =>
+  id.startsWith(GROUP_DROP_ID_PREFIX) ? id.slice(GROUP_DROP_ID_PREFIX.length) : null;
+
+function GroupDropZone({
+  groupKey,
+  className,
+  style,
+  children,
+}: {
+  groupKey: string;
+  className: string;
+  style?: CSSProperties;
+  children: ReactNode;
+}) {
+  const { isOver, setNodeRef } = useDroppable({
+    id: toGroupDropId(groupKey),
+  });
+  return (
+    <div
+      ref={setNodeRef}
+      className={`${className}${isOver ? ' drop-active' : ''}`}
+      style={style}
+    >
+      {children}
+    </div>
+  );
+}
 
 const LogsModal = lazy(async () => {
   const module = await import('./components/LogsModal');
@@ -47,8 +91,10 @@ const LogsModal = lazy(async () => {
 
 export function App() {
   const [deviceStates, setDeviceStates] = useState<Record<string, DeviceState>>({});
-  const [overviewFps, setOverviewFps] = useState<number>(0);
+  const [overviewFps, setOverviewFps] = useState<number>(10);
   const [lockPopoverOpen, setLockPopoverOpen] = useState(false);
+  const [draggingDeviceKey, setDraggingDeviceKey] = useState<string | null>(null);
+  const [previewOrderKeys, setPreviewOrderKeys] = useState<string[] | null>(null);
   const [deviceBarCollapsed, setDeviceBarCollapsed] = useState<boolean>(() => {
     try {
       return window.localStorage.getItem(DEVICE_BAR_COLLAPSED_KEY) === '1';
@@ -66,6 +112,7 @@ export function App() {
   const { colorScheme, setColorScheme } = useMantineColorScheme();
   const {
     devices,
+    orderedDevices,
     groups,
     activeTabKey,
     setActiveTabKey,
@@ -79,15 +126,13 @@ export function App() {
     groupNameDraft,
     setGroupNameDraft,
     editingGroupKey,
-    dragOverGroupKey,
-    setDragOverGroupKey,
     openCreateGroup,
     openRenameGroup,
     saveGroup,
     addDeviceToGroup,
     removeDeviceFromGroup,
     openDeviceGroup,
-    handleDrop,
+    setDeviceOrderKeys,
     groupDevicesMap,
   } = useDeviceCatalog();
   const {
@@ -162,9 +207,113 @@ export function App() {
       // Ignore persistence failures; UI state still works for current session.
     }
   }, [gridColumnsMode]);
-  useDeviceStatusPolling({ devices, setDeviceStates });
+  const websocketActiveDeviceKeys = useMemo(() => {
+    if (isOverview) {
+      return new Set(devices.map((device) => device.key));
+    }
+    return new Set(activeDeviceKeys);
+  }, [activeDeviceKeys, devices, isOverview]);
+  useDeviceStatusPolling({
+    devices,
+    setDeviceStates,
+    skipDeviceKeys: websocketActiveDeviceKeys,
+  });
   const updateState = useDeviceStateUpdater(setDeviceStates);
 
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 6 },
+    })
+  );
+  const deviceByKey = useMemo(() => {
+    return new Map(devices.map((device) => [device.key, device]));
+  }, [devices]);
+  const orderedDeviceKeys = useMemo(() => orderedDevices.map((device) => device.key), [orderedDevices]);
+  const listDevices = useMemo(() => {
+    if (!previewOrderKeys) {
+      return orderedDevices;
+    }
+    const ordered: typeof orderedDevices = [];
+    for (const key of previewOrderKeys) {
+      const device = deviceByKey.get(key);
+      if (device) {
+        ordered.push(device);
+      }
+    }
+    for (const device of orderedDevices) {
+      if (!ordered.find((item) => item.key === device.key)) {
+        ordered.push(device);
+      }
+    }
+    return ordered;
+  }, [deviceByKey, orderedDevices, previewOrderKeys]);
+
+  const resetDragPreview = useCallback(() => {
+    setDraggingDeviceKey(null);
+    setPreviewOrderKeys(null);
+  }, []);
+
+  const handleDragStart = useCallback((event: DragStartEvent) => {
+    const activeKey = String(event.active.id);
+    if (!deviceByKey.has(activeKey)) {
+      return;
+    }
+    setDraggingDeviceKey(activeKey);
+    setPreviewOrderKeys(orderedDeviceKeys);
+  }, [deviceByKey, orderedDeviceKeys]);
+
+  const handleDragOver = useCallback((event: DragOverEvent) => {
+    const activeKey = draggingDeviceKey;
+    const overId = event.over?.id;
+    if (!activeKey || overId == null) {
+      return;
+    }
+    const overKey = String(overId);
+    if (!deviceByKey.has(overKey)) {
+      return;
+    }
+    setPreviewOrderKeys((prev) => {
+      if (!prev) return prev;
+      const oldIndex = prev.indexOf(activeKey);
+      const newIndex = prev.indexOf(overKey);
+      if (oldIndex < 0 || newIndex < 0 || oldIndex === newIndex) {
+        return prev;
+      }
+      return arrayMove(prev, oldIndex, newIndex);
+    });
+  }, [deviceByKey, draggingDeviceKey]);
+
+  const handleDragEnd = useCallback((event: DragEndEvent) => {
+    const activeKey = draggingDeviceKey;
+    const overId = event.over?.id == null ? null : String(event.over.id);
+    if (!activeKey || !overId) {
+      resetDragPreview();
+      return;
+    }
+    const overGroupKey = parseGroupDropId(overId);
+    if (overGroupKey) {
+      const targetGroup = groups.find((group) => group.key === overGroupKey);
+      if (targetGroup) {
+        addDeviceToGroup(targetGroup, activeKey).catch(() => null);
+      }
+      resetDragPreview();
+      return;
+    }
+    if (deviceByKey.has(overId) && previewOrderKeys != null) {
+      setDeviceOrderKeys(previewOrderKeys);
+    }
+    resetDragPreview();
+  }, [
+    addDeviceToGroup,
+    deviceByKey,
+    draggingDeviceKey,
+    groups,
+    previewOrderKeys,
+    resetDragPreview,
+    setDeviceOrderKeys,
+  ]);
+
+  const draggingDevice = draggingDeviceKey ? deviceByKey.get(draggingDeviceKey) ?? null : null;
 
   const {
     deviceStatusMap,
@@ -246,7 +395,15 @@ export function App() {
     : undefined;
 
   return (
-    <AppShell
+    <DndContext
+      sensors={sensors}
+      collisionDetection={pointerWithin}
+      onDragStart={handleDragStart}
+      onDragOver={handleDragOver}
+      onDragEnd={handleDragEnd}
+      onDragCancel={resetDragPreview}
+    >
+      <AppShell
       padding="md"
       navbar={{
         width: 320,
@@ -254,7 +411,7 @@ export function App() {
         collapsed: { mobile: deviceBarCollapsed, desktop: deviceBarCollapsed },
       }}
       header={{ height: 60 }}
-    >
+      >
       <AppShell.Header>
         <Group h="100%" px="md" justify="space-between">
           <Text fw={700}>Linien Multi-Device</Text>
@@ -335,7 +492,7 @@ export function App() {
       {!deviceBarCollapsed ? (
         <AppShell.Navbar p="md" className="device-navbar">
           <DeviceList
-            devices={devices}
+            devices={listDevices}
             statuses={deviceStatusMap}
             lockIndicators={lockIndicatorMap}
             autoRelockStates={autoRelockMap}
@@ -431,7 +588,7 @@ export function App() {
                     setOverviewFps(Number(value));
                   }}
                   data={[
-                    { value: '0', label: 'Full' },
+                    { value: '60', label: '60 Hz' },
                     { value: '10', label: '10 Hz' },
                     { value: '5', label: '5 Hz' },
                     { value: '2', label: '2 Hz' },
@@ -461,15 +618,15 @@ export function App() {
               {devices.length === 0 ? (
                 <div className="empty-group">No devices configured.</div>
               ) : null}
-              {devices.map((device) => (
+              {orderedDevices.map((device) => (
                 <div key={device.key} className="device-card">
                   <DeviceOverviewCard
                     device={device}
-                    state={deviceStates[device.key] || { params: {} }}
+                    state={deviceStates[device.key] ?? EMPTY_DEVICE_STATE}
                     active={activeTabKey === OVERVIEW_KEY}
                     onStateUpdate={updateState}
-                    onOpenInGroup={() => openDeviceGroup(device.key)}
-                    maxFps={overviewFps || undefined}
+                    onOpenInGroup={openDeviceGroup}
+                    maxFps={overviewFps}
                   />
                 </div>
               ))}
@@ -477,24 +634,12 @@ export function App() {
           </Tabs.Panel>
           {groups.map((group) => {
             const groupDevices = groupDevicesMap.get(group.key) ?? [];
-            const dropActive = dragOverGroupKey === group.key;
             return (
               <Tabs.Panel key={group.key} value={group.key}>
-                <div
-                  className={`group-grid${fixedGridClassName}${dropActive ? ' drop-active' : ''}`}
+                <GroupDropZone
+                  groupKey={group.key}
+                  className={`group-grid${fixedGridClassName}`}
                   style={fixedGridStyle}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    setDragOverGroupKey(group.key);
-                  }}
-                  onDragLeave={() => {
-                    if (dragOverGroupKey === group.key) {
-                      setDragOverGroupKey(null);
-                    }
-                  }}
-                  onDrop={(event) => {
-                    handleDrop(group, event).catch(() => null);
-                  }}
                 >
                   {groupDevices.length === 0 ? (
                     <div className="empty-group">Drop devices here to build this view.</div>
@@ -522,13 +667,13 @@ export function App() {
                       </Group>
                       <DeviceWorkspace
                         device={device}
-                        state={deviceStates[device.key] || { params: {} }}
+                        state={deviceStates[device.key] ?? EMPTY_DEVICE_STATE}
                         active={group.key === activeTabKey}
                         onStateUpdate={updateState}
                       />
                     </div>
                   ))}
-                </div>
+                </GroupDropZone>
               </Tabs.Panel>
             );
           })}
@@ -585,6 +730,17 @@ export function App() {
         />
       </Suspense>
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
-    </AppShell>
+      </AppShell>
+      <DragOverlay>
+        {draggingDevice ? (
+          <div className="device-card device-card-drag-overlay">
+            <Text fw={600}>{draggingDevice.name || 'Unnamed device'}</Text>
+            <Text size="xs" c="dimmed">
+              {draggingDevice.host}:{draggingDevice.port}
+            </Text>
+          </div>
+        ) : null}
+      </DragOverlay>
+    </DndContext>
   );
 }

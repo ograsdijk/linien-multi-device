@@ -1,9 +1,25 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import type { DragEvent } from 'react';
 import { api } from '../../api';
 import type { Device, DeviceGroup } from '../../types';
 
 export const OVERVIEW_KEY = '__overview__';
+const DEVICE_ORDER_KEY = 'linien.deviceOrder';
+
+const arraysEqual = (a: string[], b: string[]): boolean =>
+  a.length === b.length && a.every((value, index) => value === b[index]);
+
+const readStoredDeviceOrder = (): string[] => {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(DEVICE_ORDER_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === 'string');
+  } catch {
+    return [];
+  }
+};
 
 export const useDeviceCatalog = () => {
   const [devices, setDevices] = useState<Device[]>([]);
@@ -12,7 +28,7 @@ export const useDeviceCatalog = () => {
   const [groupModalOpen, setGroupModalOpen] = useState(false);
   const [groupNameDraft, setGroupNameDraft] = useState('');
   const [editingGroupKey, setEditingGroupKey] = useState<string | null>(null);
-  const [dragOverGroupKey, setDragOverGroupKey] = useState<string | null>(null);
+  const [deviceOrder, setDeviceOrder] = useState<string[]>(() => readStoredDeviceOrder());
 
   const loadDevices = useCallback(async () => {
     const list = await api.listDevices();
@@ -39,6 +55,42 @@ export const useDeviceCatalog = () => {
     loadDevices();
     loadGroups();
   }, [loadDevices, loadGroups]);
+
+  const normalizeOrderKeys = useCallback((candidate: string[]): string[] => {
+    const deviceKeys = devices.map((device) => device.key);
+    const valid = new Set(deviceKeys);
+    const deduped: string[] = [];
+    for (const key of candidate) {
+      if (!valid.has(key) || deduped.includes(key)) {
+        continue;
+      }
+      deduped.push(key);
+    }
+    for (const key of deviceKeys) {
+      if (!deduped.includes(key)) {
+        deduped.push(key);
+      }
+    }
+    return deduped;
+  }, [devices]);
+
+  useEffect(() => {
+    setDeviceOrder((prev) => {
+      const next = normalizeOrderKeys(prev);
+      if (arraysEqual(next, prev)) {
+        return prev;
+      }
+      return next;
+    });
+  }, [normalizeOrderKeys]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(DEVICE_ORDER_KEY, JSON.stringify(deviceOrder));
+    } catch {
+      // Ignore persistence failures; ordering still works for current session.
+    }
+  }, [deviceOrder]);
 
   const isOverview = activeTabKey === OVERVIEW_KEY;
   const activeGroup = !isOverview
@@ -86,20 +138,53 @@ export const useDeviceCatalog = () => {
     setGroups((prev) => prev.map((item) => (item.key === updated.key ? updated : item)));
   };
 
-  const openDeviceGroup = (deviceKey: string) => {
+  const openDeviceGroup = useCallback((deviceKey: string) => {
     const match = groups.find((group) => group.device_keys.includes(deviceKey));
     if (match) {
       setActiveTabKey(match.key);
     }
-  };
+  }, [groups]);
 
-  const handleDrop = async (group: DeviceGroup, event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setDragOverGroupKey(null);
-    const deviceKey = event.dataTransfer.getData('text/linien-device-key');
-    if (!deviceKey) return;
-    await addDeviceToGroup(group, deviceKey);
-  };
+  const reorderDevices = useCallback((activeKey: string, overKey: string) => {
+    if (activeKey === overKey) return;
+    setDeviceOrder((prev) => {
+      const oldIndex = prev.indexOf(activeKey);
+      const newIndex = prev.indexOf(overKey);
+      if (oldIndex < 0 || newIndex < 0 || oldIndex === newIndex) {
+        return prev;
+      }
+      const next = [...prev];
+      const [moved] = next.splice(oldIndex, 1);
+      next.splice(newIndex, 0, moved);
+      return next;
+    });
+  }, []);
+
+  const setDeviceOrderKeys = useCallback((nextOrderKeys: string[]) => {
+    setDeviceOrder((prev) => {
+      const normalized = normalizeOrderKeys(nextOrderKeys);
+      return arraysEqual(normalized, prev) ? prev : normalized;
+    });
+  }, [normalizeOrderKeys]);
+
+  const orderedDevices = useMemo(() => {
+    const byKey = new Map(devices.map((device) => [device.key, device]));
+    const ordered: Device[] = [];
+    for (const key of deviceOrder) {
+      const device = byKey.get(key);
+      if (device) {
+        ordered.push(device);
+        byKey.delete(key);
+      }
+    }
+    for (const device of devices) {
+      if (byKey.has(device.key)) {
+        ordered.push(device);
+        byKey.delete(device.key);
+      }
+    }
+    return ordered;
+  }, [deviceOrder, devices]);
 
   const groupDevicesMap = useMemo(() => {
     const byKey = new Map(devices.map((device) => [device.key, device]));
@@ -115,6 +200,7 @@ export const useDeviceCatalog = () => {
 
   return {
     devices,
+    orderedDevices,
     groups,
     activeTabKey,
     setActiveTabKey,
@@ -128,15 +214,14 @@ export const useDeviceCatalog = () => {
     groupNameDraft,
     setGroupNameDraft,
     editingGroupKey,
-    dragOverGroupKey,
-    setDragOverGroupKey,
     openCreateGroup,
     openRenameGroup,
     saveGroup,
     addDeviceToGroup,
     removeDeviceFromGroup,
     openDeviceGroup,
-    handleDrop,
+    reorderDevices,
+    setDeviceOrderKeys,
     groupDevicesMap,
   };
 };
