@@ -1,8 +1,9 @@
-import { useCallback, useRef } from 'react';
+import { memo, useCallback, useRef } from 'react';
 import { Button, Group, Text } from '@mantine/core';
 import type { Device, DeviceStatus, PlotFrame, StreamMessage } from '../types';
 import { api } from '../api';
 import { useDeviceStream } from '../hooks/useDeviceStream';
+import { useInViewport } from '../hooks/useInViewport';
 import { PlotPanel } from './PlotPanel';
 import { StatusRow } from './StatusRow';
 import { resolveLockDisplay } from '../features/locks/lockState';
@@ -15,12 +16,12 @@ type DeviceOverviewCardProps = {
     status?: DeviceStatus | null;
   };
   active: boolean;
-  onOpenInGroup?: () => void;
+  onOpenInGroup?: (deviceKey: string) => void;
   maxFps?: number;
   onStateUpdate: (deviceKey: string, message: StreamMessage) => void;
 };
 
-export function DeviceOverviewCard({
+export const DeviceOverviewCard = memo(function DeviceOverviewCard({
   device,
   state,
   active,
@@ -28,6 +29,9 @@ export function DeviceOverviewCard({
   maxFps,
   onStateUpdate,
 }: DeviceOverviewCardProps) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const visible = useInViewport(rootRef, { disabled: !active });
+  const streamEnabled = active && visible;
   const connected = Boolean(state.status?.connected);
   const lockStateFromParams = typeof state.params.lock === 'boolean' ? state.params.lock : undefined;
   const lockStateFromStatus = typeof state.status?.lock === 'boolean' ? state.status.lock : undefined;
@@ -62,10 +66,10 @@ export function DeviceOverviewCard({
     [device.key, onStateUpdate, plotThrottleMs]
   );
 
-  useDeviceStream(device.key, active, onMessage, { maxFps });
+  useDeviceStream(device.key, streamEnabled, onMessage, { maxFps });
 
   return (
-    <div className="overview-card">
+    <div className="overview-card" ref={rootRef}>
       <Group justify="space-between" align="center" mb="xs">
         <div>
           <Text fw={600}>{device.name || 'Unnamed device'}</Text>
@@ -90,7 +94,7 @@ export function DeviceOverviewCard({
           <Button
             size="xs"
             variant="default"
-            onClick={() => onOpenInGroup?.()}
+            onClick={() => onOpenInGroup?.(device.key)}
             disabled={!onOpenInGroup}
           >
             Open in group
@@ -113,4 +117,4 @@ export function DeviceOverviewCard({
       />
     </div>
   );
-}
+});

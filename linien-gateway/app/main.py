@@ -17,6 +17,11 @@ from linien_client.device import Device
 from linien_common.influxdb import InfluxDBCredentials
 
 from . import device_store, group_store
+from .config import (
+    get_plot_stream_default_fps,
+    get_plot_stream_drop_old_frames,
+    get_plot_stream_max_fps_cap,
+)
 from .device_config_store import (
     CONFIG_AUTO_LOCK_SCAN,
     CONFIG_AUTO_RELOCK,
@@ -56,7 +61,11 @@ from .serializers import UNSERIALIZABLE, to_jsonable
 from .stream import WebsocketManager
 
 app = FastAPI(title="Linien Gateway")
-manager = WebsocketManager()
+manager = WebsocketManager(
+    default_plot_fps=get_plot_stream_default_fps(),
+    max_plot_fps_cap=get_plot_stream_max_fps_cap(),
+    drop_old_plot_frames=get_plot_stream_drop_old_frames(),
+)
 lock_result_postgres = LockResultPostgresService()
 log_store = LogStore(max_entries=10_000, max_age_s=24.0 * 60.0 * 60.0)
 device_config_store = DeviceConfigStore()

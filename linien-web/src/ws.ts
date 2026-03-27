@@ -6,6 +6,8 @@ type StreamOptions = {
   maxFps?: number;
 };
 
+const CLIENT_PLOT_MAX_FPS = 60;
+
 export function openDeviceStream(
   deviceKey: string,
   onMessage: (msg: StreamMessage) => void,
@@ -14,7 +16,7 @@ export function openDeviceStream(
   const wsBase = apiBase.replace(/^http/, 'ws');
   const params = new URLSearchParams();
   if (options?.maxFps && options.maxFps > 0) {
-    params.set('max_fps', String(options.maxFps));
+    params.set('max_fps', String(Math.min(options.maxFps, CLIENT_PLOT_MAX_FPS)));
   }
   const suffix = params.toString();
   const url = suffix

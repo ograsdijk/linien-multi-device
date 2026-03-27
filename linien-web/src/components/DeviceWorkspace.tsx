@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import type {
   AutoRelockConfig,
   AutoLockScanResult,
@@ -36,7 +36,12 @@ type SetParamOptions = {
   optimistic?: boolean;
 };
 
-export function DeviceWorkspace({ device, state, active, onStateUpdate }: DeviceWorkspaceProps) {
+export const DeviceWorkspace = memo(function DeviceWorkspace({
+  device,
+  state,
+  active,
+  onStateUpdate,
+}: DeviceWorkspaceProps) {
   const [selectionMode, setSelectionMode] = useState<'autolock' | 'optimization' | null>(null);
   const [, setSelectionError] = useState<string | null>(null);
   const [selectionSubmitting, setSelectionSubmitting] = useState(false);
@@ -394,4 +399,4 @@ export function DeviceWorkspace({ device, state, active, onStateUpdate }: Device
       </div>
     </div>
   );
-}
+});

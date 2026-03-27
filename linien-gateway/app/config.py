@@ -8,6 +8,9 @@ from .path_utils import find_repo_root
 
 DEFAULT_API_PORT = 8000
 DEFAULT_API_HOST = "127.0.0.1"
+DEFAULT_PLOT_STREAM_DEFAULT_FPS = 60.0
+DEFAULT_PLOT_STREAM_MAX_FPS_CAP = 60.0
+DEFAULT_PLOT_STREAM_DROP_OLD_FRAMES = True
 
 
 def _repo_root() -> Path:
@@ -38,3 +41,32 @@ def get_api_host() -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return DEFAULT_API_HOST
+
+
+def _get_positive_float(config: dict[str, Any], key: str, fallback: float) -> float:
+    value = config.get(key)
+    if isinstance(value, (int, float)) and float(value) > 0:
+        return float(value)
+    return fallback
+
+
+def get_plot_stream_default_fps() -> float:
+    config = _load_config()
+    return _get_positive_float(
+        config, "plotStreamDefaultFps", DEFAULT_PLOT_STREAM_DEFAULT_FPS
+    )
+
+
+def get_plot_stream_max_fps_cap() -> float:
+    config = _load_config()
+    return _get_positive_float(
+        config, "plotStreamMaxFpsCap", DEFAULT_PLOT_STREAM_MAX_FPS_CAP
+    )
+
+
+def get_plot_stream_drop_old_frames() -> bool:
+    config = _load_config()
+    value = config.get("plotStreamDropOldFrames")
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_PLOT_STREAM_DROP_OLD_FRAMES

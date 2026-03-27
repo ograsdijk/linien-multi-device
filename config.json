@@ -1,5 +1,8 @@
 {
   "apiHost": "0.0.0.0",
   "apiPort": 8000,
-  "webDevPort": 5175
+  "webDevPort": 5175,
+  "plotStreamDefaultFps": 60,
+  "plotStreamMaxFpsCap": 60,
+  "plotStreamDropOldFrames": true
 }
