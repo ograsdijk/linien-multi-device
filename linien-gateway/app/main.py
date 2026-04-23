@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from pathlib import Path
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any, List
 
 import uvicorn
@@ -12,7 +12,6 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-
 from linien_client.device import Device
 from linien_common.influxdb import InfluxDBCredentials
 
@@ -28,12 +27,15 @@ from .device_config_store import (
     CONFIG_LOCK_INDICATOR,
     DeviceConfigStore,
 )
+from .log_store import LogStore
+from .manual_lock_postgres import LockResultPostgresService
+from .path_utils import find_repo_root
 from .schemas import (
+    AutoLockScanResult,
+    AutoLockScanSettings,
     AutoRelockConfig,
     AutoRelockEnabledUpdate,
     AutoRelockState,
-    AutoLockScanResult,
-    AutoLockScanSettings,
     DeviceIn,
     DeviceOut,
     DevicePatch,
@@ -41,23 +43,20 @@ from .schemas import (
     GroupOut,
     GroupPatch,
     InfluxCredentials,
-    LogTailResponse,
-    LoggingParamUpdate,
-    LoggingParamsUpdate,
-    LoggingStart,
     LockIndicatorConfig,
+    LoggingParamsUpdate,
+    LoggingParamUpdate,
+    LoggingStart,
+    LogTailResponse,
     ParamUpdate,
     PostgresManualLockConfig,
     PostgresManualLockState,
     RangeSelection,
     StopTask,
 )
-from .log_store import LogStore
-from .manual_lock_postgres import LockResultPostgresService
-from .path_utils import find_repo_root
+from .serializers import UNSERIALIZABLE, to_jsonable
 from .session import DeviceSession
 from .session_registry import SessionRegistry
-from .serializers import UNSERIALIZABLE, to_jsonable
 from .stream import WebsocketManager
 
 app = FastAPI(title="Linien Gateway")
@@ -555,7 +554,10 @@ def start_lock(key: str) -> dict:
                         details["last_error"] = status.get("last_error")
                         details["active"] = status.get("active")
                 except Exception:
-                    logger.debug("Failed reading postgres state after manual enqueue rejection", exc_info=True)
+                    logger.debug(
+                        "Failed reading postgres state after manual enqueue rejection",
+                        exc_info=True,
+                    )
             _emit_log(
                 level=logging.WARNING,
                 source="postgres",
@@ -679,7 +681,10 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
                         details["last_error"] = status.get("last_error")
                         details["active"] = status.get("active")
                 except Exception:
-                    logger.debug("Failed reading postgres state after autolock enqueue rejection", exc_info=True)
+                    logger.debug(
+                        "Failed reading postgres state after autolock enqueue rejection",
+                        exc_info=True,
+                    )
             _emit_log(
                 level=logging.WARNING,
                 source="postgres",
@@ -705,13 +710,17 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
     return result
 
 
-@app.get("/api/devices/{key}/auto-lock-scan-settings", response_model=AutoLockScanSettings)
+@app.get(
+    "/api/devices/{key}/auto-lock-scan-settings", response_model=AutoLockScanSettings
+)
 def get_auto_lock_scan_settings(key: str) -> dict:
     session = _get_session(key)
     return session.get_auto_lock_scan_settings()
 
 
-@app.put("/api/devices/{key}/auto-lock-scan-settings", response_model=AutoLockScanSettings)
+@app.put(
+    "/api/devices/{key}/auto-lock-scan-settings", response_model=AutoLockScanSettings
+)
 def update_auto_lock_scan_settings(key: str, payload: AutoLockScanSettings) -> dict:
     device = _get_device_or_404(key)
     session = _session_for_device(device)
@@ -752,7 +761,9 @@ def update_auto_relock_enabled(key: str, payload: AutoRelockEnabledUpdate) -> di
 @app.post("/api/devices/{key}/control/start_optimization")
 def start_optimization(key: str, payload: RangeSelection) -> dict:
     session = _get_session(key)
-    return _run_session_action(lambda: session.start_optimization(payload.x0, payload.x1))
+    return _run_session_action(
+        lambda: session.start_optimization(payload.x0, payload.x1)
+    )
 
 
 @app.post("/api/devices/{key}/control/start_pid_optimization")
@@ -910,7 +921,7 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
         session = _get_session(key)
         snapshot = session.snapshot()
     max_fps = None
-    raw_max = websocket.query_params.get('max_fps')
+    raw_max = websocket.query_params.get("max_fps")
     if raw_max is not None:
         try:
             max_fps = float(raw_max)
@@ -932,7 +943,9 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
         encoded = to_jsonable(value)
         if encoded is UNSERIALIZABLE:
             continue
-        if not await safe_send({"type": "param_update", "name": name, "value": encoded}):
+        if not await safe_send(
+            {"type": "param_update", "name": name, "value": encoded}
+        ):
             return
     if snapshot.get("plot_frame") is not None:
         if not await safe_send(snapshot["plot_frame"]):

@@ -52,7 +52,9 @@ def load_groups(path=GROUPS_PATH) -> List[Group]:
     elif isinstance(data, dict):
         candidates = list(data.values())
     else:
-        logger.warning("Invalid groups payload type at %s: %s", path, type(data).__name__)
+        logger.warning(
+            "Invalid groups payload type at %s: %s", path, type(data).__name__
+        )
         return []
 
     groups: list[Group] = []
@@ -60,10 +62,14 @@ def load_groups(path=GROUPS_PATH) -> List[Group]:
         if not isinstance(item, dict):
             continue
         if not isinstance(item.get("key"), str):
-            logger.warning("Skipping group entry without valid key in %s: %r", path, item)
+            logger.warning(
+                "Skipping group entry without valid key in %s: %r", path, item
+            )
             continue
         if not isinstance(item.get("name"), str):
-            logger.warning("Skipping group entry without valid name in %s: %r", path, item)
+            logger.warning(
+                "Skipping group entry without valid name in %s: %r", path, item
+            )
             continue
         try:
             groups.append(Group(**item))
@@ -114,7 +120,9 @@ def list_groups(device_keys: List[str]) -> List[Group]:
     return groups
 
 
-def create_group(name: str, device_keys: List[str], auto_include: bool = False) -> Group:
+def create_group(
+    name: str, device_keys: List[str], auto_include: bool = False
+) -> Group:
     group = Group(name=name, device_keys=list(device_keys), auto_include=auto_include)
     groups = load_groups()
     groups.append(group)

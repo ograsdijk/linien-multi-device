@@ -1,6 +1,5 @@
-from fastapi.testclient import TestClient
-
 import app.main as main
+from fastapi.testclient import TestClient
 
 
 def test_device_statuses_returns_status_by_device_key(monkeypatch):
@@ -25,7 +24,9 @@ def test_device_statuses_returns_status_by_device_key(monkeypatch):
     ]
 
     monkeypatch.setattr(main.device_store, "list_devices", lambda: devices)
-    monkeypatch.setattr(main, "_session_for_device", lambda device: DummySession(device.key))
+    monkeypatch.setattr(
+        main, "_session_for_device", lambda device: DummySession(device.key)
+    )
     client = TestClient(main.app)
 
     response = client.get("/api/devices/statuses")

@@ -5,8 +5,8 @@ import math
 import pickle
 import threading
 import time
-from copy import deepcopy
 from collections.abc import Callable
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -113,7 +113,9 @@ class DeviceSession:
         self.param_cache_serialized: Dict[str, Any] = {}
         self.plot_state = PlotState()
         self.auto_lock_scan_settings = self._initial_auto_lock_scan_settings()
-        self.lock_indicator = LockIndicatorEvaluator(self._initial_lock_indicator_config())
+        self.lock_indicator = LockIndicatorEvaluator(
+            self._initial_lock_indicator_config()
+        )
         self.auto_relock = AutoRelockController(
             self._initial_auto_relock_config(),
             event_hook=self._on_auto_relock_event,
@@ -179,7 +181,9 @@ class DeviceSession:
             )
 
     @staticmethod
-    def _compact_indicator_metrics(indicator_snapshot: dict[str, Any]) -> dict[str, Any]:
+    def _compact_indicator_metrics(
+        indicator_snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
         metrics = indicator_snapshot.get("metrics")
         if not isinstance(metrics, dict):
             return {}
@@ -201,7 +205,11 @@ class DeviceSession:
     ) -> None:
         previous_state = self._last_lock_indicator_state
         self._last_lock_indicator_state = indicator_state
-        if not lock_enabled or indicator_state is None or indicator_state == previous_state:
+        if (
+            not lock_enabled
+            or indicator_state is None
+            or indicator_state == previous_state
+        ):
             return
         details = {
             "from_state": previous_state,
@@ -290,7 +298,11 @@ class DeviceSession:
 
         service = self._lock_result_postgres
         try:
-            device_name = self.device.name if getattr(self.device, "name", None) else self.device.key
+            device_name = (
+                self.device.name
+                if getattr(self.device, "name", None)
+                else self.device.key
+            )
             row = self.build_manual_lock_row(
                 device_name=device_name,
                 device_key=self.device.key,
@@ -301,7 +313,9 @@ class DeviceSession:
             state = get_state() if callable(get_state) else {}
             config = state.get("config", {}) if isinstance(state, dict) else {}
             status = state.get("status", {}) if isinstance(state, dict) else {}
-            config_enabled = bool(config.get("enabled")) if isinstance(config, dict) else False
+            config_enabled = (
+                bool(config.get("enabled")) if isinstance(config, dict) else False
+            )
             details: dict[str, Any] = {
                 "lock_source": lock_source,
                 "event_source": event_source,
@@ -364,7 +378,11 @@ class DeviceSession:
 
     def _initial_auto_lock_scan_settings(self) -> dict[str, Any]:
         parameters = getattr(self.device, "parameters", None)
-        payload = parameters.get("auto_lock_scan_settings") if isinstance(parameters, dict) else None
+        payload = (
+            parameters.get("auto_lock_scan_settings")
+            if isinstance(parameters, dict)
+            else None
+        )
         settings = AutoLockScanSettings.from_mapping(
             payload if isinstance(payload, dict) else None
         )
@@ -409,7 +427,9 @@ class DeviceSession:
         parameters = getattr(self.device, "parameters", None)
         if not isinstance(parameters, dict):
             return self._normalize_influx_logging_state(None)
-        return self._normalize_influx_logging_state(parameters.get("influx_logging_state"))
+        return self._normalize_influx_logging_state(
+            parameters.get("influx_logging_state")
+        )
 
     def sync_auto_lock_scan_settings_from_device(self) -> None:
         next_auto_lock_scan_settings = self._initial_auto_lock_scan_settings()
@@ -490,7 +510,11 @@ class DeviceSession:
         current = dict(self.influx_logging_state)
         if enabled is not None:
             current["enabled"] = bool(enabled)
-        if interval_s is not None and math.isfinite(float(interval_s)) and float(interval_s) > 0:
+        if (
+            interval_s is not None
+            and math.isfinite(float(interval_s))
+            and float(interval_s) > 0
+        ):
             current["interval_s"] = max(0.1, float(interval_s))
         if params is not None:
             current["params"] = self._normalize_influx_param_names(params)
@@ -646,7 +670,9 @@ class DeviceSession:
                         self.device.key,
                         exc_info=True,
                     )
-                should_resume_logging = bool(self.influx_logging_state.get("enabled", False))
+                should_resume_logging = bool(
+                    self.influx_logging_state.get("enabled", False)
+                )
                 resume_interval = max(
                     0.1,
                     float(
@@ -669,9 +695,7 @@ class DeviceSession:
             self.last_error = None
             self._register_callbacks()
             self._stop_event.clear()
-            self._poll_thread = threading.Thread(
-                target=self._poll_loop, daemon=True
-            )
+            self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
             self._poll_thread.start()
         except (
             ServerNotRunningException,
@@ -912,7 +936,9 @@ class DeviceSession:
             )
             self.auto_relock.tick(
                 lock=lock_value,
-                indicator_state=indicator_state if isinstance(indicator_state, str) else None,
+                indicator_state=indicator_state
+                if isinstance(indicator_state, str)
+                else None,
                 unlocked_trace_at=self.plot_state.last_unlocked_trace_at,
                 start_sweep=self.stop_lock,
                 start_relock=_start_auto_relock,
@@ -924,7 +950,9 @@ class DeviceSession:
 
         self._emit_lock_transition_log(
             lock_enabled=bool(lock_value),
-            indicator_state=indicator_state if isinstance(indicator_state, str) else None,
+            indicator_state=indicator_state
+            if isinstance(indicator_state, str)
+            else None,
             indicator_snapshot=(
                 frame_lock_indicator if isinstance(frame_lock_indicator, dict) else {}
             ),
@@ -957,7 +985,9 @@ class DeviceSession:
                 )
                 logging_active = None
                 lock_value = None
-        _, last_plot_frame, last_plot_timestamp, auto_relock_status = self._snapshot_cached_state()
+        _, last_plot_frame, last_plot_timestamp, auto_relock_status = (
+            self._snapshot_cached_state()
+        )
         if lock_value is None and isinstance(last_plot_frame, dict):
             frame_lock = last_plot_frame.get("lock")
             if isinstance(frame_lock, bool):
@@ -993,7 +1023,9 @@ class DeviceSession:
         with self._rpyc_lock:
             self.control.exposed_start_lock()
 
-    def auto_lock_from_scan(self, settings_payload: dict[str, Any] | None) -> dict[str, Any]:
+    def auto_lock_from_scan(
+        self, settings_payload: dict[str, Any] | None
+    ) -> dict[str, Any]:
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
         error_trace, monitor_trace = self._snapshot_auto_lock_traces()
@@ -1134,9 +1166,7 @@ class DeviceSession:
 
     def start_autolock(self, x0: int, x1: int) -> None:
         if AUTOMATION_TEMP_DISABLED:
-            raise RuntimeError(
-                f"Autolock is {AUTOMATION_TEMP_DISABLED_REASON}"
-            )
+            raise RuntimeError(f"Autolock is {AUTOMATION_TEMP_DISABLED_REASON}")
         if self.control is None:
             raise RuntimeError("Device not connected")
         if self.plot_state.last_plot_data is None:
@@ -1173,9 +1203,7 @@ class DeviceSession:
 
     def start_optimization(self, x0: int, x1: int) -> None:
         if AUTOMATION_TEMP_DISABLED:
-            raise RuntimeError(
-                f"Optimization is {AUTOMATION_TEMP_DISABLED_REASON}"
-            )
+            raise RuntimeError(f"Optimization is {AUTOMATION_TEMP_DISABLED_REASON}")
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
         if self.plot_state.last_plot_data is None:
@@ -1195,9 +1223,7 @@ class DeviceSession:
         if int(np.argmin(cropped)) == int(np.argmax(cropped)):
             raise RuntimeError("Selected range does not contain a slope")
         with self._rpyc_lock:
-            self.control.exposed_start_optimization(
-                x0, x1, pickle.dumps(spectrum)
-            )
+            self.control.exposed_start_optimization(x0, x1, pickle.dumps(spectrum))
 
     def start_pid_optimization(self) -> None:
         if self.control is None:
@@ -1300,7 +1326,9 @@ class DeviceSession:
             params_configured=True,
         )
 
-    def logging_set_params(self, names: list[str] | tuple[str, ...] | set[str]) -> dict[str, Any]:
+    def logging_set_params(
+        self, names: list[str] | tuple[str, ...] | set[str]
+    ) -> dict[str, Any]:
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
         selected = set(self._normalize_influx_param_names(names))
@@ -1312,7 +1340,9 @@ class DeviceSession:
             loggable_set = set(loggable_names)
             unknown = sorted(name for name in selected if name not in loggable_set)
             if unknown:
-                raise ValueError(f"Unknown or non-loggable parameters: {', '.join(unknown)}")
+                raise ValueError(
+                    f"Unknown or non-loggable parameters: {', '.join(unknown)}"
+                )
 
             applied_names: list[str] = []
             for param_name in loggable_names:
@@ -1363,4 +1393,3 @@ class DeviceSession:
                     }
                 )
         return data
-

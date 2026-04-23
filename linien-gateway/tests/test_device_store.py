@@ -11,9 +11,19 @@ def test_save_device_loads_device_list_once(monkeypatch):
         tracked_calls["load"] += 1
         return [device]
 
-    monkeypatch.setattr(device_store, 'load_device_list', fake_load_device_list)
-    monkeypatch.setattr(device_store, 'add_device', lambda _device: tracked_calls.__setitem__('add', tracked_calls['add'] + 1))
-    monkeypatch.setattr(device_store, 'update_device', lambda _device: tracked_calls.__setitem__('update', tracked_calls['update'] + 1))
+    monkeypatch.setattr(device_store, "load_device_list", fake_load_device_list)
+    monkeypatch.setattr(
+        device_store,
+        "add_device",
+        lambda _device: tracked_calls.__setitem__("add", tracked_calls["add"] + 1),
+    )
+    monkeypatch.setattr(
+        device_store,
+        "update_device",
+        lambda _device: tracked_calls.__setitem__(
+            "update", tracked_calls["update"] + 1
+        ),
+    )
 
     device_store.save_device(device)
 

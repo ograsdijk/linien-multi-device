@@ -44,7 +44,9 @@ def test_save_groups_roundtrip(tmp_path: Path):
     assert loaded[0].auto_include is True
 
 
-def test_list_groups_auto_include_preserves_existing_order_and_appends_missing(monkeypatch):
+def test_list_groups_auto_include_preserves_existing_order_and_appends_missing(
+    monkeypatch,
+):
     groups = [
         Group(
             key="all",
@@ -55,8 +57,11 @@ def test_list_groups_auto_include_preserves_existing_order_and_appends_missing(m
     ]
     saved_groups = []
 
-    monkeypatch.setattr('app.group_store.load_groups', lambda path=None: groups)
-    monkeypatch.setattr('app.group_store.save_groups', lambda payload, path=None: saved_groups.append(payload))
+    monkeypatch.setattr("app.group_store.load_groups", lambda path=None: groups)
+    monkeypatch.setattr(
+        "app.group_store.save_groups",
+        lambda payload, path=None: saved_groups.append(payload),
+    )
 
     listed = list_groups(["d1", "d2", "d3"])
 

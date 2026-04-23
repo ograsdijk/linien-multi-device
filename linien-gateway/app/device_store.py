@@ -2,7 +2,13 @@
 
 from typing import List
 
-from linien_client.device import Device, add_device, delete_device, load_device_list, update_device
+from linien_client.device import (
+    Device,
+    add_device,
+    delete_device,
+    load_device_list,
+    update_device,
+)
 
 
 def _find_device(devices: List[Device], key: str) -> Device | None:
@@ -30,4 +36,3 @@ def save_device(device: Device) -> None:
 
 def remove_device(device: Device) -> None:
     delete_device(device)
-
