@@ -5,6 +5,7 @@ import math
 import pickle
 import threading
 import time
+from copy import deepcopy
 from collections.abc import Callable
 from typing import Any, Dict, List, Optional
 
@@ -106,6 +107,7 @@ class DeviceSession:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._rpyc_lock = threading.RLock()
+        self._state_lock = threading.RLock()
         self._relock_action_lock = threading.Lock()
         self.param_cache: Dict[str, Any] = {}
         self.param_cache_serialized: Dict[str, Any] = {}
@@ -723,17 +725,72 @@ class DeviceSession:
                 )
 
     def _on_param_changed(self, name: str, value: Any) -> None:
-        self.param_cache[name] = value
+        with self._state_lock:
+            self.param_cache[name] = value
         if name in IGNORED_PARAMS:
             return
         encoded = to_jsonable(value)
         if encoded is UNSERIALIZABLE:
             return
-        self.param_cache_serialized[name] = encoded
+        with self._state_lock:
+            self.param_cache_serialized[name] = encoded
         self.manager.publish(
             self.device.key,
             {"type": "param_update", "name": name, "value": encoded},
         )
+
+    def _get_cached_param_values(self, names: tuple[str, ...]) -> dict[str, Any]:
+        with self._state_lock:
+            return {name: self.param_cache.get(name) for name in names}
+
+    def _snapshot_cached_state(
+        self,
+    ) -> tuple[dict[str, Any], Dict[str, Any] | None, float | None, dict[str, Any]]:
+        with self._state_lock:
+            params_snapshot = deepcopy(self.param_cache_serialized)
+            frame_snapshot = deepcopy(self.last_plot_frame)
+            last_plot_timestamp = self.last_plot_timestamp
+            auto_relock_status = deepcopy(self.auto_relock.get_status())
+        return (
+            params_snapshot,
+            frame_snapshot,
+            last_plot_timestamp,
+            auto_relock_status,
+        )
+
+    def _snapshot_auto_lock_traces(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        with self._state_lock:
+            plot_data = self.plot_state.last_plot_data
+            if plot_data is None or len(plot_data) < 3:
+                raise RuntimeError("No unlocked trace available")
+            error_trace_raw = plot_data[2]
+            monitor_trace_raw = plot_data[1]
+        if error_trace_raw is None:
+            raise RuntimeError("No error trace available")
+        error_trace = np.array(error_trace_raw, copy=True)
+        monitor_trace = (
+            np.array(monitor_trace_raw, copy=True)
+            if monitor_trace_raw is not None
+            else None
+        )
+        return error_trace, monitor_trace
+
+    def _snapshot_manual_lock_sources(
+        self,
+    ) -> tuple[list[np.ndarray | None] | None, Dict[str, Any] | None]:
+        with self._state_lock:
+            plot_data = self.plot_state.last_plot_data
+            if plot_data is None:
+                plot_data_snapshot = None
+            else:
+                plot_data_snapshot = [
+                    np.array(item, copy=True) if item is not None else None
+                    for item in plot_data
+                ]
+            frame_snapshot = deepcopy(self.last_plot_frame)
+        return plot_data_snapshot, frame_snapshot
 
     def _decode_to_plot_payload(self, value: Any) -> dict[str, Any] | None:
         try:
@@ -804,26 +861,6 @@ class DeviceSession:
 
         lock_value = self._derive_lock_value(to_plot)
         params = self._plot_params(lock_value)
-        frame = build_plot_frame(to_plot, params, self.plot_state)
-        if frame is None:
-            return
-        frame_lock_indicator = self.lock_indicator.update(
-            lock=lock_value,
-            to_plot=to_plot,
-        )
-        frame["lock_indicator"] = frame_lock_indicator
-        indicator_state = (
-            frame_lock_indicator.get("state")
-            if isinstance(frame_lock_indicator, dict)
-            else None
-        )
-        self._emit_lock_transition_log(
-            lock_enabled=bool(lock_value),
-            indicator_state=indicator_state if isinstance(indicator_state, str) else None,
-            indicator_snapshot=(
-                frame_lock_indicator if isinstance(frame_lock_indicator, dict) else {}
-            ),
-        )
 
         def _start_auto_relock() -> None:
             acquired = self._relock_action_lock.acquire(blocking=False)
@@ -859,24 +896,47 @@ class DeviceSession:
             finally:
                 self._relock_action_lock.release()
 
-        self.auto_relock.tick(
-            lock=lock_value,
+        with self._state_lock:
+            frame = build_plot_frame(to_plot, params, self.plot_state)
+            if frame is None:
+                return
+            frame_lock_indicator = self.lock_indicator.update(
+                lock=lock_value,
+                to_plot=to_plot,
+            )
+            frame["lock_indicator"] = frame_lock_indicator
+            indicator_state = (
+                frame_lock_indicator.get("state")
+                if isinstance(frame_lock_indicator, dict)
+                else None
+            )
+            self.auto_relock.tick(
+                lock=lock_value,
+                indicator_state=indicator_state if isinstance(indicator_state, str) else None,
+                unlocked_trace_at=self.plot_state.last_unlocked_trace_at,
+                start_sweep=self.stop_lock,
+                start_relock=_start_auto_relock,
+            )
+            auto_relock_status = deepcopy(self.auto_relock.get_status())
+            frame["auto_relock"] = auto_relock_status
+            self.last_plot_frame = frame
+            self.last_plot_timestamp = time.time()
+
+        self._emit_lock_transition_log(
+            lock_enabled=bool(lock_value),
             indicator_state=indicator_state if isinstance(indicator_state, str) else None,
-            unlocked_trace_at=self.plot_state.last_unlocked_trace_at,
-            start_sweep=self.stop_lock,
-            start_relock=_start_auto_relock,
+            indicator_snapshot=(
+                frame_lock_indicator if isinstance(frame_lock_indicator, dict) else {}
+            ),
         )
-        auto_relock_status = self.auto_relock.get_status()
-        frame["auto_relock"] = auto_relock_status
         self._emit_auto_relock_state_transition_log(auto_relock_status)
-        self.last_plot_frame = frame
-        self.last_plot_timestamp = time.time()
         self.manager.publish(self.device.key, frame)
 
     def snapshot(self) -> Dict[str, Any]:
+        params_snapshot, plot_frame_snapshot, _, _ = self._snapshot_cached_state()
         return {
-            "params": self.param_cache_serialized,
-            "plot_frame": self.last_plot_frame,
+            "params": params_snapshot,
+            "plot_frame": plot_frame_snapshot,
             "status": self.status(),
         }
 
@@ -897,18 +957,19 @@ class DeviceSession:
                 )
                 logging_active = None
                 lock_value = None
-        if lock_value is None and isinstance(self.last_plot_frame, dict):
-            frame_lock = self.last_plot_frame.get("lock")
+        _, last_plot_frame, last_plot_timestamp, auto_relock_status = self._snapshot_cached_state()
+        if lock_value is None and isinstance(last_plot_frame, dict):
+            frame_lock = last_plot_frame.get("lock")
             if isinstance(frame_lock, bool):
                 lock_value = frame_lock
         return {
             "connected": self.connected,
             "connecting": self.connecting,
             "last_error": self.last_error,
-            "last_plot": self.last_plot_timestamp,
+            "last_plot": last_plot_timestamp,
             "logging_active": logging_active,
             "lock": lock_value,
-            "auto_relock": self.auto_relock.get_status(),
+            "auto_relock": auto_relock_status,
         }
 
     def set_param(self, name: str, value: Any, write_registers: bool) -> None:
@@ -935,13 +996,7 @@ class DeviceSession:
     def auto_lock_from_scan(self, settings_payload: dict[str, Any] | None) -> dict[str, Any]:
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
-        if self.plot_state.last_plot_data is None or len(self.plot_state.last_plot_data) < 3:
-            raise RuntimeError("No unlocked trace available")
-
-        error_trace = self.plot_state.last_plot_data[2]
-        monitor_trace = self.plot_state.last_plot_data[1]
-        if error_trace is None:
-            raise RuntimeError("No error trace available")
+        error_trace, monitor_trace = self._snapshot_auto_lock_traces()
 
         if settings_payload is None:
             settings = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
@@ -1015,23 +1070,24 @@ class DeviceSession:
     def _collect_manual_lock_params(self, names: tuple[str, ...]) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if self.parameters is not None:
+            missing_names: list[str] = []
             with self._rpyc_lock:
                 for name in names:
                     try:
                         params[name] = getattr(self.parameters, name).value
                     except Exception:
-                        params[name] = self.param_cache.get(name)
+                        missing_names.append(name)
+            if missing_names:
+                params.update(self._get_cached_param_values(tuple(missing_names)))
             return params
-        for name in names:
-            params[name] = self.param_cache.get(name)
-        return params
+        return self._get_cached_param_values(names)
 
     def _extract_manual_lock_traces(
         self,
     ) -> tuple[list[float] | None, list[float] | None]:
         trace_values: list[float] | None = None
         monitor_trace_values: list[float] | None = None
-        plot_data = self.plot_state.last_plot_data
+        plot_data, last_plot_frame = self._snapshot_manual_lock_sources()
         if plot_data is not None and len(plot_data) >= 3:
             try:
                 if plot_data[2] is not None:
@@ -1050,10 +1106,10 @@ class DeviceSession:
                 monitor_trace_values = None
             return trace_values, monitor_trace_values
 
-        if self.last_plot_frame is None:
+        if last_plot_frame is None:
             return None, None
 
-        series = self.last_plot_frame.get("series", {})
+        series = last_plot_frame.get("series", {})
         combined_series = series.get("combined_error")
         monitor_series = series.get("monitor_signal")
         if monitor_series is None:

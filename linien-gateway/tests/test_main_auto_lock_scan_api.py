@@ -135,3 +135,29 @@ def test_auto_lock_scan_endpoint_enqueues_auto_lock_source(monkeypatch):
     assert dummy.last_build_kwargs["lock_source"] == "auto_lock_scan"
     assert postgres.rows
     assert postgres.rows[-1]["lock_source"] == "auto_lock_scan"
+
+
+def test_auto_lock_scan_does_not_fail_when_enqueue_raises(monkeypatch):
+    class DummyDevice:
+        key = "test-device"
+        name = "test-laser"
+        parameters = {}
+
+    class RaisingPostgres:
+        def set_event_callback(self, _callback):
+            return
+
+        def enqueue_lock_result(self, _row):
+            raise RuntimeError("queue failure")
+
+    dummy = DummyAutoLockSession()
+    monkeypatch.setattr(main.device_store, "get_device", lambda _key: DummyDevice())
+    monkeypatch.setattr(main.device_store, "save_device", lambda _device: None)
+    monkeypatch.setattr(main.device_config_store, "set_config", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(main, "_session_for_device", lambda _device: dummy)
+    monkeypatch.setattr(main, "lock_result_postgres", RaisingPostgres())
+    client = TestClient(main.app)
+
+    response = client.post("/api/devices/test-device/control/auto_lock_scan", json={})
+    assert response.status_code == 200
+    assert response.json()["detail"] == "Auto-lock started from scan."

@@ -80,9 +80,11 @@ def save_groups(groups: List[Group], path=GROUPS_PATH) -> None:
 def list_groups(device_keys: List[str]) -> List[Group]:
     groups = load_groups()
     changed = False
+    device_key_list = list(device_keys)
+    device_key_set = set(device_key_list)
 
     for group in groups:
-        filtered = [key for key in group.device_keys if key in device_keys]
+        filtered = [key for key in group.device_keys if key in device_key_set]
         if filtered != group.device_keys:
             group.device_keys = filtered
             changed = True
@@ -91,7 +93,7 @@ def list_groups(device_keys: List[str]) -> List[Group]:
         groups = [
             Group(
                 name="All devices",
-                device_keys=list(device_keys),
+                device_keys=device_key_list,
                 auto_include=True,
             )
         ]
@@ -100,10 +102,11 @@ def list_groups(device_keys: List[str]) -> List[Group]:
         for group in groups:
             if not group.auto_include:
                 continue
-            for key in device_keys:
-                if key not in group.device_keys:
-                    group.device_keys.append(key)
-                    changed = True
+            existing_keys = set(group.device_keys)
+            missing_keys = [key for key in device_key_list if key not in existing_keys]
+            if missing_keys:
+                group.device_keys.extend(missing_keys)
+                changed = True
 
     if changed:
         save_groups(groups)
@@ -152,7 +155,8 @@ def add_device_to_auto_groups(device_key: str) -> None:
     for group in groups:
         if not group.auto_include:
             continue
-        if device_key not in group.device_keys:
+        existing_keys = set(group.device_keys)
+        if device_key not in existing_keys:
             group.device_keys.append(device_key)
             changed = True
     if changed:

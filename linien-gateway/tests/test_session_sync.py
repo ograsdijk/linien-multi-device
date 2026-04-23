@@ -123,3 +123,26 @@ def test_set_influx_logging_state_updates_params():
         "params": ["d", "p"],
         "params_configured": True,
     }
+
+
+def test_snapshot_returns_copies_of_cached_state():
+    session = _make_session({})
+    session.param_cache_serialized = {"nested": {"value": 1}}
+    session.last_plot_frame = {
+        "type": "plot_frame",
+        "lock": True,
+        "series": {"combined_error": [0.1, 0.2]},
+        "signal_power": {"channel1": None, "channel2": None},
+        "stats": {"error_std": None, "control_std": None},
+        "x_label": "time",
+        "x_unit": "us",
+    }
+    session.last_plot_timestamp = 123.0
+
+    snapshot = session.snapshot()
+    snapshot["params"]["nested"]["value"] = 99
+    snapshot["plot_frame"]["series"]["combined_error"][0] = 42.0
+
+    assert session.param_cache_serialized["nested"]["value"] == 1
+    assert session.last_plot_frame["series"]["combined_error"][0] == 0.1
+    assert snapshot["status"]["last_plot"] == 123.0

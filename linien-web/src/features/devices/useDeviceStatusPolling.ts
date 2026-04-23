@@ -56,28 +56,48 @@ export const useDeviceStatusPolling = ({
   skipDeviceKeys,
 }: UseDeviceStatusPollingArgs) => {
   useEffect(() => {
-    const interval = setInterval(() => {
-      devices.forEach((device) => {
-        if (skipDeviceKeys?.has(device.key)) {
-          return;
-        }
-        api.getStatus(device.key)
-          .then((status) => {
-            if (!isDeviceStatus(status)) return;
-            setDeviceStates((prev) => {
-              const current = prev[device.key] || { params: {} };
-              if (sameDeviceStatus(current.status, status)) {
-                return prev;
+    let cancelled = false;
+
+    const pollStatuses = () => {
+      api.listStatuses()
+        .then((statuses) => {
+          if (cancelled || !statuses || typeof statuses !== 'object') {
+            return;
+          }
+          setDeviceStates((prev) => {
+            let next = prev;
+            let changed = false;
+            for (const device of devices) {
+              if (skipDeviceKeys?.has(device.key)) {
+                continue;
               }
-              return {
-                ...prev,
-                [device.key]: { ...current, status },
-              };
-            });
-          })
-          .catch(() => null);
-      });
+              const status = statuses[device.key];
+              if (!isDeviceStatus(status)) {
+                continue;
+              }
+              const current = next[device.key] || { params: {} };
+              if (sameDeviceStatus(current.status, status)) {
+                continue;
+              }
+              if (!changed) {
+                next = { ...next };
+                changed = true;
+              }
+              next[device.key] = { ...current, status };
+            }
+            return changed ? next : prev;
+          });
+        })
+        .catch(() => null);
+    };
+
+    pollStatuses();
+    const interval = setInterval(() => {
+      pollStatuses();
     }, intervalMs);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [devices, intervalMs, setDeviceStates, skipDeviceKeys]);
 };

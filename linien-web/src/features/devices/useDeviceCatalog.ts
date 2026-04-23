@@ -38,23 +38,28 @@ export const useDeviceCatalog = () => {
   const loadGroups = useCallback(async () => {
     const list = await api.listGroups();
     setGroups(list);
-    if (list.length === 0) {
-      setActiveTabKey(OVERVIEW_KEY);
+  }, []);
+
+  useEffect(() => {
+    loadDevices();
+    loadGroups();
+  }, [loadDevices, loadGroups]);
+
+  useEffect(() => {
+    if (groups.length === 0) {
+      if (activeTabKey !== OVERVIEW_KEY) {
+        setActiveTabKey(OVERVIEW_KEY);
+      }
       return;
     }
     if (!activeTabKey) {
       setActiveTabKey(OVERVIEW_KEY);
       return;
     }
-    if (activeTabKey !== OVERVIEW_KEY && !list.find((group) => group.key === activeTabKey)) {
+    if (activeTabKey !== OVERVIEW_KEY && !groups.find((group) => group.key === activeTabKey)) {
       setActiveTabKey(OVERVIEW_KEY);
     }
-  }, [activeTabKey]);
-
-  useEffect(() => {
-    loadDevices();
-    loadGroups();
-  }, [loadDevices, loadGroups]);
+  }, [activeTabKey, groups]);
 
   const normalizeOrderKeys = useCallback((candidate: string[]): string[] => {
     const deviceKeys = devices.map((device) => device.key);

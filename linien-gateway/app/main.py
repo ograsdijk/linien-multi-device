@@ -459,6 +459,16 @@ def device_status(key: str) -> dict:
         return session.status()
 
 
+@app.get("/api/devices/statuses")
+def device_statuses() -> dict[str, dict]:
+    payload: dict[str, dict] = {}
+    for device in device_store.list_devices():
+        with session_registry.lock_for(device.key):
+            session = _session_for_device(device)
+            payload[device.key] = session.status()
+    return payload
+
+
 @app.get("/api/devices/{key}/params")
 def device_params(key: str) -> list:
     with session_registry.lock_for(key):
@@ -678,7 +688,7 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
                 device_key=key,
                 details=details,
             )
-    except Exception:  # noqa: BLE001 - best effort logging hook
+    except Exception as exc:  # noqa: BLE001 - best effort logging hook
         logger.warning(
             "Auto-lock postgres enqueue failed device=%s",
             key,

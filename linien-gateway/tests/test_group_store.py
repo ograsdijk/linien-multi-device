@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app.group_store import Group, load_groups, save_groups
+from app.group_store import Group, list_groups, load_groups, save_groups
 
 
 def test_load_groups_malformed_json_returns_empty(tmp_path: Path):
@@ -42,3 +42,23 @@ def test_save_groups_roundtrip(tmp_path: Path):
     assert len(loaded) == 1
     assert loaded[0].key == "a1"
     assert loaded[0].auto_include is True
+
+
+def test_list_groups_auto_include_preserves_existing_order_and_appends_missing(monkeypatch):
+    groups = [
+        Group(
+            key="all",
+            name="All devices",
+            device_keys=["d2", "d1"],
+            auto_include=True,
+        )
+    ]
+    saved_groups = []
+
+    monkeypatch.setattr('app.group_store.load_groups', lambda path=None: groups)
+    monkeypatch.setattr('app.group_store.save_groups', lambda payload, path=None: saved_groups.append(payload))
+
+    listed = list_groups(["d1", "d2", "d3"])
+
+    assert listed[0].device_keys == ["d2", "d1", "d3"]
+    assert saved_groups

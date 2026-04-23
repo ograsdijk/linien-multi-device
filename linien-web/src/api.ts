@@ -62,6 +62,7 @@ export const api = {
   startServer: (key: string) => request(`/devices/${key}/control/start_server`, { method: 'POST' }),
   disconnectDevice: (key: string) => request(`/devices/${key}/disconnect`, { method: 'POST' }),
   getStatus: (key: string) => request<DeviceStatus>(`/devices/${key}/status`),
+  listStatuses: () => request<Record<string, DeviceStatus>>('/devices/statuses'),
   getParamMeta: (key: string) => request<ParamMeta[]>(`/devices/${key}/params`),
   getLockIndicatorConfig: (key: string) =>
     request<LockIndicatorConfig>(`/devices/${key}/lock-indicator`),

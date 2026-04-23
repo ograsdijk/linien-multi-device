@@ -6,6 +6,9 @@ type StreamOptions = {
   maxFps?: number;
 };
 
+const INITIAL_RECONNECT_DELAY_MS = 1000;
+const MAX_RECONNECT_DELAY_MS = 5000;
+
 export function useDeviceStream(
   deviceKey: string | null,
   enabled: boolean,
@@ -13,22 +16,77 @@ export function useDeviceStream(
   options?: StreamOptions
 ) {
   const socketRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectDelayRef = useRef(INITIAL_RECONNECT_DELAY_MS);
 
   useEffect(() => {
-    if (!deviceKey || !enabled) {
-      if (socketRef.current) {
-        socketRef.current.close();
-        socketRef.current = null;
+    let disposed = false;
+
+    const clearReconnectTimer = () => {
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
       }
+    };
+
+    const closeCurrentSocket = () => {
+      const socket = socketRef.current;
+      socketRef.current = null;
+      if (socket) {
+        socket.onopen = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.close();
+      }
+    };
+
+    if (!deviceKey || !enabled) {
+      clearReconnectTimer();
+      closeCurrentSocket();
       return;
     }
 
-    const socket = openDeviceStream(deviceKey, onMessage, options);
-    socketRef.current = socket;
+    reconnectDelayRef.current = INITIAL_RECONNECT_DELAY_MS;
+
+    const connect = () => {
+      if (disposed || !deviceKey || !enabled) {
+        return;
+      }
+      clearReconnectTimer();
+      closeCurrentSocket();
+
+      const socket = openDeviceStream(deviceKey, onMessage, options);
+      socketRef.current = socket;
+      socket.onopen = () => {
+        reconnectDelayRef.current = INITIAL_RECONNECT_DELAY_MS;
+      };
+      socket.onerror = () => {
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+          socket.close();
+        }
+      };
+      socket.onclose = () => {
+        if (socketRef.current === socket) {
+          socketRef.current = null;
+        }
+        if (disposed || !deviceKey || !enabled) {
+          return;
+        }
+        const nextDelay = reconnectDelayRef.current;
+        reconnectDelayRef.current = Math.min(nextDelay * 2, MAX_RECONNECT_DELAY_MS);
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null;
+          connect();
+        }, nextDelay);
+      };
+    };
+
+    connect();
 
     return () => {
-      socket.close();
-      socketRef.current = null;
+      disposed = true;
+      clearReconnectTimer();
+      closeCurrentSocket();
     };
   }, [deviceKey, enabled, onMessage, options?.maxFps]);
 }
