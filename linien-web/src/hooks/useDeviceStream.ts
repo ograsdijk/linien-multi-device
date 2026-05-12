@@ -4,6 +4,8 @@ import type { StreamMessage } from '../types';
 
 type StreamOptions = {
   maxFps?: number;
+  onOpen?: () => void;
+  onClose?: () => void;
 };
 
 const INITIAL_RECONNECT_DELAY_MS = 1000;
@@ -18,9 +20,18 @@ export function useDeviceStream(
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectDelayRef = useRef(INITIAL_RECONNECT_DELAY_MS);
+  const openedRef = useRef(false);
 
   useEffect(() => {
     let disposed = false;
+
+    const notifyClosed = () => {
+      if (!openedRef.current) {
+        return;
+      }
+      openedRef.current = false;
+      options?.onClose?.();
+    };
 
     const clearReconnectTimer = () => {
       if (reconnectTimerRef.current !== null) {
@@ -38,6 +49,7 @@ export function useDeviceStream(
         socket.onerror = null;
         socket.close();
       }
+      notifyClosed();
     };
 
     if (!deviceKey || !enabled) {
@@ -59,6 +71,8 @@ export function useDeviceStream(
       socketRef.current = socket;
       socket.onopen = () => {
         reconnectDelayRef.current = INITIAL_RECONNECT_DELAY_MS;
+        openedRef.current = true;
+        options?.onOpen?.();
       };
       socket.onerror = () => {
         if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
@@ -69,6 +83,7 @@ export function useDeviceStream(
         if (socketRef.current === socket) {
           socketRef.current = null;
         }
+        notifyClosed();
         if (disposed || !deviceKey || !enabled) {
           return;
         }
@@ -88,5 +103,5 @@ export function useDeviceStream(
       clearReconnectTimer();
       closeCurrentSocket();
     };
-  }, [deviceKey, enabled, onMessage, options?.maxFps]);
+  }, [deviceKey, enabled, onMessage, options?.maxFps, options?.onOpen, options?.onClose]);
 }

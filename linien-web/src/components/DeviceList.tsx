@@ -2,7 +2,12 @@ import { useMemo, useState, type CSSProperties } from 'react';
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { ActionIcon, Button, Card, Group, Modal, Stack, Text, TextInput } from '@mantine/core';
-import { IconChevronLeft, IconDevices, IconPencil, IconTrash } from '@tabler/icons-react';
+import {
+  IconChevronLeft,
+  IconDevices,
+  IconPencil,
+  IconTrash,
+} from '@tabler/icons-react';
 import type {
   AutoRelockStatus,
   Device,
@@ -36,6 +41,7 @@ type DeviceListProps = {
   onStartServer: (key: string) => Promise<void>;
   onConnect: (key: string) => Promise<void>;
   onDisconnect: (key: string) => Promise<void>;
+  onShutdownServer: (key: string) => Promise<void>;
 };
 
 type SortableDeviceCardProps = {
@@ -53,6 +59,7 @@ type SortableDeviceCardProps = {
   onStartServer: (key: string) => Promise<void>;
   onConnect: (key: string) => Promise<void>;
   onDisconnect: (key: string) => Promise<void>;
+  onRequestShutdown: (device: Device) => void;
 };
 
 function SortableDeviceCard({
@@ -70,6 +77,7 @@ function SortableDeviceCard({
   onStartServer,
   onConnect,
   onDisconnect,
+  onRequestShutdown,
 }: SortableDeviceCardProps) {
   const {
     attributes,
@@ -197,16 +205,27 @@ function SortableDeviceCard({
             Start server
           </Button>
           {connected ? (
-            <Button
-              size="xs"
-              color="red"
-              variant="light"
-              onClick={() => {
-                void onDisconnect(device.key);
-              }}
-            >
-              Disconnect
-            </Button>
+            <>
+              <Button
+                size="xs"
+                color="red"
+                variant="light"
+                onClick={() => {
+                  void onDisconnect(device.key);
+                }}
+              >
+                Disconnect
+              </Button>
+              <Button
+                size="xs"
+                color="red"
+                variant="subtle"
+                onClick={() => onRequestShutdown(device)}
+                disabled={!connected}
+              >
+                Shutdown
+              </Button>
+            </>
           ) : (
             <Button
               size="xs"
@@ -254,11 +273,20 @@ export function DeviceList({
   onStartServer,
   onConnect,
   onDisconnect,
+  onShutdownServer,
 }: DeviceListProps) {
   const [opened, setOpened] = useState(false);
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [form, setForm] = useState({ ...emptyForm });
+  const [shutdownDevice, setShutdownDevice] = useState<Device | null>(null);
   const activeSet = useMemo(() => new Set(activeKeys), [activeKeys]);
+  const connectableDevices = useMemo(
+    () => devices.filter((device) => {
+      const status = statuses[device.key];
+      return !status?.connected && !status?.connecting;
+    }),
+    [devices, statuses]
+  );
   const connectedDeviceCount = useMemo(
     () => devices.reduce((count, device) => count + (statuses[device.key]?.connected ? 1 : 0), 0),
     [devices, statuses]
@@ -296,6 +324,17 @@ export function DeviceList({
     setOpened(false);
   };
 
+  const confirmShutdown = async () => {
+    if (!shutdownDevice) return;
+    const key = shutdownDevice.key;
+    setShutdownDevice(null);
+    await onShutdownServer(key);
+  };
+
+  const connectAll = async () => {
+    await Promise.allSettled(connectableDevices.map((device) => onConnect(device.key)));
+  };
+
   return (
     <Stack gap="sm" className="device-list-shell">
       <Group justify="space-between" align="center">
@@ -303,6 +342,17 @@ export function DeviceList({
           <Text fw={600}>Devices</Text>
           <Button size="xs" color="orange" variant="light" onClick={openCreate}>
             Add
+          </Button>
+          <Button
+            size="xs"
+            color="green"
+            variant="light"
+            onClick={() => {
+              connectAll().catch(() => null);
+            }}
+            disabled={connectableDevices.length === 0}
+          >
+            Connect all
           </Button>
         </Group>
         <Group gap="xs" align="center">
@@ -346,6 +396,7 @@ export function DeviceList({
               onStartServer={onStartServer}
               onConnect={onConnect}
               onDisconnect={onDisconnect}
+              onRequestShutdown={setShutdownDevice}
             />
           ))}
         </SortableContext>
@@ -404,6 +455,32 @@ export function DeviceList({
             </Button>
             <Button color="orange" onClick={handleSubmit}>
               Save
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+      <Modal
+        opened={shutdownDevice !== null}
+        onClose={() => setShutdownDevice(null)}
+        title="Shutdown server?"
+        centered
+      >
+        <Stack>
+          <Text size="sm">
+            This will shut down the server for{' '}
+            <strong>{shutdownDevice?.name || shutdownDevice?.key || 'this device'}</strong>.
+          </Text>
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setShutdownDevice(null)}>
+              Cancel
+            </Button>
+            <Button
+              color="red"
+              onClick={() => {
+                confirmShutdown().catch(() => null);
+              }}
+            >
+              Shutdown server
             </Button>
           </Group>
         </Stack>

@@ -30,6 +30,11 @@ type DeviceWorkspaceProps = {
   state: DeviceState;
   active: boolean;
   onStateUpdate: (deviceKey: string, message: StreamMessage) => void;
+  onStreamActiveChange?: (deviceKey: string, active: boolean) => void;
+  onStartScanAutoLock?: (deviceKey: string) => Promise<void>;
+  autoLockBusy?: boolean;
+  lockBusy?: boolean;
+  onDisableLock?: (deviceKey: string) => Promise<void>;
 };
 
 type SetParamOptions = {
@@ -41,9 +46,13 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
   state,
   active,
   onStateUpdate,
+  onStreamActiveChange,
+  onStartScanAutoLock,
+  autoLockBusy,
+  lockBusy,
+  onDisableLock,
 }: DeviceWorkspaceProps) {
   const [selectionMode, setSelectionMode] = useState<'autolock' | 'optimization' | null>(null);
-  const [, setSelectionError] = useState<string | null>(null);
   const [selectionSubmitting, setSelectionSubmitting] = useState(false);
   const [lockMode, setLockMode] = useState<'manual' | 'autolock_scan' | 'autolock'>('manual');
   const [autoLockSettings, setAutoLockSettings] = useState<AutoLockScanSettings | null>(null);
@@ -96,7 +105,17 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     [device.key, onStateUpdate]
   );
 
-  useDeviceStream(device.key, active, onMessage);
+  const handleStreamOpen = useCallback(() => {
+    onStreamActiveChange?.(device.key, true);
+  }, [device.key, onStreamActiveChange]);
+  const handleStreamClose = useCallback(() => {
+    onStreamActiveChange?.(device.key, false);
+  }, [device.key, onStreamActiveChange]);
+
+  useDeviceStream(device.key, active, onMessage, {
+    onOpen: handleStreamOpen,
+    onClose: handleStreamClose,
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -156,7 +175,6 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
       : null;
     setSelectionMode((current) => (current === backendMode ? current : backendMode));
     if (backendMode === null) {
-      setSelectionError(null);
       setSelectionSubmitting(false);
     }
   }, [
@@ -181,7 +199,6 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
 
   const clearSelection = () => {
     setSelectionMode(null);
-    setSelectionError(null);
     setSelectionSubmitting(false);
     if (!connected) return;
     setParam('autolock_selection', false, false);
@@ -192,11 +209,9 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     if (autolockTemporarilyDisabled) {
       setSelectionMode(null);
       setSelectionSubmitting(false);
-      setSelectionError(AUTOMATION_TEMP_DISABLED_REASON);
       return;
     }
     setSelectionMode('autolock');
-    setSelectionError(null);
     setSelectionSubmitting(false);
     if (!connected) return;
     setParam('autolock_selection', true, false);
@@ -208,11 +223,9 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     if (optimizationTemporarilyDisabled) {
       setSelectionMode(null);
       setSelectionSubmitting(false);
-      setSelectionError(AUTOMATION_TEMP_DISABLED_REASON);
       return;
     }
     setSelectionMode('optimization');
-    setSelectionError(null);
     setSelectionSubmitting(false);
     if (!connected) return;
     setParam('optimization_selection', true, false);
@@ -226,13 +239,11 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
       (selectionMode === 'autolock' && autolockTemporarilyDisabled) ||
       (selectionMode === 'optimization' && optimizationTemporarilyDisabled)
     ) {
-      setSelectionError(AUTOMATION_TEMP_DISABLED_REASON);
       return;
     }
     const min = Math.max(0, Math.min(2047, x0));
     const max = Math.max(0, Math.min(2047, x1));
     const mode = selectionMode;
-    setSelectionError(null);
     setSelectionSubmitting(true);
     try {
       if (mode === 'autolock') {
@@ -242,12 +253,8 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
         await api.startOptimization(device.key, min, max);
       }
       clearSelection();
-    } catch (error) {
-      setSelectionError(
-        error instanceof Error && error.message
-          ? error.message
-          : 'Failed to start task for selected range.'
-      );
+    } catch {
+      // Errors from this legacy flow are not user-visible while it remains disabled.
     } finally {
       setSelectionSubmitting(false);
     }
@@ -277,6 +284,26 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
       throw new Error('Device not connected.');
     }
     return api.autoLockFromScan(device.key, settings);
+  };
+
+  const handleStartScanAutoLock = () => {
+    if (!connected) return;
+    if (onStartScanAutoLock) {
+      onStartScanAutoLock(device.key).catch(() => null);
+      return;
+    }
+    api.getAutoLockScanSettings(device.key)
+      .then((settings) => api.autoLockFromScan(device.key, settings))
+      .catch(() => null);
+  };
+
+  const handleStopLock = () => {
+    if (!connected) return;
+    if (onDisableLock) {
+      onDisableLock(device.key).catch(() => null);
+      return;
+    }
+    api.stopLock(device.key).catch(() => null);
   };
 
   const handleAutoLockSettingsChange = (settings: AutoLockScanSettings) => {
@@ -369,8 +396,12 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             onStartOptimizationSelection={startOptimizationSelection}
             onAbortOptimizationSelection={clearSelection}
             onStopTask={(useNew) => api.stopTask(device.key, useNew).catch(() => null)}
-            onStopLock={() => api.stopLock(device.key).catch(() => null)}
-            onShutdownServer={() => api.shutdownServer(device.key).catch(() => null)}
+            onStopLock={handleStopLock}
+            onStartScanAutoLock={handleStartScanAutoLock}
+            connected={connected}
+            lockEnabled={lockState === true}
+            autoLockBusy={autoLockBusy}
+            lockBusy={lockBusy}
             lockMode={lockMode}
             onLockModeChange={(mode) => {
               setLockMode(mode);

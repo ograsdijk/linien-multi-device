@@ -95,6 +95,7 @@ export function App() {
   const [lockPopoverOpen, setLockPopoverOpen] = useState(false);
   const [draggingDeviceKey, setDraggingDeviceKey] = useState<string | null>(null);
   const [previewOrderKeys, setPreviewOrderKeys] = useState<string[] | null>(null);
+  const [streamingDeviceKeys, setStreamingDeviceKeys] = useState<Set<string>>(() => new Set());
   const [deviceBarCollapsed, setDeviceBarCollapsed] = useState<boolean>(() => {
     try {
       return window.localStorage.getItem(DEVICE_BAR_COLLAPSED_KEY) === '1';
@@ -207,12 +208,27 @@ export function App() {
       // Ignore persistence failures; UI state still works for current session.
     }
   }, [gridColumnsMode]);
+  const handleDeviceStreamActiveChange = useCallback((deviceKey: string, active: boolean) => {
+    setStreamingDeviceKeys((prev) => {
+      const hasKey = prev.has(deviceKey);
+      if (active === hasKey) {
+        return prev;
+      }
+      const next = new Set(prev);
+      if (active) {
+        next.add(deviceKey);
+      } else {
+        next.delete(deviceKey);
+      }
+      return next;
+    });
+  }, []);
   const websocketActiveDeviceKeys = useMemo(() => {
-    if (isOverview) {
-      return new Set(devices.map((device) => device.key));
-    }
-    return new Set(activeDeviceKeys);
-  }, [activeDeviceKeys, devices, isOverview]);
+    const validDeviceKeys = new Set(devices.map((device) => device.key));
+    return new Set(
+      [...streamingDeviceKeys].filter((deviceKey) => validDeviceKeys.has(deviceKey))
+    );
+  }, [devices, streamingDeviceKeys]);
   useDeviceStatusPolling({
     devices,
     setDeviceStates,
@@ -531,6 +547,9 @@ export function App() {
             onDisconnect={async (key) => {
               await api.disconnectDevice(key);
             }}
+            onShutdownServer={async (key) => {
+              await api.shutdownServer(key);
+            }}
           />
         </AppShell.Navbar>
       ) : null}
@@ -627,6 +646,7 @@ export function App() {
                     onStateUpdate={updateState}
                     onOpenInGroup={openDeviceGroup}
                     maxFps={overviewFps}
+                    onStreamActiveChange={handleDeviceStreamActiveChange}
                   />
                 </div>
               ))}
@@ -670,6 +690,11 @@ export function App() {
                         state={deviceStates[device.key] ?? EMPTY_DEVICE_STATE}
                         active={group.key === activeTabKey}
                         onStateUpdate={updateState}
+                        onStreamActiveChange={handleDeviceStreamActiveChange}
+                        onStartScanAutoLock={startAutoLockFromHeader}
+                        autoLockBusy={Boolean(autoLockBusyKeys[device.key])}
+                        lockBusy={Boolean(lockBusyKeys[device.key])}
+                        onDisableLock={disableLock}
                       />
                     </div>
                   ))}

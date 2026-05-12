@@ -1,4 +1,4 @@
-import { Accordion } from '@mantine/core';
+import { Accordion, Button, Group } from '@mantine/core';
 import type {
   AutoRelockConfig,
   AutoRelockStatus,
@@ -30,7 +30,11 @@ type RightPanelProps = {
   onAbortOptimizationSelection: () => void;
   onStopTask: (useNew: boolean) => void;
   onStopLock: () => void;
-  onShutdownServer: () => void;
+  onStartScanAutoLock: () => void;
+  connected?: boolean;
+  lockEnabled?: boolean;
+  autoLockBusy?: boolean;
+  lockBusy?: boolean;
   lockMode?: 'manual' | 'autolock_scan' | 'autolock';
   onLockModeChange?: (mode: 'manual' | 'autolock_scan' | 'autolock') => void;
   selectionMode?: 'autolock' | 'optimization' | null;
@@ -51,6 +55,9 @@ type RightPanelProps = {
 };
 
 export function RightPanel(props: RightPanelProps) {
+  const connected = Boolean(props.connected);
+  const lockEnabled = Boolean(props.lockEnabled);
+
   return (
     <div className="panel" style={{ padding: 12 }}>
       <Accordion multiple defaultValue={[]}>
@@ -129,23 +136,38 @@ export function RightPanel(props: RightPanelProps) {
           </Accordion.Panel>
         </Accordion.Item>
       </Accordion>
-      <div style={{ marginTop: 16 }}>
-        <button
-          onClick={props.onShutdownServer}
-          style={{
-            width: '100%',
-            background: '#d74b33',
-            color: 'white',
-            border: 'none',
-            borderRadius: 10,
-            padding: '10px 12px',
-            fontWeight: 600,
-            cursor: 'pointer',
-          }}
+      <Group grow mt="md">
+        {lockEnabled ? (
+          <Button
+            color="red"
+            variant="light"
+            onClick={props.onStopLock}
+            disabled={!connected || props.lockBusy}
+            loading={props.lockBusy}
+          >
+            Disable lock
+          </Button>
+        ) : (
+          <Button
+            color="green"
+            variant="light"
+            onClick={props.onStartLock}
+            disabled={!connected || props.lockBusy}
+            loading={props.lockBusy}
+          >
+            Manual lock
+          </Button>
+        )}
+        <Button
+          color="blue"
+          variant="light"
+          onClick={props.onStartScanAutoLock}
+          disabled={!connected || lockEnabled || props.autoLockBusy}
+          loading={props.autoLockBusy}
         >
-          Shutdown server
-        </button>
-      </div>
+          Auto-lock
+        </Button>
+      </Group>
     </div>
   );
 }

@@ -19,6 +19,7 @@ type DeviceOverviewCardProps = {
   onOpenInGroup?: (deviceKey: string) => void;
   maxFps?: number;
   onStateUpdate: (deviceKey: string, message: StreamMessage) => void;
+  onStreamActiveChange?: (deviceKey: string, active: boolean) => void;
 };
 
 export const DeviceOverviewCard = memo(function DeviceOverviewCard({
@@ -28,6 +29,7 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
   onOpenInGroup,
   maxFps,
   onStateUpdate,
+  onStreamActiveChange,
 }: DeviceOverviewCardProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const visible = useInViewport(rootRef, { disabled: !active });
@@ -66,7 +68,18 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
     [device.key, onStateUpdate, plotThrottleMs]
   );
 
-  useDeviceStream(device.key, streamEnabled, onMessage, { maxFps });
+  const handleStreamOpen = useCallback(() => {
+    onStreamActiveChange?.(device.key, true);
+  }, [device.key, onStreamActiveChange]);
+  const handleStreamClose = useCallback(() => {
+    onStreamActiveChange?.(device.key, false);
+  }, [device.key, onStreamActiveChange]);
+
+  useDeviceStream(device.key, streamEnabled, onMessage, {
+    maxFps,
+    onOpen: handleStreamOpen,
+    onClose: handleStreamClose,
+  });
 
   return (
     <div className="overview-card" ref={rootRef}>
