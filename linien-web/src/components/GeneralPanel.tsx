@@ -1,4 +1,5 @@
-import { Group, NumberInput, Select, Slider, Stack, Switch, Text } from '@mantine/core';
+import { Group, Select, Slider, Stack, Switch, Text } from '@mantine/core';
+import { DeferredNumberInput } from './DeferredNumberInput';
 
 const ANALOG_OUT_V = 1.8 / ((2 ** 15) - 1);
 
@@ -108,21 +109,21 @@ export function GeneralPanel({ params, onSetParam }: GeneralPanelProps) {
         onChange={(event) => onSetParam('polarity_analog_out0', event.currentTarget.checked, true)}
       />
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="Analog out 1 (V)"
           value={(params.analog_out_1 ?? 0) * ANALOG_OUT_V}
-          onChange={(value) => onSetParam('analog_out_1', Math.round(Number(value) / ANALOG_OUT_V), true)}
+          onCommit={(value) => onSetParam('analog_out_1', Math.round(Number(value) / ANALOG_OUT_V), true)}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Analog out 2 (V)"
           value={(params.analog_out_2 ?? 0) * ANALOG_OUT_V}
-          onChange={(value) => onSetParam('analog_out_2', Math.round(Number(value) / ANALOG_OUT_V), true)}
+          onCommit={(value) => onSetParam('analog_out_2', Math.round(Number(value) / ANALOG_OUT_V), true)}
         />
       </Group>
-      <NumberInput
+      <DeferredNumberInput
         label="Analog out 3 (V)"
         value={(params.analog_out_3 ?? 0) * ANALOG_OUT_V}
-        onChange={(value) => onSetParam('analog_out_3', Math.round(Number(value) / ANALOG_OUT_V), true)}
+        onCommit={(value) => onSetParam('analog_out_3', Math.round(Number(value) / ANALOG_OUT_V), true)}
       />
     </Stack>
   );

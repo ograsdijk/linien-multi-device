@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
-import { Button, Group, NumberInput, RangeSlider, Text } from '@mantine/core';
+import { Button, Group, RangeSlider, Text } from '@mantine/core';
 import { toClampedNumberOr } from '../utils/numberInput';
+import { DeferredNumberInput } from './DeferredNumberInput';
 
 const SWEEP_MIN = -1;
 const SWEEP_MAX = 1;
@@ -363,25 +364,25 @@ export function SweepControls({ params, onSetParam }: SweepControlsProps) {
       </div>
 
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="Center"
           value={center}
           min={SWEEP_MIN}
           max={SWEEP_MAX}
           decimalScale={4}
           step={0.01}
-          onChange={(value) =>
+          onCommit={(value) =>
             onSetParam('sweep_center', toClampedNumberOr(value, center, SWEEP_MIN, SWEEP_MAX), true)
           }
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Amplitude"
           value={amplitude}
           min={0}
           max={1}
           decimalScale={4}
           step={0.01}
-          onChange={(value) =>
+          onCommit={(value) =>
             onSetParam('sweep_amplitude', toClampedNumberOr(value, amplitude, 0, 1), true)
           }
         />

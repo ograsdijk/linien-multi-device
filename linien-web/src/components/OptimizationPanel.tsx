@@ -1,4 +1,5 @@
-﻿import { Button, Divider, Group, NumberInput, Select, Stack, Switch, Text } from '@mantine/core';
+import { Button, Divider, Group, Select, Stack, Switch, Text } from '@mantine/core';
+import { DeferredNumberInput } from './DeferredNumberInput';
 
 const MHz = 0x10000000 / 8;
 const Vpp = ((1 << 14) - 1) / 4;
@@ -119,16 +120,16 @@ export function OptimizationPanel({
         disabled={disabled}
       />
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="Min (MHz)"
           value={modFreqMin}
-          onChange={(value) => onSetParam('optimization_mod_freq_min', Number(value), false)}
+          onCommit={(value) => onSetParam('optimization_mod_freq_min', Number(value), false)}
           disabled={disabled || !modFreqEnabled}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Max (MHz)"
           value={modFreqMax}
-          onChange={(value) => onSetParam('optimization_mod_freq_max', Number(value), false)}
+          onCommit={(value) => onSetParam('optimization_mod_freq_max', Number(value), false)}
           disabled={disabled || !modFreqEnabled}
         />
       </Group>
@@ -142,16 +143,16 @@ export function OptimizationPanel({
         disabled={disabled}
       />
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="Min (Vpp)"
           value={modAmpMin}
-          onChange={(value) => onSetParam('optimization_mod_amp_min', Number(value), false)}
+          onCommit={(value) => onSetParam('optimization_mod_amp_min', Number(value), false)}
           disabled={disabled || !modAmpEnabled}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Max (Vpp)"
           value={modAmpMax}
-          onChange={(value) => onSetParam('optimization_mod_amp_max', Number(value), false)}
+          onCommit={(value) => onSetParam('optimization_mod_amp_max', Number(value), false)}
           disabled={disabled || !modAmpEnabled}
         />
       </Group>

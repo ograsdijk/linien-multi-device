@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Button, Group, NumberInput, Stack, Switch, Text } from '@mantine/core';
+import { Button, Group, Stack, Switch, Text } from '@mantine/core';
 import type { AutoRelockConfig, AutoRelockStatus } from '../types';
 import { toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
+import { DeferredNumberInput } from './DeferredNumberInput';
 
 const DEFAULT_AUTO_RELOCK_CONFIG: AutoRelockConfig = {
   enabled: false,
@@ -78,50 +79,51 @@ export function AutoRelockPanel({
         onChange={(event) => updateField('enabled', event.currentTarget.checked)}
       />
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="Trigger hold (s)"
           value={draft.trigger_hold_s}
           min={0.05}
           step={0.1}
-          onChange={(value) =>
+          onCommit={(value) =>
             updateField('trigger_hold_s', toFiniteNumberOr(value, 0.8))
           }
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Verify hold (s)"
           value={draft.verify_hold_s}
           min={0.05}
           step={0.1}
-          onChange={(value) =>
+          onCommit={(value) =>
             updateField('verify_hold_s', toFiniteNumberOr(value, 1.2))
           }
         />
       </Group>
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="Unlocked trace timeout (s)"
           value={draft.unlocked_trace_timeout_s}
           min={0.1}
           step={0.1}
-          onChange={(value) =>
+          onCommit={(value) =>
             updateField('unlocked_trace_timeout_s', toFiniteNumberOr(value, 2.0))
           }
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Cooldown (s)"
           value={draft.cooldown_s}
           min={0}
           step={0.5}
-          onChange={(value) => updateField('cooldown_s', toFiniteNumberOr(value, 8.0))}
+          onCommit={(value) => updateField('cooldown_s', toFiniteNumberOr(value, 8.0))}
         />
       </Group>
-      <NumberInput
+      <DeferredNumberInput
         label="Max attempts"
         value={draft.max_attempts}
         min={1}
         step={1}
-        onChange={(value) =>
-          updateField('max_attempts', toRoundedIntOr(value, 2, 1))
+        parseCommit={(value) => toRoundedIntOr(value, 2, 1)}
+        onCommit={(value) =>
+          updateField('max_attempts', value)
         }
       />
       <Button

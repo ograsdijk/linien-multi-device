@@ -1,4 +1,5 @@
-import { Divider, Group, NumberInput, Select, Stack, Switch, Tabs, Text } from '@mantine/core';
+import { Divider, Group, Select, Stack, Switch, Tabs, Text } from '@mantine/core';
+import { DeferredNumberInput } from './DeferredNumberInput';
 
 const MHz = 0x10000000 / 8;
 const Vpp = ((1 << 14) - 1) / 4;
@@ -94,25 +95,25 @@ export function ModSweepPanel({ params, onSetParam }: ModSweepPanelProps) {
           }}
           disabled={channelDisabled}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Demodulation phase (deg)"
           value={phase}
           min={0}
           max={360}
           step={10}
-          onChange={(value) => {
+          onCommit={(value) => {
             const next = toNumber(value, phase);
             onSetParam(`demodulation_phase${suffix}`, next, true);
           }}
           disabled={channelDisabled}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Signal offset (V)"
           value={offset}
           min={-1}
           max={1}
           step={0.1}
-          onChange={(value) => {
+          onCommit={(value) => {
             const next = toNumber(value, offset);
             onSetParam(`offset${suffix}`, next * OFFSET_SCALE, true);
           }}
@@ -159,13 +160,13 @@ export function ModSweepPanel({ params, onSetParam }: ModSweepPanelProps) {
                 }}
                 disabled={channelDisabled}
               />
-              <NumberInput
+              <DeferredNumberInput
                 label="Filter 1 freq (Hz)"
                 value={filter1Freq}
                 min={0}
                 max={FILTER_FREQ_MAX}
                 step={1000}
-                onChange={(value) => {
+                onCommit={(value) => {
                   const next = toNumber(value, filter1Freq);
                   onSetParam(`filter_1_frequency${suffix}`, next, true);
                 }}
@@ -191,13 +192,13 @@ export function ModSweepPanel({ params, onSetParam }: ModSweepPanelProps) {
                 }}
                 disabled={channelDisabled}
               />
-              <NumberInput
+              <DeferredNumberInput
                 label="Filter 2 freq (Hz)"
                 value={filter2Freq}
                 min={0}
                 max={FILTER_FREQ_MAX}
                 step={1000}
-                onChange={(value) => {
+                onCommit={(value) => {
                   const next = toNumber(value, filter2Freq);
                   onSetParam(`filter_2_frequency${suffix}`, next, true);
                 }}
@@ -213,17 +214,17 @@ export function ModSweepPanel({ params, onSetParam }: ModSweepPanelProps) {
   return (
     <Stack gap="md">
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="Modulation freq (MHz)"
           value={modulationFreq}
-          onChange={(value) => onSetParam('modulation_frequency', Number(value) * MHz, true)}
+          onCommit={(value) => onSetParam('modulation_frequency', Number(value) * MHz, true)}
           step={0.1}
           disabled={pidOnly}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Modulation amp (Vpp)"
           value={modulationAmp}
-          onChange={(value) => onSetParam('modulation_amplitude', Number(value) * Vpp, true)}
+          onCommit={(value) => onSetParam('modulation_amplitude', Number(value) * Vpp, true)}
           step={0.05}
           disabled={pidOnly}
         />

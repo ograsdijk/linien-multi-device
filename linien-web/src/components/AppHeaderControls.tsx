@@ -2,7 +2,6 @@ import {
   Button,
   Group,
   MultiSelect,
-  NumberInput,
   PasswordInput,
   Popover,
   SegmentedControl,
@@ -36,6 +35,7 @@ import type {
   InfluxApplyAllResult,
 } from '../features/integrations/useInfluxController';
 import { toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
+import { DeferredNumberInput } from './DeferredNumberInput';
 
 const formatTimestamp = (value: number | null | undefined) => {
   if (!value || !Number.isFinite(value)) return 'never';
@@ -216,12 +216,12 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
                 disabled={props.influxBusy || !props.influxDeviceConnected}
               />
               <Group grow>
-                <NumberInput
+                <DeferredNumberInput
                   label="Interval (s)"
                   value={props.influxInterval}
                   min={0.1}
                   step={0.1}
-                  onChange={(value) => props.setInfluxInterval(toFiniteNumberOr(value, 1))}
+                  onCommit={(value) => props.setInfluxInterval(toFiniteNumberOr(value, 1))}
                   disabled={
                     props.influxBusy ||
                     !props.influxDeviceConnected ||
@@ -516,15 +516,16 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
                   }
                   disabled={props.postgresBusy}
                 />
-                <NumberInput
+                <DeferredNumberInput
                   label="Port"
                   value={props.postgresDraft.port}
                   min={1}
                   max={65535}
-                  onChange={(value) =>
+                  parseCommit={(value) => toRoundedIntOr(value, 5432, 1, 65535)}
+                  onCommit={(value) =>
                     props.updatePostgresDraft(
                       'port',
-                      toRoundedIntOr(value, 5432, 1, 65535)
+                      value
                     )
                   }
                   disabled={props.postgresBusy}
@@ -569,16 +570,17 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
                   }
                   disabled={props.postgresBusy}
                 />
-                <NumberInput
+                <DeferredNumberInput
                   label="Timeout (s)"
                   value={props.postgresDraft.connect_timeout_s}
                   min={1}
                   max={30}
                   step={1}
-                  onChange={(value) =>
+                  parseCommit={(value) => toRoundedIntOr(value, 3, 1, 30)}
+                  onCommit={(value) =>
                     props.updatePostgresDraft(
                       'connect_timeout_s',
-                      toRoundedIntOr(value, 3, 1, 30)
+                      value
                     )
                   }
                   disabled={props.postgresBusy}

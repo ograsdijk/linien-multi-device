@@ -3,7 +3,6 @@ import {
   Button,
   Divider,
   Group,
-  NumberInput,
   Radio,
   Select,
   Stack,
@@ -16,6 +15,7 @@ import type {
   AutoLockScanSettings,
 } from '../types';
 import { toClampedNumberOr, toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
+import { DeferredNumberInput } from './DeferredNumberInput';
 
 const DEFAULT_AUTO_LOCK_SETTINGS: AutoLockScanSettings = {
   half_range_v: 0.08,
@@ -125,20 +125,20 @@ export function LockingPanel({
     <Stack gap="sm">
       <Text fw={600}>PID</Text>
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="P"
           value={params.p ?? 0}
-          onChange={(value) => onSetParam('p', toFiniteNumberOr(value, params.p ?? 0), true)}
+          onCommit={(value) => onSetParam('p', toFiniteNumberOr(value, params.p ?? 0), true)}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="I"
           value={params.i ?? 0}
-          onChange={(value) => onSetParam('i', toFiniteNumberOr(value, params.i ?? 0), true)}
+          onCommit={(value) => onSetParam('i', toFiniteNumberOr(value, params.i ?? 0), true)}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="D"
           value={params.d ?? 0}
-          onChange={(value) => onSetParam('d', toFiniteNumberOr(value, params.d ?? 0), true)}
+          onCommit={(value) => onSetParam('d', toFiniteNumberOr(value, params.d ?? 0), true)}
         />
       </Group>
       <Radio.Group
@@ -185,54 +185,57 @@ export function LockingPanel({
               Current target slope: {slopeLabel}
             </Text>
             <Group grow>
-              <NumberInput
+              <DeferredNumberInput
                 label="Half range (V)"
                 value={autoLockSettings.half_range_v}
                 min={0.001}
                 step={0.01}
                 decimalScale={3}
-                onChange={(value) =>
+                onCommit={(value) =>
                   setAutoLockNumber(
                     'half_range_v',
                     toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.half_range_v)
                   )
                 }
               />
-              <NumberInput
+              <DeferredNumberInput
                 label="Smooth (pts)"
                 value={autoLockSettings.smooth_window_pts}
                 min={1}
                 max={101}
                 step={2}
-                onChange={(value) =>
+                parseCommit={(value) =>
+                  toRoundedIntOr(value, DEFAULT_AUTO_LOCK_SETTINGS.smooth_window_pts, 1)
+                }
+                onCommit={(value) =>
                   setAutoLockNumber(
                     'smooth_window_pts',
-                    toRoundedIntOr(value, DEFAULT_AUTO_LOCK_SETTINGS.smooth_window_pts, 1)
+                    value
                   )
                 }
               />
             </Group>
             <Group grow>
-              <NumberInput
+              <DeferredNumberInput
                 label="Crossing max (V)"
                 value={autoLockSettings.crossing_max_v}
                 min={0.0001}
                 step={0.01}
                 decimalScale={4}
-                onChange={(value) =>
+                onCommit={(value) =>
                   setAutoLockNumber(
                     'crossing_max_v',
                     toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.crossing_max_v)
                   )
                 }
               />
-              <NumberInput
+              <DeferredNumberInput
                 label="Error min (V)"
                 value={autoLockSettings.error_min}
                 min={0.0001}
                 step={0.01}
                 decimalScale={4}
-                onChange={(value) =>
+                onCommit={(value) =>
                   setAutoLockNumber(
                     'error_min',
                     toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.error_min)
@@ -241,27 +244,27 @@ export function LockingPanel({
               />
             </Group>
             <Group grow>
-              <NumberInput
+              <DeferredNumberInput
                 label="Symmetry min"
                 value={autoLockSettings.symmetry_min}
                 min={0}
                 max={1}
                 step={0.05}
                 decimalScale={2}
-                onChange={(value) =>
+                onCommit={(value) =>
                   setAutoLockNumber(
                     'symmetry_min',
                     toClampedNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.symmetry_min, 0, 1)
                   )
                 }
               />
-              <NumberInput
+              <DeferredNumberInput
                 label="Single error min (V)"
                 value={autoLockSettings.single_error_min}
                 min={0.0001}
                 step={0.01}
                 decimalScale={4}
-                onChange={(value) =>
+                onCommit={(value) =>
                   setAutoLockNumber(
                     'single_error_min',
                     toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.single_error_min)
@@ -291,13 +294,13 @@ export function LockingPanel({
               }
             />
             {autoLockSettings.use_monitor ? (
-              <NumberInput
+              <DeferredNumberInput
                 label="Monitor contrast min (V)"
                 value={autoLockSettings.monitor_contrast_min_v}
                 min={0.0001}
                 step={0.01}
                 decimalScale={4}
-                onChange={(value) =>
+                onCommit={(value) =>
                   setAutoLockNumber(
                     'monitor_contrast_min_v',
                     toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.monitor_contrast_min_v)

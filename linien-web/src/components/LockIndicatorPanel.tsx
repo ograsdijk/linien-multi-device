@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Button, Group, NumberInput, Select, Stack, Switch, Text } from '@mantine/core';
+import { Button, Group, Select, Stack, Switch, Text } from '@mantine/core';
 import type { LockIndicatorConfig, LockIndicatorSnapshot } from '../types';
 import { toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
+import { DeferredNumberInput } from './DeferredNumberInput';
 
 const DEFAULT_LOCK_INDICATOR_CONFIG: LockIndicatorConfig = {
   enabled: true,
@@ -83,19 +84,19 @@ export function LockIndicatorPanel({
         onChange={(event) => updateField('enabled', event.currentTarget.checked)}
       />
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="Bad hold (s)"
           value={draft.bad_hold_s}
           min={0.05}
           step={0.1}
-          onChange={(value) => updateField('bad_hold_s', toFiniteNumberOr(value, 1.0))}
+          onCommit={(value) => updateField('bad_hold_s', toFiniteNumberOr(value, 1.0))}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Good hold (s)"
           value={draft.good_hold_s}
           min={0.05}
           step={0.1}
-          onChange={(value) => updateField('good_hold_s', toFiniteNumberOr(value, 2.0))}
+          onCommit={(value) => updateField('good_hold_s', toFiniteNumberOr(value, 2.0))}
         />
       </Group>
       <Switch
@@ -104,44 +105,45 @@ export function LockIndicatorPanel({
         onChange={(event) => updateField('use_control', event.currentTarget.checked)}
       />
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="Control stuck Delta (counts)"
           value={draft.control_stuck_delta_counts}
           min={0}
           step={1}
-          onChange={(value) =>
-            updateField('control_stuck_delta_counts', toRoundedIntOr(value, 0, 0))
+          parseCommit={(value) => toRoundedIntOr(value, 0, 0)}
+          onCommit={(value) =>
+            updateField('control_stuck_delta_counts', value)
           }
           disabled={!draft.use_control}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Control stuck time (s)"
           value={draft.control_stuck_time_s}
           min={0.05}
           step={0.1}
-          onChange={(value) => updateField('control_stuck_time_s', toFiniteNumberOr(value, 1.5))}
+          onCommit={(value) => updateField('control_stuck_time_s', toFiniteNumberOr(value, 1.5))}
           disabled={!draft.use_control}
         />
       </Group>
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="Control rail threshold (V)"
           value={draft.control_rail_threshold_v}
           min={0}
           max={1.2}
           step={0.01}
           decimalScale={3}
-          onChange={(value) =>
+          onCommit={(value) =>
             updateField('control_rail_threshold_v', toFiniteNumberOr(value, 0.9))
           }
           disabled={!draft.use_control}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Control rail hold (s)"
           value={draft.control_rail_hold_s}
           min={0.05}
           step={0.1}
-          onChange={(value) => updateField('control_rail_hold_s', toFiniteNumberOr(value, 1.0))}
+          onCommit={(value) => updateField('control_rail_hold_s', toFiniteNumberOr(value, 1.0))}
           disabled={!draft.use_control}
         />
       </Group>
@@ -151,35 +153,35 @@ export function LockIndicatorPanel({
         onChange={(event) => updateField('use_error', event.currentTarget.checked)}
       />
       <Group grow>
-        <NumberInput
+        <DeferredNumberInput
           label="|Error mean| max (V)"
           value={draft.error_mean_abs_max_v}
           min={0}
           step={0.01}
           decimalScale={4}
-          onChange={(value) =>
+          onCommit={(value) =>
             updateField('error_mean_abs_max_v', toFiniteNumberOr(value, 0.2))
           }
           disabled={!draft.use_error}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Error std min (V)"
           value={draft.error_std_min_v}
           min={0}
           step={0.001}
           decimalScale={4}
-          onChange={(value) =>
+          onCommit={(value) =>
             updateField('error_std_min_v', toFiniteNumberOr(value, 0.001))
           }
           disabled={!draft.use_error}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Error std max (V)"
           value={draft.error_std_max_v}
           min={0}
           step={0.01}
           decimalScale={4}
-          onChange={(value) =>
+          onCommit={(value) =>
             updateField('error_std_max_v', toFiniteNumberOr(value, 0.8))
           }
           disabled={!draft.use_error}
@@ -203,12 +205,12 @@ export function LockIndicatorPanel({
           }
           disabled={!draft.use_monitor}
         />
-        <NumberInput
+        <DeferredNumberInput
           label="Monitor threshold (V)"
           value={draft.monitor_threshold_v}
           step={0.01}
           decimalScale={4}
-          onChange={(value) =>
+          onCommit={(value) =>
             updateField('monitor_threshold_v', toFiniteNumberOr(value, 0.0))
           }
           disabled={!draft.use_monitor}
