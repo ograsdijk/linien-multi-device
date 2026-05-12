@@ -49,9 +49,15 @@ class WebsocketManager:
         self._loop = loop
 
     async def register(
-        self, device_key: str, websocket: WebSocket, max_fps: float | None = None
+        self,
+        device_key: str,
+        websocket: WebSocket,
+        max_fps: float | None = None,
+        *,
+        accept: bool = True,
     ) -> None:
-        await websocket.accept()
+        if accept:
+            await websocket.accept()
         state = ConnectionState(
             max_fps=self._resolve_max_fps(max_fps),
             reliable_queue=asyncio.Queue(maxsize=self._reliable_queue_size),

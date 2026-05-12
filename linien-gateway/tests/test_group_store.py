@@ -1,6 +1,17 @@
 from pathlib import Path
+import threading
 
-from app.group_store import Group, list_groups, load_groups, save_groups
+from app.group_store import (
+    Group,
+    add_device_to_auto_groups,
+    create_group,
+    delete_group,
+    list_groups,
+    load_groups,
+    remove_device_from_groups,
+    save_groups,
+    update_group,
+)
 
 
 def test_load_groups_malformed_json_returns_empty(tmp_path: Path):
@@ -67,3 +78,53 @@ def test_list_groups_auto_include_preserves_existing_order_and_appends_missing(
 
     assert listed[0].device_keys == ["d2", "d1", "d3"]
     assert saved_groups
+
+
+def test_group_crud_helpers_roundtrip_with_explicit_path(tmp_path: Path):
+    path = tmp_path / "groups.json"
+
+    created = create_group("Lab", ["dev-a"], auto_include=False, path=path)
+    updated = update_group(
+        created.key,
+        name="Main lab",
+        device_keys=["dev-a", "dev-b"],
+        auto_include=True,
+        path=path,
+    )
+    add_device_to_auto_groups("dev-c", path=path)
+    remove_device_from_groups("dev-a", path=path)
+
+    loaded = load_groups(path=path)
+
+    assert updated.key == created.key
+    assert len(loaded) == 1
+    assert loaded[0].name == "Main lab"
+    assert loaded[0].device_keys == ["dev-b", "dev-c"]
+    assert loaded[0].auto_include is True
+
+    delete_group(created.key, path=path)
+
+    assert load_groups(path=path) == []
+
+
+def test_concurrent_auto_group_writes_do_not_corrupt_file(tmp_path: Path):
+    path = tmp_path / "groups.json"
+    save_groups(
+        [Group(key="all", name="All devices", device_keys=[], auto_include=True)],
+        path=path,
+    )
+
+    threads = [
+        threading.Thread(target=add_device_to_auto_groups, args=(f"dev-{idx}", path))
+        for idx in range(20)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    loaded = load_groups(path=path)
+
+    assert len(loaded) == 1
+    assert sorted(loaded[0].device_keys) == sorted(f"dev-{idx}" for idx in range(20))
+    assert list(tmp_path.glob("*.tmp")) == []

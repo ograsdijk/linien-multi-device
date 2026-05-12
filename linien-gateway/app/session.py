@@ -432,30 +432,34 @@ class DeviceSession:
         )
 
     def sync_auto_lock_scan_settings_from_device(self) -> None:
-        next_auto_lock_scan_settings = self._initial_auto_lock_scan_settings()
-        if next_auto_lock_scan_settings != self.auto_lock_scan_settings:
-            self.auto_lock_scan_settings = next_auto_lock_scan_settings
+        with self._state_lock:
+            next_auto_lock_scan_settings = self._initial_auto_lock_scan_settings()
+            if next_auto_lock_scan_settings != self.auto_lock_scan_settings:
+                self.auto_lock_scan_settings = next_auto_lock_scan_settings
 
     def sync_lock_indicator_settings_from_device(self) -> None:
-        next_lock_indicator_config = LockIndicatorConfig.from_mapping(
-            self._initial_lock_indicator_config()
-        ).to_dict()
-        if next_lock_indicator_config != self.lock_indicator.get_config():
-            self.lock_indicator.set_config(next_lock_indicator_config)
+        with self._state_lock:
+            next_lock_indicator_config = LockIndicatorConfig.from_mapping(
+                self._initial_lock_indicator_config()
+            ).to_dict()
+            if next_lock_indicator_config != self.lock_indicator.get_config():
+                self.lock_indicator.set_config(next_lock_indicator_config)
 
     def sync_auto_relock_config_from_device(self) -> None:
-        next_auto_relock_config = AutoRelockConfig.from_mapping(
-            self._initial_auto_relock_config()
-        ).to_dict()
-        if next_auto_relock_config != self.auto_relock.get_config():
-            self.auto_relock.set_config(next_auto_relock_config)
-        if hasattr(self.auto_relock, "set_event_hook"):
-            self.auto_relock.set_event_hook(self._on_auto_relock_event)
+        with self._state_lock:
+            next_auto_relock_config = AutoRelockConfig.from_mapping(
+                self._initial_auto_relock_config()
+            ).to_dict()
+            if next_auto_relock_config != self.auto_relock.get_config():
+                self.auto_relock.set_config(next_auto_relock_config)
+            if hasattr(self.auto_relock, "set_event_hook"):
+                self.auto_relock.set_event_hook(self._on_auto_relock_event)
 
     def sync_influx_logging_state_from_device(self) -> None:
-        next_influx_logging_state = self._initial_influx_logging_state()
-        if next_influx_logging_state != self.influx_logging_state:
-            self.influx_logging_state = next_influx_logging_state
+        with self._state_lock:
+            next_influx_logging_state = self._initial_influx_logging_state()
+            if next_influx_logging_state != self.influx_logging_state:
+                self.influx_logging_state = next_influx_logging_state
 
     def sync_configs_from_device(self) -> None:
         self.sync_auto_lock_scan_settings_from_device()
@@ -468,36 +472,44 @@ class DeviceSession:
         self.sync_configs_from_device()
 
     def get_lock_indicator_config(self) -> dict[str, Any]:
-        return self.lock_indicator.get_config()
+        with self._state_lock:
+            return self.lock_indicator.get_config()
 
     def update_lock_indicator_config(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self.lock_indicator.set_config(payload)
+        with self._state_lock:
+            return self.lock_indicator.set_config(payload)
 
     def get_auto_lock_scan_settings(self) -> dict[str, Any]:
-        return dict(self.auto_lock_scan_settings)
+        with self._state_lock:
+            return dict(self.auto_lock_scan_settings)
 
     def update_auto_lock_scan_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        settings = AutoLockScanSettings.from_mapping(payload)
-        self.auto_lock_scan_settings = settings.__dict__.copy()
-        return self.get_auto_lock_scan_settings()
+        with self._state_lock:
+            settings = AutoLockScanSettings.from_mapping(payload)
+            self.auto_lock_scan_settings = settings.__dict__.copy()
+            return dict(self.auto_lock_scan_settings)
 
     def get_auto_relock_state(self) -> dict[str, Any]:
-        return self.auto_relock.get_state()
+        with self._state_lock:
+            return self.auto_relock.get_state()
 
     def update_auto_relock_config(self, payload: dict[str, Any]) -> dict[str, Any]:
-        self.auto_relock.set_config(payload)
-        if hasattr(self.auto_relock, "set_event_hook"):
-            self.auto_relock.set_event_hook(self._on_auto_relock_event)
-        return self.get_auto_relock_state()
+        with self._state_lock:
+            self.auto_relock.set_config(payload)
+            if hasattr(self.auto_relock, "set_event_hook"):
+                self.auto_relock.set_event_hook(self._on_auto_relock_event)
+            return self.auto_relock.get_state()
 
     def set_auto_relock_enabled(self, enabled: bool) -> dict[str, Any]:
-        self.auto_relock.set_enabled(enabled)
-        if hasattr(self.auto_relock, "set_event_hook"):
-            self.auto_relock.set_event_hook(self._on_auto_relock_event)
-        return self.get_auto_relock_state()
+        with self._state_lock:
+            self.auto_relock.set_enabled(enabled)
+            if hasattr(self.auto_relock, "set_event_hook"):
+                self.auto_relock.set_event_hook(self._on_auto_relock_event)
+            return self.auto_relock.get_state()
 
     def get_influx_logging_state(self) -> dict[str, Any]:
-        return dict(self.influx_logging_state)
+        with self._state_lock:
+            return dict(self.influx_logging_state)
 
     def set_influx_logging_state(
         self,
@@ -1030,11 +1042,14 @@ class DeviceSession:
             raise RuntimeError("Device not connected")
         error_trace, monitor_trace = self._snapshot_auto_lock_traces()
 
-        if settings_payload is None:
-            settings = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
-        else:
-            settings = AutoLockScanSettings.from_mapping(settings_payload)
-            self.auto_lock_scan_settings = settings.__dict__.copy()
+        with self._state_lock:
+            if settings_payload is None:
+                settings = AutoLockScanSettings.from_mapping(
+                    self.auto_lock_scan_settings
+                )
+            else:
+                settings = AutoLockScanSettings.from_mapping(settings_payload)
+                self.auto_lock_scan_settings = settings.__dict__.copy()
         with self._rpyc_lock:
             if bool(self.parameters.lock.value):
                 raise RuntimeError("Device is already locked. Start sweep first.")
@@ -1169,10 +1184,11 @@ class DeviceSession:
             raise RuntimeError(f"Autolock is {AUTOMATION_TEMP_DISABLED_REASON}")
         if self.control is None:
             raise RuntimeError("Device not connected")
-        if self.plot_state.last_plot_data is None:
-            raise RuntimeError("No plot data available")
-        combined_error = self.plot_state.last_plot_data[2]
-        additional = self.plot_state.combined_error_cache
+        with self._state_lock:
+            if self.plot_state.last_plot_data is None:
+                raise RuntimeError("No plot data available")
+            combined_error = self.plot_state.last_plot_data[2]
+            additional = list(self.plot_state.combined_error_cache)
         with self._rpyc_lock:
             self.control.exposed_start_autolock(
                 x0,
@@ -1192,30 +1208,33 @@ class DeviceSession:
                 combined_error,
                 *sorted([x0, x1]),
             )
-            self.plot_state.autolock_ref_spectrum = rolled_error_signal
+            with self._state_lock:
+                self.plot_state.autolock_ref_spectrum = rolled_error_signal
         except Exception:  # noqa: BLE001 - optional helper for lock target overlay
             logger.debug(
                 "Failed computing autolock reference spectrum device=%s",
                 self.device.key,
                 exc_info=True,
             )
-            self.plot_state.autolock_ref_spectrum = None
+            with self._state_lock:
+                self.plot_state.autolock_ref_spectrum = None
 
     def start_optimization(self, x0: int, x1: int) -> None:
         if AUTOMATION_TEMP_DISABLED:
             raise RuntimeError(f"Optimization is {AUTOMATION_TEMP_DISABLED_REASON}")
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
-        if self.plot_state.last_plot_data is None:
-            raise RuntimeError("No plot data available")
         x0, x1 = sorted([int(x0), int(x1)])
         with self._rpyc_lock:
             dual_channel = bool(self.parameters.dual_channel.value)
             channel = int(self.parameters.optimization_channel.value)
-        if not dual_channel:
-            spectrum = self.plot_state.last_plot_data[0]
-        else:
-            spectrum = self.plot_state.last_plot_data[0 if channel == 0 else 1]
+        with self._state_lock:
+            if self.plot_state.last_plot_data is None:
+                raise RuntimeError("No plot data available")
+            if not dual_channel:
+                spectrum = self.plot_state.last_plot_data[0]
+            else:
+                spectrum = self.plot_state.last_plot_data[0 if channel == 0 else 1]
         cropped = np.array(spectrum[x0:x1], dtype=float)
         cropped = cropped[np.isfinite(cropped)]
         if cropped.size < 2:

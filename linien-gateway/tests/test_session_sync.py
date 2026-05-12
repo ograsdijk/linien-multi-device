@@ -12,14 +12,49 @@ class _ConfigSpy:
     def __init__(self, initial: dict):
         self._config = dict(initial)
         self.set_calls = 0
+        self.required_lock = None
 
     def get_config(self) -> dict:
+        if self.required_lock is not None:
+            assert self.required_lock.held
         return dict(self._config)
 
     def set_config(self, payload) -> dict:
+        if self.required_lock is not None:
+            assert self.required_lock.held
         self.set_calls += 1
         self._config = dict(payload)
         return self.get_config()
+
+    def get_state(self) -> dict:
+        if self.required_lock is not None:
+            assert self.required_lock.held
+        return {"config": self.get_config(), "status": {"state": "idle"}}
+
+    def set_enabled(self, enabled: bool) -> dict:
+        if self.required_lock is not None:
+            assert self.required_lock.held
+        self._config["enabled"] = bool(enabled)
+        return self.get_config()
+
+    def set_event_hook(self, _hook) -> None:
+        if self.required_lock is not None:
+            assert self.required_lock.held
+
+
+class _StateLockSpy:
+    def __init__(self) -> None:
+        self.held = False
+        self.entries = 0
+
+    def __enter__(self):
+        assert not self.held
+        self.held = True
+        self.entries += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.held = False
 
 
 def _make_session(parameters: dict) -> DeviceSession:
@@ -146,3 +181,33 @@ def test_snapshot_returns_copies_of_cached_state():
     assert session.param_cache_serialized["nested"]["value"] == 1
     assert session.last_plot_frame["series"]["combined_error"][0] == 0.1
     assert snapshot["status"]["last_plot"] == 123.0
+
+
+def test_config_accessors_hold_state_lock():
+    session = _make_session({})
+    lock_spy = _ConfigSpy({"enabled": True})
+    relock_spy = _ConfigSpy({"enabled": False})
+    state_lock = _StateLockSpy()
+    lock_spy.required_lock = state_lock
+    relock_spy.required_lock = state_lock
+    session.lock_indicator = lock_spy  # type: ignore[assignment]
+    session.auto_relock = relock_spy  # type: ignore[assignment]
+    session._state_lock = state_lock  # type: ignore[assignment]
+
+    assert session.get_lock_indicator_config() == {"enabled": True}
+    assert session.update_lock_indicator_config({"enabled": False}) == {
+        "enabled": False
+    }
+    assert session.get_auto_relock_state() == {
+        "config": {"enabled": False},
+        "status": {"state": "idle"},
+    }
+    assert session.update_auto_relock_config({"enabled": True}) == {
+        "config": {"enabled": True},
+        "status": {"state": "idle"},
+    }
+    assert session.set_auto_relock_enabled(False) == {
+        "config": {"enabled": False},
+        "status": {"state": "idle"},
+    }
+    assert state_lock.entries >= 5

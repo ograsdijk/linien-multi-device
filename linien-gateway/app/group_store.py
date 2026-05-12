@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List
@@ -11,6 +12,7 @@ from linien_common.config import USER_DATA_PATH
 
 GROUPS_PATH = USER_DATA_PATH / "groups.json"
 logger = logging.getLogger(__name__)
+_GROUPS_LOCK = threading.RLock()
 
 
 def _generate_key() -> str:
@@ -19,7 +21,7 @@ def _generate_key() -> str:
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(f"{path.suffix}.tmp")
+    temp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
     temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     temp_path.replace(path)
 
@@ -79,55 +81,63 @@ def load_groups(path=GROUPS_PATH) -> List[Group]:
 
 
 def save_groups(groups: List[Group], path=GROUPS_PATH) -> None:
-    payload = {i: asdict(group) for i, group in enumerate(groups)}
-    _atomic_write_json(Path(path), payload)
+    with _GROUPS_LOCK:
+        payload = {i: asdict(group) for i, group in enumerate(groups)}
+        _atomic_write_json(Path(path), payload)
 
 
 def list_groups(device_keys: List[str]) -> List[Group]:
-    groups = load_groups()
-    changed = False
-    device_key_list = list(device_keys)
-    device_key_set = set(device_key_list)
+    with _GROUPS_LOCK:
+        groups = load_groups()
+        changed = False
+        device_key_list = list(device_keys)
+        device_key_set = set(device_key_list)
 
-    for group in groups:
-        filtered = [key for key in group.device_keys if key in device_key_set]
-        if filtered != group.device_keys:
-            group.device_keys = filtered
-            changed = True
-
-    if not groups:
-        groups = [
-            Group(
-                name="All devices",
-                device_keys=device_key_list,
-                auto_include=True,
-            )
-        ]
-        changed = True
-    else:
         for group in groups:
-            if not group.auto_include:
-                continue
-            existing_keys = set(group.device_keys)
-            missing_keys = [key for key in device_key_list if key not in existing_keys]
-            if missing_keys:
-                group.device_keys.extend(missing_keys)
+            filtered = [key for key in group.device_keys if key in device_key_set]
+            if filtered != group.device_keys:
+                group.device_keys = filtered
                 changed = True
 
-    if changed:
-        save_groups(groups)
+        if not groups:
+            groups = [
+                Group(
+                    name="All devices",
+                    device_keys=device_key_list,
+                    auto_include=True,
+                )
+            ]
+            changed = True
+        else:
+            for group in groups:
+                if not group.auto_include:
+                    continue
+                existing_keys = set(group.device_keys)
+                missing_keys = [
+                    key for key in device_key_list if key not in existing_keys
+                ]
+                if missing_keys:
+                    group.device_keys.extend(missing_keys)
+                    changed = True
 
-    return groups
+        if changed:
+            save_groups(groups)
+
+        return groups
 
 
 def create_group(
-    name: str, device_keys: List[str], auto_include: bool = False
+    name: str,
+    device_keys: List[str],
+    auto_include: bool = False,
+    path=GROUPS_PATH,
 ) -> Group:
-    group = Group(name=name, device_keys=list(device_keys), auto_include=auto_include)
-    groups = load_groups()
-    groups.append(group)
-    save_groups(groups)
-    return group
+    with _GROUPS_LOCK:
+        group = Group(name=name, device_keys=list(device_keys), auto_include=auto_include)
+        groups = load_groups(path=path)
+        groups.append(group)
+        save_groups(groups, path=path)
+        return group
 
 
 def update_group(
@@ -135,48 +145,55 @@ def update_group(
     name: str | None = None,
     device_keys: List[str] | None = None,
     auto_include: bool | None = None,
+    path=GROUPS_PATH,
 ) -> Group:
-    groups = load_groups()
-    for group in groups:
-        if group.key != key:
-            continue
-        if name is not None:
-            group.name = name
-        if device_keys is not None:
-            group.device_keys = list(device_keys)
-        if auto_include is not None:
-            group.auto_include = auto_include
-        save_groups(groups)
-        return group
-    raise KeyError("Group not found")
+    with _GROUPS_LOCK:
+        groups = load_groups(path=path)
+        for group in groups:
+            if group.key != key:
+                continue
+            if name is not None:
+                group.name = name
+            if device_keys is not None:
+                group.device_keys = list(device_keys)
+            if auto_include is not None:
+                group.auto_include = auto_include
+            save_groups(groups, path=path)
+            return group
+        raise KeyError("Group not found")
 
 
-def delete_group(key: str) -> None:
-    groups = load_groups()
-    groups = [group for group in groups if group.key != key]
-    save_groups(groups)
+def delete_group(key: str, path=GROUPS_PATH) -> None:
+    with _GROUPS_LOCK:
+        groups = load_groups(path=path)
+        groups = [group for group in groups if group.key != key]
+        save_groups(groups, path=path)
 
 
-def add_device_to_auto_groups(device_key: str) -> None:
-    groups = load_groups()
-    changed = False
-    for group in groups:
-        if not group.auto_include:
-            continue
-        existing_keys = set(group.device_keys)
-        if device_key not in existing_keys:
-            group.device_keys.append(device_key)
-            changed = True
-    if changed:
-        save_groups(groups)
+def add_device_to_auto_groups(device_key: str, path=GROUPS_PATH) -> None:
+    with _GROUPS_LOCK:
+        groups = load_groups(path=path)
+        changed = False
+        for group in groups:
+            if not group.auto_include:
+                continue
+            existing_keys = set(group.device_keys)
+            if device_key not in existing_keys:
+                group.device_keys.append(device_key)
+                changed = True
+        if changed:
+            save_groups(groups, path=path)
 
 
-def remove_device_from_groups(device_key: str) -> None:
-    groups = load_groups()
-    changed = False
-    for group in groups:
-        if device_key in group.device_keys:
-            group.device_keys = [key for key in group.device_keys if key != device_key]
-            changed = True
-    if changed:
-        save_groups(groups)
+def remove_device_from_groups(device_key: str, path=GROUPS_PATH) -> None:
+    with _GROUPS_LOCK:
+        groups = load_groups(path=path)
+        changed = False
+        for group in groups:
+            if device_key in group.device_keys:
+                group.device_keys = [
+                    key for key in group.device_keys if key != device_key
+                ]
+                changed = True
+        if changed:
+            save_groups(groups, path=path)

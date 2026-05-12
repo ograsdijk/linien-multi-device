@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, List
@@ -59,7 +60,6 @@ from .session import DeviceSession
 from .session_registry import SessionRegistry
 from .stream import WebsocketManager
 
-app = FastAPI(title="Linien Gateway")
 manager = WebsocketManager(
     default_plot_fps=get_plot_stream_default_fps(),
     max_plot_fps_cap=get_plot_stream_max_fps_cap(),
@@ -70,14 +70,6 @@ log_store = LogStore(max_entries=10_000, max_age_s=24.0 * 60.0 * 60.0)
 device_config_store = DeviceConfigStore()
 session_registry = SessionRegistry()
 logger = logging.getLogger(__name__)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 def _remove_rotating_file_handlers(logger_name: str) -> None:
@@ -95,8 +87,7 @@ def _remove_rotating_file_handlers(logger_name: str) -> None:
                 )
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
+async def _startup() -> None:
     _remove_rotating_file_handlers("linien_client")
     _remove_rotating_file_handlers("linien_common")
     logging.getLogger("linien_client").setLevel(logging.WARNING)
@@ -130,10 +121,29 @@ async def on_startup() -> None:
         lock_result_postgres.start()
 
 
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
+async def _shutdown() -> None:
     if hasattr(lock_result_postgres, "stop"):
         lock_result_postgres.stop()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await _startup()
+    try:
+        yield
+    finally:
+        await _shutdown()
+
+
+app = FastAPI(title="Linien Gateway", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _resolve_web_dist_dir() -> Path:
@@ -929,14 +939,13 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
                 max_fps = None
         except ValueError:
             max_fps = None
-    await manager.register(key, websocket, max_fps=max_fps)
+    await websocket.accept()
 
     async def safe_send(payload: dict) -> bool:
         try:
             await websocket.send_json(payload)
             return True
         except WebSocketDisconnect:
-            await manager.unregister(key, websocket)
             return False
 
     for name, value in snapshot.get("params", {}).items():
@@ -952,6 +961,8 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
             return
     if not await safe_send({"type": "status", **snapshot.get("status", {})}):
         return
+
+    await manager.register(key, websocket, max_fps=max_fps, accept=False)
 
     try:
         while True:
