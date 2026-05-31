@@ -11,6 +11,8 @@ import type {
 } from '../types';
 import { api } from '../api';
 import { useDeviceStream } from '../hooks/useDeviceStream';
+import { useInViewport } from '../hooks/useInViewport';
+import { usePlotFrameBuffer } from '../hooks/usePlotFrameBuffer';
 import { PlotPanel } from './PlotPanel';
 import { RightPanel } from './RightPanel';
 import { StatusRow } from './StatusRow';
@@ -31,6 +33,8 @@ type DeviceWorkspaceProps = {
   active: boolean;
   onStateUpdate: (deviceKey: string, message: StreamMessage) => void;
   onStreamActiveChange?: (deviceKey: string, active: boolean) => void;
+  maxFps?: number;
+  detail?: 'summary' | 'full';
   onStartScanAutoLock?: (deviceKey: string) => Promise<void>;
   autoLockBusy?: boolean;
   lockBusy?: boolean;
@@ -47,6 +51,8 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
   active,
   onStateUpdate,
   onStreamActiveChange,
+  maxFps,
+  detail = 'full',
   onStartScanAutoLock,
   autoLockBusy,
   lockBusy,
@@ -62,7 +68,13 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
   const [autoRelockConfig, setAutoRelockConfig] = useState<AutoRelockConfig | null>(null);
   const [autoRelockSaving, setAutoRelockSaving] = useState(false);
   const [autoRelockError, setAutoRelockError] = useState<string | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const autoLockSettingsSaveTimerRef = useRef<number | null>(null);
+  const { plotFrame, handlePlotFrameMessage } = usePlotFrameBuffer({
+    deviceKey: device.key,
+    initialFrame: state.plotFrame ?? null,
+    onSummaryUpdate: (msg) => onStateUpdate(device.key, msg),
+  });
   const connected = Boolean(state.status?.connected);
   const hasAutolockSelectionParam = Object.prototype.hasOwnProperty.call(
     state.params,
@@ -84,9 +96,12 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
   const sweepAmplitude = Number.isFinite(sweepAmplitudeNum) ? sweepAmplitudeNum : undefined;
   const autolockTemporarilyDisabled = true;
   const optimizationTemporarilyDisabled = true;
+  const visible = useInViewport(rootRef, { disabled: !active });
+  const streamEnabled = active && visible;
 
   const onMessage = useCallback(
     (msg: StreamMessage) => {
+      if (handlePlotFrameMessage(msg)) return;
       if (msg.type === 'config_update') {
         if (msg.config_name === 'lock_indicator_config') {
           setLockIndicatorConfig(msg.value as LockIndicatorConfig);
@@ -102,7 +117,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
       }
       onStateUpdate(device.key, msg);
     },
-    [device.key, onStateUpdate]
+    [device.key, onStateUpdate, handlePlotFrameMessage]
   );
 
   const handleStreamOpen = useCallback(() => {
@@ -112,7 +127,9 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     onStreamActiveChange?.(device.key, false);
   }, [device.key, onStreamActiveChange]);
 
-  useDeviceStream(device.key, active, onMessage, {
+  useDeviceStream(device.key, streamEnabled, onMessage, {
+    maxFps,
+    detail,
     onOpen: handleStreamOpen,
     onClose: handleStreamClose,
   });
@@ -354,7 +371,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
   };
 
   return (
-    <div>
+    <div ref={rootRef}>
       {!connected ? (
         <div className="panel" style={{ padding: 12, marginBottom: 12 }}>
           Not connected. Use the device list on the left to connect.
@@ -367,7 +384,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
         <div className="plot-stack">
           <SweepControls params={state.params} onSetParam={setParam} />
           <PlotPanel
-            plotFrame={state.plotFrame}
+            plotFrame={plotFrame}
             selectionMode={selectionMode}
             onSelectRange={handleSelectRange}
             lockState={lockState}
@@ -376,8 +393,8 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             showManualTarget={lockMode !== 'autolock'}
           />
           <StatusRow
-            plotFrame={state.plotFrame}
-            lockIndicator={state.plotFrame?.lock_indicator ?? null}
+            plotFrame={plotFrame}
+            lockIndicator={plotFrame?.lock_indicator ?? null}
             connected={connected}
             lockEnabled={lockState}
           />
@@ -417,10 +434,10 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             lockIndicatorSaving={lockIndicatorSaving}
             lockIndicatorError={lockIndicatorError}
             onSaveLockIndicatorConfig={handleSaveLockIndicatorConfig}
-            lockIndicatorSnapshot={state.plotFrame?.lock_indicator ?? null}
+            lockIndicatorSnapshot={plotFrame?.lock_indicator ?? null}
             autoRelockConfig={autoRelockConfig}
             autoRelockStatus={
-              state.plotFrame?.auto_relock ?? state.status?.auto_relock ?? null
+              plotFrame?.auto_relock ?? state.status?.auto_relock ?? null
             }
             autoRelockSaving={autoRelockSaving}
             autoRelockError={autoRelockError}

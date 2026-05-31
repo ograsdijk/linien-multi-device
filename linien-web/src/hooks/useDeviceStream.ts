@@ -4,6 +4,7 @@ import type { StreamMessage } from '../types';
 
 type StreamOptions = {
   maxFps?: number;
+  detail?: 'summary' | 'full';
   onOpen?: () => void;
   onClose?: () => void;
 };
@@ -103,5 +104,5 @@ export function useDeviceStream(
       clearReconnectTimer();
       closeCurrentSocket();
     };
-  }, [deviceKey, enabled, onMessage, options?.maxFps, options?.onOpen, options?.onClose]);
+  }, [deviceKey, enabled, onMessage, options?.maxFps, options?.detail, options?.onOpen, options?.onClose]);
 }

@@ -4,6 +4,7 @@ import { parseLogsStreamMessage, parseStreamMessage } from './features/runtime/m
 
 type StreamOptions = {
   maxFps?: number;
+  detail?: 'summary' | 'full';
 };
 
 const CLIENT_PLOT_MAX_FPS = 60;
@@ -17,6 +18,9 @@ export function openDeviceStream(
   const params = new URLSearchParams();
   if (options?.maxFps && options.maxFps > 0) {
     params.set('max_fps', String(Math.min(options.maxFps, CLIENT_PLOT_MAX_FPS)));
+  }
+  if (options?.detail) {
+    params.set('detail', options.detail);
   }
   const suffix = params.toString();
   const url = suffix

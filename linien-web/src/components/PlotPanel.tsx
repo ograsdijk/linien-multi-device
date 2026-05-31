@@ -92,6 +92,24 @@ const SERIES_STYLE: Record<
 };
 
 const POINT_STYLE: uPlot.Series.Points = { show: false };
+const X_CACHE = new Map<number, number[]>();
+const NULL_SERIES_CACHE = new Map<number, Array<number | null>>();
+
+const getXValues = (count: number) => {
+  const cached = X_CACHE.get(count);
+  if (cached) return cached;
+  const values = Array.from({ length: count }, (_, i) => i);
+  X_CACHE.set(count, values);
+  return values;
+};
+
+const getNullSeries = (count: number) => {
+  const cached = NULL_SERIES_CACHE.get(count);
+  if (cached) return cached;
+  const values = Array<number | null>(count).fill(null);
+  NULL_SERIES_CACHE.set(count, values);
+  return values;
+};
 
 const toFinite = (value: unknown): number | null => {
   if (value == null) return null;
@@ -228,7 +246,7 @@ export function PlotPanel({
     }
     const maxLen = Math.max(...seriesRaw.map((series) => series.length), 0);
     const count = maxLen > 0 ? maxLen : N_POINTS;
-    const x = Array.from({ length: count }, (_, i) => i);
+    const x = getXValues(count);
     const seriesData = seriesRaw.map((series) => {
       if (series.length === count) {
         return series;
@@ -236,7 +254,7 @@ export function PlotPanel({
       if (series.length > 0) {
         return Array.from({ length: count }, (_, idx) => series[idx] ?? null);
       }
-      return Array(count).fill(null);
+      return getNullSeries(count);
     });
     return { data: [x, ...seriesData], pointCount: count };
   }, [activePlotFrame, lockAxis]);

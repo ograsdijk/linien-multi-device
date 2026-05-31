@@ -4,6 +4,7 @@ import type { Device, DeviceStatus, PlotFrame, StreamMessage } from '../types';
 import { api } from '../api';
 import { useDeviceStream } from '../hooks/useDeviceStream';
 import { useInViewport } from '../hooks/useInViewport';
+import { usePlotFrameBuffer } from '../hooks/usePlotFrameBuffer';
 import { PlotPanel } from './PlotPanel';
 import { StatusRow } from './StatusRow';
 import { resolveLockDisplay } from '../features/locks/lockState';
@@ -32,6 +33,11 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
   onStreamActiveChange,
 }: DeviceOverviewCardProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const { plotFrame, handlePlotFrameMessage } = usePlotFrameBuffer({
+    deviceKey: device.key,
+    initialFrame: state.plotFrame ?? null,
+    onSummaryUpdate: (msg) => onStateUpdate(device.key, msg),
+  });
   const visible = useInViewport(rootRef, { disabled: !active });
   const streamEnabled = active && visible;
   const connected = Boolean(state.status?.connected);
@@ -45,7 +51,7 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
   const sweepAmplitudeNum = sweepAmplitudeRaw == null ? NaN : Number(sweepAmplitudeRaw);
   const sweepAmplitude = Number.isFinite(sweepAmplitudeNum) ? sweepAmplitudeNum : undefined;
   const statusLabel = connected ? (lockState ? 'Locked' : 'Unlocked') : 'Disconnected';
-  const lockIndicator = state.plotFrame?.lock_indicator ?? null;
+  const lockIndicator = plotFrame?.lock_indicator ?? null;
   const lockDisplay = resolveLockDisplay({
     connected,
     lockEnabled: lockState,
@@ -63,9 +69,10 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
         }
         lastPlotRef.current = now;
       }
+      if (handlePlotFrameMessage(msg)) return;
       onStateUpdate(device.key, msg);
     },
-    [device.key, onStateUpdate, plotThrottleMs]
+    [device.key, onStateUpdate, plotThrottleMs, handlePlotFrameMessage]
   );
 
   const handleStreamOpen = useCallback(() => {
@@ -77,6 +84,7 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
 
   useDeviceStream(device.key, streamEnabled, onMessage, {
     maxFps,
+    detail: 'summary',
     onOpen: handleStreamOpen,
     onClose: handleStreamClose,
   });
@@ -115,7 +123,7 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
         </Group>
       </Group>
       <PlotPanel
-        plotFrame={state.plotFrame}
+        plotFrame={plotFrame}
         selectionMode={null}
         lockState={lockState}
         sweepCenter={sweepCenter}
@@ -123,7 +131,7 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
         showManualTarget={false}
       />
       <StatusRow
-        plotFrame={state.plotFrame}
+        plotFrame={plotFrame}
         lockIndicator={lockIndicator}
         connected={connected}
         lockEnabled={lockState}
