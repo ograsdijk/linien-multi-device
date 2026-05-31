@@ -1,7 +1,7 @@
 import { useMemo, useState, type CSSProperties } from 'react';
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { ActionIcon, Button, Card, Group, Modal, Stack, Text, TextInput } from '@mantine/core';
+import { ActionIcon, Button, Card, Group, Modal, Select, Stack, Text, TextInput } from '@mantine/core';
 import {
   IconChevronLeft,
   IconDevices,
@@ -14,6 +14,7 @@ import type {
   DeviceStatus,
   LockIndicatorSnapshot,
 } from '../types';
+import { toDeviceListDragId } from '../features/devices/dragIds';
 import { resolveLockDisplay, resolveRelockTag } from '../features/locks/lockState';
 
 const emptyForm = {
@@ -24,6 +25,16 @@ const emptyForm = {
   password: 'root',
 };
 
+export type DeviceSortMode = 'manual' | 'name' | 'host' | 'connected' | 'lock';
+
+const DEVICE_SORT_OPTIONS: { value: DeviceSortMode; label: string }[] = [
+  { value: 'manual', label: 'Manual' },
+  { value: 'name', label: 'Name' },
+  { value: 'host', label: 'Host/IP' },
+  { value: 'connected', label: 'Connected' },
+  { value: 'lock', label: 'Lock state' },
+];
+
 type DeviceListProps = {
   devices: Device[];
   statuses: Record<string, DeviceStatus | undefined>;
@@ -32,6 +43,8 @@ type DeviceListProps = {
   autoRelockBusyKeys?: Record<string, boolean>;
   activeKeys: string[];
   canAddToGroup: boolean;
+  sortMode: DeviceSortMode;
+  onSortModeChange: (mode: DeviceSortMode) => void;
   onCollapse: () => void;
   onAddToGroup: (key: string) => void;
   onToggleAutoRelock: (key: string, enabled: boolean) => void;
@@ -52,6 +65,7 @@ type SortableDeviceCardProps = {
   autoRelockBusy: boolean;
   inActiveGroup: boolean;
   canAddToGroup: boolean;
+  sortable: boolean;
   onEdit: (device: Device) => void;
   onDelete: (key: string) => Promise<void>;
   onAddToGroup: (key: string) => void;
@@ -70,6 +84,7 @@ function SortableDeviceCard({
   autoRelockBusy,
   inActiveGroup,
   canAddToGroup,
+  sortable,
   onEdit,
   onDelete,
   onAddToGroup,
@@ -87,7 +102,8 @@ function SortableDeviceCard({
     transition,
     isDragging,
   } = useSortable({
-    id: device.key,
+    id: toDeviceListDragId(device.key),
+    disabled: !sortable,
     transition: {
       duration: 180,
       easing: 'cubic-bezier(0.2, 0, 0, 1)',
@@ -140,8 +156,9 @@ function SortableDeviceCard({
         style={cardStyle}
         className="device-card-sortable"
         data-dragging={isDragging ? 'true' : undefined}
-        {...attributes}
-        {...listeners}
+        data-sortable={sortable ? 'true' : 'false'}
+        {...(sortable ? attributes : {})}
+        {...(sortable ? listeners : {})}
       >
         <Group justify="space-between" align="center">
           <div>
@@ -264,6 +281,8 @@ export function DeviceList({
   autoRelockBusyKeys,
   activeKeys,
   canAddToGroup,
+  sortMode,
+  onSortModeChange,
   onCollapse,
   onAddToGroup,
   onToggleAutoRelock,
@@ -280,6 +299,7 @@ export function DeviceList({
   const [form, setForm] = useState({ ...emptyForm });
   const [shutdownDevice, setShutdownDevice] = useState<Device | null>(null);
   const activeSet = useMemo(() => new Set(activeKeys), [activeKeys]);
+  const sortable = sortMode === 'manual';
   const connectableDevices = useMemo(
     () => devices.filter((device) => {
       const status = statuses[device.key];
@@ -377,8 +397,20 @@ export function DeviceList({
           </ActionIcon>
         </Group>
       </Group>
+      <Select
+        size="xs"
+        label="Sort"
+        value={sortMode}
+        data={DEVICE_SORT_OPTIONS}
+        onChange={(value) => {
+          if (value) onSortModeChange(value as DeviceSortMode);
+        }}
+      />
       <Stack gap="xs" className="device-list-scroll">
-        <SortableContext items={devices.map((device) => device.key)} strategy={verticalListSortingStrategy}>
+        <SortableContext
+          items={devices.map((device) => toDeviceListDragId(device.key))}
+          strategy={verticalListSortingStrategy}
+        >
           {devices.map((device) => (
             <SortableDeviceCard
               key={device.key}
@@ -389,6 +421,7 @@ export function DeviceList({
               autoRelockBusy={Boolean(autoRelockBusyKeys?.[device.key])}
               inActiveGroup={activeSet.has(device.key)}
               canAddToGroup={canAddToGroup}
+              sortable={sortable}
               onEdit={openEdit}
               onDelete={onDelete}
               onAddToGroup={onAddToGroup}

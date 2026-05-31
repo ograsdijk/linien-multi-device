@@ -57,6 +57,8 @@ export const api = {
     request<DeviceGroup>('/groups', { method: 'POST', body: JSON.stringify(payload) }),
   updateGroup: (key: string, payload: Partial<DeviceGroup>) =>
     request<DeviceGroup>(`/groups/${key}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  reorderGroups: (keys: string[]) =>
+    request<DeviceGroup[]>('/groups/order', { method: 'PUT', body: JSON.stringify({ keys }) }),
   deleteGroup: (key: string) => request(`/groups/${key}`, { method: 'DELETE' }),
   connectDevice: (key: string) => request(`/devices/${key}/connect`, { method: 'POST' }),
   startServer: (key: string) => request(`/devices/${key}/control/start_server`, { method: 'POST' }),

@@ -93,6 +93,10 @@ body {
   transition: box-shadow 160ms ease, filter 160ms ease;
 }
 
+.device-card-sortable[data-sortable='false'] {
+  cursor: default;
+}
+
 .device-card-sortable:active {
   cursor: grabbing;
 }
@@ -453,6 +457,33 @@ body {
   padding: 12px;
   min-width: 0;
   overflow: hidden;
+}
+
+.device-card[data-dragging='true'] {
+  opacity: 0.35;
+}
+
+.group-device-card {
+  position: relative;
+  padding-top: 34px;
+}
+
+.group-card-drag-handle {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  border: 1px solid var(--panel-border);
+  background: var(--tag-bg);
+  color: var(--tag-text);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: grab;
+}
+
+.group-card-drag-handle:active {
+  cursor: grabbing;
 }
 
 .empty-group {

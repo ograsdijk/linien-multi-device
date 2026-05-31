@@ -143,6 +143,16 @@ export const useDeviceCatalog = () => {
     setGroups((prev) => prev.map((item) => (item.key === updated.key ? updated : item)));
   };
 
+  const reorderGroupDevices = useCallback(async (groupKey: string, deviceKeys: string[]) => {
+    const updated = await api.updateGroup(groupKey, { device_keys: deviceKeys });
+    setGroups((prev) => prev.map((item) => (item.key === updated.key ? updated : item)));
+  }, []);
+
+  const reorderGroups = useCallback(async (groupKeys: string[]) => {
+    const updated = await api.reorderGroups(groupKeys);
+    setGroups(updated);
+  }, []);
+
   const openDeviceGroup = useCallback((deviceKey: string) => {
     const match = groups.find((group) => group.device_keys.includes(deviceKey));
     if (match) {
@@ -224,6 +234,8 @@ export const useDeviceCatalog = () => {
     saveGroup,
     addDeviceToGroup,
     removeDeviceFromGroup,
+    reorderGroupDevices,
+    reorderGroups,
     openDeviceGroup,
     reorderDevices,
     setDeviceOrderKeys,
