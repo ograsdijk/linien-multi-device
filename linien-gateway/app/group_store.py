@@ -170,6 +170,25 @@ def delete_group(key: str, path=GROUPS_PATH) -> None:
         save_groups(groups, path=path)
 
 
+def reorder_groups(keys: List[str], path=GROUPS_PATH) -> List[Group]:
+    with _GROUPS_LOCK:
+        groups = load_groups(path=path)
+        by_key = {group.key: group for group in groups}
+        ordered: list[Group] = []
+        seen: set[str] = set()
+        for key in keys:
+            group = by_key.get(key)
+            if group is None or key in seen:
+                continue
+            ordered.append(group)
+            seen.add(key)
+        for group in groups:
+            if group.key not in seen:
+                ordered.append(group)
+        save_groups(ordered, path=path)
+        return ordered
+
+
 def add_device_to_auto_groups(device_key: str, path=GROUPS_PATH) -> None:
     with _GROUPS_LOCK:
         groups = load_groups(path=path)

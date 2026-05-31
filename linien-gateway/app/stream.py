@@ -4,11 +4,14 @@ import asyncio
 import contextlib
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
 from fastapi import WebSocket
+
+from .plot_processing import SUMMARY_SERIES_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +19,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ConnectionState:
     max_fps: float | None = None
+    detail: str = "full"
     last_plot: float = 0.0
     reliable_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     latest_plot_message: Dict[str, Any] | None = None
@@ -33,6 +37,7 @@ class WebsocketManager:
         reliable_queue_size: int = 256,
     ) -> None:
         self._connections: Dict[str, Dict[WebSocket, ConnectionState]] = {}
+        self._connections_lock = threading.RLock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._default_plot_fps = self._normalize_positive_fps(default_plot_fps)
         self._max_plot_fps_cap = self._normalize_positive_fps(max_plot_fps_cap)
@@ -53,6 +58,7 @@ class WebsocketManager:
         device_key: str,
         websocket: WebSocket,
         max_fps: float | None = None,
+        detail: str = "full",
         *,
         accept: bool = True,
     ) -> None:
@@ -60,20 +66,23 @@ class WebsocketManager:
             await websocket.accept()
         state = ConnectionState(
             max_fps=self._resolve_max_fps(max_fps),
+            detail=self._normalize_detail(detail),
             reliable_queue=asyncio.Queue(maxsize=self._reliable_queue_size),
         )
         state.sender_task = asyncio.create_task(
             self._sender_loop(device_key, websocket, state)
         )
-        self._connections.setdefault(device_key, {})[websocket] = state
+        with self._connections_lock:
+            self._connections.setdefault(device_key, {})[websocket] = state
 
     async def unregister(self, device_key: str, websocket: WebSocket) -> None:
-        connections = self._connections.get(device_key)
-        if connections is None:
-            return
-        state = connections.pop(websocket, None)
-        if not connections:
-            self._connections.pop(device_key, None)
+        with self._connections_lock:
+            connections = self._connections.get(device_key)
+            if connections is None:
+                return
+            state = connections.pop(websocket, None)
+            if not connections:
+                self._connections.pop(device_key, None)
         if state is None:
             return
         sender_task = state.sender_task
@@ -88,18 +97,21 @@ class WebsocketManager:
             await sender_task
 
     async def broadcast(self, device_key: str, message: Dict[str, Any]) -> None:
-        if device_key not in self._connections:
+        with self._connections_lock:
+            connections = list(self._connections.get(device_key, {}).items())
+        if not connections:
             return
         stale: list[WebSocket] = []
-        now = time.monotonic()
-        for websocket, state in list(self._connections[device_key].items()):
-            if message.get("type") == "plot_frame":
+        is_plot_frame = message.get("type") == "plot_frame"
+        for websocket, state in connections:
+            if is_plot_frame:
                 if state.max_fps:
                     min_dt = 1.0 / state.max_fps
+                    now = time.monotonic()
                     if now - state.last_plot < min_dt:
                         continue
                     state.last_plot = now
-                self._enqueue_plot_frame(state, message)
+                self._enqueue_plot_frame(state, self.filter_plot_frame(message, state.detail))
                 state.wake_event.set()
                 continue
             try:
@@ -109,6 +121,25 @@ class WebsocketManager:
                 stale.append(websocket)
         for websocket in stale:
             await self.unregister(device_key, websocket)
+
+    def peek_required_detail(self, device_key: str) -> str | None:
+        """Return the highest detail level required by any current subscriber.
+
+        Pure read: snapshots the current connection set and returns "full" if
+        any subscriber needs full detail, "summary" if only summary subscribers
+        exist, or None if there are no subscribers. Does NOT mutate any
+        per-connection state — it is a hint used by producers to decide
+        whether to publish at all. Per-subscriber fps throttling and detail
+        filtering happen in `broadcast`.
+        """
+        with self._connections_lock:
+            connections = list(self._connections.get(device_key, {}).values())
+        if not connections:
+            return None
+        for state in connections:
+            if state.detail == "full":
+                return "full"
+        return "summary"
 
     def publish(self, device_key: str, message: Dict[str, Any]) -> None:
         if self._loop is None:
@@ -176,6 +207,26 @@ class WebsocketManager:
             return
         if state.latest_plot_message is None:
             state.latest_plot_message = message
+
+    @staticmethod
+    def filter_plot_frame(message: Dict[str, Any], detail: str) -> Dict[str, Any]:
+        if detail == "full":
+            return message
+        series = message.get("series")
+        if not isinstance(series, dict):
+            return message
+        return {
+            **message,
+            "series": {
+                key: value
+                for key, value in series.items()
+                if key in SUMMARY_SERIES_KEYS
+            },
+        }
+
+    @staticmethod
+    def _normalize_detail(value: str | None) -> str:
+        return "summary" if value == "summary" else "full"
 
     def _resolve_max_fps(self, requested: float | None) -> float | None:
         fps = self._normalize_positive_fps(requested)

@@ -933,7 +933,7 @@ class DeviceSession:
                 self._relock_action_lock.release()
 
         with self._state_lock:
-            frame = build_plot_frame(to_plot, params, self.plot_state)
+            frame = build_plot_frame(to_plot, params, self.plot_state, detail="full")
             if frame is None:
                 return
             frame_lock_indicator = self.lock_indicator.update(
@@ -970,7 +970,11 @@ class DeviceSession:
             ),
         )
         self._emit_auto_relock_state_transition_log(auto_relock_status)
-        self.manager.publish(self.device.key, frame)
+
+        required_detail = self.manager.peek_required_detail(self.device.key)
+        auto_relock_enabled = bool(auto_relock_status.get("enabled"))
+        if required_detail is not None or auto_relock_enabled:
+            self.manager.publish(self.device.key, frame)
 
     def snapshot(self) -> Dict[str, Any]:
         params_snapshot, plot_frame_snapshot, _, _ = self._snapshot_cached_state()

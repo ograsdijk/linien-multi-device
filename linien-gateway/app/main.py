@@ -41,6 +41,7 @@ from .schemas import (
     DeviceOut,
     DevicePatch,
     GroupIn,
+    GroupOrderUpdate,
     GroupOut,
     GroupPatch,
     InfluxCredentials,
@@ -256,6 +257,15 @@ def _persist_influx_logging_state(device: Device, value: dict) -> None:
     device_store.save_device(device)
 
 
+def _group_out(group: group_store.Group) -> GroupOut:
+    return GroupOut(
+        key=group.key,
+        name=group.name,
+        device_keys=group.device_keys,
+        auto_include=group.auto_include,
+    )
+
+
 def _publish_status_update(device_key: str, session: DeviceSession) -> None:
     manager.publish(
         device_key,
@@ -392,15 +402,7 @@ def delete_device(key: str) -> dict:
 def list_groups() -> List[GroupOut]:
     devices = device_store.list_devices()
     groups = group_store.list_groups([device.key for device in devices])
-    return [
-        GroupOut(
-            key=group.key,
-            name=group.name,
-            device_keys=group.device_keys,
-            auto_include=group.auto_include,
-        )
-        for group in groups
-    ]
+    return [_group_out(group) for group in groups]
 
 
 @app.post("/api/groups", response_model=GroupOut)
@@ -411,12 +413,13 @@ def create_group(payload: GroupIn) -> GroupOut:
     group = group_store.create_group(
         payload.name, device_keys, auto_include=payload.auto_include
     )
-    return GroupOut(
-        key=group.key,
-        name=group.name,
-        device_keys=group.device_keys,
-        auto_include=group.auto_include,
-    )
+    return _group_out(group)
+
+
+@app.put("/api/groups/order", response_model=List[GroupOut])
+def reorder_groups(payload: GroupOrderUpdate) -> List[GroupOut]:
+    groups = group_store.reorder_groups(payload.keys)
+    return [_group_out(group) for group in groups]
 
 
 @app.patch("/api/groups/{key}", response_model=GroupOut)
@@ -431,12 +434,7 @@ def update_group(key: str, payload: GroupPatch) -> GroupOut:
         group = group_store.update_group(key, **data)
     except KeyError:
         raise HTTPException(status_code=404, detail="Group not found")
-    return GroupOut(
-        key=group.key,
-        name=group.name,
-        device_keys=group.device_keys,
-        auto_include=group.auto_include,
-    )
+    return _group_out(group)
 
 
 @app.delete("/api/groups/{key}")
@@ -931,6 +929,9 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
         session = _get_session(key)
         snapshot = session.snapshot()
     max_fps = None
+    detail = websocket.query_params.get("detail") or "full"
+    if detail not in {"summary", "full"}:
+        detail = "full"
     raw_max = websocket.query_params.get("max_fps")
     if raw_max is not None:
         try:
@@ -957,12 +958,13 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
         ):
             return
     if snapshot.get("plot_frame") is not None:
-        if not await safe_send(snapshot["plot_frame"]):
+        plot_frame = manager.filter_plot_frame(snapshot["plot_frame"], detail)
+        if not await safe_send(plot_frame):
             return
     if not await safe_send({"type": "status", **snapshot.get("status", {})}):
         return
 
-    await manager.register(key, websocket, max_fps=max_fps, accept=False)
+    await manager.register(key, websocket, max_fps=max_fps, detail=detail, accept=False)
 
     try:
         while True:

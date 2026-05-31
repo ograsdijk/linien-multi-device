@@ -9,6 +9,7 @@ from app.group_store import (
     list_groups,
     load_groups,
     remove_device_from_groups,
+    reorder_groups,
     save_groups,
     update_group,
 )
@@ -105,6 +106,23 @@ def test_group_crud_helpers_roundtrip_with_explicit_path(tmp_path: Path):
     delete_group(created.key, path=path)
 
     assert load_groups(path=path) == []
+
+
+def test_reorder_groups_preserves_omitted_and_ignores_unknown(tmp_path: Path):
+    path = tmp_path / "groups.json"
+    save_groups(
+        [
+            Group(key="a", name="A"),
+            Group(key="b", name="B"),
+            Group(key="c", name="C"),
+        ],
+        path=path,
+    )
+
+    reordered = reorder_groups(["c", "missing", "a", "c"], path=path)
+
+    assert [group.key for group in reordered] == ["c", "a", "b"]
+    assert [group.key for group in load_groups(path=path)] == ["c", "a", "b"]
 
 
 def test_concurrent_auto_group_writes_do_not_corrupt_file(tmp_path: Path):

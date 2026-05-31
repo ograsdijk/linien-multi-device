@@ -188,6 +188,11 @@ class GroupPatch(BaseModel):
     auto_include: Optional[bool] = None
 
 
+class GroupOrderUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    keys: list[str] = Field(default_factory=list)
+
+
 class PostgresManualLockConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False

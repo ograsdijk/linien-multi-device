@@ -17,6 +17,20 @@ from linien_common.common import (
 
 V = 8192
 
+# Source of truth for the series keys that `build_plot_frame` populates when
+# called with detail="summary". `stream.filter_plot_frame` MUST use this same
+# set when stripping a full-detail broadcast down to summary form; the two
+# code paths must agree on which series a summary subscriber receives.
+SUMMARY_SERIES_KEYS: frozenset[str] = frozenset(
+    {
+        "combined_error",
+        "control_signal",
+        "error_signal_1",
+        "error_signal_2",
+        "monitor_signal",
+    }
+)
+
 
 @dataclass
 class PlotState:
@@ -124,10 +138,12 @@ def build_plot_frame(
     to_plot: Dict[str, np.ndarray],
     params: Dict[str, Any],
     state: PlotState,
+    detail: str = "full",
 ) -> Optional[Dict[str, Any]]:
     if to_plot is None:
         return None
     lock = bool(params.get("lock"))
+    full_detail = detail != "summary"
     if state.last_lock_state is None or state.last_lock_state != lock:
         state.error_std_history = []
         state.control_std_history = []
@@ -162,33 +178,34 @@ def build_plot_frame(
         if control_signal is not None:
             series["control_signal"] = (control_signal / V).tolist()
 
-        control_times = scale_history_times(
-            state.control_history["times"], timescale
-        )
-        control_series = history_to_series(
-            control_times, state.control_history["values"]
-        )
-        series["control_signal_history"] = [
-            (v / V) if v is not None else None for v in control_series
-        ]
-
-        if params.get("pid_on_slow_enabled"):
-            slow_series = history_to_series(
-                scale_history_times(state.control_history["slow_times"], timescale),
-                state.control_history["slow_values"],
+        if full_detail:
+            control_times = scale_history_times(
+                state.control_history["times"], timescale
             )
-            series["slow_history"] = [
-                (v / V) if v is not None else None for v in slow_series
+            control_series = history_to_series(
+                control_times, state.control_history["values"]
+            )
+            series["control_signal_history"] = [
+                (v / V) if v is not None else None for v in control_series
             ]
 
-        if not params.get("dual_channel"):
-            monitor_series = history_to_series(
-                scale_history_times(state.monitor_history["times"], timescale),
-                state.monitor_history["values"],
-            )
-            series["monitor_signal_history"] = [
-                (v / V) if v is not None else None for v in monitor_series
-            ]
+            if params.get("pid_on_slow_enabled"):
+                slow_series = history_to_series(
+                    scale_history_times(state.control_history["slow_times"], timescale),
+                    state.control_history["slow_values"],
+                )
+                series["slow_history"] = [
+                    (v / V) if v is not None else None for v in slow_series
+                ]
+
+            if not params.get("dual_channel"):
+                monitor_series = history_to_series(
+                    scale_history_times(state.monitor_history["times"], timescale),
+                    state.monitor_history["values"],
+                )
+                series["monitor_signal_history"] = [
+                    (v / V) if v is not None else None for v in monitor_series
+                ]
     else:
         dual_channel = bool(params.get("dual_channel"))
         monitor_signal = to_plot.get("monitor_signal")
@@ -228,7 +245,7 @@ def build_plot_frame(
 
         modulation_frequency = float(params.get("modulation_frequency", 0))
         pid_only_mode = bool(params.get("pid_only_mode"))
-        if modulation_frequency != 0 and not pid_only_mode:
+        if full_detail and modulation_frequency != 0 and not pid_only_mode:
             error_1_quadrature = to_plot.get("error_signal_1_quadrature")
             error_2_quadrature = to_plot.get("error_signal_2_quadrature")
 
