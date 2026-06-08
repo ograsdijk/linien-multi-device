@@ -39,7 +39,8 @@ node_modules/
 .pnp.*
 
 # Vite / React
-linien-web/dist/
+!linien-web/dist/
+!linien-web/dist/**
 linien-web/.vite/
 
 # Gateway build artifacts
