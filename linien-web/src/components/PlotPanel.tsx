@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { PlotFrame } from '../types';
@@ -19,7 +19,11 @@ type PlotPanelProps = {
   showManualTarget?: boolean;
 };
 
-type PlotData = [number[], ...Array<Array<number | null>>];
+// uPlot accepts typed arrays as well as plain arrays. We use Float64Array
+// for both x and series data so we can reuse pre-allocated buffers across
+// plot frames and avoid the per-frame allocation of thousands of
+// `Array<number | null>` slots.
+type PlotData = [Float64Array, ...Float64Array[]];
 
 const SERIES_KEYS = [
   'combined_error',
@@ -92,22 +96,17 @@ const SERIES_STYLE: Record<
 };
 
 const POINT_STYLE: uPlot.Series.Points = { show: false };
-const X_CACHE = new Map<number, number[]>();
-const NULL_SERIES_CACHE = new Map<number, Array<number | null>>();
+// Shared monotonic x-axis buffer pool keyed by point count. uPlot accepts
+// typed arrays in `setData`, so we can hand out the same buffer for every
+// PlotPanel sharing the same point count without copying.
+const X_BUFFER_CACHE = new Map<number, Float64Array>();
 
-const getXValues = (count: number) => {
-  const cached = X_CACHE.get(count);
+const getXBuffer = (count: number): Float64Array => {
+  const cached = X_BUFFER_CACHE.get(count);
   if (cached) return cached;
-  const values = Array.from({ length: count }, (_, i) => i);
-  X_CACHE.set(count, values);
-  return values;
-};
-
-const getNullSeries = (count: number) => {
-  const cached = NULL_SERIES_CACHE.get(count);
-  if (cached) return cached;
-  const values = Array<number | null>(count).fill(null);
-  NULL_SERIES_CACHE.set(count, values);
+  const values = new Float64Array(count);
+  for (let i = 0; i < count; i++) values[i] = i;
+  X_BUFFER_CACHE.set(count, values);
   return values;
 };
 
@@ -117,27 +116,91 @@ const toFinite = (value: unknown): number | null => {
   return Number.isFinite(num) ? num : null;
 };
 
-const normalizeSeries = (value: unknown): Array<number | null> => {
+// Coerce a single value to a finite number or NaN. Used by the buffer
+// writer below; we use NaN as the "no point" marker because uPlot's
+// `spanGaps: true` treats NaN as a gap, matching the previous behaviour
+// of `null` entries in plain arrays.
+const coerceToFiniteOrNaN = (v: unknown): number => {
+  if (v == null) return NaN;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : NaN;
+  const num = Number(v);
+  return Number.isFinite(num) ? num : NaN;
+};
+
+// Write `value` into the first `count` slots of `out`, returning whether
+// any finite point was written. The destination buffer is reused across
+// frames, so the hot path is now a single tight numeric loop with no
+// allocations beyond the buffer itself.
+const writeSeriesInto = (
+  out: Float64Array,
+  count: number,
+  value: unknown
+): boolean => {
+  let hasFinite = false;
   if (Array.isArray(value)) {
-    return value.map((v) => toFinite(v));
+    const len = Math.min(value.length, count);
+    for (let i = 0; i < len; i++) {
+      const num = coerceToFiniteOrNaN(value[i]);
+      out[i] = num;
+      if (!hasFinite && num === num) hasFinite = true;
+    }
+    for (let i = len; i < count; i++) out[i] = NaN;
+    return hasFinite;
   }
   if (ArrayBuffer.isView(value)) {
-    if ('length' in value) {
-      const typed = value as unknown as ArrayLike<number>;
-      return Array.from(typed, (v) => toFinite(v));
+    const typed = value as unknown as ArrayLike<number>;
+    const len = Math.min(typed.length, count);
+    for (let i = 0; i < len; i++) {
+      const v = typed[i];
+      if (Number.isFinite(v)) {
+        out[i] = v;
+        hasFinite = true;
+      } else {
+        out[i] = NaN;
+      }
     }
-    return [];
+    for (let i = len; i < count; i++) out[i] = NaN;
+    return hasFinite;
   }
   if (value && typeof value === 'object') {
+    // Slow path: object with numeric-string keys (rare in practice but
+    // kept for compatibility with legacy payloads).
     const entries = Object.entries(value as Record<string, unknown>)
       .filter(([key]) => String(Number(key)) === key)
       .sort((a, b) => Number(a[0]) - Number(b[0]));
     if (entries.length > 0) {
-      return entries.map(([, v]) => toFinite(v));
+      const len = Math.min(entries.length, count);
+      for (let i = 0; i < len; i++) {
+        const num = coerceToFiniteOrNaN(entries[i][1]);
+        out[i] = num;
+        if (!hasFinite && num === num) hasFinite = true;
+      }
+      for (let i = len; i < count; i++) out[i] = NaN;
+      return hasFinite;
     }
-    return Object.values(value as Record<string, unknown>).map((v) => toFinite(v));
+    const values = Object.values(value as Record<string, unknown>);
+    const len = Math.min(values.length, count);
+    for (let i = 0; i < len; i++) {
+      const num = coerceToFiniteOrNaN(values[i]);
+      out[i] = num;
+      if (!hasFinite && num === num) hasFinite = true;
+    }
+    for (let i = len; i < count; i++) out[i] = NaN;
+    return hasFinite;
   }
-  return [];
+  for (let i = 0; i < count; i++) out[i] = NaN;
+  return false;
+};
+
+const seriesArrayLength = (value: unknown): number => {
+  if (Array.isArray(value)) return value.length;
+  if (ArrayBuffer.isView(value) && 'length' in (value as object)) {
+    return (value as unknown as ArrayLike<number>).length;
+  }
+  if (value && typeof value === 'object') {
+    return Object.keys(value as Record<string, unknown>).length;
+  }
+  return 0;
 };
 
 const SERIES_INDEX = SERIES_KEYS.reduce((acc, key, idx) => {
@@ -222,6 +285,30 @@ export function PlotPanel({
     onSelectRange?: PlotPanelProps['onSelectRange'];
   }>({ mode: selectionMode, onSelectRange });
 
+  // Per-PlotPanel reusable typed-array buffers for series data. Allocated
+  // once at N_POINTS and grown only if a frame ever exceeds that count
+  // (effectively never in practice). The same Float64Array is handed to
+  // uPlot every frame, mutated in place by `writeSeriesInto`; uPlot reads
+  // it on the next batch+setData call.
+  const seriesBuffersRef = useRef<Float64Array[]>(
+    SERIES_KEYS.map(() => new Float64Array(N_POINTS))
+  );
+  const hasDataByKeyRef = useRef<Record<SeriesKey, boolean>>(
+    SERIES_KEYS.reduce((acc, key) => {
+      acc[key] = false;
+      return acc;
+    }, {} as Record<SeriesKey, boolean>)
+  );
+  // Track the last visibility configuration applied to uPlot so we can
+  // skip the per-frame setSeries loop and legend DOM walk when nothing
+  // visibility-related actually changed (the common case during steady
+  // streaming).
+  const lastVisibilityRef = useRef<{
+    lockAxis: boolean | null;
+    dual: boolean | null;
+    hasDataKey: string;
+  }>({ lockAxis: null, dual: null, hasDataKey: '' });
+
   useEffect(() => {
     if (selectionMode === null) {
       setFrozenFrame(null);
@@ -235,60 +322,74 @@ export function PlotPanel({
   const sweepCenterValue = toFinite(sweepCenter) ?? 0;
   const sweepAmplitudeValue = toFinite(sweepAmplitude) ?? 1;
 
-  const { data, pointCount } = useMemo<{ data: PlotData; pointCount: number }>(() => {
-    const seriesRaw = SERIES_KEYS.map((key) => normalizeSeries(activePlotFrame?.series?.[key]));
-    if (!lockAxis) {
-      const combinedIdx = SERIES_KEYS.indexOf('combined_error');
-      const errIdx = SERIES_KEYS.indexOf('error_signal_1');
-      if (seriesRaw[errIdx] && seriesRaw[errIdx].length > 0) {
-        seriesRaw[combinedIdx] = seriesRaw[errIdx];
-      }
+  // Compute point count as a pure derivation. Buffer writes happen in
+  // the commit-phase effect below so we do not mutate refs during render
+  // (which is unsafe under React 18 concurrent rendering / StrictMode
+  // double-invocation, where a render may be discarded and the next
+  // render would observe ref state inconsistent with the data uPlot
+  // actually has).
+  const pointCount = useMemo(() => {
+    const series = activePlotFrame?.series;
+    let maxLen = 0;
+    for (const key of SERIES_KEYS) {
+      const len = seriesArrayLength(series?.[key]);
+      if (len > maxLen) maxLen = len;
     }
-    const maxLen = Math.max(...seriesRaw.map((series) => series.length), 0);
-    const count = maxLen > 0 ? maxLen : N_POINTS;
-    const x = getXValues(count);
-    const seriesData = seriesRaw.map((series) => {
-      if (series.length === count) {
-        return series;
-      }
-      if (series.length > 0) {
-        return Array.from({ length: count }, (_, idx) => series[idx] ?? null);
-      }
-      return getNullSeries(count);
-    });
-    return { data: [x, ...seriesData], pointCount: count };
-  }, [activePlotFrame, lockAxis]);
+    return maxLen > 0 ? maxLen : N_POINTS;
+  }, [activePlotFrame]);
 
   useEffect(() => {
     pointCountRef.current = pointCount;
   }, [pointCount]);
 
+  // Hold the inputs that the axis/cursor formatters depend on in refs so
+  // the formatters themselves can be stable across renders. Without this,
+  // every sweep-center adjustment OR per-frame `pointCount` change would
+  // invalidate the formatters and trigger an extra
+  // `u.redraw(false, true)` outside the data update path.
+  const axisInputsRef = useRef({
+    lockAxis,
+    sweepCenterValue,
+    sweepAmplitudeValue,
+    pointCount,
+  });
+  useEffect(() => {
+    axisInputsRef.current = {
+      lockAxis,
+      sweepCenterValue,
+      sweepAmplitudeValue,
+      pointCount,
+    };
+  }, [lockAxis, sweepCenterValue, sweepAmplitudeValue, pointCount]);
+
   const axisValues = useMemo(() => {
     const dtMicroSeconds = (DECIMATION / ADC_SAMPLE_RATE) * 1e6;
     return (_u: uPlot, ticks: number[]) => {
-      if (lockAxis) {
+      const inputs = axisInputsRef.current;
+      if (inputs.lockAxis) {
         return ticks.map((v) => (v * dtMicroSeconds).toFixed(1));
       }
-      const min = sweepCenterValue - sweepAmplitudeValue;
-      const max = sweepCenterValue + sweepAmplitudeValue;
-      const spacing = (max - min) / (Math.max(pointCount, 2) - 1);
+      const min = inputs.sweepCenterValue - inputs.sweepAmplitudeValue;
+      const max = inputs.sweepCenterValue + inputs.sweepAmplitudeValue;
+      const spacing = (max - min) / (Math.max(inputs.pointCount, 2) - 1);
       return ticks.map((v) => (min + v * spacing).toFixed(2));
     };
-  }, [lockAxis, sweepCenterValue, sweepAmplitudeValue, pointCount]);
+  }, []);
 
   const xValueFormatter = useMemo(() => {
     const dtMicroSeconds = (DECIMATION / ADC_SAMPLE_RATE) * 1e6;
     return (_u: uPlot, val: number) => {
       if (!Number.isFinite(val)) return '';
-      if (lockAxis) {
+      const inputs = axisInputsRef.current;
+      if (inputs.lockAxis) {
         return `${(val * dtMicroSeconds).toFixed(2)} us`;
       }
-      const min = sweepCenterValue - sweepAmplitudeValue;
-      const max = sweepCenterValue + sweepAmplitudeValue;
-      const spacing = (max - min) / (Math.max(pointCount, 2) - 1);
+      const min = inputs.sweepCenterValue - inputs.sweepAmplitudeValue;
+      const max = inputs.sweepCenterValue + inputs.sweepAmplitudeValue;
+      const spacing = (max - min) / (Math.max(inputs.pointCount, 2) - 1);
       return `${(min + val * spacing).toFixed(3)} V`;
     };
-  }, [lockAxis, sweepCenterValue, sweepAmplitudeValue, pointCount]);
+  }, []);
 
   const axisLabel = lockAxis ? 'time (us)' : 'sweep voltage (V)';
 
@@ -486,8 +587,16 @@ export function PlotPanel({
       },
     };
 
-    uplotRef.current = new uPlot(opts, data, container);
-    uplotRef.current.setData(data, true);
+    // Initial data: the existing typed-array buffers (filled with NaN
+    // until the first frame arrives). The layout effect that owns the
+    // data path will call setData with the real frame contents on its
+    // first run.
+    const initialData = [
+      getXBuffer(N_POINTS),
+      ...seriesBuffersRef.current,
+    ] as unknown as PlotData;
+    uplotRef.current = new uPlot(opts, initialData, container);
+    uplotRef.current.setData(initialData, true);
     handleResize();
 
     const applyAxisTheme = () => {
@@ -524,14 +633,56 @@ export function PlotPanel({
     };
   }, []);
 
-  useEffect(() => {
+  // Single commit-phase effect that owns:
+  //  1. Filling the reusable typed-array series buffers from the latest
+  //     plot frame.
+  //  2. Recomputing `hasDataByKey` and applying visibility/legend
+  //     changes (only when actually changed).
+  //  3. Calling uPlot setData/setScale.
+  //
+  // Doing this in `useLayoutEffect` (not `useMemo` during render)
+  // ensures we never mutate refs in a render that React may discard
+  // under concurrent rendering. uPlot then sees state consistent with
+  // what we actually committed.
+  useLayoutEffect(() => {
     if (!uplotRef.current) return;
-    const hasDataByKey = SERIES_KEYS.reduce((acc, key, idx) => {
-      const values = data[idx + 1];
-      const hasFinite = values.some((v) => typeof v === 'number' && Number.isFinite(v));
-      acc[key] = hasFinite;
-      return acc;
-    }, {} as Record<SeriesKey, boolean>);
+    const buffers = seriesBuffersRef.current;
+    const hasDataByKey = hasDataByKeyRef.current;
+    const series = activePlotFrame?.series;
+    const count = pointCount;
+
+    // Grow buffers only if a longer frame arrives. Capacity stays
+    // monotonic so a single jumbo frame doesn't permanently inflate
+    // memory across all PlotPanels (each panel only grows its own).
+    for (let i = 0; i < buffers.length; i++) {
+      if (buffers[i].length < count) {
+        buffers[i] = new Float64Array(count);
+      }
+    }
+
+    SERIES_KEYS.forEach((key, idx) => {
+      hasDataByKey[key] = writeSeriesInto(buffers[idx], count, series?.[key]);
+    });
+
+    // When the time axis is in sweep-voltage mode, alias combined_error
+    // to error_signal_1 if the latter has data — mirrors the previous
+    // behavior of swapping the raw array.
+    if (!lockAxis) {
+      const combinedIdx = SERIES_KEYS.indexOf('combined_error');
+      const errIdx = SERIES_KEYS.indexOf('error_signal_1');
+      if (hasDataByKey.error_signal_1) {
+        const src = buffers[errIdx];
+        if (buffers[combinedIdx].length < count) {
+          buffers[combinedIdx] = new Float64Array(count);
+        }
+        const target = buffers[combinedIdx];
+        for (let i = 0; i < count; i++) target[i] = src[i];
+        hasDataByKey.combined_error = hasDataByKey.error_signal_1;
+      }
+    }
+
+    const x = getXBuffer(count);
+    const plotData = [x, ...buffers] as unknown as PlotData;
 
     const dual = Boolean(activePlotFrame?.dual_channel);
     const desiredVisibility: Record<SeriesKey, boolean> = {
@@ -577,43 +728,64 @@ export function PlotPanel({
       hasDataByKey.error_signal_2 &&
       (userShowRef.current[error2Idx] ?? true);
 
+    // Fingerprint the visibility-affecting inputs so we can short-circuit
+    // the per-frame setSeries loop and legend DOM walk when only the
+    // series numeric contents changed.
+    let hasDataKey = '';
+    for (const key of SERIES_KEYS) {
+      hasDataKey += hasDataByKey[key] ? '1' : '0';
+    }
+    const last = lastVisibilityRef.current;
+    const visibilityChanged =
+      last.lockAxis !== lockAxis ||
+      last.dual !== dual ||
+      last.hasDataKey !== hasDataKey;
+
     uplotRef.current.batch((u: uPlot) => {
-      suppressSeriesEventRef.current = true;
-      SERIES_KEYS.forEach((key, idx) => {
-        const seriesIdx = idx + 1;
-        let show = desiredVisibility[key] && hasDataByKey[key];
-        if (show) {
-          show = userShowRef.current[seriesIdx] ?? true;
-        }
-        if (key === 'signal_strength_a_upper' || key === 'signal_strength_a_lower') {
-          show = desiredVisibility[key] && hasDataByKey[key] && error1Visible;
-        }
-        if (key === 'signal_strength_b_upper' || key === 'signal_strength_b_lower') {
-          show = desiredVisibility[key] && hasDataByKey[key] && error2Visible;
-        }
-        u.setSeries(seriesIdx, { show }, false);
-      });
-      suppressSeriesEventRef.current = false;
-      u.setData(data, true);
-      u.setScale('x', { min: 0, max: Math.max(pointCount - 1, 1) });
-      const rows = u.root.querySelectorAll<HTMLElement>('.u-legend .u-series');
-      rows.forEach((row: HTMLElement, rowIdx: number) => {
-        if (rowIdx === 0) return;
-        const key = SERIES_KEYS[rowIdx - 1];
-        if (!key) return;
-        const hide = SERIES_STYLE[key].legendHidden || !desiredVisibility[key] || !hasDataByKey[key];
-        row.classList.toggle('legend-hidden', hide);
-      });
+      if (visibilityChanged) {
+        suppressSeriesEventRef.current = true;
+        SERIES_KEYS.forEach((key, idx) => {
+          const seriesIdx = idx + 1;
+          let show = desiredVisibility[key] && hasDataByKey[key];
+          if (show) {
+            show = userShowRef.current[seriesIdx] ?? true;
+          }
+          if (key === 'signal_strength_a_upper' || key === 'signal_strength_a_lower') {
+            show = desiredVisibility[key] && hasDataByKey[key] && error1Visible;
+          }
+          if (key === 'signal_strength_b_upper' || key === 'signal_strength_b_lower') {
+            show = desiredVisibility[key] && hasDataByKey[key] && error2Visible;
+          }
+          u.setSeries(seriesIdx, { show }, false);
+        });
+        suppressSeriesEventRef.current = false;
+      }
+      u.setData(plotData, true);
+      u.setScale('x', { min: 0, max: Math.max(count - 1, 1) });
+      if (visibilityChanged) {
+        const rows = u.root.querySelectorAll<HTMLElement>('.u-legend .u-series');
+        rows.forEach((row: HTMLElement, rowIdx: number) => {
+          if (rowIdx === 0) return;
+          const key = SERIES_KEYS[rowIdx - 1];
+          if (!key) return;
+          const hide =
+            SERIES_STYLE[key].legendHidden || !desiredVisibility[key] || !hasDataByKey[key];
+          row.classList.toggle('legend-hidden', hide);
+        });
+        lastVisibilityRef.current = { lockAxis, dual, hasDataKey };
+      }
     });
-  }, [data, pointCount, lockAxis, activePlotFrame?.dual_channel]);
+  }, [activePlotFrame, pointCount, lockAxis]);
 
   useEffect(() => {
     if (!uplotRef.current) return;
     const u = uplotRef.current;
     u.axes[0].label = axisLabel;
+    // axisValues / xValueFormatter are stable references that read their
+    // numeric inputs from a ref, so we only need to wire them once and
+    // then redraw when the human-readable axis label actually changes.
     u.axes[0].values = axisValues;
     u.series[0].value = xValueFormatter;
-    // Force uPlot to recalculate axis ticks even when x-scale min/max did not change.
     u.redraw(false, true);
   }, [axisLabel, axisValues, xValueFormatter]);
 
