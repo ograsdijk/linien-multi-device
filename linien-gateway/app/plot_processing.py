@@ -52,6 +52,46 @@ class PlotState:
     last_unlocked_trace_at: float | None = None
     autolock_ref_spectrum: Optional[np.ndarray] = None
     last_lock_state: Optional[bool] = None
+    # Cached scaled history series for the full-detail path. Rebuilding
+    # these per frame is expensive (two 2048-element Python lists each)
+    # and the underlying history values only mutate via append, so we
+    # gate the rebuild on a cheap signature.
+    #
+    # IMPORTANT: the cached lists are returned by reference inside the
+    # plot frame's `series` dict and may be shared across many frames
+    # while the underlying history is unchanged. Consumers of the
+    # frame's `series` lists MUST NOT mutate them in place; doing so
+    # would corrupt subsequent frames. All current consumers
+    # (`filter_plot_frame`, `_encode_ws_payload`/orjson, REST snapshot
+    # readers) treat them as read-only.
+    _control_history_signature: Optional[Tuple[Any, ...]] = None
+    _control_history_scaled: Optional[List[Optional[float]]] = None
+    _slow_history_signature: Optional[Tuple[Any, ...]] = None
+    _slow_history_scaled: Optional[List[Optional[float]]] = None
+    _monitor_history_signature: Optional[Tuple[Any, ...]] = None
+    _monitor_history_scaled: Optional[List[Optional[float]]] = None
+
+
+def _history_signature(
+    times: List[float], values: List[float], timescale: float
+) -> Tuple[Any, ...]:
+    """Cheap fingerprint of an append-only history series + scaling."""
+    n = len(values)
+    return (
+        n,
+        values[-1] if n else None,
+        times[0] if times else None,
+        times[-1] if times else None,
+        timescale,
+    )
+
+
+def _scale_history(
+    times: List[float], values: List[float], timescale: float
+) -> List[Optional[float]]:
+    scaled_times = scale_history_times(times, timescale)
+    series = history_to_series(scaled_times, values)
+    return [(v / V) if v is not None else None for v in series]
 
 
 def peak_voltage_to_dbm(voltage: float) -> Optional[float]:
@@ -179,33 +219,50 @@ def build_plot_frame(
             series["control_signal"] = (control_signal / V).tolist()
 
         if full_detail:
-            control_times = scale_history_times(
-                state.control_history["times"], timescale
+            control_times = state.control_history["times"]
+            control_values = state.control_history["values"]
+            control_sig = _history_signature(
+                control_times, control_values, timescale
             )
-            control_series = history_to_series(
-                control_times, state.control_history["values"]
-            )
-            series["control_signal_history"] = [
-                (v / V) if v is not None else None for v in control_series
-            ]
+            if (
+                state._control_history_signature != control_sig
+                or state._control_history_scaled is None
+            ):
+                state._control_history_scaled = _scale_history(
+                    control_times, control_values, timescale
+                )
+                state._control_history_signature = control_sig
+            series["control_signal_history"] = state._control_history_scaled
 
             if params.get("pid_on_slow_enabled"):
-                slow_series = history_to_series(
-                    scale_history_times(state.control_history["slow_times"], timescale),
-                    state.control_history["slow_values"],
-                )
-                series["slow_history"] = [
-                    (v / V) if v is not None else None for v in slow_series
-                ]
+                slow_times = state.control_history["slow_times"]
+                slow_values = state.control_history["slow_values"]
+                slow_sig = _history_signature(slow_times, slow_values, timescale)
+                if (
+                    state._slow_history_signature != slow_sig
+                    or state._slow_history_scaled is None
+                ):
+                    state._slow_history_scaled = _scale_history(
+                        slow_times, slow_values, timescale
+                    )
+                    state._slow_history_signature = slow_sig
+                series["slow_history"] = state._slow_history_scaled
 
             if not params.get("dual_channel"):
-                monitor_series = history_to_series(
-                    scale_history_times(state.monitor_history["times"], timescale),
-                    state.monitor_history["values"],
+                monitor_times = state.monitor_history["times"]
+                monitor_values = state.monitor_history["values"]
+                monitor_sig = _history_signature(
+                    monitor_times, monitor_values, timescale
                 )
-                series["monitor_signal_history"] = [
-                    (v / V) if v is not None else None for v in monitor_series
-                ]
+                if (
+                    state._monitor_history_signature != monitor_sig
+                    or state._monitor_history_scaled is None
+                ):
+                    state._monitor_history_scaled = _scale_history(
+                        monitor_times, monitor_values, timescale
+                    )
+                    state._monitor_history_signature = monitor_sig
+                series["monitor_signal_history"] = state._monitor_history_scaled
     else:
         dual_channel = bool(params.get("dual_channel"))
         monitor_signal = to_plot.get("monitor_signal")

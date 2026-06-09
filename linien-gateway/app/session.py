@@ -761,10 +761,15 @@ class DeviceSession:
                 )
 
     def _on_param_changed(self, name: str, value: Any) -> None:
-        with self._state_lock:
-            self.param_cache[name] = value
+        # Filter ignored params BEFORE caching. Some of these (e.g.
+        # `to_plot`, `signal_stats`, `*_history`) are large blobs or
+        # remote-reference objects, and stashing them in `param_cache`
+        # would keep the RPyC reference alive on the server, leak memory,
+        # and waste cycles on every subsequent snapshot.
         if name in IGNORED_PARAMS:
             return
+        with self._state_lock:
+            self.param_cache[name] = value
         encoded = to_jsonable(value)
         if encoded is UNSERIALIZABLE:
             return
