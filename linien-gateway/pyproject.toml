@@ -15,6 +15,7 @@ dependencies = [
   "linien-client==2.1.0",
   "linien-common==2.1.0",
   "numpy>=2.0",
+  "orjson>=3.10",
 ]
 
 [project.scripts]

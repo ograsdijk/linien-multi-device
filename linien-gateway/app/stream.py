@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import threading
@@ -9,11 +10,41 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
+import orjson
 from fastapi import WebSocket
 
 from .plot_processing import SUMMARY_SERIES_KEYS
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_ws_payload(payload: Dict[str, Any]) -> str:
+    """Encode a websocket payload as a JSON string.
+
+    Uses orjson for the heavy lifting (orders of magnitude faster than the
+    stdlib encoder on numeric arrays, which dominate plot_frame payloads),
+    then decodes back to ``str`` so the value can be sent as a text WS
+    frame. Sending as text keeps backwards compatibility with browsers
+    that consume the existing JSON message stream.
+
+    Falls back to stdlib ``json.dumps`` if orjson rejects the payload.
+    The most likely cause is an unexpected ``NaN``/``Infinity`` slipping
+    through the processing pipeline — note that stdlib will emit those
+    as ``NaN``/``Infinity`` literals which browser ``JSON.parse`` does
+    not accept, so the fallback is a "log and don't crash the sender"
+    safety net rather than a fully correct path. Investigate any log
+    line emitted by the ``except`` branch as a data-quality bug.
+    """
+    try:
+        return orjson.dumps(payload).decode("utf-8")
+    except TypeError:
+        logger.warning(
+            "orjson encode rejected payload, falling back to stdlib json. "
+            "Output may contain NaN/Infinity literals which the browser "
+            "cannot parse; treat as a data-quality bug.",
+            exc_info=True,
+        )
+        return json.dumps(payload)
 
 
 @dataclass
@@ -182,7 +213,7 @@ class WebsocketManager:
                     if payload is None:
                         await state.wake_event.wait()
                         continue
-                await websocket.send_json(payload)
+                await websocket.send_text(_encode_ws_payload(payload))
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -17,9 +18,9 @@ class DummyWebSocket:
     async def accept(self) -> None:
         self.accepted = True
 
-    async def send_json(self, payload: dict) -> None:
+    async def send_text(self, payload: str) -> None:
         await self.release_send.wait()
-        self.sent.append(payload)
+        self.sent.append(json.loads(payload))
 
 
 def _snapshot_state(state: ConnectionState) -> dict:
