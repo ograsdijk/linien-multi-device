@@ -786,13 +786,34 @@ class DeviceSession:
             params_snapshot = deepcopy(self.param_cache_serialized)
             frame_snapshot = deepcopy(self.last_plot_frame)
             last_plot_timestamp = self.last_plot_timestamp
-            auto_relock_status = deepcopy(self.auto_relock.get_status())
+        # auto_relock.get_status() returns a freshly-constructed flat dict of
+        # primitives, so we don't need to deepcopy it.
+        auto_relock_status = self.auto_relock.get_status()
         return (
             params_snapshot,
             frame_snapshot,
             last_plot_timestamp,
             auto_relock_status,
         )
+
+    def _snapshot_status_fields(
+        self,
+    ) -> tuple[float | None, bool | None, dict[str, Any]]:
+        """Cheap snapshot for status() polls.
+
+        Avoids deep-copying the cached plot frame (multi-MB) and the
+        serialized param cache. Only reads the small primitives that
+        status() actually needs.
+        """
+        with self._state_lock:
+            ts = self.last_plot_timestamp
+            frame_lock: bool | None = None
+            if isinstance(self.last_plot_frame, dict):
+                fl = self.last_plot_frame.get("lock")
+                if isinstance(fl, bool):
+                    frame_lock = fl
+        auto_relock_status = self.auto_relock.get_status()
+        return ts, frame_lock, auto_relock_status
 
     def _snapshot_auto_lock_traces(
         self,
@@ -975,7 +996,9 @@ class DeviceSession:
                 start_sweep=self.stop_lock,
                 start_relock=_start_auto_relock,
             )
-            auto_relock_status = deepcopy(self.auto_relock.get_status())
+            # auto_relock.get_status() already returns a freshly-constructed
+            # flat dict of primitives; no need to deepcopy it.
+            auto_relock_status = self.auto_relock.get_status()
             frame["auto_relock"] = auto_relock_status
             self.last_plot_frame = frame
             self.last_plot_timestamp = time.time()
@@ -1021,13 +1044,11 @@ class DeviceSession:
                 )
                 logging_active = None
                 lock_value = None
-        _, last_plot_frame, last_plot_timestamp, auto_relock_status = (
-            self._snapshot_cached_state()
+        last_plot_timestamp, frame_lock, auto_relock_status = (
+            self._snapshot_status_fields()
         )
-        if lock_value is None and isinstance(last_plot_frame, dict):
-            frame_lock = last_plot_frame.get("lock")
-            if isinstance(frame_lock, bool):
-                lock_value = frame_lock
+        if lock_value is None and frame_lock is not None:
+            lock_value = frame_lock
         return {
             "connected": self.connected,
             "connecting": self.connecting,

@@ -467,12 +467,27 @@ def device_status(key: str) -> dict:
 
 
 @app.get("/api/devices/statuses")
-def device_statuses() -> dict[str, dict]:
-    payload: dict[str, dict] = {}
-    for device in device_store.list_devices():
+async def device_statuses() -> dict[str, dict]:
+    devices = device_store.list_devices()
+
+    def _status_for(device: Device) -> tuple[str, dict]:
         with session_registry.lock_for(device.key):
             session = _session_for_device(device)
-            payload[device.key] = session.status()
+            return device.key, session.status()
+
+    results = await asyncio.gather(
+        *(asyncio.to_thread(_status_for, device) for device in devices),
+        return_exceptions=True,
+    )
+    payload: dict[str, dict] = {}
+    for item in results:
+        if isinstance(item, Exception):
+            logger.warning(
+                "device_statuses worker failed: %s", item, exc_info=item
+            )
+            continue
+        key, status = item
+        payload[key] = status
     return payload
 
 
