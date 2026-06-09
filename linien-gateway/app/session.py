@@ -111,6 +111,7 @@ class DeviceSession:
         self._relock_action_lock = threading.Lock()
         self.param_cache: Dict[str, Any] = {}
         self.param_cache_serialized: Dict[str, Any] = {}
+        self._param_metadata_cache: List[Dict[str, Any]] | None = None
         self.plot_state = PlotState()
         self.auto_lock_scan_settings = self._initial_auto_lock_scan_settings()
         self.lock_indicator = LockIndicatorEvaluator(
@@ -586,6 +587,7 @@ class DeviceSession:
             self.control.exposed_set_parameter_log(name, should_log)
             if hasattr(param, "log"):
                 param.log = should_log
+                self._invalidate_param_metadata_cache()
 
     @staticmethod
     def _value_needs_normalization(current: Any, normalized: Any) -> bool:
@@ -630,6 +632,7 @@ class DeviceSession:
             self.last_error = last_error
             self._last_lock_indicator_state = None
             self._last_auto_relock_state = None
+            self._param_metadata_cache = None
         self._disconnect_client_safely(client_to_close)
 
     def _handle_poll_failure(self, exc: Exception) -> None:
@@ -671,6 +674,7 @@ class DeviceSession:
             self.parameters = client.parameters
             self.param_cache = {}
             self.param_cache_serialized = {}
+            self._param_metadata_cache = None
             self.plot_state = PlotState()
             with self._rpyc_lock:
                 self._sanitize_parameters_on_connect()
@@ -879,23 +883,26 @@ class DeviceSession:
         )
         return None
 
-    def _derive_lock_value(self, to_plot: dict[str, Any]) -> bool:
-        with self._rpyc_lock:
-            if self.parameters is None:
-                return False
-            lock_value = bool(self.parameters.lock.value)
-        if "error_signal" in to_plot and "control_signal" in to_plot:
-            return True
-        if "error_signal_1" in to_plot:
-            return False
-        return lock_value
+    def _derive_lock_and_plot_params(
+        self, to_plot: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        """Single-acquisition variant of `_derive_lock_value` + `_plot_params`.
 
-    def _plot_params(self, lock_value: bool) -> dict[str, Any]:
+        Reads `parameters.lock` and every plot param under one `_rpyc_lock`
+        acquisition. This halves lock churn on the hot plot path (one
+        acquisition per frame instead of two) and reduces contention with
+        API request handlers that also need `_rpyc_lock`.
+        """
         with self._rpyc_lock:
             if self.parameters is None:
-                return {"lock": lock_value}
-            return {
-                "lock": lock_value,
+                lock_value = False
+                if "error_signal" in to_plot and "control_signal" in to_plot:
+                    lock_value = True
+                elif "error_signal_1" in to_plot:
+                    lock_value = False
+                return lock_value, {"lock": lock_value}
+            raw_lock = bool(self.parameters.lock.value)
+            params = {
                 "dual_channel": self.parameters.dual_channel.value,
                 "channel_mixing": self.parameters.channel_mixing.value,
                 "combined_offset": self.parameters.combined_offset.value,
@@ -909,6 +916,14 @@ class DeviceSession:
                 "autolock_initial_sweep_amplitude": self.parameters.autolock_initial_sweep_amplitude.value,
                 "control_signal_history_length": self.parameters.control_signal_history_length.value,
             }
+        if "error_signal" in to_plot and "control_signal" in to_plot:
+            lock_value = True
+        elif "error_signal_1" in to_plot:
+            lock_value = False
+        else:
+            lock_value = raw_lock
+        params["lock"] = lock_value
+        return lock_value, params
 
     def _on_to_plot(self, value: Any) -> None:
         if self.parameters is None:
@@ -921,8 +936,7 @@ class DeviceSession:
         if to_plot is None:
             return
 
-        lock_value = self._derive_lock_value(to_plot)
-        params = self._plot_params(lock_value)
+        lock_value, params = self._derive_lock_and_plot_params(to_plot)
 
         def _start_auto_relock() -> None:
             acquired = self._relock_action_lock.acquire(blocking=False)
@@ -1389,6 +1403,7 @@ class DeviceSession:
                         self.device.key,
                         exc_info=True,
                     )
+                self._invalidate_param_metadata_cache()
         current_params = self._normalize_influx_param_names(
             self.influx_logging_state.get("params")
         )
@@ -1435,6 +1450,7 @@ class DeviceSession:
                     )
                 if should_log:
                     applied_names.append(param_name)
+            self._invalidate_param_metadata_cache()
         return self.set_influx_logging_state(
             params=applied_names,
             params_configured=True,
@@ -1454,10 +1470,21 @@ class DeviceSession:
         with self._rpyc_lock:
             return self.control.exposed_update_influxdb_credentials(credentials)
 
+    def _invalidate_param_metadata_cache(self) -> None:
+        self._param_metadata_cache = None
+
     def param_metadata(self) -> List[Dict[str, Any]]:
         if self.parameters is None:
             raise RuntimeError("Device not connected")
-        data = []
+        # `restorable`, `loggable`, and `log` are stable across reads for
+        # the lifetime of a connection (the only mutator of `log` is this
+        # module, and those code paths invalidate this cache). Caching
+        # avoids ~3 RPyC round trips per parameter (~240 RTTs for the
+        # ~80-param namespace) every time the Influx popover is opened.
+        cached = self._param_metadata_cache
+        if cached is not None:
+            return cached
+        data: List[Dict[str, Any]] = []
         with self._rpyc_lock:
             for name, param in self.parameters:
                 data.append(
@@ -1468,4 +1495,5 @@ class DeviceSession:
                         "log": bool(param.log),
                     }
                 )
+        self._param_metadata_cache = data
         return data
