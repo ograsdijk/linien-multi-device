@@ -81,10 +81,36 @@ export const useDeviceStateUpdater = () => {
   return useCallback(
     (deviceKey: string, message: StreamMessage) => {
       if (message.type === 'plot_frame') {
-        deviceStatesStore.updateDevice(deviceKey, (prev) => ({
-          ...prev,
-          plotFrame: message,
-        }));
+        // Plot frames arrive at the per-card stream FPS (up to 10/s/device,
+        // 120/s across 12 devices). The store's aggregate channel feeds
+        // useLockSummary, whose only plot-derived inputs are `lock`,
+        // `lock_indicator.state`, and `auto_relock.{state,enabled}`. Writing
+        // the full frame on every message triggers a microtask flush in the
+        // bookkeeper for every frame, which re-renders every subscriber of
+        // useLockSummary (including App). Skip the write when none of those
+        // primitives changed — under steady-state locking we'll write at
+        // most on state transitions instead of continuously.
+        deviceStatesStore.updateDevice(deviceKey, (prev) => {
+          const prevFrame = prev.plotFrame;
+          const prevIndState = prevFrame?.lock_indicator?.state ?? null;
+          const nextIndState = message.lock_indicator?.state ?? null;
+          const prevAutoEnabled = prevFrame?.auto_relock?.enabled ?? null;
+          const nextAutoEnabled = message.auto_relock?.enabled ?? null;
+          const prevAutoState = prevFrame?.auto_relock?.state ?? null;
+          const nextAutoState = message.auto_relock?.state ?? null;
+          const prevLock = prevFrame?.lock ?? null;
+          const nextLock = message.lock ?? null;
+          if (
+            prevFrame != null &&
+            prevIndState === nextIndState &&
+            prevAutoEnabled === nextAutoEnabled &&
+            prevAutoState === nextAutoState &&
+            prevLock === nextLock
+          ) {
+            return undefined;
+          }
+          return { ...prev, plotFrame: message };
+        });
         return;
       }
 
