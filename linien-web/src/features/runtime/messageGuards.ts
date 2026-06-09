@@ -18,11 +18,16 @@ const isStringArray = (value: unknown): value is string[] =>
 
 const isSeriesRecord = (value: unknown): boolean => {
   if (!isObject(value)) return false;
-  return Object.values(value).every(
-    (series) =>
-      Array.isArray(series) &&
-      series.every((point) => point == null || (typeof point === 'number' && Number.isFinite(point)))
-  );
+  // Shape check only: confirm every entry is an array. Per-point numeric
+  // validation is intentionally skipped here because plot frames carry
+  // thousands of points per device and validating each on every websocket
+  // message dominates the main thread when many devices stream
+  // concurrently. Downstream consumers (PlotPanel.normalizeSeries) already
+  // coerce values to finite numbers or null before rendering.
+  for (const series of Object.values(value)) {
+    if (!Array.isArray(series)) return false;
+  }
+  return true;
 };
 
 export const isDeviceStatus = (value: unknown): value is DeviceStatus => {

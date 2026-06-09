@@ -22,6 +22,24 @@ export function useDeviceStream(
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectDelayRef = useRef(INITIAL_RECONNECT_DELAY_MS);
   const openedRef = useRef(false);
+  // Keep current callbacks in refs so updates to handlers (e.g. when the
+  // parent re-renders and creates a new closure) do not tear down the
+  // websocket and trigger reconnect storms.
+  const onMessageRef = useRef(onMessage);
+  const onOpenRef = useRef(options?.onOpen);
+  const onCloseRef = useRef(options?.onClose);
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+  }, [onMessage]);
+  useEffect(() => {
+    onOpenRef.current = options?.onOpen;
+  }, [options?.onOpen]);
+  useEffect(() => {
+    onCloseRef.current = options?.onClose;
+  }, [options?.onClose]);
+
+  const maxFps = options?.maxFps;
+  const detail = options?.detail;
 
   useEffect(() => {
     let disposed = false;
@@ -31,7 +49,18 @@ export function useDeviceStream(
         return;
       }
       openedRef.current = false;
-      options?.onClose?.();
+      // During unmount React may already be unmounting parent state
+      // owners. Calling parent setState synchronously here would cause a
+      // "cannot update a component while rendering a different component"
+      // warning. Defer the notification when we are tearing down so the
+      // parent's own cleanup wins the race.
+      const fn = onCloseRef.current;
+      if (!fn) return;
+      if (disposed) {
+        queueMicrotask(() => fn());
+      } else {
+        fn();
+      }
     };
 
     const clearReconnectTimer = () => {
@@ -48,6 +77,7 @@ export function useDeviceStream(
         socket.onopen = null;
         socket.onclose = null;
         socket.onerror = null;
+        socket.onmessage = null;
         socket.close();
       }
       notifyClosed();
@@ -68,12 +98,16 @@ export function useDeviceStream(
       clearReconnectTimer();
       closeCurrentSocket();
 
-      const socket = openDeviceStream(deviceKey, onMessage, options);
+      const socket = openDeviceStream(
+        deviceKey,
+        (msg) => onMessageRef.current(msg),
+        { maxFps, detail }
+      );
       socketRef.current = socket;
       socket.onopen = () => {
         reconnectDelayRef.current = INITIAL_RECONNECT_DELAY_MS;
         openedRef.current = true;
-        options?.onOpen?.();
+        onOpenRef.current?.();
       };
       socket.onerror = () => {
         if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
@@ -104,5 +138,5 @@ export function useDeviceStream(
       clearReconnectTimer();
       closeCurrentSocket();
     };
-  }, [deviceKey, enabled, onMessage, options?.maxFps, options?.detail, options?.onOpen, options?.onClose]);
+  }, [deviceKey, enabled, maxFps, detail]);
 }

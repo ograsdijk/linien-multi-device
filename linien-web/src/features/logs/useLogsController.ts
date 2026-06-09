@@ -9,6 +9,28 @@ const MAX_LOG_ROWS = 5000;
 const TOAST_COOLDOWN_MS = 20_000;
 const TOAST_DURATION_MS = 6000;
 
+// Stored alongside the user-visible fields on each in-memory log row so we
+// can do free-text filtering with a single substring check instead of
+// rebuilding a `JSON.stringify(...)`-laden haystack per row per keystroke.
+type LogRow = UiLogEntry & { _haystack: string };
+
+const buildHaystack = (entry: UiLogEntry, deviceLabel: string): string => {
+  let details = '';
+  if (entry.details) {
+    try {
+      details = JSON.stringify(entry.details);
+    } catch {
+      details = '';
+    }
+  }
+  return `${entry.message || ''} ${entry.code || ''} ${details} ${deviceLabel}`.toLowerCase();
+};
+
+const attachHaystack = (entry: UiLogEntry, deviceLabel: string): LogRow => ({
+  ...entry,
+  _haystack: buildHaystack(entry, deviceLabel),
+});
+
 const levelBucket = (entry: UiLogEntry): 'info' | 'warning' | 'error' => {
   const levelName = String(entry.level_name || '').toLowerCase();
   if (levelName === 'critical' || levelName === 'error') return 'error';
@@ -64,7 +86,7 @@ export const useLogsController = (devices: Device[]) => {
   const [logsWsConnected, setLogsWsConnected] = useState(false);
   const [logsLoading, setLogsLoading] = useState(false);
   const [logsErrorLatched, setLogsErrorLatched] = useState(false);
-  const [logRows, setLogRows] = useState<UiLogEntry[]>([]);
+  const [logRows, setLogRows] = useState<LogRow[]>([]);
   const [logLevelFilter, setLogLevelFilter] = useState('all');
   const [logSourceFilter, setLogSourceFilter] = useState('all');
   const [logDeviceFilter, setLogDeviceFilter] = useState('all');
@@ -74,6 +96,17 @@ export const useLogsController = (devices: Device[]) => {
   const logScrollRef = useRef<HTMLDivElement | null>(null);
   const logSeenInModalRef = useRef(false);
   const toastCooldownRef = useRef<Record<string, number>>({});
+  // O(1) dedup ref aligned with logRows. Membership is checked here rather
+  // than rebuilding a Set from `prev.map(...)` on every append (which is
+  // O(n) per entry and dominates with a large log buffer under bursty
+  // logging).
+  const seenLogIdsRef = useRef<Set<string>>(new Set());
+  // Latch ref so a log burst that includes a new error can flip the
+  // `logsErrorLatched` state once via an effect, instead of doing
+  // `setLogsErrorLatched` from inside `setLogRows`'s updater (an
+  // anti-pattern that breaks under StrictMode/concurrent rendering).
+  const pendingErrorLatchRef = useRef(false);
+  const [errorLatchTick, setErrorLatchTick] = useState(0);
 
   const deviceNameByKey = useMemo(
     () =>
@@ -110,40 +143,90 @@ export const useLogsController = (devices: Device[]) => {
     (entries: UiLogEntry[]) => {
       if (entries.length === 0) return;
       const nowMs = Date.now();
-      setLogRows((prev) => {
-        const seen = new Set(prev.map((entry) => entry.id));
-        const next = [...prev];
-        for (const entry of entries) {
-          if (!entry || typeof entry.id !== 'string' || seen.has(entry.id)) {
-            continue;
-          }
-          seen.add(entry.id);
-          next.push(entry);
-          if (levelBucket(entry) === 'error') {
-            setLogsErrorLatched(true);
-          }
-          const toast = toastFromLogEntry(
-            entry,
-            resolveDeviceLabel(entry.device_key ?? undefined)
-          );
-          if (!toast) {
-            continue;
-          }
-          const fingerprint = `${entry.code || ''}|${entry.device_key || ''}|${toast.level}|${entry.message || ''}`;
-          const lastShown = toastCooldownRef.current[fingerprint] ?? 0;
-          if (nowMs - lastShown > TOAST_COOLDOWN_MS) {
-            toastCooldownRef.current[fingerprint] = nowMs;
-            pushToast(toast);
-          }
+      const seenIds = seenLogIdsRef.current;
+      const accepted: LogRow[] = [];
+      let sawError = false;
+      for (const entry of entries) {
+        if (!entry || typeof entry.id !== 'string' || seenIds.has(entry.id)) {
+          continue;
         }
-        if (next.length > MAX_LOG_ROWS) {
-          return next.slice(next.length - MAX_LOG_ROWS);
+        seenIds.add(entry.id);
+        const deviceLabel = resolveDeviceLabel(entry.device_key ?? undefined);
+        accepted.push(attachHaystack(entry, deviceLabel));
+        if (levelBucket(entry) === 'error') {
+          sawError = true;
+        }
+        const toast = toastFromLogEntry(entry, deviceLabel);
+        if (!toast) {
+          continue;
+        }
+        const fingerprint = `${entry.code || ''}|${entry.device_key || ''}|${toast.level}|${entry.message || ''}`;
+        const lastShown = toastCooldownRef.current[fingerprint] ?? 0;
+        if (nowMs - lastShown > TOAST_COOLDOWN_MS) {
+          toastCooldownRef.current[fingerprint] = nowMs;
+          pushToast(toast);
+        }
+      }
+      if (accepted.length === 0) {
+        return;
+      }
+      if (sawError) {
+        pendingErrorLatchRef.current = true;
+        setErrorLatchTick((tick) => tick + 1);
+      }
+      setLogRows((prev) => {
+        let next: LogRow[];
+        if (prev.length + accepted.length <= MAX_LOG_ROWS) {
+          next = prev.concat(accepted);
+        } else {
+          // Need to evict; also clean the dedup set so it doesn't grow
+          // without bound across long sessions.
+          const combined = prev.concat(accepted);
+          const startIdx = combined.length - MAX_LOG_ROWS;
+          for (let i = 0; i < startIdx; i++) {
+            const dropped = combined[i];
+            if (dropped) seenIds.delete(dropped.id);
+          }
+          next = combined.slice(startIdx);
         }
         return next;
       });
     },
     [pushToast, resolveDeviceLabel]
   );
+
+  // Flip the error-latch flag once per burst, after `setLogRows` has been
+  // queued. Reading `pendingErrorLatchRef` outside any state updater keeps
+  // the side effect out of the reducer and avoids StrictMode double-invoke
+  // warnings.
+  useEffect(() => {
+    if (!pendingErrorLatchRef.current) return;
+    pendingErrorLatchRef.current = false;
+    setLogsErrorLatched(true);
+  }, [errorLatchTick]);
+
+  // Rebuild haystacks if the device label map shifts (rename or new
+  // device). Without this, free-text search could miss the new label on
+  // pre-existing rows.
+  useEffect(() => {
+    setLogRows((prev) => {
+      if (prev.length === 0) return prev;
+      let mutated = false;
+      const next: LogRow[] = new Array(prev.length);
+      for (let i = 0; i < prev.length; i++) {
+        const row = prev[i];
+        const label = resolveDeviceLabel(row.device_key ?? undefined);
+        const fresh = buildHaystack(row, label);
+        if (fresh === row._haystack) {
+          next[i] = row;
+        } else {
+          next[i] = { ...row, _haystack: fresh };
+          mutated = true;
+        }
+      }
+      return mutated ? next : prev;
+    });
+  }, [resolveDeviceLabel]);
 
   const appendUiErrorLog = useCallback(
     (source: string, code: string, message: string, deviceKey?: string) => {
@@ -169,17 +252,32 @@ export const useLogsController = (devices: Device[]) => {
     try {
       const payload = await api.getLogsTail(1000);
       const entries = sanitizeUiLogEntries(payload.entries);
-      setLogRows(entries.slice(Math.max(0, entries.length - MAX_LOG_ROWS)));
+      const trimmed = entries.slice(Math.max(0, entries.length - MAX_LOG_ROWS));
+      // Rebuild the dedup set from scratch since we just replaced the
+      // entire backing array.
+      const nextSeen = new Set<string>();
+      const rows: LogRow[] = [];
+      for (const entry of trimmed) {
+        if (!entry || typeof entry.id !== 'string' || nextSeen.has(entry.id)) {
+          continue;
+        }
+        nextSeen.add(entry.id);
+        const deviceLabel = resolveDeviceLabel(entry.device_key ?? undefined);
+        rows.push(attachHaystack(entry, deviceLabel));
+      }
+      seenLogIdsRef.current = nextSeen;
+      setLogRows(rows);
     } catch {
       // Best effort refresh.
     } finally {
       setLogsLoading(false);
     }
-  }, []);
+  }, [resolveDeviceLabel]);
 
   const clearLogs = useCallback(async () => {
     try {
       await api.clearLogs();
+      seenLogIdsRef.current = new Set();
       setLogRows([]);
     } catch {
       // Best effort clear.
@@ -238,13 +336,7 @@ export const useLogsController = (devices: Device[]) => {
       const deviceValue = String(entry.device_key || '');
       if (logDeviceFilter !== 'all' && deviceValue !== logDeviceFilter) return false;
       if (!needle) return true;
-      const deviceName = entry.device_key
-        ? (deviceNameByKey.get(entry.device_key) ?? '')
-        : '';
-      const haystack = `${entry.message || ''} ${entry.code || ''} ${JSON.stringify(
-        entry.details || {}
-      )} ${deviceName}`.toLowerCase();
-      return haystack.includes(needle);
+      return entry._haystack.includes(needle);
     });
   }, [
     logRows,
@@ -252,7 +344,6 @@ export const useLogsController = (devices: Device[]) => {
     logSourceFilter,
     logDeviceFilter,
     logSearchText,
-    deviceNameByKey,
   ]);
 
   return {

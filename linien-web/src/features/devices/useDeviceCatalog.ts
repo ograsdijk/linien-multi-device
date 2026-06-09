@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../../api';
 import type { Device, DeviceGroup } from '../../types';
 
@@ -61,23 +61,45 @@ export const useDeviceCatalog = () => {
     }
   }, [activeTabKey, groups]);
 
+  // Keep `devices` in a ref so the normalize callback stays stable across
+  // renders. The downstream effect should only run when the *set of
+  // device keys* changes, not on every devices array identity change
+  // (e.g. status refresh that returns a new array with identical keys).
+  const devicesRef = useRef<Device[]>(devices);
+  useEffect(() => {
+    devicesRef.current = devices;
+  }, [devices]);
+
+  const deviceKeysSignature = useMemo(
+    () =>
+      devices
+        .map((device) => device.key)
+        .sort()
+        .join('\u0001'),
+    [devices]
+  );
+
   const normalizeOrderKeys = useCallback((candidate: string[]): string[] => {
-    const deviceKeys = devices.map((device) => device.key);
+    const currentDevices = devicesRef.current;
+    const deviceKeys = currentDevices.map((device) => device.key);
     const valid = new Set(deviceKeys);
+    const seen = new Set<string>();
     const deduped: string[] = [];
     for (const key of candidate) {
-      if (!valid.has(key) || deduped.includes(key)) {
+      if (!valid.has(key) || seen.has(key)) {
         continue;
       }
+      seen.add(key);
       deduped.push(key);
     }
     for (const key of deviceKeys) {
-      if (!deduped.includes(key)) {
+      if (!seen.has(key)) {
+        seen.add(key);
         deduped.push(key);
       }
     }
     return deduped;
-  }, [devices]);
+  }, []);
 
   useEffect(() => {
     setDeviceOrder((prev) => {
@@ -87,7 +109,8 @@ export const useDeviceCatalog = () => {
       }
       return next;
     });
-  }, [normalizeOrderKeys]);
+    // Re-run only when the unique key set changes.
+  }, [deviceKeysSignature, normalizeOrderKeys]);
 
   useEffect(() => {
     try {

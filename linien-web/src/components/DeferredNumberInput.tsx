@@ -34,7 +34,17 @@ export function DeferredNumberInput({
   clampBehavior = 'none',
   ...props
 }: DeferredNumberInputProps) {
-  const format = (nextValue: number) => formatValue?.(nextValue) ?? nextValue;
+  // Store the formatter in a ref so callers that pass an unmemoized
+  // formatValue closure (very common) do not retrigger the
+  // sync-from-prop effect every render, which would clobber the user's
+  // in-progress edit.
+  const formatValueRef = useRef(formatValue);
+  useEffect(() => {
+    formatValueRef.current = formatValue;
+  }, [formatValue]);
+
+  const format = (nextValue: number) =>
+    formatValueRef.current?.(nextValue) ?? nextValue;
   const [draft, setDraft] = useState<number | string>(() => format(value));
   const focusedRef = useRef(false);
   const editedRef = useRef(false);
@@ -46,7 +56,11 @@ export function DeferredNumberInput({
       setDraft(format(value));
       editedRef.current = false;
     }
-  }, [formatValue, value]);
+    // Intentionally only depend on `value`. `formatValue` is read via ref
+    // so external value updates are still picked up without firing on
+    // every render of the parent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
 
   const revertDraft = () => {
     setDraft(format(value));
