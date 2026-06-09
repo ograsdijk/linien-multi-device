@@ -1,12 +1,12 @@
+import { memo } from 'react';
 import { Button, Popover, Table, Text } from '@mantine/core';
 import type { Device } from '../types';
-import type { DeviceState } from './DeviceWorkspace';
+import { useDeviceStateEntry } from '../state/deviceStatesStore';
 
 const MHz = 0x10000000 / 8;
 
 type GroupModulationSummaryProps = {
   devices: Device[];
-  deviceStates: Record<string, DeviceState>;
 };
 
 const toFiniteNumber = (value: unknown): number | null => {
@@ -28,7 +28,21 @@ const formatState = (params: Record<string, any>): string => {
   return amplitude > 0 ? 'active' : 'inactive';
 };
 
-export function GroupModulationSummary({ devices, deviceStates }: GroupModulationSummaryProps) {
+// Each row subscribes to its own device entry so unrelated devices'
+// updates don't trigger a re-render of the entire table.
+const ModFreqRow = memo(function ModFreqRow({ device }: { device: Device }) {
+  const entry = useDeviceStateEntry(device.key);
+  const params = entry.params;
+  return (
+    <Table.Tr>
+      <Table.Td>{device.name || device.key}</Table.Td>
+      <Table.Td>{formatDemodFrequency(params)}</Table.Td>
+      <Table.Td>{formatState(params)}</Table.Td>
+    </Table.Tr>
+  );
+});
+
+export function GroupModulationSummary({ devices }: GroupModulationSummaryProps) {
   return (
     <Popover width={420} position="bottom-end" shadow="md" withinPortal>
       <Popover.Target>
@@ -54,16 +68,9 @@ export function GroupModulationSummary({ devices, deviceStates }: GroupModulatio
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
-              {devices.map((device) => {
-                const params = deviceStates[device.key]?.params ?? {};
-                return (
-                  <Table.Tr key={device.key}>
-                    <Table.Td>{device.name || device.key}</Table.Td>
-                    <Table.Td>{formatDemodFrequency(params)}</Table.Td>
-                    <Table.Td>{formatState(params)}</Table.Td>
-                  </Table.Tr>
-                );
-              })}
+              {devices.map((device) => (
+                <ModFreqRow key={device.key} device={device} />
+              ))}
             </Table.Tbody>
           </Table>
         )}

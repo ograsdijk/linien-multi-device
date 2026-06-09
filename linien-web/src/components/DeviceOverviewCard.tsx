@@ -1,6 +1,6 @@
 import { memo, useCallback, useRef } from 'react';
 import { Button, Group, Text } from '@mantine/core';
-import type { Device, DeviceStatus, PlotFrame, StreamMessage } from '../types';
+import type { Device, StreamMessage } from '../types';
 import { api } from '../api';
 import { useDeviceStream } from '../hooks/useDeviceStream';
 import { useInViewport } from '../hooks/useInViewport';
@@ -8,14 +8,10 @@ import { usePlotFrameBuffer } from '../hooks/usePlotFrameBuffer';
 import { PlotPanel } from './PlotPanel';
 import { StatusRow } from './StatusRow';
 import { resolveLockDisplay } from '../features/locks/lockState';
+import { useDeviceStateEntry } from '../state/deviceStatesStore';
 
 type DeviceOverviewCardProps = {
   device: Device;
-  state: {
-    params: Record<string, any>;
-    plotFrame?: PlotFrame | null;
-    status?: DeviceStatus | null;
-  };
   active: boolean;
   onOpenInGroup?: (deviceKey: string) => void;
   maxFps?: number;
@@ -25,13 +21,13 @@ type DeviceOverviewCardProps = {
 
 export const DeviceOverviewCard = memo(function DeviceOverviewCard({
   device,
-  state,
   active,
   onOpenInGroup,
   maxFps,
   onStateUpdate,
   onStreamActiveChange,
 }: DeviceOverviewCardProps) {
+  const state = useDeviceStateEntry(device.key);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const { plotFrame, handlePlotFrameMessage } = usePlotFrameBuffer({
     deviceKey: device.key,

@@ -5,9 +5,7 @@ import type {
   AutoLockScanSettings,
   Device,
   LockIndicatorConfig,
-  PlotFrame,
   StreamMessage,
-  DeviceStatus,
 } from '../types';
 import { api } from '../api';
 import { useDeviceStream } from '../hooks/useDeviceStream';
@@ -17,19 +15,13 @@ import { PlotPanel } from './PlotPanel';
 import { RightPanel } from './RightPanel';
 import { StatusRow } from './StatusRow';
 import { SweepControls } from './SweepControls';
+import { useDeviceStateEntry } from '../state/deviceStatesStore';
 
 const AUTOMATION_TEMP_DISABLED_REASON =
   'Temporarily disabled due to NumPy pickle compatibility between gateway and server.';
 
-export type DeviceState = {
-  params: Record<string, any>;
-  plotFrame?: PlotFrame | null;
-  status?: DeviceStatus | null;
-};
-
 type DeviceWorkspaceProps = {
   device: Device;
-  state: DeviceState;
   active: boolean;
   onStateUpdate: (deviceKey: string, message: StreamMessage) => void;
   onStreamActiveChange?: (deviceKey: string, active: boolean) => void;
@@ -47,7 +39,6 @@ type SetParamOptions = {
 
 export const DeviceWorkspace = memo(function DeviceWorkspace({
   device,
-  state,
   active,
   onStateUpdate,
   onStreamActiveChange,
@@ -58,6 +49,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
   lockBusy,
   onDisableLock,
 }: DeviceWorkspaceProps) {
+  const state = useDeviceStateEntry(device.key);
   const [selectionMode, setSelectionMode] = useState<'autolock' | 'optimization' | null>(null);
   const [selectionSubmitting, setSelectionSubmitting] = useState(false);
   const [lockMode, setLockMode] = useState<'manual' | 'autolock_scan' | 'autolock'>('manual');

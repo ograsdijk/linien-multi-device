@@ -1,17 +1,11 @@
-import { useEffect } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { api } from '../../api';
-import type { Device, DeviceStatus, PlotFrame } from '../../types';
+import type { Device, DeviceStatus } from '../../types';
 import { isDeviceStatus } from '../runtime/messageGuards';
-
-type DeviceStateLike = {
-  params: Record<string, unknown>;
-  plotFrame?: PlotFrame | null;
-  status?: DeviceStatus | null;
-};
+import { deviceStatesStore } from '../../state/deviceStatesStore';
 
 type UseDeviceStatusPollingArgs = {
   devices: Device[];
-  setDeviceStates: React.Dispatch<React.SetStateAction<Record<string, DeviceStateLike>>>;
   intervalMs?: number;
   skipDeviceKeys?: ReadonlySet<string>;
 };
@@ -51,10 +45,30 @@ const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceStatus) =
 
 export const useDeviceStatusPolling = ({
   devices,
-  setDeviceStates,
   intervalMs = 5000,
   skipDeviceKeys,
 }: UseDeviceStatusPollingArgs) => {
+  // Keep the set of websocket-active device keys in a ref so frequent
+  // open/close churn (every plot frame can change `streamingDeviceKeys`
+  // upstream) does not tear down and restart the polling interval, which
+  // would otherwise re-issue a /statuses request immediately on every
+  // stream lifecycle event.
+  const skipDeviceKeysRef = useRef<ReadonlySet<string> | undefined>(skipDeviceKeys);
+  useEffect(() => {
+    skipDeviceKeysRef.current = skipDeviceKeys;
+  }, [skipDeviceKeys]);
+
+  const devicesRef = useRef<Device[]>(devices);
+  useEffect(() => {
+    devicesRef.current = devices;
+  }, [devices]);
+
+  // Stable poller bound to the latest setter via ref so we can call it
+  // both from the periodic interval and from a one-shot effect that
+  // fires when the device-key set changes (e.g. devices arrive after the
+  // initial render).
+  const pollerRef = useRef<() => void>(() => {});
+
   useEffect(() => {
     let cancelled = false;
 
@@ -64,33 +78,38 @@ export const useDeviceStatusPolling = ({
           if (cancelled || !statuses || typeof statuses !== 'object') {
             return;
           }
-          setDeviceStates((prev) => {
-            let next = prev;
-            let changed = false;
-            for (const device of devices) {
-              if (skipDeviceKeys?.has(device.key)) {
-                continue;
-              }
-              const status = statuses[device.key];
-              if (!isDeviceStatus(status)) {
-                continue;
-              }
-              const current = next[device.key] || { params: {} };
-              if (sameDeviceStatus(current.status, status)) {
-                continue;
-              }
-              if (!changed) {
-                next = { ...next };
-                changed = true;
-              }
-              next[device.key] = { ...current, status };
+          const skip = skipDeviceKeysRef.current;
+          const currentDevices = devicesRef.current;
+          const entries: Array<{
+            deviceKey: string;
+            updater: (prev: { params: Record<string, unknown>; status?: DeviceStatus | null }) =>
+              | { params: Record<string, unknown>; status?: DeviceStatus | null }
+              | undefined;
+          }> = [];
+          for (const device of currentDevices) {
+            if (skip?.has(device.key)) {
+              continue;
             }
-            return changed ? next : prev;
-          });
+            const status = statuses[device.key];
+            if (!isDeviceStatus(status)) {
+              continue;
+            }
+            entries.push({
+              deviceKey: device.key,
+              updater: (prev) => {
+                if (sameDeviceStatus(prev.status, status)) return undefined;
+                return { ...prev, status };
+              },
+            });
+          }
+          if (entries.length > 0) {
+            deviceStatesStore.batchUpdate(entries);
+          }
         })
         .catch(() => null);
     };
 
+    pollerRef.current = pollStatuses;
     pollStatuses();
     const interval = setInterval(() => {
       pollStatuses();
@@ -98,6 +117,26 @@ export const useDeviceStatusPolling = ({
     return () => {
       cancelled = true;
       clearInterval(interval);
+      pollerRef.current = () => {};
     };
-  }, [devices, intervalMs, setDeviceStates, skipDeviceKeys]);
+    // Only restart the polling loop when the cadence changes. Device list
+    // and skip-set updates are picked up via refs above and do not need
+    // to recreate the interval.
+  }, [intervalMs]);
+
+  // Fire an immediate poll whenever the set of device keys changes so the
+  // first /statuses round trip after devices appear doesn't wait for the
+  // next interval tick.
+  const deviceKeysSignature = useMemo(
+    () =>
+      devices
+        .map((device) => device.key)
+        .sort()
+        .join('\u0001'),
+    [devices]
+  );
+  useEffect(() => {
+    if (!deviceKeysSignature) return;
+    pollerRef.current();
+  }, [deviceKeysSignature]);
 };

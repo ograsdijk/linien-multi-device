@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import {
   DndContext,
   DragOverlay,
@@ -33,7 +33,7 @@ import {
 import { useMantineColorScheme } from '@mantine/core';
 import { api } from './api';
 import { DeviceList, type DeviceSortMode } from './components/DeviceList';
-import { DeviceWorkspace, DeviceState } from './components/DeviceWorkspace';
+import { DeviceWorkspace } from './components/DeviceWorkspace';
 import { DeviceOverviewCard } from './components/DeviceOverviewCard';
 import { AppHeaderControls } from './components/AppHeaderControls';
 import { GroupModulationSummary } from './components/GroupModulationSummary';
@@ -44,6 +44,7 @@ import { usePostgresController } from './features/integrations/usePostgresContro
 import { useInfluxController } from './features/integrations/useInfluxController';
 import { useLockActions } from './features/locks/useLockActions';
 import { OVERVIEW_KEY, useDeviceCatalog } from './features/devices/useDeviceCatalog';
+import { deviceStatesStore } from './state/deviceStatesStore';
 import {
   parseDeviceListDragId,
   parseGroupCardDragId,
@@ -65,7 +66,7 @@ type GridColumnsMode = 'auto' | '1' | '2' | '3' | '4';
 
 const normalizeGridColumnsMode = (value: string | null): GridColumnsMode =>
   value === '1' || value === '2' || value === '3' || value === '4' ? value : 'auto';
-const EMPTY_DEVICE_STATE: DeviceState = { params: {} };
+
 
 const normalizeDeviceSortMode = (value: string | null): DeviceSortMode =>
   value === 'name' || value === 'host' || value === 'connected' || value === 'lock'
@@ -156,7 +157,6 @@ const LogsModal = lazy(async () => {
 });
 
 export function App() {
-  const [deviceStates, setDeviceStates] = useState<Record<string, DeviceState>>({});
   const [overviewFps, setOverviewFps] = useState<number>(10);
   const [groupFps, setGroupFps] = useState<number>(() => {
     try {
@@ -169,7 +169,12 @@ export function App() {
   const [lockPopoverOpen, setLockPopoverOpen] = useState(false);
   const [draggingDeviceKey, setDraggingDeviceKey] = useState<string | null>(null);
   const [previewOrderKeys, setPreviewOrderKeys] = useState<string[] | null>(null);
-  const [streamingDeviceKeys, setStreamingDeviceKeys] = useState<Set<string>>(() => new Set());
+  // Streaming-device tracking is now a mutable ref-backed Set instead of a
+  // React state. Open/close events fire frequently (~12 events on initial
+  // 12-device load), and storing them in React state forced an App
+  // re-render plus a fresh `Set` allocation each time. The polling hook
+  // reads this ref directly.
+  const streamingDeviceKeysRef = useRef<Set<string>>(new Set());
   const [deviceBarCollapsed, setDeviceBarCollapsed] = useState<boolean>(() => {
     try {
       return window.localStorage.getItem(DEVICE_BAR_COLLAPSED_KEY) === '1';
@@ -254,27 +259,20 @@ export function App() {
     disableLock,
     startAutoLockFromHeader,
   } = useLockActions({
-    setDeviceStates,
     appendUiErrorLog,
   });
 
   const updateLoggingState = useCallback((deviceKey: string, loggingActive: boolean) => {
-    setDeviceStates((prev) => {
-      const current = prev[deviceKey] || { params: {} };
-      return {
-        ...prev,
-        [deviceKey]: {
-          ...current,
-          status: {
-            ...(current.status ?? {
-              connected: true,
-              connecting: false,
-            }),
-            logging_active: loggingActive,
-          },
-        },
-      };
-    });
+    deviceStatesStore.updateDevice(deviceKey, (prev) => ({
+      ...prev,
+      status: {
+        ...(prev.status ?? {
+          connected: true,
+          connecting: false,
+        }),
+        logging_active: loggingActive,
+      },
+    }));
   }, []);
 
   useEffect(() => {
@@ -306,32 +304,22 @@ export function App() {
     }
   }, [groupFps]);
   const handleDeviceStreamActiveChange = useCallback((deviceKey: string, active: boolean) => {
-    setStreamingDeviceKeys((prev) => {
-      const hasKey = prev.has(deviceKey);
-      if (active === hasKey) {
-        return prev;
-      }
-      const next = new Set(prev);
-      if (active) {
-        next.add(deviceKey);
-      } else {
-        next.delete(deviceKey);
-      }
-      return next;
-    });
+    // Mutate the ref in place. No React state update is needed because
+    // `useDeviceStatusPolling` reads the set via the same ref and the
+    // skip behaviour just needs to be eventually consistent (the next
+    // poll tick honours the latest membership).
+    const set = streamingDeviceKeysRef.current;
+    if (active) {
+      set.add(deviceKey);
+    } else {
+      set.delete(deviceKey);
+    }
   }, []);
-  const websocketActiveDeviceKeys = useMemo(() => {
-    const validDeviceKeys = new Set(devices.map((device) => device.key));
-    return new Set(
-      [...streamingDeviceKeys].filter((deviceKey) => validDeviceKeys.has(deviceKey))
-    );
-  }, [devices, streamingDeviceKeys]);
   useDeviceStatusPolling({
     devices,
-    setDeviceStates,
-    skipDeviceKeys: websocketActiveDeviceKeys,
+    skipDeviceKeys: streamingDeviceKeysRef.current,
   });
-  const updateState = useDeviceStateUpdater(setDeviceStates);
+  const updateState = useDeviceStateUpdater();
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -461,7 +449,7 @@ export function App() {
     connectedDeviceCount,
     lockedDeviceCount,
     connectedRelockEnabledCount,
-  } = useLockSummary(devices, deviceStates);
+  } = useLockSummary(devices);
   const sortedDevices = useMemo(() => {
     if (deviceSortMode === 'manual') return orderedDevices;
     const lockRank = (deviceKey: string) => {
@@ -817,7 +805,6 @@ export function App() {
                   />
                   <GroupModulationSummary
                     devices={groupDevicesMap.get(activeGroup.key) ?? []}
-                    deviceStates={deviceStates}
                   />
                 </>
               ) : null}
@@ -848,7 +835,6 @@ export function App() {
                 <div key={device.key} className="device-card">
                   <DeviceOverviewCard
                     device={device}
-                    state={deviceStates[device.key] ?? EMPTY_DEVICE_STATE}
                     active={activeTabKey === OVERVIEW_KEY}
                     onStateUpdate={updateState}
                     onOpenInGroup={openDeviceGroup}
@@ -898,7 +884,6 @@ export function App() {
                         </Group>
                         <DeviceWorkspace
                           device={device}
-                          state={deviceStates[device.key] ?? EMPTY_DEVICE_STATE}
                           active={group.key === activeTabKey}
                           onStateUpdate={updateState}
                           onStreamActiveChange={handleDeviceStreamActiveChange}

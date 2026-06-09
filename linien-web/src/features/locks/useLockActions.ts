@@ -1,22 +1,16 @@
 import { useState } from 'react';
 import { api } from '../../api';
-import type { AutoRelockStatus, DeviceStatus, PlotFrame } from '../../types';
+import type { AutoRelockStatus } from '../../types';
+import { deviceStatesStore } from '../../state/deviceStatesStore';
 
 const toErrorMessage = (error: unknown, fallback: string) =>
   error instanceof Error && error.message ? error.message : fallback;
 
-type DeviceStateLike = {
-  params: Record<string, unknown>;
-  plotFrame?: PlotFrame | null;
-  status?: DeviceStatus | null;
-};
-
 type UseLockActionsArgs = {
-  setDeviceStates: React.Dispatch<React.SetStateAction<Record<string, DeviceStateLike>>>;
   appendUiErrorLog: (source: string, code: string, message: string, deviceKey?: string) => void;
 };
 
-export const useLockActions = ({ setDeviceStates, appendUiErrorLog }: UseLockActionsArgs) => {
+export const useLockActions = ({ appendUiErrorLog }: UseLockActionsArgs) => {
   const [lockBusyKeys, setLockBusyKeys] = useState<Record<string, boolean>>({});
   const [autoLockBusyKeys, setAutoLockBusyKeys] = useState<Record<string, boolean>>({});
   const [autoRelockBusyKeys, setAutoRelockBusyKeys] = useState<Record<string, boolean>>({});
@@ -25,49 +19,37 @@ export const useLockActions = ({ setDeviceStates, appendUiErrorLog }: UseLockAct
     deviceKey: string,
     autoRelock: AutoRelockStatus | null | undefined
   ) => {
-    setDeviceStates((prev) => {
-      const current = prev[deviceKey] || { params: {} };
-      return {
-        ...prev,
-        [deviceKey]: {
-          ...current,
-          plotFrame:
-            current.plotFrame == null
-              ? current.plotFrame
-              : { ...current.plotFrame, auto_relock: autoRelock ?? undefined },
-          status: {
-            ...(current.status ?? {
-              connected: true,
-              connecting: false,
-            }),
-            auto_relock: autoRelock,
-          },
-        },
-      };
-    });
+    deviceStatesStore.updateDevice(deviceKey, (prev) => ({
+      ...prev,
+      plotFrame:
+        prev.plotFrame == null
+          ? prev.plotFrame
+          : { ...prev.plotFrame, auto_relock: autoRelock ?? undefined },
+      status: {
+        ...(prev.status ?? {
+          connected: true,
+          connecting: false,
+        }),
+        auto_relock: autoRelock,
+      },
+    }));
   };
 
   const updateLockState = (deviceKey: string, lock: boolean | null | undefined) => {
-    setDeviceStates((prev) => {
-      const current = prev[deviceKey] || { params: {} };
-      return {
-        ...prev,
-        [deviceKey]: {
-          ...current,
-          plotFrame:
-            current.plotFrame == null || lock == null
-              ? current.plotFrame
-              : { ...current.plotFrame, lock: Boolean(lock) },
-          status: {
-            ...(current.status ?? {
-              connected: true,
-              connecting: false,
-            }),
-            lock,
-          },
-        },
-      };
-    });
+    deviceStatesStore.updateDevice(deviceKey, (prev) => ({
+      ...prev,
+      plotFrame:
+        prev.plotFrame == null || lock == null
+          ? prev.plotFrame
+          : { ...prev.plotFrame, lock: Boolean(lock) },
+      status: {
+        ...(prev.status ?? {
+          connected: true,
+          connecting: false,
+        }),
+        lock,
+      },
+    }));
   };
 
   const toggleAutoRelock = async (deviceKey: string, enabled: boolean) => {
