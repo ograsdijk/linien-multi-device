@@ -2,10 +2,27 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { PlotFrame } from '../types';
-
-const N_POINTS = 2048;
-const DECIMATION = 8;
-const ADC_SAMPLE_RATE = 125e6;
+import {
+  ADC_SAMPLE_RATE,
+  BAND_CONFIGS,
+  DECIMATION,
+  LABELS,
+  N_POINTS,
+  SERIES_INDEX,
+  SERIES_KEYS,
+  SERIES_STYLE,
+  type PlotData,
+  type SeriesKey,
+  type SeriesStats,
+  getAccentColor,
+  getAxisTheme,
+  getXBuffer,
+  padYRange,
+  seriesArrayLength,
+  toFinite,
+  toRgba,
+  writeSeriesInto,
+} from './plotShared';
 
 type SelectionMode = 'autolock' | 'optimization' | null;
 
@@ -19,220 +36,7 @@ type PlotPanelProps = {
   showManualTarget?: boolean;
 };
 
-// uPlot accepts typed arrays as well as plain arrays. We use Float64Array
-// for both x and series data so we can reuse pre-allocated buffers across
-// plot frames and avoid the per-frame allocation of thousands of
-// `Array<number | null>` slots.
-type PlotData = [Float64Array, ...Float64Array[]];
-
-const SERIES_KEYS = [
-  'combined_error',
-  'control_signal',
-  'control_signal_history',
-  'slow_history',
-  'monitor_signal_history',
-  'error_signal_1',
-  'error_signal_2',
-  'monitor_signal',
-  'signal_strength_a_upper',
-  'signal_strength_a_lower',
-  'signal_strength_b_upper',
-  'signal_strength_b_lower',
-] as const;
-
-type SeriesKey = (typeof SERIES_KEYS)[number];
-
-const LABELS: Record<SeriesKey, string> = {
-  combined_error: 'error',
-  control_signal: 'control',
-  control_signal_history: 'control history',
-  slow_history: 'slow history',
-  monitor_signal_history: 'monitor history',
-  error_signal_1: 'error 1',
-  error_signal_2: 'error 2',
-  monitor_signal: 'monitor',
-  signal_strength_a_upper: 'signal A+',
-  signal_strength_a_lower: 'signal A-',
-  signal_strength_b_upper: 'signal B+',
-  signal_strength_b_lower: 'signal B-',
-};
-
-const PALETTE = {
-  errorCombined: '#d62728',
-  slowHistory: '#2ca02c',
-  monitor: '#1f77b4',
-  controlSignal: '#bcbd22',
-  error1: '#e377c2',
-  controlHistory: '#ff7f0e',
-  error2: '#9467bd',
-  monitorHistory: '#17becf',
-};
-
-const toRgba = (hex: string, alpha: number) => {
-  const normalized = hex.replace('#', '');
-  if (normalized.length !== 6) return hex;
-  const r = parseInt(normalized.slice(0, 2), 16);
-  const g = parseInt(normalized.slice(2, 4), 16);
-  const b = parseInt(normalized.slice(4, 6), 16);
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-};
-
-const SERIES_STYLE: Record<
-  SeriesKey,
-  { color: string; strokeAlpha?: number; legendHidden?: boolean }
-> = {
-  combined_error: { color: PALETTE.errorCombined },
-  control_signal: { color: PALETTE.controlSignal },
-  control_signal_history: { color: PALETTE.controlHistory },
-  slow_history: { color: PALETTE.slowHistory },
-  monitor_signal_history: { color: PALETTE.monitorHistory },
-  error_signal_1: { color: PALETTE.error1 },
-  error_signal_2: { color: PALETTE.error2 },
-  monitor_signal: { color: PALETTE.monitor },
-  signal_strength_a_upper: { color: PALETTE.error1, strokeAlpha: 0.4, legendHidden: true },
-  signal_strength_a_lower: { color: PALETTE.error1, strokeAlpha: 0.4, legendHidden: true },
-  signal_strength_b_upper: { color: PALETTE.error2, strokeAlpha: 0.4, legendHidden: true },
-  signal_strength_b_lower: { color: PALETTE.error2, strokeAlpha: 0.4, legendHidden: true },
-};
-
 const POINT_STYLE: uPlot.Series.Points = { show: false };
-// Shared monotonic x-axis buffer pool keyed by point count. uPlot accepts
-// typed arrays in `setData`, so we can hand out the same buffer for every
-// PlotPanel sharing the same point count without copying.
-const X_BUFFER_CACHE = new Map<number, Float64Array>();
-
-const getXBuffer = (count: number): Float64Array => {
-  const cached = X_BUFFER_CACHE.get(count);
-  if (cached) return cached;
-  const values = new Float64Array(count);
-  for (let i = 0; i < count; i++) values[i] = i;
-  X_BUFFER_CACHE.set(count, values);
-  return values;
-};
-
-const toFinite = (value: unknown): number | null => {
-  if (value == null) return null;
-  const num = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(num) ? num : null;
-};
-
-// Coerce a single value to a finite number or NaN. Used by the buffer
-// writer below; we use NaN as the "no point" marker because uPlot's
-// `spanGaps: true` treats NaN as a gap, matching the previous behaviour
-// of `null` entries in plain arrays.
-const coerceToFiniteOrNaN = (v: unknown): number => {
-  if (v == null) return NaN;
-  if (typeof v === 'number') return Number.isFinite(v) ? v : NaN;
-  const num = Number(v);
-  return Number.isFinite(num) ? num : NaN;
-};
-
-// Write `value` into the first `count` slots of `out`, returning whether
-// any finite point was written. The destination buffer is reused across
-// frames, so the hot path is now a single tight numeric loop with no
-// allocations beyond the buffer itself.
-const writeSeriesInto = (
-  out: Float64Array,
-  count: number,
-  value: unknown
-): boolean => {
-  let hasFinite = false;
-  if (Array.isArray(value)) {
-    const len = Math.min(value.length, count);
-    for (let i = 0; i < len; i++) {
-      const num = coerceToFiniteOrNaN(value[i]);
-      out[i] = num;
-      if (!hasFinite && num === num) hasFinite = true;
-    }
-    for (let i = len; i < count; i++) out[i] = NaN;
-    return hasFinite;
-  }
-  if (ArrayBuffer.isView(value)) {
-    const typed = value as unknown as ArrayLike<number>;
-    const len = Math.min(typed.length, count);
-    for (let i = 0; i < len; i++) {
-      const v = typed[i];
-      if (Number.isFinite(v)) {
-        out[i] = v;
-        hasFinite = true;
-      } else {
-        out[i] = NaN;
-      }
-    }
-    for (let i = len; i < count; i++) out[i] = NaN;
-    return hasFinite;
-  }
-  if (value && typeof value === 'object') {
-    // Slow path: object with numeric-string keys (rare in practice but
-    // kept for compatibility with legacy payloads).
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([key]) => String(Number(key)) === key)
-      .sort((a, b) => Number(a[0]) - Number(b[0]));
-    if (entries.length > 0) {
-      const len = Math.min(entries.length, count);
-      for (let i = 0; i < len; i++) {
-        const num = coerceToFiniteOrNaN(entries[i][1]);
-        out[i] = num;
-        if (!hasFinite && num === num) hasFinite = true;
-      }
-      for (let i = len; i < count; i++) out[i] = NaN;
-      return hasFinite;
-    }
-    const values = Object.values(value as Record<string, unknown>);
-    const len = Math.min(values.length, count);
-    for (let i = 0; i < len; i++) {
-      const num = coerceToFiniteOrNaN(values[i]);
-      out[i] = num;
-      if (!hasFinite && num === num) hasFinite = true;
-    }
-    for (let i = len; i < count; i++) out[i] = NaN;
-    return hasFinite;
-  }
-  for (let i = 0; i < count; i++) out[i] = NaN;
-  return false;
-};
-
-const seriesArrayLength = (value: unknown): number => {
-  if (Array.isArray(value)) return value.length;
-  if (ArrayBuffer.isView(value) && 'length' in (value as object)) {
-    return (value as unknown as ArrayLike<number>).length;
-  }
-  if (value && typeof value === 'object') {
-    return Object.keys(value as Record<string, unknown>).length;
-  }
-  return 0;
-};
-
-const SERIES_INDEX = SERIES_KEYS.reduce((acc, key, idx) => {
-  acc[key] = idx + 1;
-  return acc;
-}, {} as Record<SeriesKey, number>);
-
-const BAND_CONFIGS = [
-  {
-    upper: 'signal_strength_a_upper' as SeriesKey,
-    lower: 'signal_strength_a_lower' as SeriesKey,
-    fill: toRgba(PALETTE.error1, 0.22),
-    controller: 'error_signal_1' as SeriesKey,
-  },
-  {
-    upper: 'signal_strength_b_upper' as SeriesKey,
-    lower: 'signal_strength_b_lower' as SeriesKey,
-    fill: toRgba(PALETTE.error2, 0.22),
-    controller: 'error_signal_2' as SeriesKey,
-  },
-];
-
-const getAxisTheme = () => {
-  if (typeof window === 'undefined') {
-    return { axis: '#111111', grid: 'rgba(0, 0, 0, 0.15)', tick: 'rgba(0, 0, 0, 0.35)' };
-  }
-  const styles = getComputedStyle(document.documentElement);
-  const axis = styles.getPropertyValue('--ink').trim() || '#111111';
-  const grid = styles.getPropertyValue('--grid').trim() || 'rgba(0, 0, 0, 0.15)';
-  const tick = styles.getPropertyValue('--tick').trim() || 'rgba(0, 0, 0, 0.35)';
-  return { axis, grid, tick };
-};
 
 const getSelectionWidth = (mode: SelectionMode) => (mode === 'optimization' ? 0.75 : 0.99);
 
@@ -250,14 +54,6 @@ const getSelectionBounds = (mode: Exclude<SelectionMode, null>, pointCount: numb
 
 const getSelectionThreshold = (bounds: { minVal: number; maxVal: number }) =>
   Math.max(1, (bounds.maxVal - bounds.minVal) * 0.01);
-
-const getAccentColor = () => {
-  if (typeof window === 'undefined') {
-    return '#c4472d';
-  }
-  const styles = getComputedStyle(document.documentElement);
-  return styles.getPropertyValue('--accent').trim() || '#c4472d';
-};
 
 export function PlotPanel({
   plotFrame,
@@ -299,6 +95,12 @@ export function PlotPanel({
       return acc;
     }, {} as Record<SeriesKey, boolean>)
   );
+  // Per-series finite-stats from the most recent writeSeriesInto pass.
+  // Aggregated over the visible-series subset to drive the explicit
+  // y-axis setScale, avoiding uPlot's own all-series rescale sweep.
+  const seriesStatsRef = useRef<SeriesStats[]>(
+    SERIES_KEYS.map(() => ({ hasFinite: false, min: Infinity, max: -Infinity }))
+  );
   // Track the last visibility configuration applied to uPlot so we can
   // skip the per-frame setSeries loop and legend DOM walk when nothing
   // visibility-related actually changed (the common case during steady
@@ -308,6 +110,15 @@ export function PlotPanel({
     dual: boolean | null;
     hasDataKey: string;
   }>({ lockAxis: null, dual: null, hasDataKey: '' });
+  // Track the x scale we last pushed to uPlot. Skipping setScale('x')
+  // when the point count hasn't moved avoids a redundant scale update
+  // per frame (the common case — pointCount is virtually always
+  // N_POINTS).
+  const lastAppliedXMaxRef = useRef<number | null>(null);
+  // Track the y scale we last pushed so we can skip setScale('y') when
+  // the rounded range hasn't changed enough to be visible. Avoids
+  // micro-redraws as the signal jitters.
+  const lastAppliedYRef = useRef<{ min: number; max: number } | null>(null);
 
   useEffect(() => {
     if (selectionMode === null) {
@@ -449,7 +260,13 @@ export function PlotPanel({
       width: initialWidth,
       height: sizeRef.current.height,
       scales: {
-        x: { time: false },
+        // Both scales `auto: false` so uPlot never sweeps the
+        // visible-series points looking for min/max on each setData.
+        // The per-frame layout effect computes y range from
+        // writeSeriesInto's stats (already iterating the data) and
+        // sets x explicitly only when the point count changes.
+        x: { time: false, auto: false, range: [0, N_POINTS - 1] },
+        y: { auto: false },
       },
       cursor: {
         drag: { setScale: false },
@@ -596,7 +413,12 @@ export function PlotPanel({
       ...seriesBuffersRef.current,
     ] as unknown as PlotData;
     uplotRef.current = new uPlot(opts, initialData, container);
-    uplotRef.current.setData(initialData, true);
+    // Seed both scales explicitly. With auto:false on both, uPlot
+    // won't recompute them during setData calls — we drive them from
+    // the per-frame layout effect.
+    uplotRef.current.setScale('x', { min: 0, max: N_POINTS - 1 });
+    uplotRef.current.setScale('y', { min: -1, max: 1 });
+    uplotRef.current.setData(initialData, false);
     handleResize();
 
     const applyAxisTheme = () => {
@@ -660,29 +482,34 @@ export function PlotPanel({
       }
     }
 
+    const stats = seriesStatsRef.current;
     SERIES_KEYS.forEach((key, idx) => {
-      hasDataByKey[key] = writeSeriesInto(buffers[idx], count, series?.[key]);
+      const s = writeSeriesInto(buffers[idx], count, series?.[key]);
+      hasDataByKey[key] = s.hasFinite;
+      stats[idx] = s;
     });
 
     // When the time axis is in sweep-voltage mode, alias combined_error
-    // to error_signal_1 if the latter has data — mirrors the previous
-    // behavior of swapping the raw array.
-    if (!lockAxis) {
-      const combinedIdx = SERIES_KEYS.indexOf('combined_error');
-      const errIdx = SERIES_KEYS.indexOf('error_signal_1');
-      if (hasDataByKey.error_signal_1) {
-        const src = buffers[errIdx];
-        if (buffers[combinedIdx].length < count) {
-          buffers[combinedIdx] = new Float64Array(count);
-        }
-        const target = buffers[combinedIdx];
-        for (let i = 0; i < count; i++) target[i] = src[i];
-        hasDataByKey.combined_error = hasDataByKey.error_signal_1;
-      }
+    // to error_signal_1 if the latter has data. Previously we copied
+    // 2048 floats per frame; uPlot accepts shared buffer refs across
+    // series, so we just point the plotData slot at the same buffer
+    // and copy the per-series stats too.
+    const combinedIdx = SERIES_KEYS.indexOf('combined_error');
+    const errIdx = SERIES_KEYS.indexOf('error_signal_1');
+    let aliasCombinedToErr1 = false;
+    if (!lockAxis && hasDataByKey.error_signal_1) {
+      hasDataByKey.combined_error = true;
+      stats[combinedIdx] = stats[errIdx];
+      aliasCombinedToErr1 = true;
     }
 
     const x = getXBuffer(count);
     const plotData = [x, ...buffers] as unknown as PlotData;
+    if (aliasCombinedToErr1) {
+      // plotData is a fresh array per frame (new spread); mutating the
+      // alias slot here does not mutate seriesBuffersRef.current.
+      plotData[combinedIdx + 1] = buffers[errIdx];
+    }
 
     const dual = Boolean(activePlotFrame?.dual_channel);
     const desiredVisibility: Record<SeriesKey, boolean> = {
@@ -741,6 +568,38 @@ export function PlotPanel({
       last.dual !== dual ||
       last.hasDataKey !== hasDataKey;
 
+    // Aggregate y range over only the series that will actually be
+    // drawn. Doing it from the per-series stats we already collected
+    // in writeSeriesInto (one pass over the data) replaces uPlot's
+    // built-in scale-recompute, which would otherwise sweep every
+    // visible series's points again on every setData call.
+    let yMin = Infinity;
+    let yMax = -Infinity;
+    SERIES_KEYS.forEach((key, idx) => {
+      if (!desiredVisibility[key] || !hasDataByKey[key]) return;
+      if (key === 'signal_strength_a_upper' || key === 'signal_strength_a_lower') {
+        if (!error1Visible) return;
+      }
+      if (key === 'signal_strength_b_upper' || key === 'signal_strength_b_lower') {
+        if (!error2Visible) return;
+      }
+      const s = stats[idx];
+      if (!s.hasFinite) return;
+      if (s.min < yMin) yMin = s.min;
+      if (s.max > yMax) yMax = s.max;
+    });
+    const padded = padYRange(yMin, yMax);
+    const lastY = lastAppliedYRef.current;
+    // Only push y scale when range moves perceptibly (>0.5% of the
+    // current span). Tiny ADC jitter would otherwise trigger a full
+    // canvas redraw on every frame.
+    const ySpan = Math.max(1e-9, padded.yMax - padded.yMin);
+    const yChanged =
+      lastY === null ||
+      Math.abs(lastY.min - padded.yMin) > ySpan * 0.005 ||
+      Math.abs(lastY.max - padded.yMax) > ySpan * 0.005;
+    const xChanged = lastAppliedXMaxRef.current !== count;
+
     uplotRef.current.batch((u: uPlot) => {
       if (visibilityChanged) {
         suppressSeriesEventRef.current = true;
@@ -760,8 +619,17 @@ export function PlotPanel({
         });
         suppressSeriesEventRef.current = false;
       }
-      u.setData(plotData, true);
-      u.setScale('x', { min: 0, max: Math.max(count - 1, 1) });
+      // setData(false) skips uPlot's internal autoscale; we drive
+      // scales explicitly below.
+      u.setData(plotData, false);
+      if (xChanged) {
+        u.setScale('x', { min: 0, max: Math.max(count - 1, 1) });
+        lastAppliedXMaxRef.current = count;
+      }
+      if (yChanged) {
+        u.setScale('y', { min: padded.yMin, max: padded.yMax });
+        lastAppliedYRef.current = { min: padded.yMin, max: padded.yMax };
+      }
       if (visibilityChanged) {
         const rows = u.root.querySelectorAll<HTMLElement>('.u-legend .u-series');
         rows.forEach((row: HTMLElement, rowIdx: number) => {
