@@ -932,8 +932,28 @@ class DeviceSession:
             finally:
                 self._relock_action_lock.release()
 
+        # Decide what detail level to build at. When every connected
+        # websocket subscriber only needs a summary frame (the common case
+        # when many devices are displayed on the overview grid), building
+        # the full frame's history/quadrature series wastes CPU and
+        # allocates large lists that are immediately discarded by
+        # `filter_plot_frame`. We still build "full" when any subscriber
+        # wants full detail, when auto-relock is active (it needs the full
+        # frame stored as `last_plot_frame` for snapshots), or when there
+        # are no subscribers at all (so that REST snapshot consumers see a
+        # complete frame).
+        required_detail = self.manager.peek_required_detail(self.device.key)
+        auto_relock_active = bool(self.auto_relock.get_status().get("enabled"))
+        build_detail = (
+            "full"
+            if required_detail == "full" or auto_relock_active or required_detail is None
+            else "summary"
+        )
+
         with self._state_lock:
-            frame = build_plot_frame(to_plot, params, self.plot_state, detail="full")
+            frame = build_plot_frame(
+                to_plot, params, self.plot_state, detail=build_detail
+            )
             if frame is None:
                 return
             frame_lock_indicator = self.lock_indicator.update(
