@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { openDeviceStream } from '../ws';
+import { openDeviceStream, type DeviceStreamHandle } from '../ws';
 import type { StreamMessage } from '../types';
 
 type StreamOptions = {
@@ -19,6 +19,7 @@ export function useDeviceStream(
   options?: StreamOptions
 ) {
   const socketRef = useRef<WebSocket | null>(null);
+  const streamHandleRef = useRef<DeviceStreamHandle | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectDelayRef = useRef(INITIAL_RECONNECT_DELAY_MS);
   const openedRef = useRef(false);
@@ -72,13 +73,18 @@ export function useDeviceStream(
 
     const closeCurrentSocket = () => {
       const socket = socketRef.current;
+      const handle = streamHandleRef.current;
       socketRef.current = null;
+      streamHandleRef.current = null;
       if (socket) {
         socket.onopen = null;
         socket.onclose = null;
         socket.onerror = null;
         socket.onmessage = null;
         socket.close();
+      }
+      if (handle) {
+        handle.disposeParser();
       }
       notifyClosed();
     };
@@ -98,12 +104,14 @@ export function useDeviceStream(
       clearReconnectTimer();
       closeCurrentSocket();
 
-      const socket = openDeviceStream(
+      const handle = openDeviceStream(
         deviceKey,
         (msg) => onMessageRef.current(msg),
         { maxFps, detail }
       );
+      const socket = handle.socket;
       socketRef.current = socket;
+      streamHandleRef.current = handle;
       socket.onopen = () => {
         reconnectDelayRef.current = INITIAL_RECONNECT_DELAY_MS;
         openedRef.current = true;

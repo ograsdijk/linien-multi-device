@@ -1,6 +1,9 @@
 import { apiBase } from './api';
 import type { LogsStreamMessage, StreamMessage } from './types';
-import { parseLogsStreamMessage, parseStreamMessage } from './features/runtime/messageGuards';
+import {
+  registerLogsParser,
+  registerStreamParser,
+} from './workers/streamParserClient';
 
 type StreamOptions = {
   maxFps?: number;
@@ -9,11 +12,18 @@ type StreamOptions = {
 
 const CLIENT_PLOT_MAX_FPS = 60;
 
+// Returned alongside the raw WebSocket so callers know to dispose the
+// per-stream parser registration when they close the socket.
+export type DeviceStreamHandle = {
+  socket: WebSocket;
+  disposeParser: () => void;
+};
+
 export function openDeviceStream(
   deviceKey: string,
   onMessage: (msg: StreamMessage) => void,
   options?: StreamOptions
-) {
+): DeviceStreamHandle {
   const wsBase = apiBase.replace(/^http/, 'ws');
   const params = new URLSearchParams();
   if (options?.maxFps && options.maxFps > 0) {
@@ -28,40 +38,29 @@ export function openDeviceStream(
     : `${wsBase}/devices/${deviceKey}/stream`;
   const socket = new WebSocket(url);
 
+  // Hand parsing + shape validation off to a shared worker so the main
+  // thread is not consumed by JSON.parse + validation across N streams.
+  const { parse, dispose } = registerStreamParser(onMessage);
   socket.onmessage = (event) => {
-    try {
-      const parsed = JSON.parse(event.data) as unknown;
-      const message = parseStreamMessage(parsed);
-      if (!message) {
-        console.warn('Bad WS message shape', parsed);
-        return;
-      }
-      onMessage(message);
-    } catch (err) {
-      console.warn('Bad WS message', err);
-    }
+    if (typeof event.data !== 'string') return;
+    parse(event.data);
   };
 
-  return socket;
+  return { socket, disposeParser: dispose };
 }
 
-export function openLogsStream(onMessage: (msg: LogsStreamMessage) => void) {
+export function openLogsStream(onMessage: (msg: LogsStreamMessage) => void): WebSocket {
   const wsBase = apiBase.replace(/^http/, 'ws');
   const socket = new WebSocket(`${wsBase}/logs/stream`);
-
+  const { parse, dispose } = registerLogsParser(onMessage);
   socket.onmessage = (event) => {
-    try {
-      const parsed = JSON.parse(event.data) as unknown;
-      const message = parseLogsStreamMessage(parsed);
-      if (!message) {
-        console.warn('Bad logs WS message shape', parsed);
-        return;
-      }
-      onMessage(message);
-    } catch (err) {
-      console.warn('Bad logs WS message', err);
-    }
+    if (typeof event.data !== 'string') return;
+    parse(event.data);
   };
-
+  const handleClose = () => {
+    dispose();
+    socket.removeEventListener('close', handleClose);
+  };
+  socket.addEventListener('close', handleClose);
   return socket;
 }
