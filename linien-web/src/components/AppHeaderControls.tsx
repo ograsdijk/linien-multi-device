@@ -14,28 +14,24 @@ import {
 import {
   IconDatabase,
   IconFileText,
-  IconLock,
   IconMoonStars,
   IconSun,
 } from '@tabler/icons-react';
 import { useState } from 'react';
 import type {
-  AutoRelockStatus,
   Device,
-  DeviceStatus,
   InfluxCredentials,
-  LockIndicatorSnapshot,
   ParamMeta,
   PostgresManualLockConfig,
   PostgresManualLockStatus,
 } from '../types';
-import { resolveLockDisplay } from '../features/locks/lockState';
 import type {
   InfluxApplyAllOptions,
   InfluxApplyAllResult,
 } from '../features/integrations/useInfluxController';
 import { toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
 import { DeferredNumberInput } from './DeferredNumberInput';
+import { LockChipPopover } from './header/LockChipPopover';
 
 const formatTimestamp = (value: number | null | undefined) => {
   if (!value || !Number.isFinite(value)) return 'never';
@@ -71,22 +67,13 @@ type AppHeaderControlsProps = {
   influxMessageError: boolean;
   lockPopoverOpen: boolean;
   setLockPopoverOpen: (open: boolean) => void;
-  lockChipTone: 'gray' | 'yellow' | 'green' | 'red';
-  lockLabel: string;
   devices: Device[];
-  deviceStatusMap: Record<string, DeviceStatus | undefined>;
-  lockStateMap: Record<string, boolean | undefined>;
-  lockIndicatorMap: Record<string, LockIndicatorSnapshot | undefined>;
-  autoRelockMap: Record<string, AutoRelockStatus | undefined>;
   lockBusyKeys: Record<string, boolean>;
   autoLockBusyKeys: Record<string, boolean>;
   autoRelockBusyKeys: Record<string, boolean>;
   onStartAutoLock: (deviceKey: string) => void;
   onDisableLock: (deviceKey: string) => void;
   onToggleAutoRelock: (deviceKey: string, enabled: boolean) => void;
-  lockedDeviceCount: number;
-  connectedDeviceCount: number;
-  connectedRelockEnabledCount: number;
   postgresPopoverOpen: boolean;
   setPostgresPopoverOpen: (open: boolean) => void;
   postgresChipColor: string;
@@ -366,111 +353,17 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
         </Popover>
       </div>
       <div style={{ order: 0 }}>
-        <Popover
+        <LockChipPopover
           opened={props.lockPopoverOpen}
-          onChange={props.setLockPopoverOpen}
-          position="bottom-end"
-          shadow="md"
-          width={480}
-          withArrow
-        >
-          <Popover.Target>
-            <Button
-              size="xs"
-              variant="light"
-              className="lock-chip-button"
-              data-tone={props.lockChipTone}
-              leftSection={<IconLock size={14} />}
-              onClick={() => props.setLockPopoverOpen(!props.lockPopoverOpen)}
-            >
-              Lock - {props.lockLabel}
-            </Button>
-          </Popover.Target>
-          <Popover.Dropdown>
-            <Stack gap="xs">
-              <Text fw={600}>Lock controls</Text>
-              <Text size="xs" c="dimmed">
-                Locked: {props.lockedDeviceCount}/{props.connectedDeviceCount} connected devices | Auto relock
-                enabled: {props.connectedRelockEnabledCount}/{props.connectedDeviceCount}
-              </Text>
-              {props.devices.length === 0 ? (
-                <Text size="xs" c="dimmed">
-                  No devices configured.
-                </Text>
-              ) : null}
-              <Stack gap={6}>
-                {props.devices.map((device) => {
-                  const status = props.deviceStatusMap[device.key];
-                  const connected = Boolean(status?.connected);
-                  const lockState = props.lockStateMap[device.key];
-                  const indicator = props.lockIndicatorMap[device.key];
-                  const lockDisplay = resolveLockDisplay({
-                    connected,
-                    lockEnabled: lockState,
-                    indicator,
-                  });
-                  const autoRelock =
-                    props.autoRelockMap[device.key] ?? status?.auto_relock ?? undefined;
-                  const autoRelockEnabled = Boolean(autoRelock?.enabled);
-                  const disableBusy = Boolean(props.lockBusyKeys[device.key]);
-                  const autoLockBusy = Boolean(props.autoLockBusyKeys[device.key]);
-                  const relockBusy = Boolean(props.autoRelockBusyKeys[device.key]);
-                  return (
-                    <Group key={device.key} justify="space-between" align="flex-start" wrap="nowrap">
-                      <Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
-                        <Text size="sm" fw={500}>
-                          {device.name || device.key}
-                        </Text>
-                        <Text size="xs" c="dimmed">
-                          {device.host}:{device.port}
-                        </Text>
-                        <Text size="xs" c={lockDisplay.color}>
-                          {lockDisplay.label}
-                        </Text>
-                      </Stack>
-                      <Stack gap={4} align="flex-end" style={{ minWidth: 300 }}>
-                        <Group gap={6} wrap="nowrap">
-                          <Button
-                            size="xs"
-                            variant="light"
-                            color="blue"
-                            disabled={!connected || lockState === true || autoLockBusy}
-                            loading={autoLockBusy}
-                            onClick={() => props.onStartAutoLock(device.key)}
-                          >
-                            Auto lock
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="light"
-                            color="red"
-                            disabled={!connected || lockState !== true || disableBusy}
-                            loading={disableBusy}
-                            onClick={() => props.onDisableLock(device.key)}
-                          >
-                            Disable lock
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="light"
-                            color={autoRelockEnabled ? 'green' : 'gray'}
-                            disabled={!connected || relockBusy}
-                            loading={relockBusy}
-                            onClick={() =>
-                              props.onToggleAutoRelock(device.key, !autoRelockEnabled)
-                            }
-                          >
-                            {autoRelockEnabled ? 'Relock on' : 'Relock off'}
-                          </Button>
-                        </Group>
-                      </Stack>
-                    </Group>
-                  );
-                })}
-              </Stack>
-            </Stack>
-          </Popover.Dropdown>
-        </Popover>
+          onOpenedChange={props.setLockPopoverOpen}
+          devices={props.devices}
+          lockBusyKeys={props.lockBusyKeys}
+          autoLockBusyKeys={props.autoLockBusyKeys}
+          autoRelockBusyKeys={props.autoRelockBusyKeys}
+          onStartAutoLock={props.onStartAutoLock}
+          onDisableLock={props.onDisableLock}
+          onToggleAutoRelock={props.onToggleAutoRelock}
+        />
       </div>
       <div style={{ order: 3 }}>
         <Popover

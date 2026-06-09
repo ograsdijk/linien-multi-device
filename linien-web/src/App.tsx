@@ -440,15 +440,16 @@ export function App() {
 
   const draggingDevice = draggingDeviceKey ? deviceByKey.get(draggingDeviceKey) ?? null : null;
 
+  // App needs only the slices used by DeviceList / sortedDevices / the
+  // connected-count chip. Counters and health summary are consumed by
+  // the extracted LockChipPopover, which subscribes directly. The
+  // lockState map is no longer used in App body after the popover
+  // extraction.
   const {
     deviceStatusMap,
     lockIndicatorMap,
     autoRelockMap,
-    lockStateMap,
-    lockHealthSummary,
     connectedDeviceCount,
-    lockedDeviceCount,
-    connectedRelockEnabledCount,
   } = useLockSummary(devices);
   const sortedDevices = useMemo(() => {
     if (deviceSortMode === 'manual') return orderedDevices;
@@ -550,20 +551,9 @@ export function App() {
     savePostgresConfig,
     testPostgresConnection,
   } = usePostgresController();
-  const lockChipTone =
-    connectedDeviceCount === 0
-      ? 'gray'
-      : lockHealthSummary.lost > 0
-      ? 'red'
-      : lockHealthSummary.considered === 0
-      ? 'gray'
-      : lockHealthSummary.marginalOrUnknown > 0
-      ? 'yellow'
-      : 'green';
-  const lockLabel =
-    devices.length === 0
-      ? 'No devices'
-      : `${lockedDeviceCount}/${connectedDeviceCount} locked | ${connectedRelockEnabledCount}/${connectedDeviceCount} relock`;
+  // Lock chip tone and label are now computed inside `LockChipPopover`,
+  // which subscribes to the lock summary itself. App no longer needs to
+  // read those aggregate values just to forward them as props.
   const logsChipColor = logsErrorLatched ? 'red' : 'gray';
   const gridColumns =
     gridColumnsMode === 'auto' ? null : Number.parseInt(gridColumnsMode, 10);
@@ -628,13 +618,7 @@ export function App() {
             influxMessageError={influxMessageError}
             lockPopoverOpen={lockPopoverOpen}
             setLockPopoverOpen={setLockPopoverOpen}
-            lockChipTone={lockChipTone}
-            lockLabel={lockLabel}
             devices={devices}
-            deviceStatusMap={deviceStatusMap}
-            lockStateMap={lockStateMap}
-            lockIndicatorMap={lockIndicatorMap}
-            autoRelockMap={autoRelockMap}
             lockBusyKeys={lockBusyKeys}
             autoLockBusyKeys={autoLockBusyKeys}
             autoRelockBusyKeys={autoRelockBusyKeys}
@@ -647,9 +631,6 @@ export function App() {
             onToggleAutoRelock={(deviceKey, enabled) => {
               toggleAutoRelock(deviceKey, enabled).catch(() => null);
             }}
-            lockedDeviceCount={lockedDeviceCount}
-            connectedDeviceCount={connectedDeviceCount}
-            connectedRelockEnabledCount={connectedRelockEnabledCount}
             postgresPopoverOpen={postgresPopoverOpen}
             setPostgresPopoverOpen={setPostgresPopoverOpen}
             postgresChipColor={postgresChipColor}
