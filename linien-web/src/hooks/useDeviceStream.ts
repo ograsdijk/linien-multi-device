@@ -42,6 +42,25 @@ export function useDeviceStream(
   const maxFps = options?.maxFps;
   const detail = options?.detail;
 
+  // The socket is opened with the maxFps value at mount, but later
+  // changes should NOT recycle the socket — that caused a visible
+  // reconnect storm across all 12 cards every time the FPS selector
+  // moved. We keep the latest value in a ref and push it to the
+  // server via a small control message on the existing socket.
+  const maxFpsRef = useRef(maxFps);
+  useEffect(() => {
+    maxFpsRef.current = maxFps;
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    try {
+      socket.send(
+        JSON.stringify({ type: 'set_max_fps', value: maxFps ?? null })
+      );
+    } catch {
+      // Server may be shutting down; ignore.
+    }
+  }, [maxFps]);
+
   useEffect(() => {
     let disposed = false;
 
@@ -104,10 +123,13 @@ export function useDeviceStream(
       clearReconnectTimer();
       closeCurrentSocket();
 
+      // Read maxFps from the ref so the initial URL param reflects
+      // the latest value at (re)connect time, even though changes
+      // alone don't trigger a reconnect.
       const handle = openDeviceStream(
         deviceKey,
         (msg) => onMessageRef.current(msg),
-        { maxFps, detail }
+        { maxFps: maxFpsRef.current, detail }
       );
       const socket = handle.socket;
       socketRef.current = socket;
@@ -146,5 +168,8 @@ export function useDeviceStream(
       clearReconnectTimer();
       closeCurrentSocket();
     };
-  }, [deviceKey, enabled, maxFps, detail]);
+    // `maxFps` intentionally excluded from this dep list — see the
+    // ref + control-message effect above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deviceKey, enabled, detail]);
 }

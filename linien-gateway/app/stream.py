@@ -106,6 +106,31 @@ class WebsocketManager:
         with self._connections_lock:
             self._connections.setdefault(device_key, {})[websocket] = state
 
+    def update_max_fps(
+        self, device_key: str, websocket: WebSocket, max_fps: float | None
+    ) -> None:
+        """Update the per-connection plot-frame FPS cap in place.
+
+        Called from the per-stream receive loop in response to a
+        `set_max_fps` control message from the client. Avoids tearing
+        down and recreating the websocket every time the user changes
+        the FPS selector — with 12 cards a full reconnect storm is
+        noticeably stuttery.
+        """
+        resolved = self._resolve_max_fps(max_fps)
+        with self._connections_lock:
+            connections = self._connections.get(device_key)
+            if connections is None:
+                return
+            state = connections.get(websocket)
+            if state is None:
+                return
+            state.max_fps = resolved
+            # Reset last_plot so a lower-to-higher transition doesn't
+            # leave us starved until the next frame; the immediate frame
+            # is allowed through.
+            state.last_plot = 0.0
+
     async def unregister(self, device_key: str, websocket: WebSocket) -> None:
         with self._connections_lock:
             connections = self._connections.get(device_key)

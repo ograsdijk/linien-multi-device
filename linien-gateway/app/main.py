@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from contextlib import asynccontextmanager
@@ -983,7 +984,30 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
 
     try:
         while True:
-            await websocket.receive_text()
+            raw = await websocket.receive_text()
+            # Best-effort control channel: clients can send
+            # `{"type":"set_max_fps","value":N}` to retune the per-
+            # connection FPS cap without closing and reopening the
+            # socket. Anything we can't parse is silently ignored —
+            # this stays backwards-compatible with clients that never
+            # send anything (the previous behaviour).
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "set_max_fps":
+                value = payload.get("value")
+                if value is None:
+                    manager.update_max_fps(key, websocket, None)
+                else:
+                    try:
+                        manager.update_max_fps(key, websocket, float(value))
+                    except (ValueError, TypeError):
+                        pass
     except WebSocketDisconnect:
         await manager.unregister(key, websocket)
 
