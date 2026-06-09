@@ -958,16 +958,23 @@ class DeviceSession:
         # when many devices are displayed on the overview grid), building
         # the full frame's history/quadrature series wastes CPU and
         # allocates large lists that are immediately discarded by
-        # `filter_plot_frame`. We still build "full" when any subscriber
-        # wants full detail, when auto-relock is active (it needs the full
-        # frame stored as `last_plot_frame` for snapshots), or when there
-        # are no subscribers at all (so that REST snapshot consumers see a
-        # complete frame).
+        # `filter_plot_frame`.
+        #
+        # We build "full" only when at least one subscriber wants full
+        # detail, or when auto-relock is active (it inspects
+        # `last_plot_frame` for snapshots). When there are NO subscribers
+        # at all we still build (so internal state — `last_plot_frame`,
+        # `plot_state`, `lock_indicator`, `auto_relock` — stays current),
+        # but at "summary" detail to avoid the heavy history/quadrature
+        # work that nobody is consuming. REST snapshot consumers that read
+        # `last_plot_frame` (e.g. manual lock trace fallback) only need
+        # the `combined_error` and `monitor_signal`/`error_signal_2`
+        # series, both of which are present in summary frames.
         required_detail = self.manager.peek_required_detail(self.device.key)
         auto_relock_active = bool(self.auto_relock.get_status().get("enabled"))
         build_detail = (
             "full"
-            if required_detail == "full" or auto_relock_active or required_detail is None
+            if required_detail == "full" or auto_relock_active
             else "summary"
         )
 

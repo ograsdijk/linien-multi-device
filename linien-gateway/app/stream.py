@@ -134,6 +134,10 @@ class WebsocketManager:
             return
         stale: list[WebSocket] = []
         is_plot_frame = message.get("type") == "plot_frame"
+        # When a single "full" message is broadcast to many summary
+        # subscribers, the filtered (summary) variant is identical for
+        # all of them. Build it at most once per broadcast.
+        summary_variant: Dict[str, Any] | None = None
         for websocket, state in connections:
             if is_plot_frame:
                 if state.max_fps:
@@ -142,7 +146,15 @@ class WebsocketManager:
                     if now - state.last_plot < min_dt:
                         continue
                     state.last_plot = now
-                self._enqueue_plot_frame(state, self.filter_plot_frame(message, state.detail))
+                if state.detail == "full":
+                    payload = message
+                else:
+                    if summary_variant is None:
+                        summary_variant = self.filter_plot_frame(
+                            message, "summary"
+                        )
+                    payload = summary_variant
+                self._enqueue_plot_frame(state, payload)
                 state.wake_event.set()
                 continue
             try:
