@@ -91,7 +91,11 @@ export const LockChipPopover = memo(function LockChipPopover({
             </Text>
           ) : null}
           <Stack gap={6}>
-            {devices.map((device) => {
+            {/* Skip rendering the per-device row tree when the popover is
+                closed. Mantine mounts Popover.Dropdown children regardless
+                of `opened`, so without this gate we re-render 12 device
+                rows + 36 Mantine Buttons on every lock-summary flush. */}
+            {opened ? devices.map((device) => {
               const status = deviceStatusMap[device.key];
               const connected = Boolean(status?.connected);
               const lockState = lockStateMap[device.key];
@@ -156,7 +160,7 @@ export const LockChipPopover = memo(function LockChipPopover({
                   </Stack>
                 </Group>
               );
-            })}
+            }) : null}
           </Stack>
         </Stack>
       </Popover.Dropdown>
