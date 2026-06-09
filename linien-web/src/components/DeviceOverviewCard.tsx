@@ -5,7 +5,7 @@ import { api } from '../api';
 import { useDeviceStream } from '../hooks/useDeviceStream';
 import { useInViewport } from '../hooks/useInViewport';
 import { usePlotFrameBuffer } from '../hooks/usePlotFrameBuffer';
-import { PlotPanel } from './PlotPanel';
+import { OverviewPlotPanel } from './OverviewPlotPanel';
 import { StatusRow } from './StatusRow';
 import { resolveLockDisplay } from '../features/locks/lockState';
 import { useDeviceStateEntry } from '../state/deviceStatesStore';
@@ -40,12 +40,6 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
   const lockStateFromParams = typeof state.params.lock === 'boolean' ? state.params.lock : undefined;
   const lockStateFromStatus = typeof state.status?.lock === 'boolean' ? state.status.lock : undefined;
   const lockState = lockStateFromParams ?? lockStateFromStatus;
-  const sweepCenterRaw = state.params.sweep_center;
-  const sweepCenterNum = sweepCenterRaw == null ? NaN : Number(sweepCenterRaw);
-  const sweepCenter = Number.isFinite(sweepCenterNum) ? sweepCenterNum : undefined;
-  const sweepAmplitudeRaw = state.params.sweep_amplitude;
-  const sweepAmplitudeNum = sweepAmplitudeRaw == null ? NaN : Number(sweepAmplitudeRaw);
-  const sweepAmplitude = Number.isFinite(sweepAmplitudeNum) ? sweepAmplitudeNum : undefined;
   const statusLabel = connected ? (lockState ? 'Locked' : 'Unlocked') : 'Disconnected';
   const lockIndicator = plotFrame?.lock_indicator ?? null;
   const lockDisplay = resolveLockDisplay({
@@ -118,14 +112,7 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
           </Button>
         </Group>
       </Group>
-      <PlotPanel
-        plotFrame={plotFrame}
-        selectionMode={null}
-        lockState={lockState}
-        sweepCenter={sweepCenter}
-        sweepAmplitude={sweepAmplitude}
-        showManualTarget={false}
-      />
+      <OverviewPlotPanel plotFrame={plotFrame} lockState={lockState} />
       <StatusRow
         plotFrame={plotFrame}
         lockIndicator={lockIndicator}
