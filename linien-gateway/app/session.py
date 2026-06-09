@@ -30,6 +30,11 @@ from .plot_processing import PlotState, build_plot_frame
 from .serializers import UNSERIALIZABLE, to_jsonable
 from .stream import WebsocketManager
 
+# Sentinel for `_read_param_fast` to distinguish "cache miss" from a
+# legitimately-cached `None` value. `getattr(..., _UNSET)` returns this
+# object when `_cached_value` is absent on the RemoteParameter.
+_UNSET = object()
+
 IGNORED_PARAMS = {
     "to_plot",
     "signal_stats",
@@ -124,6 +129,14 @@ class DeviceSession:
         self._last_lock_indicator_state: str | None = None
         self._last_auto_relock_state: str | None = None
         self.influx_logging_state = self._initial_influx_logging_state()
+        # Locally-mirrored value of `control.exposed_get_logging_status()`.
+        # Refreshed on connect and whenever we call exposed_start_logging /
+        # exposed_stop_logging. status() reads from this cache so the
+        # /api/devices/statuses poll doesn't have to do an RPyC round-trip
+        # per device every 5 s — the only callers that can change the
+        # server-side state route through this session, so the cache stays
+        # authoritative.
+        self._logging_active_cache: bool | None = None
 
     def _emit_log_event(
         self,
@@ -633,6 +646,7 @@ class DeviceSession:
             self._last_lock_indicator_state = None
             self._last_auto_relock_state = None
             self._param_metadata_cache = None
+            self._logging_active_cache = None
         self._disconnect_client_safely(client_to_close)
 
     def _handle_poll_failure(self, exc: Exception) -> None:
@@ -700,12 +714,24 @@ class DeviceSession:
                 if should_resume_logging:
                     try:
                         self.control.exposed_start_logging(resume_interval)
+                        self._logging_active_cache = True
                     except Exception:  # noqa: BLE001 - optional resume path
                         logger.warning(
                             "Failed to resume influx logging for device=%s",
                             self.device.key,
                             exc_info=True,
                         )
+                        self._logging_active_cache = None
+                else:
+                    # Seed the cache once from the server so /statuses
+                    # has an authoritative value without polling RPyC
+                    # every 5 s.
+                    try:
+                        self._logging_active_cache = bool(
+                            self.control.exposed_get_logging_status()
+                        )
+                    except Exception:  # noqa: BLE001 - best effort seed
+                        self._logging_active_cache = None
             self.connected = True
             self.connecting = False
             self.last_error = None
@@ -883,39 +909,80 @@ class DeviceSession:
         )
         return None
 
+    def _read_param_fast(self, name: str, default: Any = None) -> Any:
+        """Read a parameter without holding `_rpyc_lock` when cached.
+
+        The linien-client cache is populated on connect for every
+        cacheable param, then mutated only by
+        `check_for_changed_parameters()` which runs on the poll thread.
+        `_on_to_plot` (and thus the plot hot path) is invoked from that
+        same poll thread, so a cache read here cannot race a cache
+        write. Holding `_rpyc_lock` for these reads serialised the plot
+        path against /api/devices/statuses and other API request
+        handlers for no reason.
+
+        Falls back to a locked RPyC read if the param is non-cacheable
+        or the cache hasn't been populated yet (the first frame after
+        connect, in pathological cases).
+        """
+        if self.parameters is None:
+            return default
+        try:
+            param = getattr(self.parameters, name)
+        except AttributeError:
+            return default
+        cached = getattr(param, "_cached_value", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        with self._rpyc_lock:
+            try:
+                return param.value
+            except Exception:  # noqa: BLE001 - hot path, fall back to default
+                logger.debug(
+                    "Fast param read failed device=%s name=%s",
+                    self.device.key,
+                    name,
+                    exc_info=True,
+                )
+                return default
+
     def _derive_lock_and_plot_params(
         self, to_plot: dict[str, Any]
     ) -> tuple[bool, dict[str, Any]]:
-        """Single-acquisition variant of `_derive_lock_value` + `_plot_params`.
+        """Snapshot the params needed to build a plot frame.
 
-        Reads `parameters.lock` and every plot param under one `_rpyc_lock`
-        acquisition. This halves lock churn on the hot plot path (one
-        acquisition per frame instead of two) and reduces contention with
-        API request handlers that also need `_rpyc_lock`.
+        Every param read here is a cacheable status/config value.
+        `_read_param_fast` reads them straight from the linien-client
+        cache without touching `_rpyc_lock`, eliminating contention
+        with API request handlers (the previous design held the lock
+        for ~13 reads per frame).
         """
-        with self._rpyc_lock:
-            if self.parameters is None:
+        if self.parameters is None:
+            lock_value = False
+            if "error_signal" in to_plot and "control_signal" in to_plot:
+                lock_value = True
+            elif "error_signal_1" in to_plot:
                 lock_value = False
-                if "error_signal" in to_plot and "control_signal" in to_plot:
-                    lock_value = True
-                elif "error_signal_1" in to_plot:
-                    lock_value = False
-                return lock_value, {"lock": lock_value}
-            raw_lock = bool(self.parameters.lock.value)
-            params = {
-                "dual_channel": self.parameters.dual_channel.value,
-                "channel_mixing": self.parameters.channel_mixing.value,
-                "combined_offset": self.parameters.combined_offset.value,
-                "modulation_frequency": self.parameters.modulation_frequency.value,
-                "pid_only_mode": self.parameters.pid_only_mode.value,
-                "offset_a": self.parameters.offset_a.value,
-                "offset_b": self.parameters.offset_b.value,
-                "pid_on_slow_enabled": self.parameters.pid_on_slow_enabled.value,
-                "autolock_preparing": self.parameters.autolock_preparing.value,
-                "sweep_amplitude": self.parameters.sweep_amplitude.value,
-                "autolock_initial_sweep_amplitude": self.parameters.autolock_initial_sweep_amplitude.value,
-                "control_signal_history_length": self.parameters.control_signal_history_length.value,
-            }
+            return lock_value, {"lock": lock_value}
+        raw_lock = bool(self._read_param_fast("lock", False))
+        params = {
+            "dual_channel": self._read_param_fast("dual_channel"),
+            "channel_mixing": self._read_param_fast("channel_mixing"),
+            "combined_offset": self._read_param_fast("combined_offset"),
+            "modulation_frequency": self._read_param_fast("modulation_frequency"),
+            "pid_only_mode": self._read_param_fast("pid_only_mode"),
+            "offset_a": self._read_param_fast("offset_a"),
+            "offset_b": self._read_param_fast("offset_b"),
+            "pid_on_slow_enabled": self._read_param_fast("pid_on_slow_enabled"),
+            "autolock_preparing": self._read_param_fast("autolock_preparing"),
+            "sweep_amplitude": self._read_param_fast("sweep_amplitude"),
+            "autolock_initial_sweep_amplitude": self._read_param_fast(
+                "autolock_initial_sweep_amplitude"
+            ),
+            "control_signal_history_length": self._read_param_fast(
+                "control_signal_history_length"
+            ),
+        }
         if "error_signal" in to_plot and "control_signal" in to_plot:
             lock_value = True
         elif "error_signal_1" in to_plot:
@@ -989,6 +1056,11 @@ class DeviceSession:
         # `last_plot_frame` (e.g. manual lock trace fallback) only need
         # the `combined_error` and `monitor_signal`/`error_signal_2`
         # series, both of which are present in summary frames.
+        # `peek_required_detail` walks the per-device connection set
+        # under a lock. Subscriber set is stable for the duration of
+        # one frame build, so we capture it once and reuse for both
+        # the build-detail decision below and the publish-gate
+        # decision further down.
         required_detail = self.manager.peek_required_detail(self.device.key)
         auto_relock_active = bool(self.auto_relock.get_status().get("enabled"))
         build_detail = (
@@ -1040,7 +1112,6 @@ class DeviceSession:
         )
         self._emit_auto_relock_state_transition_log(auto_relock_status)
 
-        required_detail = self.manager.peek_required_detail(self.device.key)
         auto_relock_enabled = bool(auto_relock_status.get("enabled"))
         if required_detail is not None or auto_relock_enabled:
             self.manager.publish(self.device.key, frame)
@@ -1054,22 +1125,23 @@ class DeviceSession:
         }
 
     def status(self) -> Dict[str, Any]:
-        logging_active = None
-        lock_value = None
-        if self.connected and self.control is not None:
-            try:
-                with self._rpyc_lock:
-                    logging_active = self.control.exposed_get_logging_status()
-                    if self.parameters is not None:
-                        lock_value = bool(self.parameters.lock.value)
-            except Exception:  # noqa: BLE001 - status endpoint should remain available
-                logger.debug(
-                    "Failed to query live status from control for device=%s",
-                    self.device.key,
-                    exc_info=True,
-                )
-                logging_active = None
-                lock_value = None
+        # Read entirely from cache. Previously this method did two
+        # synchronous RPyC calls per device (`exposed_get_logging_status`
+        # + `parameters.lock.value`) under `_rpyc_lock`, and
+        # /api/devices/statuses fans this out across all 12 devices every
+        # 5 s. That serialised the plot poll thread against the status
+        # poll and was visible as cursor/button lag in the UI.
+        #
+        # Both values now come from session-local caches that are kept
+        # current by the only callers that can change them
+        # (logging_start/stop, and the linien-client change queue).
+        logging_active: bool | None = None
+        lock_value: bool | None = None
+        if self.connected:
+            logging_active = self._logging_active_cache
+            cached_lock = self._read_param_fast("lock")
+            if cached_lock is not None:
+                lock_value = bool(cached_lock)
         last_plot_timestamp, frame_lock, auto_relock_status = (
             self._snapshot_status_fields()
         )
@@ -1378,6 +1450,7 @@ class DeviceSession:
         with self._rpyc_lock:
             self._apply_influx_logging_params_locked()
             self.control.exposed_start_logging(safe_interval)
+        self._logging_active_cache = True
         return self.set_influx_logging_state(enabled=True, interval_s=safe_interval)
 
     def logging_stop(self) -> dict[str, Any]:
@@ -1385,6 +1458,7 @@ class DeviceSession:
             raise RuntimeError("Device not connected")
         with self._rpyc_lock:
             self.control.exposed_stop_logging()
+        self._logging_active_cache = False
         return self.set_influx_logging_state(enabled=False)
 
     def logging_set_param(self, name: str, enabled: bool) -> dict[str, Any]:
