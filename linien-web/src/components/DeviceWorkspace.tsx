@@ -3,19 +3,59 @@ import type {
   AutoRelockConfig,
   AutoLockScanResult,
   AutoLockScanSettings,
+  AutoRelockStatus,
   Device,
   LockIndicatorConfig,
+  LockIndicatorSnapshot,
+  PlotFrame,
   StreamMessage,
 } from '../types';
 import { api } from '../api';
 import { useDeviceStream } from '../hooks/useDeviceStream';
 import { useInViewport } from '../hooks/useInViewport';
-import { usePlotFrameBuffer } from '../hooks/usePlotFrameBuffer';
-import { PlotPanel } from './PlotPanel';
+import { PlotPanel, type PlotPanelHandle } from './PlotPanel';
 import { RightPanel } from './RightPanel';
-import { StatusRow } from './StatusRow';
+import { ThrottledStatusRow } from './ThrottledStatusRow';
 import { SweepControls } from './SweepControls';
 import { useDeviceStateEntry } from '../state/deviceStatesStore';
+
+// Compare lock-indicator snapshots by the fields downstream UI reads.
+// Avoids forcing a render when the backend sends a fresh indicator
+// object every frame whose contents are identical.
+const indicatorEqual = (
+  a: LockIndicatorSnapshot | null,
+  b: LockIndicatorSnapshot | null,
+): boolean => {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (a.state !== b.state) return false;
+  if (a.reasons === b.reasons) return true;
+  if (!a.reasons || !b.reasons) return false;
+  if (a.reasons.length !== b.reasons.length) return false;
+  for (let i = 0; i < a.reasons.length; i++) {
+    if (a.reasons[i] !== b.reasons[i]) return false;
+  }
+  return true;
+};
+
+// Compare auto-relock status by the fields the RightPanel reads
+// (state, enabled, attempts, cooldown, last error). Skips frame-rate
+// re-renders when nothing meaningful changed.
+const autoRelockEqual = (
+  a: AutoRelockStatus | null,
+  b: AutoRelockStatus | null,
+): boolean => {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.enabled === b.enabled &&
+    a.state === b.state &&
+    a.attempts === b.attempts &&
+    a.max_attempts === b.max_attempts &&
+    a.cooldown_remaining_s === b.cooldown_remaining_s &&
+    a.last_error === b.last_error
+  );
+};
 
 const AUTOMATION_TEMP_DISABLED_REASON =
   'Temporarily disabled due to NumPy pickle compatibility between gateway and server.';
@@ -62,11 +102,23 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
   const [autoRelockError, setAutoRelockError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const autoLockSettingsSaveTimerRef = useRef<number | null>(null);
-  const { plotFrame, handlePlotFrameMessage } = usePlotFrameBuffer({
-    deviceKey: device.key,
-    initialFrame: state.plotFrame ?? null,
-    onSummaryUpdate: (msg) => onStateUpdate(device.key, msg),
-  });
+  // Imperative handle into PlotPanel: parent pushes plot frames
+  // directly to uPlot via ref, bypassing React state on the hot
+  // path. See OverviewPlotPanel for the same pattern.
+  const panelRef = useRef<PlotPanelHandle>(null);
+  // Stash for ThrottledStatusRow to pull at 2 Hz.
+  const latestFrameRef = useRef<PlotFrame | null>(null);
+  // Narrow React state for things RightPanel + the card UI display.
+  // Only updates when the underlying primitives change (state +
+  // enabled, etc.), so streaming plot frames don't force per-frame
+  // renders of the entire DeviceWorkspace subtree.
+  const [lockIndicator, setLockIndicator] = useState<LockIndicatorSnapshot | null>(null);
+  const [autoRelockStatus, setAutoRelockStatus] = useState<AutoRelockStatus | null>(null);
+  // selectionMode lives below as React state. Mirror in ref so the
+  // onMessage callback (which is memoized) can read latest without
+  // re-binding -- and so plot-frame skip during freeze stays atomic
+  // with the React state update.
+  const selectionModeRef = useRef<'autolock' | 'optimization' | null>(null);
   const connected = Boolean(state.status?.connected);
   const hasAutolockSelectionParam = Object.prototype.hasOwnProperty.call(
     state.params,
@@ -93,7 +145,27 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
 
   const onMessage = useCallback(
     (msg: StreamMessage) => {
-      if (handlePlotFrameMessage(msg)) return;
+      if (msg.type === 'plot_frame') {
+        latestFrameRef.current = msg;
+        // During selection (autolock / optimization range pick) the
+        // plot freezes -- skip pushing new frames to uPlot. When the
+        // selection clears, the lockState / latest-frame useEffect on
+        // PlotPanel handles re-application.
+        if (selectionModeRef.current === null) {
+          panelRef.current?.applyFrame(msg);
+        }
+        const nextIndicator = msg.lock_indicator ?? null;
+        setLockIndicator((prev) =>
+          indicatorEqual(prev, nextIndicator) ? prev : nextIndicator,
+        );
+        const nextAutoRelock = msg.auto_relock ?? null;
+        setAutoRelockStatus((prev) =>
+          autoRelockEqual(prev, nextAutoRelock) ? prev : nextAutoRelock,
+        );
+        // Smart-diff store write for bookkeeper (commit 75a46b7).
+        onStateUpdate(device.key, msg);
+        return;
+      }
       if (msg.type === 'config_update') {
         if (msg.config_name === 'lock_indicator_config') {
           setLockIndicatorConfig(msg.value as LockIndicatorConfig);
@@ -109,8 +181,20 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
       }
       onStateUpdate(device.key, msg);
     },
-    [device.key, onStateUpdate, handlePlotFrameMessage]
+    [device.key, onStateUpdate]
   );
+
+  // Keep selectionModeRef in sync with the React state, and re-apply
+  // the latest frame on transition out of selection so the plot
+  // immediately catches up to the live stream (rather than staying
+  // frozen on the pre-selection frame until the next message arrives).
+  useEffect(() => {
+    const previous = selectionModeRef.current;
+    selectionModeRef.current = selectionMode;
+    if (previous !== null && selectionMode === null && latestFrameRef.current) {
+      panelRef.current?.applyFrame(latestFrameRef.current);
+    }
+  }, [selectionMode]);
 
   const handleStreamOpen = useCallback(() => {
     onStreamActiveChange?.(device.key, true);
@@ -376,7 +460,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
         <div className="plot-stack">
           <SweepControls params={state.params} onSetParam={setParam} />
           <PlotPanel
-            plotFrame={plotFrame}
+            ref={panelRef}
             selectionMode={selectionMode}
             onSelectRange={handleSelectRange}
             lockState={lockState}
@@ -385,9 +469,10 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             showManualTarget={lockMode !== 'autolock'}
             initActive={streamEnabled}
           />
-          <StatusRow
-            plotFrame={plotFrame}
-            lockIndicator={plotFrame?.lock_indicator ?? null}
+          <ThrottledStatusRow
+            frameRef={latestFrameRef}
+            intervalMs={500}
+            lockIndicator={lockIndicator}
             connected={connected}
             lockEnabled={lockState}
           />
@@ -427,11 +512,9 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             lockIndicatorSaving={lockIndicatorSaving}
             lockIndicatorError={lockIndicatorError}
             onSaveLockIndicatorConfig={handleSaveLockIndicatorConfig}
-            lockIndicatorSnapshot={plotFrame?.lock_indicator ?? null}
+            lockIndicatorSnapshot={lockIndicator}
             autoRelockConfig={autoRelockConfig}
-            autoRelockStatus={
-              plotFrame?.auto_relock ?? state.status?.auto_relock ?? null
-            }
+            autoRelockStatus={autoRelockStatus ?? state.status?.auto_relock ?? null}
             autoRelockSaving={autoRelockSaving}
             autoRelockError={autoRelockError}
             onSaveAutoRelockConfig={handleSaveAutoRelockConfig}
