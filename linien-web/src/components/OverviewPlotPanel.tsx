@@ -1,4 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { PlotFrame } from '../types';
@@ -23,41 +29,59 @@ import {
 
 // Thumbnail variant of PlotPanel used by DeviceOverviewCard.
 //
-// Differences from the full PlotPanel:
-//   - cursor disabled (no mousemove redraws across 12 overview canvases)
-//   - legend hidden (no DOM rows, no theme mutation observer wiring)
-//   - axis values reduced to plain numbers (no us/V formatting)
+// Imperative API: instead of receiving plot data as a React prop, the
+// parent grabs a ref and calls `applyFrame(frame)` directly on each WS
+// message. This bypasses React reconciliation entirely on the plot
+// hot path -- the panel renders only on lockState / initActive changes
+// (rare). Lighthouse showed 46 s of React script-evaluation time
+// across a 70 s window with 12 cards streaming; almost all of it was
+// reconciliation triggered by the prior plotFrame-prop pattern.
+//
+// Differences from the full PlotPanel still apply:
+//   - cursor disabled
+//   - legend hidden (so legend-toggle state is ref-only)
+//   - axis values reduced to plain numbers
 //   - smaller default height
 //   - no selection / autolock / optimization handlers
 //   - no manual-target overlay
-//   - lock-target line is still drawn (useful at-a-glance signal)
+//   - lock-target line drawn via the imperative draw hook
 //
-// Shares the buffer-reuse, y-autoscale, and buffer-alias pipeline with
-// PlotPanel via plotShared so per-frame data work is identical.
+// Shares the buffer-reuse, y-autoscale, and alias pipeline with
+// PlotPanel via plotShared.
 
 const POINT_STYLE: uPlot.Series.Points = { show: false };
 const DEFAULT_HEIGHT = 220;
 
+export type OverviewPlotPanelHandle = {
+  applyFrame: (frame: PlotFrame) => void;
+};
+
 type OverviewPlotPanelProps = {
-  plotFrame?: PlotFrame | null;
   lockState?: boolean;
   // When false (or absent), defer the uPlot constructor until the
-  // card becomes active+visible. Avoids the new uPlot(...) cost for
-  // cards scrolled off-screen at first paint. The init effect
-  // re-evaluates when this transitions true.
+  // card becomes active+visible. Frames that arrive before init
+  // completes are buffered and replayed once uPlot is up.
   initActive?: boolean;
 };
 
-export function OverviewPlotPanel({ plotFrame, lockState, initActive = true }: OverviewPlotPanelProps) {
+export const OverviewPlotPanel = forwardRef<
+  OverviewPlotPanelHandle,
+  OverviewPlotPanelProps
+>(function OverviewPlotPanel(
+  { lockState, initActive = true },
+  ref,
+) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const uplotRef = useRef<uPlot | null>(null);
   const sizeRef = useRef({ width: 400, height: DEFAULT_HEIGHT });
-  const pointCountRef = useRef(N_POINTS);
   const lockTargetRef = useRef<number | null>(null);
   const suppressSeriesEventRef = useRef(false);
   const userShowRef = useRef<Record<number, boolean>>({});
-  const [error1Visible, setError1Visible] = useState(true);
-  const [error2Visible, setError2Visible] = useState(true);
+  // Legend is hidden so visibility toggles can only happen via the
+  // setSeries hook fired by uPlot itself. With cursor off this almost
+  // never fires; storing as refs avoids any per-frame React work.
+  const error1VisibleRef = useRef(true);
+  const error2VisibleRef = useRef(true);
 
   const seriesBuffersRef = useRef<Float64Array[]>(
     SERIES_KEYS.map(() => new Float64Array(N_POINTS))
@@ -79,41 +103,221 @@ export function OverviewPlotPanel({ plotFrame, lockState, initActive = true }: O
   const lastAppliedXMaxRef = useRef<number | null>(null);
   const lastAppliedYRef = useRef<{ min: number; max: number } | null>(null);
 
-  const lockAxis = typeof lockState === 'boolean' ? lockState : plotFrame?.lock ?? false;
+  // Latest frame stashed for:
+  //   - lockState changes (visibility set differs between lock/sweep)
+  //   - init completion (frames arriving pre-init are replayed)
+  const latestFrameRef = useRef<PlotFrame | null>(null);
 
-  // Point count is purely derived from the incoming frame; refs hold
-  // the last applied value for fast change-detection in the layout
-  // effect.
-  const series = plotFrame?.series;
-  let detectedCount = 0;
-  if (series) {
+  // Track lockState in a ref so applyFrameInternal can read it
+  // without re-closing on every render.
+  const lockStateRef = useRef<boolean | undefined>(lockState);
+  useEffect(() => {
+    lockStateRef.current = lockState;
+  }, [lockState]);
+
+  // Flip to true the first time we apply a frame, so the
+  // "Waiting for data..." placeholder disappears. The ref is the
+  // authoritative read inside applyFrameInternal (which closes over
+  // the first render's state via useImperativeHandle's [] deps);
+  // the state mirror just drives the placeholder removal render.
+  // Exactly one setHasData call per card lifetime.
+  const hasDataRef = useRef(false);
+  const [hasData, setHasData] = useState(false);
+
+  const initializedRef = useRef(false);
+
+  // The actual work. Mirrors the previous useLayoutEffect body but
+  // is invoked directly (not via React state -> render -> effect).
+  const applyFrameInternal = (frame: PlotFrame): void => {
+    latestFrameRef.current = frame;
+    const u = uplotRef.current;
+    if (!u) {
+      // Init hasn't run yet (lazy uPlot). The init effect will
+      // replay latestFrameRef once uPlot is up.
+      return;
+    }
+    if (!hasDataRef.current) {
+      hasDataRef.current = true;
+      setHasData(true);
+    }
+
+    const buffers = seriesBuffersRef.current;
+    const hasDataByKey = hasDataByKeyRef.current;
+    const stats = seriesStatsRef.current;
+    const series = frame.series;
+
+    // Derive point count from the longest series in this frame.
+    let count = 0;
     for (const key of SERIES_KEYS) {
-      const v = series[key];
+      const v = series?.[key];
       const len = Array.isArray(v)
         ? v.length
         : ArrayBuffer.isView(v)
         ? (v as unknown as ArrayLike<number>).length
         : 0;
-      if (len > detectedCount) detectedCount = len;
+      if (len > count) count = len;
     }
-  }
-  const pointCount = detectedCount > 0 ? detectedCount : N_POINTS;
+    if (count === 0) count = N_POINTS;
 
-  useEffect(() => {
-    pointCountRef.current = pointCount;
-  }, [pointCount]);
+    // Grow buffers monotonically.
+    for (let i = 0; i < buffers.length; i++) {
+      if (buffers[i].length < count) {
+        buffers[i] = new Float64Array(count);
+      }
+    }
 
+    SERIES_KEYS.forEach((key, idx) => {
+      const s = writeSeriesInto(buffers[idx], count, series?.[key]);
+      hasDataByKey[key] = s.hasFinite;
+      stats[idx] = s;
+    });
+
+    // lockAxis: explicit lockState prop wins; otherwise read from the
+    // frame itself. Same precedence as before.
+    const lockAxis =
+      typeof lockStateRef.current === 'boolean'
+        ? lockStateRef.current
+        : Boolean(frame.lock);
+
+    // Alias combined_error <- error_signal_1 in sweep mode (zero-copy).
+    const combinedIdx = SERIES_KEYS.indexOf('combined_error');
+    const errIdx = SERIES_KEYS.indexOf('error_signal_1');
+    let aliasCombinedToErr1 = false;
+    if (!lockAxis && hasDataByKey.error_signal_1) {
+      hasDataByKey.combined_error = true;
+      stats[combinedIdx] = stats[errIdx];
+      aliasCombinedToErr1 = true;
+    }
+
+    const x = getXBuffer(count);
+    const plotData = [x, ...buffers] as unknown as PlotData;
+    if (aliasCombinedToErr1) {
+      plotData[combinedIdx + 1] = buffers[errIdx];
+    }
+
+    const dual = Boolean(frame.dual_channel);
+    const desiredVisibility: Record<SeriesKey, boolean> = {
+      combined_error: false,
+      control_signal: false,
+      control_signal_history: false,
+      slow_history: false,
+      monitor_signal_history: false,
+      error_signal_1: false,
+      error_signal_2: false,
+      monitor_signal: false,
+      signal_strength_a_upper: false,
+      signal_strength_a_lower: false,
+      signal_strength_b_upper: false,
+      signal_strength_b_lower: false,
+    };
+    if (lockAxis) {
+      desiredVisibility.combined_error = true;
+      desiredVisibility.control_signal = true;
+    } else {
+      desiredVisibility.combined_error = !dual;
+      desiredVisibility.error_signal_1 = dual;
+      desiredVisibility.error_signal_2 = dual;
+      desiredVisibility.monitor_signal = true;
+      desiredVisibility.signal_strength_a_upper = true;
+      desiredVisibility.signal_strength_a_lower = true;
+      desiredVisibility.signal_strength_b_upper = true;
+      desiredVisibility.signal_strength_b_lower = true;
+    }
+
+    const error1Visible = error1VisibleRef.current;
+    const error2Visible = error2VisibleRef.current;
+
+    // Visibility-change fingerprint.
+    let hasDataKey = '';
+    for (const key of SERIES_KEYS) hasDataKey += hasDataByKey[key] ? '1' : '0';
+    const last = lastVisibilityRef.current;
+    const visibilityChanged =
+      last.lockAxis !== lockAxis ||
+      last.dual !== dual ||
+      last.hasDataKey !== hasDataKey;
+
+    // Aggregate y range over visible-and-data series.
+    let yMin = Infinity;
+    let yMax = -Infinity;
+    SERIES_KEYS.forEach((key, idx) => {
+      if (!desiredVisibility[key] || !hasDataByKey[key]) return;
+      if (key === 'signal_strength_a_upper' || key === 'signal_strength_a_lower') {
+        if (!error1Visible) return;
+      }
+      if (key === 'signal_strength_b_upper' || key === 'signal_strength_b_lower') {
+        if (!error2Visible) return;
+      }
+      const s = stats[idx];
+      if (!s.hasFinite) return;
+      if (s.min < yMin) yMin = s.min;
+      if (s.max > yMax) yMax = s.max;
+    });
+    const padded = padYRange(yMin, yMax);
+    const lastY = lastAppliedYRef.current;
+    const ySpan = Math.max(1e-9, padded.yMax - padded.yMin);
+    const yChanged =
+      lastY === null ||
+      Math.abs(lastY.min - padded.yMin) > ySpan * 0.005 ||
+      Math.abs(lastY.max - padded.yMax) > ySpan * 0.005;
+    const xChanged = lastAppliedXMaxRef.current !== count;
+
+    // Lock-target overlay is read off the ref inside the draw hook;
+    // update before the batch so the redraw sees the new value.
+    lockTargetRef.current = toFinite(frame.lock_target);
+
+    u.batch((uplot: uPlot) => {
+      if (visibilityChanged) {
+        suppressSeriesEventRef.current = true;
+        SERIES_KEYS.forEach((key, idx) => {
+          const seriesIdx = idx + 1;
+          let show = desiredVisibility[key] && hasDataByKey[key];
+          if (show) {
+            show = userShowRef.current[seriesIdx] ?? true;
+          }
+          if (key === 'signal_strength_a_upper' || key === 'signal_strength_a_lower') {
+            show = desiredVisibility[key] && hasDataByKey[key] && error1Visible;
+          }
+          if (key === 'signal_strength_b_upper' || key === 'signal_strength_b_lower') {
+            show = desiredVisibility[key] && hasDataByKey[key] && error2Visible;
+          }
+          uplot.setSeries(seriesIdx, { show }, false);
+        });
+        suppressSeriesEventRef.current = false;
+        lastVisibilityRef.current = { lockAxis, dual, hasDataKey };
+      }
+      uplot.setData(plotData, false);
+      if (xChanged) {
+        uplot.setScale('x', { min: 0, max: Math.max(count - 1, 1) });
+        lastAppliedXMaxRef.current = count;
+      }
+      if (yChanged) {
+        uplot.setScale('y', { min: padded.yMin, max: padded.yMax });
+        lastAppliedYRef.current = { min: padded.yMin, max: padded.yMax };
+      }
+    });
+  };
+
+  // Expose imperative API.
+  useImperativeHandle(
+    ref,
+    () => ({
+      applyFrame: applyFrameInternal,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // Re-apply latest frame when lockState changes. Visibility set
+  // differs between lock and sweep modes, so the displayed series
+  // must update even though no new data arrived.
   useEffect(() => {
-    lockTargetRef.current = toFinite(plotFrame?.lock_target);
-    uplotRef.current?.redraw();
-  }, [plotFrame?.lock_target]);
+    if (uplotRef.current && latestFrameRef.current) {
+      applyFrameInternal(latestFrameRef.current);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lockState]);
 
   // Init uPlot exactly once, the first time `initActive` becomes true.
-  // Cards scrolled off-screen at first paint never construct uPlot;
-  // they pay for it lazily on first visibility. Once initialized,
-  // a later transition back to inactive does NOT destroy the
-  // instance — re-creation on every scroll would defeat the win.
-  const initializedRef = useRef(false);
   useEffect(() => {
     if (initializedRef.current || !initActive) return;
     initializedRef.current = true;
@@ -131,7 +335,8 @@ export function OverviewPlotPanel({ plotFrame, lockState, initActive = true }: O
     const container = containerRef.current;
     if (!container || uplotRef.current) return;
 
-    const initialWidth = container.clientWidth > 10 ? container.clientWidth : sizeRef.current.width;
+    const initialWidth =
+      container.clientWidth > 10 ? container.clientWidth : sizeRef.current.width;
     sizeRef.current.width = initialWidth;
 
     const axisTheme = getAxisTheme();
@@ -143,11 +348,11 @@ export function OverviewPlotPanel({ plotFrame, lockState, initActive = true }: O
     }));
 
     // Force the canvas backing store to a 1:1 pixel ratio even on
-    // HiDPI displays. Default behavior (devicePixelRatio = 2 or 3)
-    // multiplies the pixel count 4-9x per canvas, which dominates
-    // paint cost across 12 thumbnails. At thumbnail size the loss
-    // of sharpness is invisible. uPlot reads `pxRatio` from opts at
-    // construction time even though its TS types omit it.
+    // HiDPI displays. Default behavior multiplies the pixel count 4-9x
+    // per canvas, which dominates paint cost across 12 thumbnails. At
+    // thumbnail size the loss of sharpness is invisible. uPlot reads
+    // `pxRatio` from opts at construction time even though its TS
+    // types omit it.
     const opts: uPlot.Options = {
       width: initialWidth,
       height: sizeRef.current.height,
@@ -156,10 +361,6 @@ export function OverviewPlotPanel({ plotFrame, lockState, initActive = true }: O
         x: { time: false, auto: false, range: [0, N_POINTS - 1] },
         y: { auto: false },
       },
-      // Cursor entirely disabled. With 12 overview cards we don't
-      // want every mousemove to trigger uPlot's cursor draw and
-      // legend value update for the hovered card; the thumbnail is
-      // read-only.
       cursor: { show: false, drag: { setScale: false }, points: { show: false } },
       legend: { show: false },
       axes: [
@@ -167,8 +368,6 @@ export function OverviewPlotPanel({ plotFrame, lockState, initActive = true }: O
           stroke: makeStroke(axisTheme.axis),
           grid: { stroke: makeStroke(axisTheme.grid) },
           ticks: { stroke: makeStroke(axisTheme.tick) },
-          // Compact tick labels: no units, two decimals. The full
-          // PlotPanel formats us/V; thumbnails skip that overhead.
           values: (_u, ticks) => ticks.map((v) => v.toFixed(0)),
         },
         {
@@ -210,8 +409,10 @@ export function OverviewPlotPanel({ plotFrame, lockState, initActive = true }: O
               u.setSeries(memberIdx, { show }, false);
             });
             suppressSeriesEventRef.current = false;
-            if (idx === SERIES_INDEX.error_signal_1) setError1Visible(show);
-            if (idx === SERIES_INDEX.error_signal_2) setError2Visible(show);
+            // Stored as refs (legend is hidden so these never change
+            // in practice, but keep the wiring correct).
+            if (idx === SERIES_INDEX.error_signal_1) error1VisibleRef.current = show;
+            if (idx === SERIES_INDEX.error_signal_2) error2VisibleRef.current = show;
           },
         ],
         draw: [
@@ -272,6 +473,11 @@ export function OverviewPlotPanel({ plotFrame, lockState, initActive = true }: O
     observer.observe(container);
     window.addEventListener('resize', handleResize);
 
+    // Replay any frame that arrived before uPlot was constructed.
+    if (latestFrameRef.current) {
+      applyFrameInternal(latestFrameRef.current);
+    }
+
     return () => {
       window.removeEventListener('resize', handleResize);
       schemeObserver?.disconnect();
@@ -281,146 +487,17 @@ export function OverviewPlotPanel({ plotFrame, lockState, initActive = true }: O
     };
   }, [initActive]);
 
-  useLayoutEffect(() => {
-    if (!uplotRef.current) return;
-    const buffers = seriesBuffersRef.current;
-    const hasDataByKey = hasDataByKeyRef.current;
-    const stats = seriesStatsRef.current;
-    const count = pointCount;
-
-    for (let i = 0; i < buffers.length; i++) {
-      if (buffers[i].length < count) {
-        buffers[i] = new Float64Array(count);
-      }
-    }
-
-    SERIES_KEYS.forEach((key, idx) => {
-      const s = writeSeriesInto(buffers[idx], count, series?.[key]);
-      hasDataByKey[key] = s.hasFinite;
-      stats[idx] = s;
-    });
-
-    const combinedIdx = SERIES_KEYS.indexOf('combined_error');
-    const errIdx = SERIES_KEYS.indexOf('error_signal_1');
-    let aliasCombinedToErr1 = false;
-    if (!lockAxis && hasDataByKey.error_signal_1) {
-      hasDataByKey.combined_error = true;
-      stats[combinedIdx] = stats[errIdx];
-      aliasCombinedToErr1 = true;
-    }
-
-    const x = getXBuffer(count);
-    const plotData = [x, ...buffers] as unknown as PlotData;
-    if (aliasCombinedToErr1) {
-      plotData[combinedIdx + 1] = buffers[errIdx];
-    }
-
-    const dual = Boolean(plotFrame?.dual_channel);
-    const desiredVisibility: Record<SeriesKey, boolean> = {
-      combined_error: false,
-      control_signal: false,
-      control_signal_history: false,
-      slow_history: false,
-      monitor_signal_history: false,
-      error_signal_1: false,
-      error_signal_2: false,
-      monitor_signal: false,
-      signal_strength_a_upper: false,
-      signal_strength_a_lower: false,
-      signal_strength_b_upper: false,
-      signal_strength_b_lower: false,
-    };
-
-    if (lockAxis) {
-      desiredVisibility.combined_error = true;
-      desiredVisibility.control_signal = true;
-    } else {
-      desiredVisibility.combined_error = !dual;
-      desiredVisibility.error_signal_1 = dual;
-      desiredVisibility.error_signal_2 = dual;
-      desiredVisibility.monitor_signal = true;
-      desiredVisibility.signal_strength_a_upper = true;
-      desiredVisibility.signal_strength_a_lower = true;
-      desiredVisibility.signal_strength_b_upper = true;
-      desiredVisibility.signal_strength_b_lower = true;
-    }
-
-    let hasDataKey = '';
-    for (const key of SERIES_KEYS) hasDataKey += hasDataByKey[key] ? '1' : '0';
-    const last = lastVisibilityRef.current;
-    const visibilityChanged =
-      last.lockAxis !== lockAxis ||
-      last.dual !== dual ||
-      last.hasDataKey !== hasDataKey;
-
-    // y autoscale from per-series stats (only over visible series).
-    let yMin = Infinity;
-    let yMax = -Infinity;
-    SERIES_KEYS.forEach((key, idx) => {
-      if (!desiredVisibility[key] || !hasDataByKey[key]) return;
-      if (key === 'signal_strength_a_upper' || key === 'signal_strength_a_lower') {
-        if (!error1Visible) return;
-      }
-      if (key === 'signal_strength_b_upper' || key === 'signal_strength_b_lower') {
-        if (!error2Visible) return;
-      }
-      const s = stats[idx];
-      if (!s.hasFinite) return;
-      if (s.min < yMin) yMin = s.min;
-      if (s.max > yMax) yMax = s.max;
-    });
-    const padded = padYRange(yMin, yMax);
-    const lastY = lastAppliedYRef.current;
-    const ySpan = Math.max(1e-9, padded.yMax - padded.yMin);
-    const yChanged =
-      lastY === null ||
-      Math.abs(lastY.min - padded.yMin) > ySpan * 0.005 ||
-      Math.abs(lastY.max - padded.yMax) > ySpan * 0.005;
-    const xChanged = lastAppliedXMaxRef.current !== count;
-
-    uplotRef.current.batch((u: uPlot) => {
-      if (visibilityChanged) {
-        suppressSeriesEventRef.current = true;
-        SERIES_KEYS.forEach((key, idx) => {
-          const seriesIdx = idx + 1;
-          let show = desiredVisibility[key] && hasDataByKey[key];
-          if (show) {
-            show = userShowRef.current[seriesIdx] ?? true;
-          }
-          if (key === 'signal_strength_a_upper' || key === 'signal_strength_a_lower') {
-            show = desiredVisibility[key] && hasDataByKey[key] && error1Visible;
-          }
-          if (key === 'signal_strength_b_upper' || key === 'signal_strength_b_lower') {
-            show = desiredVisibility[key] && hasDataByKey[key] && error2Visible;
-          }
-          u.setSeries(seriesIdx, { show }, false);
-        });
-        suppressSeriesEventRef.current = false;
-        lastVisibilityRef.current = { lockAxis, dual, hasDataKey };
-      }
-      u.setData(plotData, false);
-      if (xChanged) {
-        u.setScale('x', { min: 0, max: Math.max(count - 1, 1) });
-        lastAppliedXMaxRef.current = count;
-      }
-      if (yChanged) {
-        u.setScale('y', { min: padded.yMin, max: padded.yMax });
-        lastAppliedYRef.current = { min: padded.yMin, max: padded.yMax };
-      }
-    });
-  }, [plotFrame, pointCount, lockAxis, error1Visible, error2Visible, series]);
-
   return (
     <div className="panel plot-panel" style={{ padding: 8 }}>
-      {(!plotFrame || !plotFrame.series || Object.keys(plotFrame.series).length === 0) && (
+      {!hasData ? (
         <div style={{ color: '#7a6a58', fontSize: 12, marginBottom: 6 }}>
           Waiting for data...
         </div>
-      )}
+      ) : null}
       <div
         ref={containerRef}
         style={{ width: '100%', height: DEFAULT_HEIGHT, position: 'relative' }}
       />
     </div>
   );
-}
+});
