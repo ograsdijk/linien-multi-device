@@ -43,15 +43,9 @@ const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceStatus) =
   );
 };
 
-// Backstop poll for things the WS stream might have missed (e.g. a
-// status event lost during a reconnect race). The gateway's /statuses
-// endpoint is now cache-only (commit 1ff0745) so each call is cheap,
-// but every response still triggers a bookkeeper flush + an App tree
-// re-render. 30s is enough headroom for backstop safety without the
-// 5s churn.
 export const useDeviceStatusPolling = ({
   devices,
-  intervalMs = 30000,
+  intervalMs = 5000,
   skipDeviceKeys,
 }: UseDeviceStatusPollingArgs) => {
   // Keep the set of websocket-active device keys in a ref so frequent
