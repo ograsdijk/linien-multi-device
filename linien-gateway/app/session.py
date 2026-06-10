@@ -1068,10 +1068,22 @@ class DeviceSession:
             if required_detail == "full" or auto_relock_active
             else "summary"
         )
+        # When there are no subscribers AND auto-relock is idle, we
+        # still build a frame so state-mutating side effects in
+        # build_plot_frame stay current (histories, last_plot_data,
+        # std stats), but skip the per-series (arr / V).tolist()
+        # conversions that dominate plot CPU. Lock indicator and
+        # auto-relock both read raw `to_plot` directly, so they
+        # remain correct without the series payload.
+        needs_series = required_detail is not None or auto_relock_active
 
         with self._state_lock:
             frame = build_plot_frame(
-                to_plot, params, self.plot_state, detail=build_detail
+                to_plot,
+                params,
+                self.plot_state,
+                detail=build_detail,
+                build_series=needs_series,
             )
             if frame is None:
                 return
@@ -1304,16 +1316,21 @@ class DeviceSession:
         monitor_series = series.get("monitor_signal")
         if monitor_series is None:
             monitor_series = series.get("error_signal_2")
-        if isinstance(combined_series, list):
-            trace_values = [
-                float(value) if value is not None else float("nan")
-                for value in combined_series
-            ]
-        if isinstance(monitor_series, list):
-            monitor_trace_values = [
-                float(value) if value is not None else float("nan")
-                for value in monitor_series
-            ]
+
+        def _series_to_list(value: Any) -> list[float] | None:
+            # Plot frames now hold numpy arrays in `series`; legacy
+            # list-with-Nones (from pre-#6 caches or tests) also supported.
+            if isinstance(value, np.ndarray):
+                arr = value.astype(float, copy=False)
+                return [float(v) for v in arr]
+            if isinstance(value, list):
+                return [
+                    float(v) if v is not None else float("nan") for v in value
+                ]
+            return None
+
+        trace_values = _series_to_list(combined_series)
+        monitor_trace_values = _series_to_list(monitor_series)
         return trace_values, monitor_trace_values
 
     def start_sweep(self) -> None:

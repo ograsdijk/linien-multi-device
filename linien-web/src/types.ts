@@ -56,7 +56,11 @@ export type PlotFrame = {
   type: 'plot_frame';
   lock: boolean;
   dual_channel: boolean;
-  series: Record<string, Array<number | null>>;
+  // Series values may arrive as Array<number | null> (JSON path, with
+  // nulls for missing samples) or Float32Array (binary path, with
+  // NaN for missing samples). PlotPanel/OverviewPlotPanel's
+  // writeSeriesInto handles both via its ArrayBuffer.isView branch.
+  series: Record<string, Array<number | null> | Float32Array>;
   signal_power: { channel1?: number | null; channel2?: number | null };
   stats: { error_std?: number | null; control_std?: number | null };
   lock_indicator?: LockIndicatorSnapshot;

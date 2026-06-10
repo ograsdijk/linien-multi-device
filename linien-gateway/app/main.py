@@ -956,11 +956,27 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
                 max_fps = None
         except ValueError:
             max_fps = None
+    # Binary protocol opt-in. Clients that pass `binary=1` get plot
+    # frames as binary WebSocket messages (encode_plot_frame_binary
+    # format). Others continue receiving JSON-encoded frames.
+    binary_param = websocket.query_params.get("binary") or "0"
+    binary = binary_param == "1" or binary_param.lower() == "true"
     await websocket.accept()
 
-    async def safe_send(payload: dict) -> bool:
+    async def safe_send_initial(payload: dict) -> bool:
         try:
-            await websocket.send_json(payload)
+            from .stream import (
+                _encode_ws_payload,
+                encode_plot_frame_binary,
+                encode_plot_frame_json,
+            )
+            if payload.get("type") == "plot_frame":
+                if binary:
+                    await websocket.send_bytes(encode_plot_frame_binary(payload))
+                else:
+                    await websocket.send_text(encode_plot_frame_json(payload))
+            else:
+                await websocket.send_text(_encode_ws_payload(payload))
             return True
         except WebSocketDisconnect:
             return False
@@ -969,18 +985,20 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
         encoded = to_jsonable(value)
         if encoded is UNSERIALIZABLE:
             continue
-        if not await safe_send(
+        if not await safe_send_initial(
             {"type": "param_update", "name": name, "value": encoded}
         ):
             return
     if snapshot.get("plot_frame") is not None:
         plot_frame = manager.filter_plot_frame(snapshot["plot_frame"], detail)
-        if not await safe_send(plot_frame):
+        if not await safe_send_initial(plot_frame):
             return
-    if not await safe_send({"type": "status", **snapshot.get("status", {})}):
+    if not await safe_send_initial({"type": "status", **snapshot.get("status", {})}):
         return
 
-    await manager.register(key, websocket, max_fps=max_fps, detail=detail, accept=False)
+    await manager.register(
+        key, websocket, max_fps=max_fps, detail=detail, binary=binary, accept=False
+    )
 
     try:
         while True:

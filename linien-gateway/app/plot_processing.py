@@ -53,23 +53,23 @@ class PlotState:
     autolock_ref_spectrum: Optional[np.ndarray] = None
     last_lock_state: Optional[bool] = None
     # Cached scaled history series for the full-detail path. Rebuilding
-    # these per frame is expensive (two 2048-element Python lists each)
-    # and the underlying history values only mutate via append, so we
-    # gate the rebuild on a cheap signature.
+    # these per frame is expensive and the underlying history values
+    # only mutate via append, so we gate the rebuild on a cheap
+    # signature.
     #
-    # IMPORTANT: the cached lists are returned by reference inside the
-    # plot frame's `series` dict and may be shared across many frames
-    # while the underlying history is unchanged. Consumers of the
-    # frame's `series` lists MUST NOT mutate them in place; doing so
-    # would corrupt subsequent frames. All current consumers
-    # (`filter_plot_frame`, `_encode_ws_payload`/orjson, REST snapshot
-    # readers) treat them as read-only.
+    # IMPORTANT: the cached arrays are returned by reference inside
+    # the plot frame's `series` dict and may be shared across many
+    # frames while the underlying history is unchanged. Consumers MUST
+    # NOT mutate them in place; doing so would corrupt subsequent
+    # frames. All current consumers (`filter_plot_frame`,
+    # `encode_plot_frame_json`/`encode_plot_frame_binary`, REST
+    # snapshot readers) treat them as read-only.
     _control_history_signature: Optional[Tuple[Any, ...]] = None
-    _control_history_scaled: Optional[List[Optional[float]]] = None
+    _control_history_scaled: Optional[np.ndarray] = None
     _slow_history_signature: Optional[Tuple[Any, ...]] = None
-    _slow_history_scaled: Optional[List[Optional[float]]] = None
+    _slow_history_scaled: Optional[np.ndarray] = None
     _monitor_history_signature: Optional[Tuple[Any, ...]] = None
-    _monitor_history_scaled: Optional[List[Optional[float]]] = None
+    _monitor_history_scaled: Optional[np.ndarray] = None
 
 
 def _history_signature(
@@ -88,10 +88,22 @@ def _history_signature(
 
 def _scale_history(
     times: List[float], values: List[float], timescale: float
-) -> List[Optional[float]]:
+) -> np.ndarray:
+    """Scaled history as a Float64 ndarray with NaN for empty slots.
+
+    The result lives directly in plot frames (no Python list step) so
+    binary encoders can `.astype(np.float32).tobytes()` it without
+    re-walking. JSON encoders convert via `_array_to_json_list` at
+    encode time, which produces `null` for NaN entries to match the
+    previous list-of-Optional[float] shape.
+    """
     scaled_times = scale_history_times(times, timescale)
-    series = history_to_series(scaled_times, values)
-    return [(v / V) if v is not None else None for v in series]
+    out = np.full(N_POINTS, np.nan, dtype=np.float64)
+    for t, v in zip(scaled_times, values):
+        idx = int(round(float(t)))
+        if 0 <= idx < N_POINTS:
+            out[idx] = float(v) / V
+    return out
 
 
 def peak_voltage_to_dbm(voltage: float) -> Optional[float]:
@@ -179,7 +191,19 @@ def build_plot_frame(
     params: Dict[str, Any],
     state: PlotState,
     detail: str = "full",
+    build_series: bool = True,
 ) -> Optional[Dict[str, Any]]:
+    """Build a plot frame from a raw ``to_plot`` payload.
+
+    ``build_series=False`` skips the expensive per-series
+    ``(arr / V).tolist()`` conversions and the signal-strength band
+    work. Use it when there are no websocket subscribers AND no
+    auto-relock active — the resulting frame has an empty ``series``
+    dict but state-mutating side effects (history updates,
+    ``last_plot_data`` for auto-lock, std stats, autolock target)
+    still run, so the next subscriber that connects starts with
+    coherent backing state.
+    """
     if to_plot is None:
         return None
     lock = bool(params.get("lock"))
@@ -213,12 +237,18 @@ def build_plot_frame(
             error_std_mean = float(np.mean(state.error_std_history))
             control_std_mean = float(np.mean(state.control_std_history))
 
-        if error_signal is not None:
-            series["combined_error"] = (error_signal / V).tolist()
-        if control_signal is not None:
-            series["control_signal"] = (control_signal / V).tolist()
+        if build_series:
+            # Series values stored as numpy float64 arrays; the
+            # encoders (encode_plot_frame_json /
+            # encode_plot_frame_binary) handle the per-protocol
+            # conversion. Skipping the .tolist() step here saves the
+            # per-series Python-list build on the gateway hot path.
+            if error_signal is not None:
+                series["combined_error"] = (error_signal / V).astype(np.float64)
+            if control_signal is not None:
+                series["control_signal"] = (control_signal / V).astype(np.float64)
 
-        if full_detail:
+        if build_series and full_detail:
             control_times = state.control_history["times"]
             control_values = state.control_history["values"]
             control_sig = _history_signature(
@@ -291,18 +321,18 @@ def build_plot_frame(
         state.combined_error_cache.append(combined_error)
         state.combined_error_cache = state.combined_error_cache[-20:]
 
-        series["combined_error"] = (combined_error / V).tolist()
-
-        if error_signal_1 is not None:
-            series["error_signal_1"] = (error_signal_1 / V).tolist()
-        if error_signal_2 is not None:
-            series["error_signal_2"] = (error_signal_2 / V).tolist()
-        if monitor_signal is not None:
-            series["monitor_signal"] = (monitor_signal / V).tolist()
+        if build_series:
+            series["combined_error"] = (combined_error / V).astype(np.float64)
+            if error_signal_1 is not None:
+                series["error_signal_1"] = (error_signal_1 / V).astype(np.float64)
+            if error_signal_2 is not None:
+                series["error_signal_2"] = (error_signal_2 / V).astype(np.float64)
+            if monitor_signal is not None:
+                series["monitor_signal"] = (monitor_signal / V).astype(np.float64)
 
         modulation_frequency = float(params.get("modulation_frequency", 0))
         pid_only_mode = bool(params.get("pid_only_mode"))
-        if full_detail and modulation_frequency != 0 and not pid_only_mode:
+        if build_series and full_detail and modulation_frequency != 0 and not pid_only_mode:
             error_1_quadrature = to_plot.get("error_signal_1_quadrature")
             error_2_quadrature = to_plot.get("error_signal_2_quadrature")
 
@@ -312,8 +342,8 @@ def build_plot_frame(
                     error_1_quadrature,
                     float(params.get("offset_a", 0)),
                 )
-                series["signal_strength_a_upper"] = upper.tolist()
-                series["signal_strength_a_lower"] = lower.tolist()
+                series["signal_strength_a_upper"] = upper.astype(np.float64)
+                series["signal_strength_a_lower"] = lower.astype(np.float64)
                 signal_power1 = peak_voltage_to_dbm(max_strength / V)
 
             if error_2_quadrature is not None and monitor_or_error_signal_2 is not None:
@@ -322,8 +352,8 @@ def build_plot_frame(
                     error_2_quadrature,
                     float(params.get("offset_b", 0)),
                 )
-                series["signal_strength_b_upper"] = upper.tolist()
-                series["signal_strength_b_lower"] = lower.tolist()
+                series["signal_strength_b_upper"] = upper.astype(np.float64)
+                series["signal_strength_b_lower"] = lower.astype(np.float64)
                 signal_power2 = peak_voltage_to_dbm(max_strength / V)
 
         if params.get("autolock_preparing"):

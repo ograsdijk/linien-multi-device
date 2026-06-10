@@ -43,7 +43,11 @@ const ensureWorker = (): Worker => {
 // waste a worker round trip just to be silently dropped.
 export const registerStreamParser = (
   onMessage: StreamCallback
-): { parse: (data: string) => void; dispose: () => void } => {
+): {
+  parse: (data: string) => void;
+  parseBinary: (data: ArrayBuffer) => void;
+  dispose: () => void;
+} => {
   const worker = ensureWorker();
   const streamId = nextStreamId++;
   streamCallbacks.set(streamId, onMessage);
@@ -52,6 +56,16 @@ export const registerStreamParser = (
     parse: (data: string) => {
       if (!active) return;
       worker.postMessage({ type: 'parse', streamId, data });
+    },
+    parseBinary: (data: ArrayBuffer) => {
+      if (!active) return;
+      // Transfer ownership of the buffer to the worker (zero copy).
+      // We never read the original buffer on the main thread after
+      // this, so detaching is safe.
+      worker.postMessage(
+        { type: 'parseBinary', streamId, data },
+        [data]
+      );
     },
     dispose: () => {
       active = false;
