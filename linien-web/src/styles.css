@@ -382,6 +382,11 @@ body {
 
 .plot-panel {
   position: relative;
+  /* Tell the browser this subtree's layout/paint/style is self-
+     contained -- changes inside the plot do not require restyling
+     or relayout of anything outside. Skips a lot of style-recalc
+     work when sibling cards update at high frequency. */
+  contain: layout style paint;
 }
 
 .plot-selection-banner {
@@ -457,6 +462,18 @@ body {
   padding: 12px;
   min-width: 0;
   overflow: hidden;
+  /* Each device card is a self-contained box; layout/paint inside
+     one card never affects siblings. Cuts style-recalc cost when
+     12 cards stream updates concurrently. */
+  contain: layout style paint;
+}
+
+.overview-card {
+  /* Overview thumbnails are paint-isolated too. The inner
+     .plot-panel already declares contain, so this is mostly belt-
+     and-braces, but it lets the browser early-out style recalc
+     above the card boundary. */
+  contain: layout style paint;
 }
 
 .device-card[data-dragging='true'] {
