@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from linien_client.device import Device
 from linien_common.influxdb import InfluxDBCredentials
 
@@ -146,6 +147,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Compress HTTP responses (Content-Encoding: gzip) above 1 KB.
+# Saves ~3.6x on the JS+CSS bundle initial page load (bench/bundle_gzip.mjs:
+# 841 KB raw -> 235 KB gzipped). API JSON responses also benefit modestly.
+# Does NOT touch WebSocket frames -- those use uvicorn's
+# ws_per_message_deflate, configured separately in run.py / main().
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 def _resolve_web_dist_dir() -> Path:
