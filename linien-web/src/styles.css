@@ -474,6 +474,15 @@ body {
      and-braces, but it lets the browser early-out style recalc
      above the card boundary. */
   contain: layout style paint;
+  /* Browser can skip layout/paint entirely while the card is
+     scrolled outside the viewport. contain-intrinsic-size keeps
+     the scrollbar position stable -- without it the scrollbar
+     would jump as cards scroll in/out. The 540px hint matches
+     the typical card height (panel header + 220px plot + status
+     row + paddings); the `auto` keyword lets the browser refine
+     once a real measurement is available. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 540px;
 }
 
 .device-card[data-dragging='true'] {
