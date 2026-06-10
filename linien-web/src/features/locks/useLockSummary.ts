@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type {
   AutoRelockStatus,
   Device,
@@ -281,3 +281,45 @@ export const useLockSummary = (devices: Device[]): LockSummaryMaps => {
   }, []);
   return snapshot;
 };
+
+// Narrow selector: subscribe to the lock-summary bookkeeper but only
+// re-render when `selector(snapshot)` produces a value different from
+// the previous (by Object.is). The full useLockSummary hook returns
+// the entire snapshot, so any change anywhere (status poll, indicator
+// transition) re-renders every consumer; this lets consumers like
+// App that only need `connectedDeviceCount` (a single number) avoid
+// re-rendering on unrelated changes.
+export function useLockSummarySlice<T>(
+  devices: Device[],
+  selector: (snapshot: LockSummaryMaps) => T,
+): T {
+  // Keep selector / device wiring identical to useLockSummary.
+  useEffect(() => {
+    lockSummaryStore.setDevices(devices);
+  }, [devices]);
+  useEffect(() => {
+    lockSummaryStore.reseedFromStore();
+  }, [devices]);
+
+  const selectorRef = useRef(selector);
+  selectorRef.current = selector;
+  const [value, setValue] = useState<T>(() =>
+    selectorRef.current(lockSummaryStore.getSnapshot()),
+  );
+  // `value` ref tracks the most recently committed selector result so
+  // the subscribe callback can compare without depending on React state.
+  const lastValueRef = useRef<T>(value);
+  useEffect(() => {
+    lastValueRef.current = value;
+  }, [value]);
+  useEffect(() => {
+    return lockSummaryStore.subscribe(() => {
+      const next = selectorRef.current(lockSummaryStore.getSnapshot());
+      if (!Object.is(lastValueRef.current, next)) {
+        lastValueRef.current = next;
+        setValue(next);
+      }
+    });
+  }, []);
+  return value;
+}

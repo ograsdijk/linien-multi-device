@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from 'react';
+import { useRef, useSyncExternalStore } from 'react';
 import type { DeviceStatus, PlotFrame } from '../types';
 
 export type DeviceStateEntry = {
@@ -134,5 +134,65 @@ export function useDeviceStateEntry(deviceKey: string): DeviceStateEntry {
     (listener) => deviceStatesStore.subscribeDevice(deviceKey, listener),
     () => deviceStatesStore.getDeviceSnapshot(deviceKey),
     () => EMPTY_PARAMS_ENTRY
+  );
+}
+
+// Narrow subscription: re-render only when `selector(entry)` returns
+// a value that differs (per `isEqual`, default Object.is) from the
+// last call. Used by card components that read only a couple of
+// fields off the entry -- without this, every param-batch write
+// forces a card re-render because the entry's top-level ref changes
+// even though the fields the card reads (lock, status.connected)
+// did not.
+//
+// IMPORTANT: pass selector/isEqual that are stable across renders
+// (define them at module scope or wrap in useCallback). The hook
+// captures the first-render selector via refs to avoid resubscribing
+// per render, so a mid-render selector swap would not take effect
+// until the next remount.
+export function useDeviceStateSlice<T>(
+  deviceKey: string,
+  selector: (entry: DeviceStateEntry) => T,
+  isEqual: (a: T, b: T) => boolean = Object.is,
+): T {
+  const selectorRef = useRef(selector);
+  const isEqualRef = useRef(isEqual);
+  // Refs are read inside the subscribe + getSnapshot callbacks below.
+  // We deliberately do NOT re-subscribe when these change; that would
+  // tear down the store listener and lose the cached lastValue.
+  selectorRef.current = selector;
+  isEqualRef.current = isEqual;
+  // The cached last selected value is kept in a ref so React's
+  // getSnapshot can return a stable reference between calls. Without
+  // this, React detects "new value" every render and re-renders even
+  // when nothing changed.
+  const lastValueRef = useRef<{ has: false } | { has: true; value: T }>({
+    has: false,
+  });
+  return useSyncExternalStore(
+    (listener) =>
+      deviceStatesStore.subscribeDevice(deviceKey, () => {
+        const entry = deviceStatesStore.getDeviceSnapshot(deviceKey);
+        const next = selectorRef.current(entry);
+        const last = lastValueRef.current;
+        if (last.has && isEqualRef.current(last.value, next)) return;
+        lastValueRef.current = { has: true, value: next };
+        listener();
+      }),
+    () => {
+      const entry = deviceStatesStore.getDeviceSnapshot(deviceKey);
+      const next = selectorRef.current(entry);
+      const last = lastValueRef.current;
+      if (last.has && isEqualRef.current(last.value, next)) {
+        return last.value;
+      }
+      lastValueRef.current = { has: true, value: next };
+      return next;
+    },
+    () => {
+      const next = selectorRef.current(EMPTY_PARAMS_ENTRY);
+      lastValueRef.current = { has: true, value: next };
+      return next;
+    },
   );
 }

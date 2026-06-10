@@ -7,7 +7,41 @@ import { useInViewport } from '../hooks/useInViewport';
 import { OverviewPlotPanel, type OverviewPlotPanelHandle } from './OverviewPlotPanel';
 import { ThrottledStatusRow } from './ThrottledStatusRow';
 import { resolveLockDisplay } from '../features/locks/lockState';
-import { useDeviceStateEntry } from '../state/deviceStatesStore';
+import { type DeviceStateEntry, useDeviceStateSlice } from '../state/deviceStatesStore';
+
+// Narrow slice this card actually consumes: the lock primitive and a
+// few status fields. The previous useDeviceStateEntry subscription
+// fired a card re-render on EVERY param batch (since the entry's
+// top-level ref changes whenever any param updates), even though
+// nothing the card displays had moved. This selector ignores
+// param updates that don't touch `lock`.
+type CardSlice = {
+  lockFromParams: boolean | undefined;
+  connected: boolean;
+  connecting: boolean;
+  lockFromStatus: boolean | undefined;
+};
+
+const selectCardSlice = (entry: DeviceStateEntry): CardSlice => {
+  const lockRaw = entry.params.lock;
+  const lockFromParams = typeof lockRaw === 'boolean' ? lockRaw : undefined;
+  const s = entry.status;
+  return {
+    lockFromParams,
+    connected: Boolean(s?.connected),
+    connecting: Boolean(s?.connecting),
+    lockFromStatus: typeof s?.lock === 'boolean' ? s.lock : undefined,
+  };
+};
+
+const cardSliceEqual = (a: CardSlice, b: CardSlice): boolean => {
+  return (
+    a.lockFromParams === b.lockFromParams &&
+    a.connected === b.connected &&
+    a.connecting === b.connecting &&
+    a.lockFromStatus === b.lockFromStatus
+  );
+};
 
 type DeviceOverviewCardProps = {
   device: Device;
@@ -47,7 +81,7 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
   onStateUpdate,
   onStreamActiveChange,
 }: DeviceOverviewCardProps) {
-  const state = useDeviceStateEntry(device.key);
+  const slice = useDeviceStateSlice(device.key, selectCardSlice, cardSliceEqual);
   const rootRef = useRef<HTMLDivElement | null>(null);
   // Imperative handle into OverviewPlotPanel. Plot frames are pushed
   // straight to uPlot via this ref -- no React state, no render of
@@ -64,12 +98,8 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
 
   const visible = useInViewport(rootRef, { disabled: !active });
   const streamEnabled = active && visible;
-  const connected = Boolean(state.status?.connected);
-  const lockStateFromParams =
-    typeof state.params.lock === 'boolean' ? state.params.lock : undefined;
-  const lockStateFromStatus =
-    typeof state.status?.lock === 'boolean' ? state.status.lock : undefined;
-  const lockState = lockStateFromParams ?? lockStateFromStatus;
+  const connected = slice.connected;
+  const lockState = slice.lockFromParams ?? slice.lockFromStatus;
   const statusLabel = connected ? (lockState ? 'Locked' : 'Unlocked') : 'Disconnected';
   const lockDisplay = resolveLockDisplay({
     connected,
