@@ -112,7 +112,7 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
           </Button>
         </Group>
       </Group>
-      <OverviewPlotPanel plotFrame={plotFrame} lockState={lockState} />
+      <OverviewPlotPanel plotFrame={plotFrame} lockState={lockState} initActive={streamEnabled} />
       <StatusRow
         plotFrame={plotFrame}
         lockIndicator={lockIndicator}

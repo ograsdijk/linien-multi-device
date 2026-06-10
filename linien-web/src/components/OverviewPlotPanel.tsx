@@ -41,9 +41,14 @@ const DEFAULT_HEIGHT = 220;
 type OverviewPlotPanelProps = {
   plotFrame?: PlotFrame | null;
   lockState?: boolean;
+  // When false (or absent), defer the uPlot constructor until the
+  // card becomes active+visible. Avoids the new uPlot(...) cost for
+  // cards scrolled off-screen at first paint. The init effect
+  // re-evaluates when this transitions true.
+  initActive?: boolean;
 };
 
-export function OverviewPlotPanel({ plotFrame, lockState }: OverviewPlotPanelProps) {
+export function OverviewPlotPanel({ plotFrame, lockState, initActive = true }: OverviewPlotPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const uplotRef = useRef<uPlot | null>(null);
   const sizeRef = useRef({ width: 400, height: DEFAULT_HEIGHT });
@@ -103,7 +108,15 @@ export function OverviewPlotPanel({ plotFrame, lockState }: OverviewPlotPanelPro
     uplotRef.current?.redraw();
   }, [plotFrame?.lock_target]);
 
+  // Init uPlot exactly once, the first time `initActive` becomes true.
+  // Cards scrolled off-screen at first paint never construct uPlot;
+  // they pay for it lazily on first visibility. Once initialized,
+  // a later transition back to inactive does NOT destroy the
+  // instance — re-creation on every scroll would defeat the win.
+  const initializedRef = useRef(false);
   useEffect(() => {
+    if (initializedRef.current || !initActive) return;
+    initializedRef.current = true;
     let observer: ResizeObserver | null = null;
     const handleResize = () => {
       if (!uplotRef.current || !containerRef.current) return;
@@ -129,9 +142,16 @@ export function OverviewPlotPanel({ plotFrame, lockState }: OverviewPlotPanelPro
       memberIdxs: [SERIES_INDEX[band.upper], SERIES_INDEX[band.lower]],
     }));
 
+    // Force the canvas backing store to a 1:1 pixel ratio even on
+    // HiDPI displays. Default behavior (devicePixelRatio = 2 or 3)
+    // multiplies the pixel count 4-9x per canvas, which dominates
+    // paint cost across 12 thumbnails. At thumbnail size the loss
+    // of sharpness is invisible. uPlot reads `pxRatio` from opts at
+    // construction time even though its TS types omit it.
     const opts: uPlot.Options = {
       width: initialWidth,
       height: sizeRef.current.height,
+      ...({ pxRatio: 1 } as { pxRatio: number }),
       scales: {
         x: { time: false, auto: false, range: [0, N_POINTS - 1] },
         y: { auto: false },
@@ -259,7 +279,7 @@ export function OverviewPlotPanel({ plotFrame, lockState }: OverviewPlotPanelPro
       uplotRef.current?.destroy();
       uplotRef.current = null;
     };
-  }, []);
+  }, [initActive]);
 
   useLayoutEffect(() => {
     if (!uplotRef.current) return;

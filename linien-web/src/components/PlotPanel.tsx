@@ -34,6 +34,9 @@ type PlotPanelProps = {
   sweepCenter?: number;
   sweepAmplitude?: number;
   showManualTarget?: boolean;
+  // When false (or absent), defer uPlot constructor until first true.
+  // Matches the gating used by DeviceWorkspace's streamEnabled.
+  initActive?: boolean;
 };
 
 const POINT_STYLE: uPlot.Series.Points = { show: false };
@@ -63,6 +66,7 @@ export function PlotPanel({
   sweepCenter,
   sweepAmplitude,
   showManualTarget,
+  initActive = true,
 }: PlotPanelProps) {
   const [frozenFrame, setFrozenFrame] = useState<PlotFrame | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -228,7 +232,13 @@ export function PlotPanel({
     uplotRef.current?.redraw();
   }, [activePlotFrame?.lock_target]);
 
+  // Init uPlot lazily once `initActive` becomes true. Cards in
+  // off-screen group panels never construct uPlot. Once initialized,
+  // the instance is kept alive until unmount.
+  const initializedRef = useRef(false);
   useEffect(() => {
+    if (initializedRef.current || !initActive) return;
+    initializedRef.current = true;
     let observer: ResizeObserver | null = null;
     const handleResize = () => {
       if (!uplotRef.current || !containerRef.current) return;
@@ -453,7 +463,7 @@ export function PlotPanel({
       uplotRef.current?.destroy();
       uplotRef.current = null;
     };
-  }, []);
+  }, [initActive]);
 
   // Single commit-phase effect that owns:
   //  1. Filling the reusable typed-array series buffers from the latest

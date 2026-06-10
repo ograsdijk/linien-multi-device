@@ -383,6 +383,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             sweepCenter={sweepCenter}
             sweepAmplitude={sweepAmplitude}
             showManualTarget={lockMode !== 'autolock'}
+            initActive={streamEnabled}
           />
           <StatusRow
             plotFrame={plotFrame}
