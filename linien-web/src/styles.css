@@ -251,7 +251,15 @@ body {
   gap: 12px 24px;
   font-size: 14px;
   color: var(--ink);
+  /* Tabular-nums makes digits monospaced so the values that update
+     every ~500 ms (signal_power, error_std, control_std) don't
+     shift the surrounding text horizontally as their digit count
+     changes. The flex layout still re-flows if a whole stat
+     appears or disappears, but the common case (just numbers
+     ticking) becomes layout-stable. */
+  font-variant-numeric: tabular-nums;
 }
+
 
 .device-tag {
   font-size: 12px;
@@ -429,6 +437,11 @@ body {
   padding: 2px 6px;
   border-radius: 6px;
   box-shadow: var(--panel-shadow);
+  /* Reserve vertical space so the legend doesn't contribute to
+     CLS when entries appear / disappear as series visibility
+     changes (lighthouse flagged this as a layout-shift source). */
+  min-height: 28px;
+  box-sizing: border-box;
 }
 
 .group-grid {
