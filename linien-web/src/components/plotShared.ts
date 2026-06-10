@@ -223,23 +223,61 @@ export const seriesArrayLength = (value: unknown): number => {
   return 0;
 };
 
-export const getAxisTheme = () => {
+export type AxisTheme = { axis: string; grid: string; tick: string };
+
+const FALLBACK_AXIS_THEME: AxisTheme = {
+  axis: '#111111',
+  grid: 'rgba(0, 0, 0, 0.15)',
+  tick: 'rgba(0, 0, 0, 0.35)',
+};
+const FALLBACK_ACCENT = '#c4472d';
+
+export const getAxisTheme = (): AxisTheme => {
   if (typeof window === 'undefined') {
-    return { axis: '#111111', grid: 'rgba(0, 0, 0, 0.15)', tick: 'rgba(0, 0, 0, 0.35)' };
+    return { ...FALLBACK_AXIS_THEME };
   }
   const styles = getComputedStyle(document.documentElement);
-  const axis = styles.getPropertyValue('--ink').trim() || '#111111';
-  const grid = styles.getPropertyValue('--grid').trim() || 'rgba(0, 0, 0, 0.15)';
-  const tick = styles.getPropertyValue('--tick').trim() || 'rgba(0, 0, 0, 0.35)';
+  const axis = styles.getPropertyValue('--ink').trim() || FALLBACK_AXIS_THEME.axis;
+  const grid = styles.getPropertyValue('--grid').trim() || FALLBACK_AXIS_THEME.grid;
+  const tick = styles.getPropertyValue('--tick').trim() || FALLBACK_AXIS_THEME.tick;
   return { axis, grid, tick };
 };
 
-export const getAccentColor = () => {
+export const getAccentColor = (): string => {
   if (typeof window === 'undefined') {
-    return '#c4472d';
+    return FALLBACK_ACCENT;
   }
   const styles = getComputedStyle(document.documentElement);
-  return styles.getPropertyValue('--accent').trim() || '#c4472d';
+  return styles.getPropertyValue('--accent').trim() || FALLBACK_ACCENT;
+};
+
+// Module-level theme cache shared by every plot panel. All panels read
+// the same CSS variables off document.documentElement, so one cache
+// serves all of them and we do exactly ONE getComputedStyle per
+// color-scheme change instead of one per panel per draw.
+//
+// getComputedStyle forces a style flush; calling it inside a uPlot
+// `draw` hook (which fires on every frame and every redraw) was a
+// per-frame forced reflow -- Lighthouse measured ~57 ms of it across
+// the tab-switch redraw bursts. The draw hooks now read from this
+// cache, which is refreshed only when the scheme MutationObserver
+// fires.
+let _cachedAxisTheme: AxisTheme | null = null;
+let _cachedAccent: string | null = null;
+
+export const refreshThemeCache = (): void => {
+  _cachedAxisTheme = getAxisTheme();
+  _cachedAccent = getAccentColor();
+};
+
+export const getCachedAxisTheme = (): AxisTheme => {
+  if (_cachedAxisTheme === null) refreshThemeCache();
+  return _cachedAxisTheme as AxisTheme;
+};
+
+export const getCachedAccentColor = (): string => {
+  if (_cachedAccent === null) refreshThemeCache();
+  return _cachedAccent as string;
 };
 
 // Default y-range pad and fallback for when no visible series has any

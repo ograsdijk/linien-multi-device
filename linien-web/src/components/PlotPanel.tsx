@@ -21,10 +21,12 @@ import {
   type PlotData,
   type SeriesKey,
   type SeriesStats,
-  getAccentColor,
   getAxisTheme,
+  getCachedAccentColor,
+  getCachedAxisTheme,
   getXBuffer,
   padYRange,
+  refreshThemeCache,
   toFinite,
   toRgba,
   writeSeriesInto,
@@ -568,7 +570,9 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
           (u) => {
             const { top, height } = u.bbox;
             const ctx = u.ctx;
-            const theme = getAxisTheme();
+            // Cached theme/accent -- no getComputedStyle on the
+            // per-draw hot path. Refreshed by the scheme observer.
+            const theme = getCachedAxisTheme();
 
             const manualTarget = manualTargetRef.current;
             if (manualTarget.enabled && manualTarget.xVal != null) {
@@ -592,7 +596,7 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
               const xPos = u.valToPos(lockTarget, 'x', true);
               if (Number.isFinite(xPos)) {
                 ctx.save();
-                ctx.strokeStyle = getAccentColor();
+                ctx.strokeStyle = getCachedAccentColor();
                 ctx.globalAlpha = 0.8;
                 ctx.lineWidth = 1.5;
                 ctx.setLineDash([7, 5]);
@@ -657,7 +661,11 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
 
     const applyAxisTheme = () => {
       if (!uplotRef.current) return;
-      const theme = getAxisTheme();
+      // Refresh the shared theme cache from the DOM here (rare path:
+      // init + scheme change), so the per-draw hot path can read the
+      // cache without ever calling getComputedStyle.
+      refreshThemeCache();
+      const theme = getCachedAxisTheme();
       uplotRef.current.axes.forEach((axis) => {
         axis.stroke = makeStroke(theme.axis);
         axis.grid = { ...(axis.grid || {}), stroke: makeStroke(theme.grid) };

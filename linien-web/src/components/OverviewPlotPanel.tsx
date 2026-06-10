@@ -18,9 +18,10 @@ import {
   type PlotData,
   type SeriesKey,
   type SeriesStats,
-  getAccentColor,
   getAxisTheme,
+  getCachedAccentColor,
   getXBuffer,
+  refreshThemeCache,
   padYRange,
   toFinite,
   toRgba,
@@ -446,7 +447,9 @@ export const OverviewPlotPanel = forwardRef<
             const { top, height } = u.bbox;
             const ctx = u.ctx;
             ctx.save();
-            ctx.strokeStyle = getAccentColor();
+            // Cached accent -- no getComputedStyle on the per-draw
+            // hot path. Refreshed by the scheme observer.
+            ctx.strokeStyle = getCachedAccentColor();
             ctx.globalAlpha = 0.75;
             ctx.lineWidth = 1.25;
             ctx.setLineDash([6, 4]);
@@ -472,6 +475,9 @@ export const OverviewPlotPanel = forwardRef<
 
     const applyAxisTheme = () => {
       if (!uplotRef.current) return;
+      // Refresh the shared theme cache here (init + scheme change)
+      // so the per-draw hot path reads the cache, never getComputedStyle.
+      refreshThemeCache();
       const theme = getAxisTheme();
       uplotRef.current.axes.forEach((axis) => {
         axis.stroke = makeStroke(theme.axis);
