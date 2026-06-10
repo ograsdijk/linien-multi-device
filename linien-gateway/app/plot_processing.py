@@ -93,16 +93,35 @@ def _scale_history(
 
     The result lives directly in plot frames (no Python list step) so
     binary encoders can `.astype(np.float32).tobytes()` it without
-    re-walking. JSON encoders convert via `_array_to_json_list` at
+    re-walking. JSON encoders convert via `_array_to_json_safe` at
     encode time, which produces `null` for NaN entries to match the
     previous list-of-Optional[float] shape.
+
+    Vectorized with numpy fancy-indexing: ~15x faster than the prior
+    Python for-loop at ~500 samples (bench/optimizations.py #7).
+    Duplicate target indices fall back to "last write wins" same as
+    the loop did.
     """
     scaled_times = scale_history_times(times, timescale)
     out = np.full(N_POINTS, np.nan, dtype=np.float64)
-    for t, v in zip(scaled_times, values):
-        idx = int(round(float(t)))
-        if 0 <= idx < N_POINTS:
-            out[idx] = float(v) / V
+    if scaled_times.size == 0 or not values:
+        return out
+    idxs = np.round(scaled_times).astype(np.int64)
+    mask = (idxs >= 0) & (idxs < N_POINTS)
+    if not mask.any():
+        return out
+    vals = np.asarray(values, dtype=np.float64)
+    # `values` may be a longer list than `scaled_times` in edge cases
+    # (linien-common's update_signal_history can briefly desync). Trim
+    # to the safer of the two lengths so the mask + assignment stay
+    # consistent.
+    pair_len = min(idxs.size, vals.size)
+    if pair_len < idxs.size:
+        idxs = idxs[:pair_len]
+        mask = mask[:pair_len]
+    elif pair_len < vals.size:
+        vals = vals[:pair_len]
+    out[idxs[mask]] = vals[mask] / V
     return out
 
 
