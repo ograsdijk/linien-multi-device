@@ -1053,7 +1053,15 @@ def serve_spa(path: str):
 
 
 def main() -> None:
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+        # See run.py for the rationale; same flag for the no-reload
+        # production-style invocation.
+        ws_per_message_deflate=True,
+    )
 
 
 if __name__ == "__main__":
