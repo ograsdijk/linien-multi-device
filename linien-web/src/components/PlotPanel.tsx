@@ -226,6 +226,12 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
   const [hasData, setHasData] = useState(false);
 
   const initializedRef = useRef(false);
+  // Disposables captured at init time, torn down only on unmount.
+  // See the unmount-only effect at the end of the component for why
+  // these don't live inside the [initActive] effect's cleanup.
+  const observerRef = useRef<ResizeObserver | null>(null);
+  const schemeObserverRef = useRef<MutationObserver | null>(null);
+  const resizeHandlerRef = useRef<(() => void) | null>(null);
 
   const applyFrameInternal = (frame: PlotFrame): void => {
     latestFrameRef.current = frame;
@@ -453,15 +459,23 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
     uplotRef.current.redraw();
   }, [selectionMode]);
 
-  // Init uPlot lazily once initActive becomes true.
+  // Init uPlot lazily once initActive becomes true. No cleanup is
+  // returned here on purpose -- the unmount-only effect at the end
+  // handles disposal so uPlot survives tab visibility toggles
+  // (Mantine Tabs.Panel keeps panels mounted by default; destroying
+  // uPlot when initActive flips false would leave panels blank
+  // when the tab is revisited because the initializedRef guard
+  // would block re-creation).
   useEffect(() => {
     if (initializedRef.current || !initActive) return;
     initializedRef.current = true;
-    let observer: ResizeObserver | null = null;
-    const handleResize = () => {
-      if (!uplotRef.current || !containerRef.current) return;
-      const width = containerRef.current.clientWidth;
-      if (width && width > 10) {
+    // Layout-read-free resize handler: takes the new width from the
+    // ResizeObserverEntry (the browser has already computed it for
+    // this notification). Reading container.clientWidth here would
+    // force a reflow on every observer fire.
+    const applyContainerWidth = (width: number | null) => {
+      if (!uplotRef.current) return;
+      if (width != null && width > 10) {
         sizeRef.current.width = width;
       }
       uplotRef.current.setSize({
@@ -473,6 +487,8 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
     const container = containerRef.current;
     if (!container || uplotRef.current) return;
 
+    // Single layout read at init time; subsequent updates come from
+    // the ResizeObserver entry below.
     const initialWidth =
       container.clientWidth > 10 ? container.clientWidth : sizeRef.current.width;
     sizeRef.current.width = initialWidth;
@@ -637,7 +653,7 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
     uplotRef.current.setScale('x', { min: 0, max: N_POINTS - 1 });
     uplotRef.current.setScale('y', { min: -1, max: 1 });
     uplotRef.current.setData(initialData, false);
-    handleResize();
+    applyContainerWidth(initialWidth);
 
     const applyAxisTheme = () => {
       if (!uplotRef.current) return;
@@ -660,24 +676,46 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
       });
     }
 
-    observer = new ResizeObserver(() => handleResize());
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (!entry) return;
+      const size = entry.contentBoxSize?.[0];
+      const width = size ? size.inlineSize : entry.contentRect?.width;
+      applyContainerWidth(typeof width === 'number' ? width : null);
+    });
     observer.observe(container);
-    window.addEventListener('resize', handleResize);
+    // ResizeObserver fires on size changes including those caused by
+    // window resizes affecting our layout -- no separate window
+    // 'resize' listener needed.
+
+    observerRef.current = observer;
+    schemeObserverRef.current = schemeObserver;
+    resizeHandlerRef.current = null;
 
     // Replay any frame stashed before init completed.
     if (latestFrameRef.current) {
       applyFrameInternal(latestFrameRef.current);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initActive]);
 
+  // Unmount-only cleanup. Tears down resources captured by the init
+  // effect above. Does NOT fire on initActive toggle -- uPlot stays
+  // alive across tab visibility changes.
+  useEffect(() => {
     return () => {
-      window.removeEventListener('resize', handleResize);
-      schemeObserver?.disconnect();
-      observer?.disconnect();
+      observerRef.current?.disconnect();
+      observerRef.current = null;
+      schemeObserverRef.current?.disconnect();
+      schemeObserverRef.current = null;
+      if (resizeHandlerRef.current) {
+        window.removeEventListener('resize', resizeHandlerRef.current);
+        resizeHandlerRef.current = null;
+      }
       uplotRef.current?.destroy();
       uplotRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initActive]);
+  }, []);
 
   // Selection touch handlers (unchanged from prior version).
   useEffect(() => {
@@ -704,13 +742,19 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
 
     let startX: number | null = null;
     let currentX: number | null = null;
+    // Cache the overlay's bounding rect at touchstart so each
+    // touchmove doesn't re-read getBoundingClientRect (which forces
+    // a layout flush). The overlay can't move within a single
+    // touch sequence, so the cache stays correct until touchend.
+    let cachedRect: DOMRect | null = null;
+    let cachedHeight = 0;
 
     const clearSelection = () => {
       u.setSelect({ left: 0, width: 0, top: 0, height: 0 }, false);
     };
 
     const clampToPlotX = (clientX: number) => {
-      const rect = over.getBoundingClientRect();
+      const rect = cachedRect ?? over.getBoundingClientRect();
       const raw = clientX - rect.left;
       return clamp(raw, lowerPos, upperPos);
     };
@@ -719,7 +763,7 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
       const left = Math.min(x0, x1);
       const width = Math.abs(x1 - x0);
       u.setSelect(
-        { left, width, top: 0, height: over.clientHeight },
+        { left, width, top: 0, height: cachedHeight || over.clientHeight },
         false,
       );
     };
@@ -756,6 +800,10 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
     const onTouchStart = (event: TouchEvent) => {
       if (event.touches.length !== 1) return;
       event.preventDefault();
+      // One layout read at the start of the gesture; reuse for the
+      // duration of this touch sequence.
+      cachedRect = over.getBoundingClientRect();
+      cachedHeight = over.clientHeight;
       const x = clampToPlotX(event.touches[0].clientX);
       startX = x;
       currentX = x;
@@ -774,12 +822,14 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
       if (startX == null) return;
       event.preventDefault();
       finishSelection();
+      cachedRect = null;
     };
 
     const onTouchCancel = () => {
       clearSelection();
       startX = null;
       currentX = null;
+      cachedRect = null;
     };
 
     over.addEventListener('touchstart', onTouchStart, { passive: false });

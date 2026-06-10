@@ -125,6 +125,17 @@ export const OverviewPlotPanel = forwardRef<
   const [hasData, setHasData] = useState(false);
 
   const initializedRef = useRef(false);
+  // Disposable resources captured at init time. They live in refs so
+  // the unmount-only cleanup effect below can tear them down without
+  // being part of the [initActive] effect's dep cycle. If we put the
+  // cleanup inside the [initActive] effect, React would fire it
+  // whenever initActive flipped to false (tab deactivate) and we'd
+  // destroy uPlot. The init re-entry guard (initializedRef) would
+  // then block reinit on the next initActive=true, leaving the panel
+  // permanently blank after the first tab switch-away-and-back.
+  const observerRef = useRef<ResizeObserver | null>(null);
+  const schemeObserverRef = useRef<MutationObserver | null>(null);
+  const resizeHandlerRef = useRef<(() => void) | null>(null);
 
   // The actual work. Mirrors the previous useLayoutEffect body but
   // is invoked directly (not via React state -> render -> effect).
@@ -318,14 +329,22 @@ export const OverviewPlotPanel = forwardRef<
   }, [lockState]);
 
   // Init uPlot exactly once, the first time `initActive` becomes true.
+  // No cleanup is returned from this effect on purpose -- see the
+  // unmount-only effect below for resource teardown. Putting cleanup
+  // here would destroy uPlot when initActive toggles back to false
+  // (tab deactivate), and the initializedRef guard would then block
+  // re-creation on the next activation.
   useEffect(() => {
     if (initializedRef.current || !initActive) return;
     initializedRef.current = true;
-    let observer: ResizeObserver | null = null;
-    const handleResize = () => {
-      if (!uplotRef.current || !containerRef.current) return;
-      const width = containerRef.current.clientWidth;
-      if (width && width > 10) sizeRef.current.width = width;
+    // setSize is the only DOM-mutating side effect we drive from
+    // resize events. Reading layout (clientWidth/getBoundingClientRect)
+    // synchronously inside a ResizeObserver callback forces a reflow;
+    // we pull the new size off the observer entry instead so the call
+    // is layout-read-free.
+    const applyContainerWidth = (width: number | null) => {
+      if (!uplotRef.current) return;
+      if (width != null && width > 10) sizeRef.current.width = width;
       uplotRef.current.setSize({
         width: sizeRef.current.width,
         height: sizeRef.current.height,
@@ -335,6 +354,9 @@ export const OverviewPlotPanel = forwardRef<
     const container = containerRef.current;
     if (!container || uplotRef.current) return;
 
+    // One layout read at init time is unavoidable since the observer
+    // hasn't fired yet. After init the observer keeps us up to date
+    // without further layout flushes.
     const initialWidth =
       container.clientWidth > 10 ? container.clientWidth : sizeRef.current.width;
     sizeRef.current.width = initialWidth;
@@ -446,7 +468,7 @@ export const OverviewPlotPanel = forwardRef<
     uplotRef.current.setScale('x', { min: 0, max: N_POINTS - 1 });
     uplotRef.current.setScale('y', { min: -1, max: 1 });
     uplotRef.current.setData(initialData, false);
-    handleResize();
+    applyContainerWidth(initialWidth);
 
     const applyAxisTheme = () => {
       if (!uplotRef.current) return;
@@ -469,23 +491,54 @@ export const OverviewPlotPanel = forwardRef<
       });
     }
 
-    observer = new ResizeObserver(() => handleResize());
+    // Read the new width off the ResizeObserverEntry directly --
+    // entry.contentBoxSize is the post-layout box dimensions the
+    // browser already computed for this notification. Reading
+    // container.clientWidth here would force the browser to flush
+    // pending layout work (forced reflow), which Lighthouse called
+    // out as ~47ms in our hot paths.
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (!entry) return;
+      const size = entry.contentBoxSize?.[0];
+      const width = size
+        ? size.inlineSize
+        : entry.contentRect?.width;
+      applyContainerWidth(typeof width === 'number' ? width : null);
+    });
     observer.observe(container);
-    window.addEventListener('resize', handleResize);
+    // ResizeObserver fires whenever the container's box size
+    // changes -- including from window resizes affecting the
+    // layout. No separate window resize listener needed.
+
+    observerRef.current = observer;
+    schemeObserverRef.current = schemeObserver;
+    resizeHandlerRef.current = null;
 
     // Replay any frame that arrived before uPlot was constructed.
     if (latestFrameRef.current) {
       applyFrameInternal(latestFrameRef.current);
     }
+  }, [initActive]);
 
+  // Unmount-only cleanup. Tears down resources captured by the init
+  // effect above. Does NOT fire when initActive toggles -- uPlot
+  // stays alive across tab visibility changes (Mantine Tabs.Panel
+  // keeps panels mounted by default; we keep the plot ready).
+  useEffect(() => {
     return () => {
-      window.removeEventListener('resize', handleResize);
-      schemeObserver?.disconnect();
-      observer?.disconnect();
+      observerRef.current?.disconnect();
+      observerRef.current = null;
+      schemeObserverRef.current?.disconnect();
+      schemeObserverRef.current = null;
+      if (resizeHandlerRef.current) {
+        window.removeEventListener('resize', resizeHandlerRef.current);
+        resizeHandlerRef.current = null;
+      }
       uplotRef.current?.destroy();
       uplotRef.current = null;
     };
-  }, [initActive]);
+  }, []);
 
   return (
     <div className="panel plot-panel" style={{ padding: 8 }}>
