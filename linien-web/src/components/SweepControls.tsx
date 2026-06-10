@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import { Button, Group, RangeSlider, Text } from '@mantine/core';
 import { toClampedNumberOr } from '../utils/numberInput';
@@ -25,7 +25,7 @@ type SweepControlsProps = {
   ) => void;
 };
 
-export function SweepControls({ params, onSetParam }: SweepControlsProps) {
+export const SweepControls = memo(function SweepControls({ params, onSetParam }: SweepControlsProps) {
   const centerRaw = params.sweep_center;
   const centerParsed = centerRaw == null ? NaN : Number(centerRaw);
   const center = Number.isFinite(centerParsed) ? centerParsed : 0;
@@ -389,4 +389,4 @@ export function SweepControls({ params, onSetParam }: SweepControlsProps) {
       </Group>
     </div>
   );
-}
+});

@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { Group, Select, Slider, Stack, Switch, Text } from '@mantine/core';
 import { DeferredNumberInput } from './DeferredNumberInput';
 
@@ -24,7 +25,7 @@ type GeneralPanelProps = {
   onSetParam: (name: string, value: any, writeRegisters?: boolean) => void;
 };
 
-export function GeneralPanel({ params, onSetParam }: GeneralPanelProps) {
+export const GeneralPanel = memo(function GeneralPanel({ params, onSetParam }: GeneralPanelProps) {
   const dual = Boolean(params.dual_channel);
   const pidOnly = Boolean(params.pid_only_mode);
   const rawChannelMix = typeof params.channel_mixing === 'number' ? params.channel_mixing : 0;
@@ -127,4 +128,4 @@ export function GeneralPanel({ params, onSetParam }: GeneralPanelProps) {
       />
     </Stack>
   );
-}
+});

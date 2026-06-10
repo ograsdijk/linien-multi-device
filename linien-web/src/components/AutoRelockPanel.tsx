@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import { Button, Group, Stack, Switch, Text } from '@mantine/core';
 import type { AutoRelockConfig, AutoRelockStatus } from '../types';
 import { toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
@@ -21,7 +21,7 @@ type AutoRelockPanelProps = {
   onSaveConfig?: (config: AutoRelockConfig) => Promise<void>;
 };
 
-export function AutoRelockPanel({
+export const AutoRelockPanel = memo(function AutoRelockPanel({
   config,
   status,
   saving,
@@ -154,4 +154,4 @@ export function AutoRelockPanel({
       ) : null}
     </Stack>
   );
-}
+});

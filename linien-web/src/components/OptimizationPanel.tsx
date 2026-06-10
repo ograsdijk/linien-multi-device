@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { Button, Divider, Group, Select, Stack, Switch, Text } from '@mantine/core';
 import { DeferredNumberInput } from './DeferredNumberInput';
 
@@ -27,7 +28,7 @@ type OptimizationPanelProps = {
   disableReason?: string;
 };
 
-export function OptimizationPanel({
+export const OptimizationPanel = memo(function OptimizationPanel({
   params,
   onSetParam,
   onStartSelection,
@@ -218,4 +219,4 @@ export function OptimizationPanel({
       </Group>
     </Stack>
   );
-}
+});

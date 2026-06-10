@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react';
+import { memo, useEffect, useId, useState } from 'react';
 import {
   Button,
   Divider,
@@ -49,7 +49,7 @@ type LockingPanelProps = {
   disableReason?: string;
 };
 
-export function LockingPanel({
+export const LockingPanel = memo(function LockingPanel({
   params,
   onSetParam,
   onStartLock,
@@ -394,4 +394,4 @@ export function LockingPanel({
       </Text>
     </Stack>
   );
-}
+});

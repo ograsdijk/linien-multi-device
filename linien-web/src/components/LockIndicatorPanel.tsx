@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import { Button, Group, Select, Stack, Switch, Text } from '@mantine/core';
 import type { LockIndicatorConfig, LockIndicatorSnapshot } from '../types';
 import { toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
@@ -30,7 +30,7 @@ type LockIndicatorPanelProps = {
   onSaveConfig?: (config: LockIndicatorConfig) => Promise<void>;
 };
 
-export function LockIndicatorPanel({
+export const LockIndicatorPanel = memo(function LockIndicatorPanel({
   config,
   saving,
   error,
@@ -239,4 +239,4 @@ export function LockIndicatorPanel({
       ) : null}
     </Stack>
   );
-}
+});

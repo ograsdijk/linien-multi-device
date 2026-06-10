@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AutoRelockConfig,
   AutoLockScanResult,
@@ -143,6 +143,45 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
   const visible = useInViewport(rootRef, { disabled: !active });
   const streamEnabled = active && visible;
 
+  // Narrowed, referentially-stable params for SweepControls. Only
+  // changes identity when one of the three sweep fields changes, so
+  // the memoized SweepControls skips the param-flood re-renders.
+  const sweepParams = useMemo(
+    () => ({
+      sweep_center: state.params.sweep_center,
+      sweep_amplitude: state.params.sweep_amplitude,
+      sweep_pause: state.params.sweep_pause,
+    }),
+    [state.params.sweep_center, state.params.sweep_amplitude, state.params.sweep_pause],
+  );
+
+  // All handlers below are wrapped in useCallback with empty deps so
+  // they keep a stable identity across renders -- a prerequisite for
+  // the memoized RightPanel sub-panels to actually skip reconciliation
+  // during the param flood on tab activation. They read the
+  // frequently-changing values they need from this single "latest"
+  // ref, refreshed on every render, instead of closing over them.
+  const latestRef = useRef({
+    connected,
+    selectionMode,
+    selectionSubmitting,
+    lockMode,
+    params: state.params,
+    onStateUpdate,
+    onStartScanAutoLock,
+    onDisableLock,
+  });
+  latestRef.current = {
+    connected,
+    selectionMode,
+    selectionSubmitting,
+    lockMode,
+    params: state.params,
+    onStateUpdate,
+    onStartScanAutoLock,
+    onDisableLock,
+  };
+
   const onMessage = useCallback(
     (msg: StreamMessage) => {
       if (msg.type === 'plot_frame') {
@@ -277,28 +316,29 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     state.params.optimization_selection,
   ]);
 
-  const setParam = (
+  const setParam = useCallback((
     name: string,
     value: any,
     writeRegisters = true,
     options?: SetParamOptions
   ) => {
-    if (!connected) return;
+    const l = latestRef.current;
+    if (!l.connected) return;
     if (options?.optimistic !== false) {
-      onStateUpdate(device.key, { type: 'param_update', name, value });
+      l.onStateUpdate(device.key, { type: 'param_update', name, value });
     }
     api.setParam(device.key, name, value, writeRegisters).catch(() => null);
-  };
+  }, [device.key]);
 
-  const clearSelection = () => {
+  const clearSelection = useCallback(() => {
     setSelectionMode(null);
     setSelectionSubmitting(false);
-    if (!connected) return;
+    if (!latestRef.current.connected) return;
     setParam('autolock_selection', false, false);
     setParam('optimization_selection', false, false);
-  };
+  }, [setParam]);
 
-  const startAutolockSelection = () => {
+  const startAutolockSelection = useCallback(() => {
     if (autolockTemporarilyDisabled) {
       setSelectionMode(null);
       setSelectionSubmitting(false);
@@ -306,13 +346,13 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     }
     setSelectionMode('autolock');
     setSelectionSubmitting(false);
-    if (!connected) return;
+    if (!latestRef.current.connected) return;
     setParam('autolock_selection', true, false);
     setParam('optimization_selection', false, false);
     setParam('automatic_mode', true, false);
-  };
+  }, [autolockTemporarilyDisabled, setParam]);
 
-  const startOptimizationSelection = () => {
+  const startOptimizationSelection = useCallback(() => {
     if (optimizationTemporarilyDisabled) {
       setSelectionMode(null);
       setSelectionSubmitting(false);
@@ -320,23 +360,24 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     }
     setSelectionMode('optimization');
     setSelectionSubmitting(false);
-    if (!connected) return;
+    if (!latestRef.current.connected) return;
     setParam('optimization_selection', true, false);
     setParam('autolock_selection', false, false);
-  };
+  }, [optimizationTemporarilyDisabled, setParam]);
 
-  const handleSelectRange = async (x0: number, x1: number) => {
-    if (!connected) return;
-    if (selectionMode === null || selectionSubmitting) return;
+  const handleSelectRange = useCallback(async (x0: number, x1: number) => {
+    const l = latestRef.current;
+    if (!l.connected) return;
+    if (l.selectionMode === null || l.selectionSubmitting) return;
     if (
-      (selectionMode === 'autolock' && autolockTemporarilyDisabled) ||
-      (selectionMode === 'optimization' && optimizationTemporarilyDisabled)
+      (l.selectionMode === 'autolock' && autolockTemporarilyDisabled) ||
+      (l.selectionMode === 'optimization' && optimizationTemporarilyDisabled)
     ) {
       return;
     }
     const min = Math.max(0, Math.min(2047, x0));
     const max = Math.max(0, Math.min(2047, x1));
-    const mode = selectionMode;
+    const mode = l.selectionMode;
     setSelectionSubmitting(true);
     try {
       if (mode === 'autolock') {
@@ -351,12 +392,13 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     } finally {
       setSelectionSubmitting(false);
     }
-  };
+  }, [autolockTemporarilyDisabled, optimizationTemporarilyDisabled, clearSelection, device.key]);
 
-  const handleStartLock = async () => {
-    if (!connected) return;
+  const handleStartLock = useCallback(async () => {
+    const l = latestRef.current;
+    if (!l.connected) return;
     try {
-      const centerRaw = state.params.sweep_center;
+      const centerRaw = l.params.sweep_center;
       const center = centerRaw == null ? NaN : Number(centerRaw);
       if (Number.isFinite(center)) {
         // Ensure latest sweep center is on backend before lock handover.
@@ -368,38 +410,40 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
       // Best effort only; still attempt lock start.
     }
     api.startLock(device.key).catch(() => null);
-  };
+  }, [device.key]);
 
-  const handleAutoLockFromScan = async (
+  const handleAutoLockFromScan = useCallback(async (
     settings: AutoLockScanSettings
   ): Promise<AutoLockScanResult> => {
-    if (!connected) {
+    if (!latestRef.current.connected) {
       throw new Error('Device not connected.');
     }
     return api.autoLockFromScan(device.key, settings);
-  };
+  }, [device.key]);
 
-  const handleStartScanAutoLock = () => {
-    if (!connected) return;
-    if (onStartScanAutoLock) {
-      onStartScanAutoLock(device.key).catch(() => null);
+  const handleStartScanAutoLock = useCallback(() => {
+    const l = latestRef.current;
+    if (!l.connected) return;
+    if (l.onStartScanAutoLock) {
+      l.onStartScanAutoLock(device.key).catch(() => null);
       return;
     }
     api.getAutoLockScanSettings(device.key)
       .then((settings) => api.autoLockFromScan(device.key, settings))
       .catch(() => null);
-  };
+  }, [device.key]);
 
-  const handleStopLock = () => {
-    if (!connected) return;
-    if (onDisableLock) {
-      onDisableLock(device.key).catch(() => null);
+  const handleStopLock = useCallback(() => {
+    const l = latestRef.current;
+    if (!l.connected) return;
+    if (l.onDisableLock) {
+      l.onDisableLock(device.key).catch(() => null);
       return;
     }
     api.stopLock(device.key).catch(() => null);
-  };
+  }, [device.key]);
 
-  const handleAutoLockSettingsChange = (settings: AutoLockScanSettings) => {
+  const handleAutoLockSettingsChange = useCallback((settings: AutoLockScanSettings) => {
     setAutoLockSettings(settings);
     if (autoLockSettingsSaveTimerRef.current !== null) {
       window.clearTimeout(autoLockSettingsSaveTimerRef.current);
@@ -408,9 +452,9 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
       api.updateAutoLockScanSettings(device.key, settings).catch(() => null);
       autoLockSettingsSaveTimerRef.current = null;
     }, 250);
-  };
+  }, [device.key]);
 
-  const handleSaveLockIndicatorConfig = async (config: LockIndicatorConfig) => {
+  const handleSaveLockIndicatorConfig = useCallback(async (config: LockIndicatorConfig) => {
     setLockIndicatorSaving(true);
     setLockIndicatorError(null);
     try {
@@ -426,9 +470,9 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     } finally {
       setLockIndicatorSaving(false);
     }
-  };
+  }, [device.key]);
 
-  const handleSaveAutoRelockConfig = async (config: AutoRelockConfig) => {
+  const handleSaveAutoRelockConfig = useCallback(async (config: AutoRelockConfig) => {
     setAutoRelockSaving(true);
     setAutoRelockError(null);
     try {
@@ -444,7 +488,22 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     } finally {
       setAutoRelockSaving(false);
     }
-  };
+  }, [device.key]);
+
+  // Stable wrappers for the small inline callbacks RightPanel passes
+  // down, so the memoized panels see stable identities.
+  const handleStopTask = useCallback(
+    (useNew: boolean) => api.stopTask(device.key, useNew).catch(() => null),
+    [device.key],
+  );
+  const handleLockModeChange = useCallback(
+    (mode: 'manual' | 'autolock_scan' | 'autolock') => {
+      setLockMode(mode);
+      if (!latestRef.current.connected) return;
+      setParam('automatic_mode', mode === 'autolock', false);
+    },
+    [setParam],
+  );
 
   return (
     <div ref={rootRef}>
@@ -458,7 +517,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
         style={!connected ? { pointerEvents: 'none', opacity: 0.5 } : undefined}
       >
         <div className="plot-stack">
-          <SweepControls params={state.params} onSetParam={setParam} />
+          <SweepControls params={sweepParams} onSetParam={setParam} />
           <PlotPanel
             ref={panelRef}
             selectionMode={selectionMode}
@@ -490,7 +549,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             onAutoLockSettingsChange={handleAutoLockSettingsChange}
             onStartOptimizationSelection={startOptimizationSelection}
             onAbortOptimizationSelection={clearSelection}
-            onStopTask={(useNew) => api.stopTask(device.key, useNew).catch(() => null)}
+            onStopTask={handleStopTask}
             onStopLock={handleStopLock}
             onStartScanAutoLock={handleStartScanAutoLock}
             connected={connected}
@@ -498,11 +557,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             autoLockBusy={autoLockBusy}
             lockBusy={lockBusy}
             lockMode={lockMode}
-            onLockModeChange={(mode) => {
-              setLockMode(mode);
-              if (!connected) return;
-              setParam('automatic_mode', mode === 'autolock', false);
-            }}
+            onLockModeChange={handleLockModeChange}
             selectionMode={selectionMode}
             selectionSubmitting={selectionSubmitting}
             autolockTemporarilyDisabled={autolockTemporarilyDisabled}

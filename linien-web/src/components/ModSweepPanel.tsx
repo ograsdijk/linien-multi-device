@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { Divider, Group, Select, Stack, Switch, Tabs, Text } from '@mantine/core';
 import { DeferredNumberInput } from './DeferredNumberInput';
 
@@ -51,7 +52,7 @@ type ModSweepPanelProps = {
   onSetParam: (name: string, value: any, writeRegisters?: boolean) => void;
 };
 
-export function ModSweepPanel({ params, onSetParam }: ModSweepPanelProps) {
+export const ModSweepPanel = memo(function ModSweepPanel({ params, onSetParam }: ModSweepPanelProps) {
   const modulationFreq = typeof params.modulation_frequency === 'number'
     ? params.modulation_frequency / MHz
     : 0;
@@ -251,4 +252,4 @@ export function ModSweepPanel({ params, onSetParam }: ModSweepPanelProps) {
       </Tabs>
     </Stack>
   );
-}
+});
