@@ -7,7 +7,8 @@ import threading
 import time
 from collections.abc import Callable
 from copy import deepcopy
-from typing import Any, Dict, List, Optional
+from datetime import UTC, datetime
+from typing import Any, Dict, List
 
 import numpy as np
 from linien_client.connection import LinienClient
@@ -22,6 +23,7 @@ from linien_common.common import get_lock_point
 from linien_common.communication import unpack
 from linien_common.influxdb import InfluxDBCredentials
 
+from . import device_store
 from .auto_lock_scan import AutoLockScanSettings, find_auto_lock_target
 from .auto_relock import AutoRelockConfig, AutoRelockController
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
@@ -58,6 +60,13 @@ NORMALIZED_PARAMS_ON_CONNECT = (
     "channel_mixing",
     "modulation_frequency",
 )
+PERSISTENT_SETTINGS_SNAPSHOT_KEY = "linien_settings_snapshot"
+PERSISTENT_SETTINGS_SNAPSHOT_VERSION = 1
+EXTRA_PERSISTENT_SETTINGS = {
+    # Upstream linien-server 2.1.0 does not mark this as restorable, but it is a
+    # user setting that controls the sign of the PID gains written to the FPGA.
+    "target_slope_rising",
+}
 
 # Temporary compatibility switch.
 # Set to False to re-enable the original autolock/optimization implementations below.
@@ -129,6 +138,9 @@ class DeviceSession:
         self._last_lock_indicator_state: str | None = None
         self._last_auto_relock_state: str | None = None
         self.influx_logging_state = self._initial_influx_logging_state()
+        self._persistent_param_names: set[str] = set(EXTRA_PERSISTENT_SETTINGS)
+        self._persistent_replay_active = False
+        self._pending_gateway_param_writes: dict[str, Any] = {}
         # Locally-mirrored value of `control.exposed_get_logging_status()`.
         # Refreshed on connect and whenever we call exposed_start_logging /
         # exposed_stop_logging. status() reads from this cache so the
@@ -137,6 +149,168 @@ class DeviceSession:
         # server-side state route through this session, so the cache stays
         # authoritative.
         self._logging_active_cache: bool | None = None
+
+    @staticmethod
+    def _utc_now_iso() -> str:
+        return datetime.now(UTC).isoformat()
+
+    @staticmethod
+    def _settings_values_equal(left: Any, right: Any) -> bool:
+        return to_jsonable(left) == to_jsonable(right)
+
+    @staticmethod
+    def _serializable_setting_value(value: Any) -> Any:
+        encoded = to_jsonable(value)
+        if encoded is UNSERIALIZABLE:
+            raise ValueError("Persistent setting value is not JSON serializable")
+        return encoded
+
+    def _device_parameters(self) -> dict[str, Any]:
+        parameters = self.device.parameters
+        if not isinstance(parameters, dict):
+            parameters = {}
+            self.device.parameters = parameters
+        return parameters
+
+    def _persistent_settings_snapshot(self) -> dict[str, Any] | None:
+        snapshot = self._device_parameters().get(PERSISTENT_SETTINGS_SNAPSHOT_KEY)
+        if not isinstance(snapshot, dict):
+            return None
+        values = snapshot.get("values")
+        if not isinstance(values, dict):
+            return None
+        return snapshot
+
+    def _persist_settings_snapshot_values(self, values: dict[str, Any]) -> None:
+        normalized_values: dict[str, Any] = {}
+        for name, value in values.items():
+            if name not in self._persistent_param_names:
+                continue
+            try:
+                normalized_values[name] = self._serializable_setting_value(value)
+            except ValueError:
+                logger.debug(
+                    "Skipping unserializable persistent setting device=%s param=%s",
+                    self.device.key,
+                    name,
+                )
+        parameters = self._device_parameters()
+        parameters[PERSISTENT_SETTINGS_SNAPSHOT_KEY] = {
+            "version": PERSISTENT_SETTINGS_SNAPSHOT_VERSION,
+            "updated_at": self._utc_now_iso(),
+            "values": normalized_values,
+        }
+        device_store.save_device(self.device)
+
+    def _update_persistent_setting(self, name: str, value: Any) -> bool:
+        if name not in self._persistent_param_names:
+            return False
+        try:
+            encoded = self._serializable_setting_value(value)
+        except ValueError:
+            return False
+        parameters = self._device_parameters()
+        snapshot = self._persistent_settings_snapshot()
+        if snapshot is None:
+            snapshot = {
+                "version": PERSISTENT_SETTINGS_SNAPSHOT_VERSION,
+                "values": {},
+            }
+            parameters[PERSISTENT_SETTINGS_SNAPSHOT_KEY] = snapshot
+        values = snapshot.setdefault("values", {})
+        if not isinstance(values, dict):
+            values = {}
+            snapshot["values"] = values
+        if values.get(name) == encoded:
+            return False
+        values[name] = encoded
+        snapshot["version"] = PERSISTENT_SETTINGS_SNAPSHOT_VERSION
+        snapshot["updated_at"] = self._utc_now_iso()
+        device_store.save_device(self.device)
+        return True
+
+    def _refresh_persistent_param_names_locked(self) -> None:
+        if self.parameters is None:
+            self._persistent_param_names = set(EXTRA_PERSISTENT_SETTINGS)
+            return
+        names = set(EXTRA_PERSISTENT_SETTINGS)
+        for name, param in self.parameters:
+            if bool(getattr(param, "restorable", False)):
+                names.add(name)
+        names.difference_update(IGNORED_PARAMS)
+        self._persistent_param_names = names
+
+    def _current_persistent_remote_values_locked(self) -> dict[str, Any]:
+        if self.parameters is None:
+            return {}
+        values: dict[str, Any] = {}
+        for name in sorted(self._persistent_param_names):
+            try:
+                param = getattr(self.parameters, name)
+                values[name] = self._serializable_setting_value(param.value)
+            except (AttributeError, ValueError):
+                continue
+        return values
+
+    def _seed_or_replay_persistent_settings_locked(self) -> None:
+        if self.parameters is None or self.control is None:
+            return
+        self._refresh_persistent_param_names_locked()
+        snapshot = self._persistent_settings_snapshot()
+        if snapshot is None:
+            values = self._current_persistent_remote_values_locked()
+            self._persist_settings_snapshot_values(values)
+            logger.info(
+                "Seeded Linien settings snapshot device=%s count=%s",
+                self.device.key,
+                len(values),
+            )
+            return
+
+        values = snapshot.get("values")
+        if not isinstance(values, dict):
+            return
+        changed = 0
+        self._persistent_replay_active = True
+        try:
+            for name, value in values.items():
+                if name not in self._persistent_param_names:
+                    continue
+                try:
+                    param = getattr(self.parameters, name)
+                except AttributeError:
+                    continue
+                if self._settings_values_equal(param.value, value):
+                    continue
+                normalized_value = self._normalize_param_value(name, value)
+                param.value = normalized_value
+                changed += 1
+                self._pending_gateway_param_writes[name] = normalized_value
+            if changed:
+                self.control.exposed_write_registers()
+                logger.info(
+                    "Replayed Linien settings snapshot device=%s count=%s",
+                    self.device.key,
+                    changed,
+                )
+        finally:
+            self._persistent_replay_active = False
+
+    def _adopt_persistent_setting_change(self, name: str, value: Any) -> None:
+        if self._persistent_replay_active or name not in self._persistent_param_names:
+            return
+        pending = self._pending_gateway_param_writes.get(name, _UNSET)
+        if pending is not _UNSET:
+            if self._settings_values_equal(pending, value):
+                self._pending_gateway_param_writes.pop(name, None)
+                return
+            self._pending_gateway_param_writes.pop(name, None)
+        if self._update_persistent_setting(name, value):
+            logger.info(
+                "Adopted remote Linien setting change device=%s param=%s",
+                self.device.key,
+                name,
+            )
 
     def _emit_log_event(
         self,
@@ -692,6 +866,7 @@ class DeviceSession:
             self.plot_state = PlotState()
             with self._rpyc_lock:
                 self._sanitize_parameters_on_connect()
+                self._seed_or_replay_persistent_settings_locked()
                 try:
                     self._apply_influx_logging_params_locked()
                 except Exception:  # noqa: BLE001 - optional logging setup path
@@ -798,6 +973,7 @@ class DeviceSession:
         # and waste cycles on every subsequent snapshot.
         if name in IGNORED_PARAMS:
             return
+        self._adopt_persistent_setting_change(name, value)
         with self._state_lock:
             self.param_cache[name] = value
         encoded = to_jsonable(value)
@@ -1174,7 +1350,15 @@ class DeviceSession:
             raise RuntimeError("Device not connected")
         with self._rpyc_lock:
             param = getattr(self.parameters, name)
-            param.value = self._normalize_param_value(name, value)
+            normalized_value = self._normalize_param_value(name, value)
+            if name in self._persistent_param_names:
+                self._pending_gateway_param_writes[name] = normalized_value
+            try:
+                param.value = normalized_value
+            except Exception:
+                self._pending_gateway_param_writes.pop(name, None)
+                raise
+            self._update_persistent_setting(name, normalized_value)
             if write_registers:
                 self.control.exposed_write_registers()
 
