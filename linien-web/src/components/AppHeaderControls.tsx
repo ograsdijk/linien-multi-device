@@ -197,6 +197,7 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
               <TextInput
                 label="Measurement"
                 value={props.influxCredentials.measurement}
+                placeholder={props.influxSelectedDevice?.name || props.influxSelectedDevice?.key}
                 onChange={(event) =>
                   props.onInfluxCredentialChange('measurement', event.currentTarget.value)
                 }
@@ -273,7 +274,7 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
                 </Text>
               ) : null}
               <Text fw={500} size="sm" mt={4}>
-                Apply to all devices
+                Apply to connected devices
               </Text>
               <Stack gap={4}>
                 <Switch
@@ -324,7 +325,7 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
                     .catch(() => setApplyAllResult(null));
                 }}
               >
-                Apply to all devices
+                Apply to connected devices
               </Button>
               {applyAllResult ? (
                 <Text size="xs" c={applyAllResult.failed > 0 ? 'red' : 'dimmed'}>

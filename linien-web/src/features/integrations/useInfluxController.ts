@@ -7,11 +7,40 @@ const DEFAULT_INFLUX_CREDENTIALS: InfluxCredentials = {
   org: 'my-org',
   token: 'my-token',
   bucket: 'my-bucket',
-  measurement: 'my-measurement',
+  measurement: '',
 };
 
 const toErrorMessage = (error: unknown, fallback: string) =>
   error instanceof Error && error.message ? error.message : fallback;
+
+const defaultMeasurementForDevice = (device: Device | null | undefined) =>
+  device?.name?.trim() || device?.key?.trim() || 'linien';
+
+const shouldUseDeviceMeasurementDefault = (measurement: string) => {
+  const normalized = measurement.trim();
+  return normalized === '' || normalized === 'my-measurement';
+};
+
+const withDeviceMeasurementDefault = (
+  credentials: InfluxCredentials,
+  device: Device | null | undefined
+): InfluxCredentials => {
+  if (!shouldUseDeviceMeasurementDefault(credentials.measurement)) {
+    return credentials;
+  }
+  return {
+    ...credentials,
+    measurement: defaultMeasurementForDevice(device),
+  };
+};
+
+const credentialsForTargetDevice = (
+  credentials: InfluxCredentials,
+  device: Device
+): InfluxCredentials => ({
+  ...credentials,
+  measurement: defaultMeasurementForDevice(device),
+});
 
 type UseInfluxControllerArgs = {
   devices: Device[];
@@ -96,7 +125,7 @@ export const useInfluxController = ({
     Promise.all([api.loggingGetCredentials(influxDeviceKey), api.getParamMeta(influxDeviceKey)])
       .then(([credentials, metadata]) => {
         if (cancelled) return;
-        setInfluxCredentials(credentials);
+        setInfluxCredentials(withDeviceMeasurementDefault(credentials, influxSelectedDevice));
         setInfluxParams(
           metadata
             .filter((item) => item.loggable)
@@ -115,7 +144,7 @@ export const useInfluxController = ({
     return () => {
       cancelled = true;
     };
-  }, [influxPopoverOpen, influxDeviceKey, influxDeviceConnected]);
+  }, [influxPopoverOpen, influxDeviceKey, influxDeviceConnected, influxSelectedDevice]);
 
   const updateInfluxCredential = (name: keyof InfluxCredentials, value: string) => {
     setInfluxCredentials((prev) => ({ ...prev, [name]: value }));
@@ -127,7 +156,9 @@ export const useInfluxController = ({
     setInfluxMessage(null);
     setInfluxMessageError(false);
     try {
-      const result = await api.loggingUpdateCredentials(influxDeviceKey, influxCredentials);
+      const credentials = withDeviceMeasurementDefault(influxCredentials, influxSelectedDevice);
+      const result = await api.loggingUpdateCredentials(influxDeviceKey, credentials);
+      setInfluxCredentials(credentials);
       setInfluxMessage(result.message);
       setInfluxMessageError(!result.success);
     } catch (error) {
@@ -234,7 +265,12 @@ export const useInfluxController = ({
   const applyInfluxToAll = async (
     options: InfluxApplyAllOptions
   ): Promise<InfluxApplyAllResult> => {
-    if (!influxDeviceKey || devices.length === 0) {
+    const targetDevices = devices.filter((device) =>
+      Boolean(deviceStatusMap[device.key]?.connected)
+    );
+    if (!influxDeviceKey || targetDevices.length === 0) {
+      setInfluxMessage('No connected devices to apply InfluxDB settings to.');
+      setInfluxMessageError(true);
       return { total: 0, succeeded: 0, failed: 0, failures: [] };
     }
 
@@ -243,93 +279,100 @@ export const useInfluxController = ({
     const targetInterval = Math.max(0.1, Number(influxInterval) || 1);
     const targetLoggingActive = influxLoggingActive;
 
-    const failures: Array<{ deviceKey: string; message: string }> = [];
-    let succeeded = 0;
-
     setInfluxBusy(true);
     setInfluxMessage(null);
     setInfluxMessageError(false);
     try {
-      for (const device of devices) {
-        const deviceKey = device.key;
-        const status = deviceStatusMap[deviceKey];
-        const connected = Boolean(status?.connected);
-        try {
-          if (options.applyCredentials) {
-            await api.loggingUpdateCredentials(deviceKey, influxCredentials);
-          }
+      const results = await Promise.all(
+        targetDevices.map(async (device) => {
+          const deviceKey = device.key;
+          const status = deviceStatusMap[deviceKey];
+          try {
+            if (options.applyCredentials) {
+              const result = await api.loggingUpdateCredentials(
+                deviceKey,
+                credentialsForTargetDevice(influxCredentials, device)
+              );
+              if (!result.success) {
+                throw new Error(result.message);
+              }
+            }
 
-          if (options.applyParams) {
-            if (!connected) {
-              throw new Error('Device disconnected; cannot apply parameter selection.');
+            if (options.applyParams) {
+              const metadata = await api.getParamMeta(deviceKey);
+              const loggable = metadata
+                .filter((item) => item.loggable)
+                .map((item) => item.name);
+              const selectedForDevice = loggable.filter((name) =>
+                targetSelectedSet.has(name)
+              );
+              await api.loggingSetParams(deviceKey, selectedForDevice);
             }
-            const metadata = await api.getParamMeta(deviceKey);
-            const loggable = metadata.filter((item) => item.loggable).map((item) => item.name);
-            const selectedForDevice = loggable.filter((name) => targetSelectedSet.has(name));
-            await api.loggingSetParams(deviceKey, selectedForDevice);
-          }
 
-          if (options.applyInterval && options.applyLoggingState) {
-            if (!connected) {
-              throw new Error('Device disconnected; cannot apply logging interval/state.');
+            if (options.applyInterval && options.applyLoggingState) {
+              if (targetLoggingActive) {
+                await api.loggingStart(deviceKey, targetInterval);
+                onLoggingStateChange(deviceKey, true);
+              } else {
+                await api.loggingStop(deviceKey);
+                onLoggingStateChange(deviceKey, false);
+              }
+            } else if (options.applyInterval) {
+              if (status?.logging_active) {
+                await api.loggingStart(deviceKey, targetInterval);
+                onLoggingStateChange(deviceKey, true);
+              }
+            } else if (options.applyLoggingState) {
+              if (targetLoggingActive) {
+                await api.loggingStart(deviceKey, targetInterval);
+                onLoggingStateChange(deviceKey, true);
+              } else {
+                await api.loggingStop(deviceKey);
+                onLoggingStateChange(deviceKey, false);
+              }
             }
-            if (targetLoggingActive) {
-              await api.loggingStart(deviceKey, targetInterval);
-              onLoggingStateChange(deviceKey, true);
-            } else {
-              await api.loggingStop(deviceKey);
-              onLoggingStateChange(deviceKey, false);
-            }
-          } else if (options.applyInterval) {
-            if (!connected) {
-              throw new Error('Device disconnected; cannot apply logging interval.');
-            }
-            if (status?.logging_active) {
-              await api.loggingStart(deviceKey, targetInterval);
-              onLoggingStateChange(deviceKey, true);
-            }
-          } else if (options.applyLoggingState) {
-            if (!connected) {
-              throw new Error('Device disconnected; cannot apply logging state.');
-            }
-            if (targetLoggingActive) {
-              await api.loggingStart(deviceKey, targetInterval);
-              onLoggingStateChange(deviceKey, true);
-            } else {
-              await api.loggingStop(deviceKey);
-              onLoggingStateChange(deviceKey, false);
-            }
-          }
 
-          succeeded += 1;
-        } catch (error) {
-          failures.push({
-            deviceKey,
-            message: toErrorMessage(error, 'Failed to apply settings.'),
-          });
-        }
+            return { deviceKey, success: true as const };
+          } catch (error) {
+            return {
+              deviceKey,
+              success: false as const,
+              message: toErrorMessage(error, 'Failed to apply settings.'),
+            };
+          }
+        })
+      );
+      const failures = results
+        .filter(
+          (
+            result
+          ): result is { deviceKey: string; success: false; message: string } =>
+            !result.success
+        )
+        .map(({ deviceKey, message }) => ({ deviceKey, message }));
+      const succeeded = results.length - failures.length;
+      const failed = failures.length;
+      const result: InfluxApplyAllResult = {
+        total: targetDevices.length,
+        succeeded,
+        failed,
+        failures,
+      };
+
+      if (failed > 0) {
+        setInfluxMessage(
+          `Applied to ${succeeded}/${targetDevices.length} connected devices (${failed} failed).`
+        );
+        setInfluxMessageError(true);
+      } else {
+        setInfluxMessage(`Applied to all ${targetDevices.length} connected devices.`);
+        setInfluxMessageError(false);
       }
+
+      return result;
     } finally {
       setInfluxBusy(false);
     }
-
-    const failed = failures.length;
-    const result: InfluxApplyAllResult = {
-      total: devices.length,
-      succeeded,
-      failed,
-      failures,
-    };
-
-    if (failed > 0) {
-      setInfluxMessage(`Applied to ${succeeded}/${devices.length} devices (${failed} failed).`);
-      setInfluxMessageError(true);
-    } else {
-      setInfluxMessage(`Applied to all ${devices.length} devices.`);
-      setInfluxMessageError(false);
-    }
-
-    return result;
   };
 
   return {
