@@ -225,6 +225,8 @@ export const OverviewPlotPanel = forwardRef<
     if (lockAxis) {
       desiredVisibility.combined_error = true;
       desiredVisibility.control_signal = true;
+      desiredVisibility.control_signal_history = true;
+      desiredVisibility.monitor_signal_history = true;
     } else {
       desiredVisibility.combined_error = !dual;
       desiredVisibility.error_signal_1 = dual;

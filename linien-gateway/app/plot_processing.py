@@ -28,6 +28,12 @@ SUMMARY_SERIES_KEYS: frozenset[str] = frozenset(
         "error_signal_1",
         "error_signal_2",
         "monitor_signal",
+        # Locked-state history traces surfaced in the overview and group-tab
+        # plots. build_plot_frame emits these on the summary path too, so they
+        # must survive filter_plot_frame when a full frame is stripped for a
+        # summary subscriber (the two paths must agree -- see note above).
+        "control_signal_history",
+        "monitor_signal_history",
     }
 )
 
@@ -267,7 +273,14 @@ def build_plot_frame(
             if control_signal is not None:
                 series["control_signal"] = (control_signal / V).astype(np.float64)
 
-        if build_series and full_detail:
+        if build_series:
+            # control_signal_history and monitor_signal_history are emitted on
+            # every frame (summary AND full detail) so the overview and
+            # group-tab plots show the locked history. These are the gateway's
+            # already-accumulated rolling buffers (see update_histories) -- the
+            # same client-side accumulation the desktop GUI performs -- so this
+            # only serializes existing data; the _scale_history call is
+            # signature-cached and re-runs only when the buffer changes.
             control_times = state.control_history["times"]
             control_values = state.control_history["values"]
             control_sig = _history_signature(
@@ -282,20 +295,6 @@ def build_plot_frame(
                 )
                 state._control_history_signature = control_sig
             series["control_signal_history"] = state._control_history_scaled
-
-            if params.get("pid_on_slow_enabled"):
-                slow_times = state.control_history["slow_times"]
-                slow_values = state.control_history["slow_values"]
-                slow_sig = _history_signature(slow_times, slow_values, timescale)
-                if (
-                    state._slow_history_signature != slow_sig
-                    or state._slow_history_scaled is None
-                ):
-                    state._slow_history_scaled = _scale_history(
-                        slow_times, slow_values, timescale
-                    )
-                    state._slow_history_signature = slow_sig
-                series["slow_history"] = state._slow_history_scaled
 
             if not params.get("dual_channel"):
                 monitor_times = state.monitor_history["times"]
@@ -312,6 +311,22 @@ def build_plot_frame(
                     )
                     state._monitor_history_signature = monitor_sig
                 series["monitor_signal_history"] = state._monitor_history_scaled
+
+        if build_series and full_detail:
+            # slow_history stays full-detail only (not surfaced in summary views).
+            if params.get("pid_on_slow_enabled"):
+                slow_times = state.control_history["slow_times"]
+                slow_values = state.control_history["slow_values"]
+                slow_sig = _history_signature(slow_times, slow_values, timescale)
+                if (
+                    state._slow_history_signature != slow_sig
+                    or state._slow_history_scaled is None
+                ):
+                    state._slow_history_scaled = _scale_history(
+                        slow_times, slow_values, timescale
+                    )
+                    state._slow_history_signature = slow_sig
+                series["slow_history"] = state._slow_history_scaled
     else:
         dual_channel = bool(params.get("dual_channel"))
         monitor_signal = to_plot.get("monitor_signal")
