@@ -3,6 +3,7 @@ import {
   Button,
   Divider,
   Group,
+  Modal,
   Radio,
   Select,
   Stack,
@@ -11,6 +12,8 @@ import {
   Text,
 } from '@mantine/core';
 import type {
+  AutoLockCalibrateRequest,
+  AutoLockCalibrationResult,
   AutoLockScanResult,
   AutoLockScanSettings,
 } from '../types';
@@ -38,6 +41,9 @@ type LockingPanelProps = {
   onAutoLockFromScan: (
     settings: AutoLockScanSettings
   ) => Promise<AutoLockScanResult>;
+  onCalibrateAutoLock?: (
+    options: AutoLockCalibrateRequest
+  ) => Promise<AutoLockCalibrationResult>;
   autoLockSettingsConfig?: AutoLockScanSettings | null;
   onAutoLockSettingsChange?: (settings: AutoLockScanSettings) => void;
   onStopLock: () => void;
@@ -56,6 +62,7 @@ export const LockingPanel = memo(function LockingPanel({
   onStartAutolockSelection,
   onAbortAutolockSelection,
   onAutoLockFromScan,
+  onCalibrateAutoLock,
   autoLockSettingsConfig,
   onAutoLockSettingsChange,
   onStopLock,
@@ -84,6 +91,13 @@ export const LockingPanel = memo(function LockingPanel({
   );
   const [autoLockBusy, setAutoLockBusy] = useState(false);
   const [autoLockResult, setAutoLockResult] = useState<AutoLockScanResult | null>(null);
+  const [calibrateOpen, setCalibrateOpen] = useState(false);
+  const [calibrateBusy, setCalibrateBusy] = useState(false);
+  const [calibrateMonitor, setCalibrateMonitor] = useState(false);
+  const [calibrateSingleSide, setCalibrateSingleSide] = useState(false);
+  const [calibrateError, setCalibrateError] = useState<string | null>(null);
+  const [calibrationResult, setCalibrationResult] =
+    useState<AutoLockCalibrationResult | null>(null);
 
   useEffect(() => {
     if (!autoLockSettingsConfig) return;
@@ -118,6 +132,39 @@ export const LockingPanel = memo(function LockingPanel({
       // Errors are surfaced through global logs + toast notifications.
     } finally {
       setAutoLockBusy(false);
+    }
+  };
+
+  const openCalibrateDialog = () => {
+    // Default the optional toggles to the device's current settings.
+    setCalibrateMonitor(autoLockSettings.use_monitor);
+    setCalibrateSingleSide(autoLockSettings.allow_single_side);
+    setCalibrateError(null);
+    // Drop any prior run's diagnostics so a stale banner can't linger.
+    setCalibrationResult(null);
+    setCalibrateOpen(true);
+  };
+
+  const runCalibrate = async () => {
+    if (!onCalibrateAutoLock) return;
+    setCalibrateBusy(true);
+    setCalibrateError(null);
+    try {
+      const result = await onCalibrateAutoLock({
+        include_monitor: calibrateMonitor,
+        allow_single_side: calibrateSingleSide,
+      });
+      setCalibrationResult(result);
+      setCalibrateOpen(false);
+    } catch (error) {
+      setCalibrationResult(null);
+      setCalibrateError(
+        error instanceof Error && error.message
+          ? error.message
+          : 'Calibration failed.'
+      );
+    } finally {
+      setCalibrateBusy(false);
     }
   };
 
@@ -184,9 +231,33 @@ export const LockingPanel = memo(function LockingPanel({
             <Text size="xs" c="dimmed">
               Current target slope: {slopeLabel}
             </Text>
+            {onCalibrateAutoLock ? (
+              <Stack gap={4}>
+                <Button
+                  variant="light"
+                  color="grape"
+                  onClick={openCalibrateDialog}
+                >
+                  Calibrate from current trace
+                </Button>
+                <Text size="xs" c="dimmed">
+                  Sweep and center a good PDH error signal, then calibrate to
+                  fill in the settings below from that trace.
+                </Text>
+                {calibrationResult ? (
+                  <Text size="xs" c="dimmed">
+                    Captured (normalised full-scale): amplitude=
+                    {calibrationResult.amplitude_v.toFixed(4)}
+                    {' · '}feature width=
+                    {calibrationResult.feature_half_width_v.toFixed(4)}
+                    {' · '}target={calibrationResult.target_voltage.toFixed(4)}
+                  </Text>
+                ) : null}
+              </Stack>
+            ) : null}
             <Group grow>
               <DeferredNumberInput
-                label="Half range (V)"
+                label="Half range (norm.)"
                 value={autoLockSettings.half_range_v}
                 min={0.001}
                 step={0.01}
@@ -217,7 +288,7 @@ export const LockingPanel = memo(function LockingPanel({
             </Group>
             <Group grow>
               <DeferredNumberInput
-                label="Crossing max (V)"
+                label="Crossing max (norm.)"
                 value={autoLockSettings.crossing_max_v}
                 min={0.0001}
                 step={0.01}
@@ -230,7 +301,7 @@ export const LockingPanel = memo(function LockingPanel({
                 }
               />
               <DeferredNumberInput
-                label="Error min (V)"
+                label="Error min (norm.)"
                 value={autoLockSettings.error_min}
                 min={0.0001}
                 step={0.01}
@@ -259,7 +330,7 @@ export const LockingPanel = memo(function LockingPanel({
                 }
               />
               <DeferredNumberInput
-                label="Single error min (V)"
+                label="Single error min (norm.)"
                 value={autoLockSettings.single_error_min}
                 min={0.0001}
                 step={0.01}
@@ -295,7 +366,7 @@ export const LockingPanel = memo(function LockingPanel({
             />
             {autoLockSettings.use_monitor ? (
               <DeferredNumberInput
-                label="Monitor contrast min (V)"
+                label="Monitor contrast min (norm.)"
                 value={autoLockSettings.monitor_contrast_min_v}
                 min={0.0001}
                 step={0.01}
@@ -320,10 +391,10 @@ export const LockingPanel = memo(function LockingPanel({
             </Button>
             {autoLockResult ? (
               <Text size="xs" c="dimmed">
-                target={autoLockResult.target_voltage.toFixed(4)} V (idx {autoLockResult.target_index})
+                target={autoLockResult.target_voltage.toFixed(4)} (idx {autoLockResult.target_index})
                 {' | '}score={autoLockResult.score.toFixed(3)} | pair=
-                {autoLockResult.pair_excursion_v.toFixed(3)} V | symmetry=
-                {autoLockResult.symmetry.toFixed(3)}
+                {autoLockResult.pair_excursion_v.toFixed(3)} | symmetry=
+                {autoLockResult.symmetry.toFixed(3)} (norm.)
               </Text>
             ) : null}
           </Stack>
@@ -383,6 +454,58 @@ export const LockingPanel = memo(function LockingPanel({
           </Stack>
         </Tabs.Panel>
       </Tabs>
+      {/* Rendered at the panel root (not inside a Tabs.Panel) so a tab/mode
+          switch mid-calibration cannot unmount the dialog. */}
+      <Modal
+        opened={calibrateOpen}
+        onClose={() => setCalibrateOpen(false)}
+        title="Calibrate from current trace"
+        centered
+      >
+        <Stack gap="sm">
+          <Text size="sm" c="dimmed">
+            The current PDH error trace will be analyzed to fill in the
+            auto-lock thresholds. Choose which optional features to include.
+          </Text>
+          <Switch
+            label="Use monitor signal"
+            description="Include the monitor photodiode contrast check (requires a monitor trace)."
+            checked={calibrateMonitor}
+            onChange={(event) => setCalibrateMonitor(event.currentTarget.checked)}
+          />
+          <Switch
+            label="Allow single-side acceptance"
+            description="Accept asymmetric crossings where only one side has signal."
+            checked={calibrateSingleSide}
+            onChange={(event) =>
+              setCalibrateSingleSide(event.currentTarget.checked)
+            }
+          />
+          {calibrateError ? (
+            <Text size="xs" c="red">
+              {calibrateError}
+            </Text>
+          ) : null}
+          <Group justify="flex-end" gap="sm">
+            <Button
+              variant="default"
+              onClick={() => setCalibrateOpen(false)}
+              disabled={calibrateBusy}
+            >
+              Cancel
+            </Button>
+            <Button
+              color="grape"
+              onClick={() => {
+                runCalibrate().catch(() => null);
+              }}
+              loading={calibrateBusy}
+            >
+              Calibrate
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
       <Group grow>
         <Button variant="outline" color="red" onClick={onStopLock}>
           Stop lock

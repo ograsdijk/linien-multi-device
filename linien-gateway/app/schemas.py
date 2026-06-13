@@ -77,6 +77,28 @@ class AutoLockScanResult(BaseModel):
     detail: Optional[str] = None
 
 
+class AutoLockCalibrateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    include_monitor: bool = False
+    allow_single_side: bool = False
+    # Optional override of the dead-trace amplitude floor (normalised full-scale,
+    # not volts). Lets unusually weak-but-clean signals be calibrated.
+    min_amplitude_v: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+
+
+class AutoLockCalibrationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    settings: AutoLockScanSettings
+    amplitude_v: float
+    feature_half_width_v: float
+    target_index: int
+    target_voltage: float
+    target_slope_rising: bool
+    symmetry: float
+    monitor_contrast_v: Optional[float] = None
+    detail: Optional[str] = None
+
+
 class AutoRelockConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False

@@ -1,6 +1,8 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AutoRelockConfig,
+  AutoLockCalibrateRequest,
+  AutoLockCalibrationResult,
   AutoLockScanResult,
   AutoLockScanSettings,
   AutoRelockStatus,
@@ -211,7 +213,11 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
           setLockIndicatorError(null);
         }
         if (msg.config_name === 'auto_lock_scan_settings') {
-          setAutoLockSettings(msg.value as AutoLockScanSettings);
+          // Don't let a (possibly self-originated) broadcast clobber an
+          // unsaved local edit while a debounced save is still pending.
+          if (autoLockSettingsSaveTimerRef.current === null) {
+            setAutoLockSettings(msg.value as AutoLockScanSettings);
+          }
         }
         if (msg.config_name === 'auto_relock_config') {
           setAutoRelockConfig(msg.value as AutoRelockConfig);
@@ -443,6 +449,23 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     api.stopLock(device.key).catch(() => null);
   }, [device.key]);
 
+  const handleCalibrateAutoLock = useCallback(async (
+    options: AutoLockCalibrateRequest
+  ): Promise<AutoLockCalibrationResult> => {
+    if (!latestRef.current.connected) {
+      throw new Error('Device not connected.');
+    }
+    // Cancel any pending debounced settings save so it can't overwrite the
+    // freshly calibrated values after they land.
+    if (autoLockSettingsSaveTimerRef.current !== null) {
+      window.clearTimeout(autoLockSettingsSaveTimerRef.current);
+      autoLockSettingsSaveTimerRef.current = null;
+    }
+    const result = await api.calibrateAutoLockScanSettings(device.key, options);
+    setAutoLockSettings(result.settings);
+    return result;
+  }, [device.key]);
+
   const handleAutoLockSettingsChange = useCallback((settings: AutoLockScanSettings) => {
     setAutoLockSettings(settings);
     if (autoLockSettingsSaveTimerRef.current !== null) {
@@ -545,6 +568,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             onStartAutolockSelection={startAutolockSelection}
             onAbortAutolockSelection={clearSelection}
             onAutoLockFromScan={handleAutoLockFromScan}
+            onCalibrateAutoLock={handleCalibrateAutoLock}
             autoLockSettings={autoLockSettings}
             onAutoLockSettingsChange={handleAutoLockSettingsChange}
             onStartOptimizationSelection={startOptimizationSelection}

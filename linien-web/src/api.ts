@@ -1,6 +1,8 @@
 import type {
   AutoRelockConfig,
   AutoRelockState,
+  AutoLockCalibrateRequest,
+  AutoLockCalibrationResult,
   AutoLockScanResult,
   AutoLockScanSettings,
   Device,
@@ -91,6 +93,17 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  calibrateAutoLockScanSettings: (
+    key: string,
+    payload: AutoLockCalibrateRequest
+  ) =>
+    request<AutoLockCalibrationResult>(
+      `/devices/${key}/control/auto_lock_scan/calibrate`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    ),
   getAutoLockScanSettings: (key: string) =>
     request<AutoLockScanSettings>(`/devices/${key}/auto-lock-scan-settings`),
   updateAutoLockScanSettings: (key: string, payload: AutoLockScanSettings) =>

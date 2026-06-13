@@ -24,7 +24,13 @@ from linien_common.communication import unpack
 from linien_common.influxdb import InfluxDBCredentials
 
 from . import device_store
-from .auto_lock_scan import AutoLockScanSettings, find_auto_lock_target
+from .auto_lock_scan import (
+    AutoLockCalibration,
+    AutoLockCalibrationFactors,
+    AutoLockScanSettings,
+    calibrate_auto_lock_settings,
+    find_auto_lock_target,
+)
 from .auto_relock import AutoRelockConfig, AutoRelockController
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
 from .manual_lock_record import ADC_SCALE, build_manual_lock_row
@@ -676,6 +682,75 @@ class DeviceSession:
             settings = AutoLockScanSettings.from_mapping(payload)
             self.auto_lock_scan_settings = settings.__dict__.copy()
             return dict(self.auto_lock_scan_settings)
+
+    def calibrate_auto_lock_settings(
+        self,
+        *,
+        include_monitor: bool,
+        allow_single_side: bool,
+        min_amplitude_v: float | None = None,
+    ) -> AutoLockCalibration:
+        """Derive auto-lock settings from the current (good) PDH error trace.
+
+        Pure compute: snapshots the live unlocked trace and analyses it. Does
+        not start a lock and does not mutate stored settings; the caller
+        persists the returned settings through ``update_auto_lock_scan_settings``.
+        """
+        if self.parameters is None:
+            raise RuntimeError("Device not connected")
+        error_trace, monitor_trace = self._snapshot_auto_lock_traces()
+
+        # The unlocked trace (last_plot_data) is only refreshed while sweeping;
+        # refuse to calibrate from a stale/locked trace. Reuse the same freshness
+        # definition the auto-relock subsystem applies to this trace, rather than
+        # inventing a separate timeout.
+        try:
+            trace_timeout_s = float(
+                self.auto_relock.get_config().get("unlocked_trace_timeout_s", 2.0)
+            )
+        except Exception:  # noqa: BLE001 - fall back to the schema default
+            trace_timeout_s = 2.0
+        # Allow a little slack over the plot-poll cadence so a fresh sweep is
+        # never spuriously rejected between frames.
+        trace_timeout_s = max(trace_timeout_s, 3.0)
+        with self._state_lock:
+            last_unlocked_at = self.plot_state.last_unlocked_trace_at
+        if last_unlocked_at is None or (time.time() - last_unlocked_at) > trace_timeout_s:
+            raise RuntimeError(
+                "No recent unlocked trace — start a sweep before calibrating."
+            )
+
+        with self._state_lock:
+            base = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
+        with self._rpyc_lock:
+            if bool(self.parameters.lock.value):
+                raise RuntimeError("Device is already locked. Start sweep first.")
+            sweep_center = float(self.parameters.sweep_center.value)
+            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
+            preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
+
+        error_trace_v = np.asarray(error_trace, dtype=float) / ADC_SCALE
+        monitor_trace_v = (
+            np.asarray(monitor_trace, dtype=float) / ADC_SCALE
+            if monitor_trace is not None
+            else None
+        )
+        factors = (
+            AutoLockCalibrationFactors(min_amplitude_v=float(min_amplitude_v))
+            if min_amplitude_v is not None
+            else None
+        )
+        return calibrate_auto_lock_settings(
+            error_trace_v=error_trace_v,
+            monitor_trace_v=monitor_trace_v,
+            sweep_center_v=sweep_center,
+            sweep_amplitude_v=sweep_amplitude,
+            base=base,
+            preferred_slope_rising=preferred_slope_rising,
+            include_monitor=include_monitor,
+            allow_single_side=allow_single_side,
+            factors=factors,
+        )
 
     def get_auto_relock_state(self) -> dict[str, Any]:
         with self._state_lock:

@@ -123,6 +123,25 @@ export type AutoLockScanResult = {
   detail?: string | null;
 };
 
+export type AutoLockCalibrateRequest = {
+  include_monitor: boolean;
+  allow_single_side: boolean;
+  // Optional override of the dead-trace amplitude floor (normalised full-scale).
+  min_amplitude_v?: number;
+};
+
+export type AutoLockCalibrationResult = {
+  settings: AutoLockScanSettings;
+  amplitude_v: number;
+  feature_half_width_v: number;
+  target_index: number;
+  target_voltage: number;
+  target_slope_rising: boolean;
+  symmetry: number;
+  monitor_contrast_v?: number | null;
+  detail?: string | null;
+};
+
 export type DeviceGroup = {
   key: string;
   name: string;

@@ -2,6 +2,8 @@ import { Accordion, Button, Group } from '@mantine/core';
 import type {
   AutoRelockConfig,
   AutoRelockStatus,
+  AutoLockCalibrateRequest,
+  AutoLockCalibrationResult,
   AutoLockScanResult,
   AutoLockScanSettings,
   LockIndicatorConfig,
@@ -67,6 +69,9 @@ type RightPanelProps = {
   onAutoLockFromScan: (
     settings: AutoLockScanSettings
   ) => Promise<AutoLockScanResult>;
+  onCalibrateAutoLock?: (
+    options: AutoLockCalibrateRequest
+  ) => Promise<AutoLockCalibrationResult>;
   autoLockSettings?: AutoLockScanSettings | null;
   onAutoLockSettingsChange?: (settings: AutoLockScanSettings) => void;
   onStartOptimizationSelection: () => void;
@@ -152,6 +157,7 @@ export function RightPanel(props: RightPanelProps) {
               onStartAutolockSelection={props.onStartAutolockSelection}
               onAbortAutolockSelection={props.onAbortAutolockSelection}
               onAutoLockFromScan={props.onAutoLockFromScan}
+              onCalibrateAutoLock={props.onCalibrateAutoLock}
               autoLockSettingsConfig={props.autoLockSettings}
               onAutoLockSettingsChange={props.onAutoLockSettingsChange}
               onStopLock={props.onStopLock}

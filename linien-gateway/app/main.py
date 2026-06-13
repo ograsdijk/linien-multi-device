@@ -34,6 +34,8 @@ from .log_store import LogStore
 from .manual_lock_postgres import LockResultPostgresService
 from .path_utils import find_repo_root
 from .schemas import (
+    AutoLockCalibrateRequest,
+    AutoLockCalibrationResult,
     AutoLockScanResult,
     AutoLockScanSettings,
     AutoRelockConfig,
@@ -740,6 +742,72 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
             details={"error": str(exc)},
         )
     return result
+
+
+@app.post(
+    "/api/devices/{key}/control/auto_lock_scan/calibrate",
+    response_model=AutoLockCalibrationResult,
+)
+def calibrate_auto_lock_scan(key: str, payload: AutoLockCalibrateRequest) -> dict:
+    device = _get_device_or_404(key)
+    session = _session_for_device(device)
+    try:
+        calibration = session.calibrate_auto_lock_settings(
+            include_monitor=payload.include_monitor,
+            allow_single_side=payload.allow_single_side,
+            min_amplitude_v=payload.min_amplitude_v,
+        )
+    except RuntimeError as exc:
+        _emit_log(
+            level=logging.ERROR,
+            source="auto_lock_scan",
+            code="auto_lock_calibrate_failed",
+            message="Auto-lock calibration failed.",
+            device_key=key,
+            details={"error": str(exc)},
+        )
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        _emit_log(
+            level=logging.ERROR,
+            source="auto_lock_scan",
+            code="auto_lock_calibrate_failed",
+            message="Auto-lock calibration failed.",
+            device_key=key,
+            details={"error": str(exc)},
+        )
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    settings_payload = session.update_auto_lock_scan_settings(
+        calibration.settings.__dict__.copy()
+    )
+    _persist_config_block(device, CONFIG_AUTO_LOCK_SCAN, settings_payload)
+    _publish_config_update(device.key, CONFIG_AUTO_LOCK_SCAN, settings_payload)
+    _emit_log(
+        level=logging.INFO,
+        source="auto_lock_scan",
+        code="auto_lock_calibrated",
+        message="Auto-lock settings calibrated from trace.",
+        device_key=key,
+        details={
+            "amplitude_v": calibration.amplitude_v,
+            "feature_half_width_v": calibration.feature_half_width_v,
+            "target_voltage": calibration.target_voltage,
+            "include_monitor": payload.include_monitor,
+            "allow_single_side": payload.allow_single_side,
+        },
+    )
+    return {
+        "settings": settings_payload,
+        "amplitude_v": calibration.amplitude_v,
+        "feature_half_width_v": calibration.feature_half_width_v,
+        "target_index": calibration.target_index,
+        "target_voltage": calibration.target_voltage,
+        "target_slope_rising": calibration.target_slope_rising,
+        "symmetry": calibration.symmetry,
+        "monitor_contrast_v": calibration.monitor_contrast_v,
+        "detail": calibration.detail,
+    }
 
 
 @app.get(
