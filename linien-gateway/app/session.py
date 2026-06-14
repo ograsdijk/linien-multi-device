@@ -1449,6 +1449,48 @@ class DeviceSession:
         with self._rpyc_lock:
             self.control.exposed_start_lock()
 
+    def auto_lock_detect(
+        self, settings_payload: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Run the auto-lock target finder against the latest trace WITHOUT locking.
+
+        Same detection/criteria as auto_lock_from_scan (crossing_max_v, error_min,
+        symmetry_min, optional single-side / monitor contrast), but it does not touch
+        sweep_center or start the lock. Returns the best candidate (AutoLockScanResult
+        dict); raises ValueError if no crossing meets the criteria. Read-only — it does
+        not persist settings. Intended for orchestration: probe, adjust the offset
+        (e.g. NLTL), and re-probe before committing to a lock.
+        """
+        if self.control is None or self.parameters is None:
+            raise RuntimeError("Device not connected")
+        error_trace, monitor_trace = self._snapshot_auto_lock_traces()
+
+        with self._state_lock:
+            if settings_payload is None:
+                settings = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
+            else:
+                settings = AutoLockScanSettings.from_mapping(settings_payload)
+        with self._rpyc_lock:
+            sweep_center = float(self.parameters.sweep_center.value)
+            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
+            preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
+
+        error_trace_v = np.asarray(error_trace, dtype=float) / ADC_SCALE
+        monitor_trace_v = (
+            np.asarray(monitor_trace, dtype=float) / ADC_SCALE
+            if monitor_trace is not None
+            else None
+        )
+        result = find_auto_lock_target(
+            error_trace_v=error_trace_v,
+            monitor_trace_v=monitor_trace_v,
+            sweep_center_v=sweep_center,
+            sweep_amplitude_v=sweep_amplitude,
+            settings=settings,
+            preferred_slope_rising=preferred_slope_rising,
+        )
+        return result.to_dict()
+
     def auto_lock_from_scan(
         self, settings_payload: dict[str, Any] | None
     ) -> dict[str, Any]:

@@ -645,6 +645,29 @@ def start_autolock(key: str, payload: RangeSelection) -> dict:
     return _run_session_action(lambda: session.start_autolock(payload.x0, payload.x1))
 
 
+@app.post("/api/devices/{key}/control/auto_lock_candidates")
+def auto_lock_candidates(key: str, payload: AutoLockScanSettings | None = None) -> dict:
+    """Detect a lockable target on the current scan WITHOUT locking.
+
+    Returns {"found": bool, "candidate": <AutoLockScanResult>|null, "reason": str|null}.
+    With no body, uses the device's stored auto-lock-scan settings. Lets an orchestrator
+    probe for an error signal (e.g. while stepping the NLTL offset) before committing to a
+    lock via auto_lock_scan.
+    """
+    device = _get_device_or_404(key)
+    session = _session_for_device(device)
+    settings_payload = payload.model_dump() if payload is not None else None
+    try:
+        candidate = session.auto_lock_detect(settings_payload)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        # No qualifying crossing (or trace not ready) — not an error; the caller should
+        # adjust the offset (e.g. NLTL) and retry.
+        return {"found": False, "candidate": None, "reason": str(exc)}
+    return {"found": True, "candidate": candidate, "reason": None}
+
+
 @app.post(
     "/api/devices/{key}/control/auto_lock_scan",
     response_model=AutoLockScanResult,
