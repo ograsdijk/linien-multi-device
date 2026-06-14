@@ -548,7 +548,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             lockState={lockState}
             sweepCenter={sweepCenter}
             sweepAmplitude={sweepAmplitude}
-            showManualTarget={lockMode !== 'autolock'}
+            showManualTarget
             initActive={streamEnabled}
           />
           <ThrottledStatusRow
