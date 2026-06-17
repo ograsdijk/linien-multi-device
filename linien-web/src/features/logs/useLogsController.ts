@@ -69,6 +69,14 @@ const toastFromLogEntry = (
   ) {
     return { level: 'error', title: `Error${deviceSuffix}`, message };
   }
+  if (code === 'connection_diagnosis') {
+    const category = String(entry.details?.category || '').trim();
+    // A crash with the lock still held is reassuring-but-actionable (warning);
+    // a reboot / unreachable board means the lock is gone (error).
+    const level: UiToast['level'] =
+      category === 'server_crashed' || category === 'recovering' ? 'warning' : 'error';
+    return { level, title: `Connection${deviceSuffix}`, message };
+  }
   const details = entry.details;
   if (
     levelBucket(entry) === 'error' &&

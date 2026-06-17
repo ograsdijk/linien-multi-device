@@ -319,6 +319,31 @@ body {
   color: var(--tag-red-text);
 }
 
+/* Connection-loss diagnosis badges (colour resolved in connectionState.ts). */
+.device-tag.diag-green {
+  background: var(--tag-green-bg);
+  border-color: var(--tag-green-border);
+  color: var(--tag-green-text);
+}
+
+.device-tag.diag-amber {
+  background: var(--tag-amber-bg);
+  border-color: var(--tag-amber-border);
+  color: var(--tag-amber-text);
+}
+
+.device-tag.diag-red {
+  background: var(--tag-red-bg);
+  border-color: var(--tag-red-border);
+  color: var(--tag-red-text);
+}
+
+.device-tag.diag-dimmed {
+  background: var(--tag-bg);
+  border-color: var(--tag-border);
+  color: var(--tag-text);
+}
+
 .lock-chip-button {
   background: var(--tag-bg) !important;
   border: 1px solid var(--tag-border) !important;

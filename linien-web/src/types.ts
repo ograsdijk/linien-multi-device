@@ -8,6 +8,32 @@
   parameters: Record<string, any>;
 };
 
+export type DiagnosisCategory =
+  | 'recovering'
+  | 'host_unreachable'
+  | 'server_down_unknown'
+  | 'rebooted'
+  | 'server_crashed';
+
+export type DiagnosisLockState =
+  | 'locked'
+  | 'unlocked'
+  | 'likely_held'
+  | 'lost'
+  | 'unknown';
+
+export type DeviceDiagnosis = {
+  category: DiagnosisCategory;
+  lock_state: DiagnosisLockState;
+  message: string;
+  probed_at?: number | null;
+  uptime_s?: number | null;
+  host_reachable?: boolean | null;
+  server_running?: boolean | null;
+  fpga_operating?: boolean | null;
+  seconds_since_last_connected?: number | null;
+};
+
 export type DeviceStatus = {
   connected: boolean;
   connecting: boolean;
@@ -16,6 +42,7 @@ export type DeviceStatus = {
   logging_active?: boolean | null;
   lock?: boolean | null;
   auto_relock?: AutoRelockStatus | null;
+  diagnosis?: DeviceDiagnosis | null;
 };
 
 export type LockIndicatorConfig = {

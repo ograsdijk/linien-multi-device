@@ -1,11 +1,18 @@
 import { memo, useCallback, useRef, useState } from 'react';
 import { Button, Group, Text } from '@mantine/core';
-import type { Device, LockIndicatorSnapshot, PlotFrame, StreamMessage } from '../types';
+import type {
+  Device,
+  DeviceDiagnosis,
+  LockIndicatorSnapshot,
+  PlotFrame,
+  StreamMessage,
+} from '../types';
 import { api } from '../api';
 import { useDeviceStream } from '../hooks/useDeviceStream';
 import { useInViewport } from '../hooks/useInViewport';
 import { OverviewPlotPanel, type OverviewPlotPanelHandle } from './OverviewPlotPanel';
 import { ThrottledStatusRow } from './ThrottledStatusRow';
+import { resolveConnectionDisplay } from '../features/connection/connectionState';
 import { resolveLockDisplay } from '../features/locks/lockState';
 import { type DeviceStateEntry, useDeviceStateSlice } from '../state/deviceStatesStore';
 
@@ -20,6 +27,7 @@ type CardSlice = {
   connected: boolean;
   connecting: boolean;
   lockFromStatus: boolean | undefined;
+  diagnosis: DeviceDiagnosis | null;
 };
 
 const selectCardSlice = (entry: DeviceStateEntry): CardSlice => {
@@ -31,6 +39,7 @@ const selectCardSlice = (entry: DeviceStateEntry): CardSlice => {
     connected: Boolean(s?.connected),
     connecting: Boolean(s?.connecting),
     lockFromStatus: typeof s?.lock === 'boolean' ? s.lock : undefined,
+    diagnosis: s?.diagnosis ?? null,
   };
 };
 
@@ -39,7 +48,10 @@ const cardSliceEqual = (a: CardSlice, b: CardSlice): boolean => {
     a.lockFromParams === b.lockFromParams &&
     a.connected === b.connected &&
     a.connecting === b.connecting &&
-    a.lockFromStatus === b.lockFromStatus
+    a.lockFromStatus === b.lockFromStatus &&
+    a.diagnosis?.category === b.diagnosis?.category &&
+    a.diagnosis?.lock_state === b.diagnosis?.lock_state &&
+    a.diagnosis?.probed_at === b.diagnosis?.probed_at
   );
 };
 
@@ -105,6 +117,11 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
     connected,
     lockEnabled: lockState,
     indicator: lockIndicator,
+  });
+  const connectionDisplay = resolveConnectionDisplay({
+    connected: slice.connected,
+    connecting: slice.connecting,
+    diagnosis: slice.diagnosis,
   });
 
   // Per-card frame throttle. With binary frames arriving at server
@@ -175,6 +192,14 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
           <Text size="xs" c="dimmed">
             {statusLabel}
           </Text>
+          {connectionDisplay.show ? (
+            <div
+              className={`device-tag diag-${connectionDisplay.color}`}
+              title={connectionDisplay.tooltip}
+            >
+              {connectionDisplay.label}
+            </div>
+          ) : null}
           <div className={`device-tag status-lock-${lockDisplay.uiState}`}>{lockDisplay.label}</div>
           {connected ? (
             <Button

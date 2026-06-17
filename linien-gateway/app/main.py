@@ -30,6 +30,7 @@ from .device_config_store import (
     CONFIG_LOCK_INDICATOR,
     DeviceConfigStore,
 )
+from .diagnosis import DiagnosisProbe
 from .log_store import LogStore
 from .manual_lock_postgres import LockResultPostgresService
 from .path_utils import find_repo_root
@@ -74,6 +75,7 @@ lock_result_postgres = LockResultPostgresService()
 log_store = LogStore(max_entries=10_000, max_age_s=24.0 * 60.0 * 60.0)
 device_config_store = DeviceConfigStore()
 session_registry = SessionRegistry()
+diagnosis_probe = DiagnosisProbe(session_registry)
 logger = logging.getLogger(__name__)
 
 
@@ -124,11 +126,13 @@ async def _startup() -> None:
     )
     if hasattr(lock_result_postgres, "start"):
         lock_result_postgres.start()
+    diagnosis_probe.start()
 
 
 async def _shutdown() -> None:
     if hasattr(lock_result_postgres, "stop"):
         lock_result_postgres.stop()
+    diagnosis_probe.stop()
 
 
 @asynccontextmanager
@@ -352,10 +356,12 @@ def _session_for_device(device: Device) -> DeviceSession:
                 manager,
                 lock_result_postgres,
                 log_event_callback=_emit_log,
+                diagnosis_request_callback=diagnosis_probe.request,
             ),
         )
         session.device = device
         session.set_log_event_callback(_emit_log)
+        session.set_diagnosis_request_callback(diagnosis_probe.request)
         session.sync_configs_from_device()
         return session
 

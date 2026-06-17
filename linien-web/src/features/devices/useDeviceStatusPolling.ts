@@ -30,6 +30,19 @@ const sameAutoRelock = (
   );
 };
 
+const sameDiagnosis = (
+  a: DeviceStatus['diagnosis'] | null | undefined,
+  b: DeviceStatus['diagnosis'] | null | undefined
+) => {
+  if (a === b) return true;
+  if (!a || !b) return !a && !b;
+  return (
+    a.category === b.category &&
+    a.lock_state === b.lock_state &&
+    a.probed_at === b.probed_at
+  );
+};
+
 const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceStatus) => {
   if (!a) return false;
   return (
@@ -39,7 +52,8 @@ const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceStatus) =
     a.last_plot === b.last_plot &&
     a.logging_active === b.logging_active &&
     a.lock === b.lock &&
-    sameAutoRelock(a.auto_relock, b.auto_relock)
+    sameAutoRelock(a.auto_relock, b.auto_relock) &&
+    sameDiagnosis(a.diagnosis, b.diagnosis)
   );
 };
 

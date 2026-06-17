@@ -15,6 +15,7 @@ import type {
   LockIndicatorSnapshot,
 } from '../types';
 import { toDeviceListDragId } from '../features/devices/dragIds';
+import { resolveConnectionDisplay } from '../features/connection/connectionState';
 import { resolveLockDisplay, resolveRelockTag } from '../features/locks/lockState';
 
 const emptyForm = {
@@ -133,6 +134,7 @@ function SortableDeviceCard({
     indicator: indicator ?? null,
   });
   const autoRelockDisplay = resolveRelockTag(autoRelock);
+  const connectionDisplay = resolveConnectionDisplay(status);
   const wrapperStyle: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -177,12 +179,22 @@ function SortableDeviceCard({
             <Text size="xs" c="dimmed">
               {device.host}:{device.port}
             </Text>
-            {status?.last_error ? (
+            {connectionDisplay.show ? (
+              <Text size="xs" c="dimmed">{connectionDisplay.tooltip}</Text>
+            ) : status?.last_error ? (
               <Text size="xs" c="red">{status.last_error}</Text>
             ) : null}
           </div>
           <Group gap={6} align="center">
             <div className={`device-tag status-${state}`}>{tagLabel}</div>
+            {connectionDisplay.show ? (
+              <div
+                className={`device-tag diag-${connectionDisplay.color}`}
+                title={connectionDisplay.tooltip}
+              >
+                {connectionDisplay.label}
+              </div>
+            ) : null}
             <div className={`device-tag status-lock-${lockDisplay.uiState}`}>
               {lockDisplay.label}
             </div>

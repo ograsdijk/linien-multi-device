@@ -110,11 +110,13 @@ class DeviceSession:
             [int, str, str, str, str | None, dict[str, Any] | None], None
         ]
         | None = None,
+        diagnosis_request_callback: Callable[[str], None] | None = None,
     ) -> None:
         self.device = device
         self.manager = manager
         self._lock_result_postgres = lock_result_postgres_service
         self._log_event_callback = log_event_callback
+        self._diagnosis_request_callback = diagnosis_request_callback
         self.client: LinienClient | None = None
         self.control = None
         self.parameters = None
@@ -155,6 +157,13 @@ class DeviceSession:
         # server-side state route through this session, so the cache stays
         # authoritative.
         self._logging_active_cache: bool | None = None
+        # Out-of-band connection diagnosis (populated by DiagnosisProbe while
+        # disconnected). `_wants_diagnosis` gates re-probing so intentionally
+        # disconnected devices are not probed forever.
+        self._last_connected_at: float | None = None
+        self._diagnosis_cache: dict[str, Any] | None = None
+        self._last_diagnosis_category: str | None = None
+        self._wants_diagnosis: bool = False
 
     @staticmethod
     def _utc_now_iso() -> str:
@@ -345,6 +354,59 @@ class DeviceSession:
         self._log_event_callback = callback
         if hasattr(self.auto_relock, "set_event_hook"):
             self.auto_relock.set_event_hook(self._on_auto_relock_event)
+
+    def set_diagnosis_request_callback(
+        self, callback: Callable[[str], None] | None
+    ) -> None:
+        self._diagnosis_request_callback = callback
+
+    def seconds_since_last_connected(self) -> float | None:
+        with self._state_lock:
+            ts = self._last_connected_at
+        if ts is None:
+            return None
+        return max(0.0, time.time() - ts)
+
+    def wants_diagnosis(self) -> bool:
+        with self._state_lock:
+            return self._wants_diagnosis
+
+    def request_diagnosis_probe(self) -> None:
+        """Mark this session for out-of-band diagnosis and enqueue a probe."""
+        with self._state_lock:
+            self._wants_diagnosis = True
+        callback = self._diagnosis_request_callback
+        if callback is None:
+            return
+        try:
+            callback(self.device.key)
+        except Exception:  # noqa: BLE001 - never let the poll thread crash on this
+            logger.debug("Diagnosis request callback failed", exc_info=True)
+
+    def _clear_diagnosis(self) -> None:
+        with self._state_lock:
+            self._wants_diagnosis = False
+            self._diagnosis_cache = None
+            self._last_diagnosis_category = None
+
+    def apply_diagnosis(self, diagnosis: dict[str, Any]) -> None:
+        """Store a probe result (called from the DiagnosisProbe worker)."""
+        category = diagnosis.get("category")
+        with self._state_lock:
+            if self.connected:
+                # Reconnected between scheduling and probing — drop stale result.
+                return
+            previous = self._last_diagnosis_category
+            self._diagnosis_cache = diagnosis
+            self._last_diagnosis_category = category
+        if category != previous:
+            self._emit_log_event(
+                level=logging.WARNING,
+                source="diagnosis",
+                code="connection_diagnosis",
+                message=str(diagnosis.get("message", "Connection diagnosis updated.")),
+                details=diagnosis,
+            )
 
     def _on_auto_relock_event(self, event: str, payload: dict[str, Any]) -> None:
         if event == "attempt":
@@ -881,7 +943,9 @@ class DeviceSession:
         except Exception:  # noqa: BLE001 - best effort cleanup
             logger.warning("Failed to disconnect Linien client cleanly", exc_info=True)
 
-    def _reset_connection_state(self, *, last_error: str | None = None) -> None:
+    def _reset_connection_state(
+        self, *, last_error: str | None = None, request_diagnosis: bool = False
+    ) -> None:
         client_to_close: LinienClient | None = None
         with self._lock:
             self._stop_event.set()
@@ -897,6 +961,12 @@ class DeviceSession:
             self._param_metadata_cache = None
             self._logging_active_cache = None
         self._disconnect_client_safely(client_to_close)
+        if request_diagnosis:
+            # Unexpected drop (poll failure / failed connect): probe to find out why.
+            self.request_diagnosis_probe()
+        else:
+            # Intentional disconnect: stop probing and drop any stale diagnosis.
+            self._clear_diagnosis()
 
     def _handle_poll_failure(self, exc: Exception) -> None:
         logger.warning(
@@ -911,7 +981,7 @@ class DeviceSession:
             message="Device poll loop failed.",
             details={"error": str(exc)},
         )
-        self._reset_connection_state(last_error=str(exc))
+        self._reset_connection_state(last_error=str(exc), request_diagnosis=True)
 
     def connect_async(self, autostart_server: bool = False) -> None:
         if self.connected or self.connecting:
@@ -985,6 +1055,11 @@ class DeviceSession:
             self.connected = True
             self.connecting = False
             self.last_error = None
+            with self._state_lock:
+                self._last_connected_at = time.time()
+                self._diagnosis_cache = None
+                self._last_diagnosis_category = None
+                self._wants_diagnosis = False
             self._register_callbacks()
             self._stop_event.clear()
             self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
@@ -996,7 +1071,7 @@ class DeviceSession:
             RPYCAuthenticationException,
             Exception,
         ) as exc:
-            self._reset_connection_state(last_error=str(exc))
+            self._reset_connection_state(last_error=str(exc), request_diagnosis=True)
 
     def start_server(self) -> None:
         self.connect_async(autostart_server=True)
@@ -1410,6 +1485,8 @@ class DeviceSession:
         )
         if lock_value is None and frame_lock is not None:
             lock_value = frame_lock
+        with self._state_lock:
+            diagnosis = self._diagnosis_cache
         return {
             "connected": self.connected,
             "connecting": self.connecting,
@@ -1418,6 +1495,7 @@ class DeviceSession:
             "logging_active": logging_active,
             "lock": lock_value,
             "auto_relock": auto_relock_status,
+            "diagnosis": diagnosis,
         }
 
     def set_param(self, name: str, value: Any, write_registers: bool) -> None:
