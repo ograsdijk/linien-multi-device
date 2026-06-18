@@ -23,14 +23,15 @@ def _load_config() -> dict[str, Any]:
         return {}
     try:
         return json.loads(config_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, OSError):
         return {}
 
 
 def get_api_port() -> int:
     config = _load_config()
     value = config.get("apiPort")
-    if isinstance(value, int) and value > 0:
+    # bool is an int subclass — reject `true`/`false` as a port.
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
     return DEFAULT_API_PORT
 
@@ -45,7 +46,11 @@ def get_api_host() -> str:
 
 def _get_positive_float(config: dict[str, Any], key: str, fallback: float) -> float:
     value = config.get(key)
-    if isinstance(value, (int, float)) and float(value) > 0:
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and float(value) > 0
+    ):
         return float(value)
     return fallback
 

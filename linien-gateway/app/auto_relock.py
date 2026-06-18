@@ -92,6 +92,10 @@ class AutoRelockController:
         self._verify_since: float | None = None
         self._verify_good_since: float | None = None
         self._cooldown_until: float | None = None
+        # Set when a failure primes a prompt retry; lets the retry fire even
+        # though the device is unlocked (sweeping) and so does not satisfy the
+        # normal lock=True + "lost" trigger.
+        self._retry_primed = False
         self._attempts = 0
         self._last_trigger_at: float | None = None
         self._last_attempt_at: float | None = None
@@ -120,6 +124,7 @@ class AutoRelockController:
         self._wait_since = None
         self._verify_since = None
         self._verify_good_since = None
+        self._retry_primed = False
 
     def _enter_cooldown(self, now: float) -> None:
         self._reset_transient()
@@ -146,7 +151,10 @@ class AutoRelockController:
             self._enter_cooldown(now)
             return
         self._set_state("lost_pending")
-        # Retry promptly on the next tick.
+        # Retry promptly on the next tick. _retry_primed lets the retry fire
+        # even when the device is unlocked (sweeping), which is the case for
+        # every failure reason except verify_failed.
+        self._retry_primed = True
         self._lost_since = now - float(self._config.trigger_hold_s)
         self._wait_since = None
         self._verify_since = None
@@ -242,6 +250,21 @@ class AutoRelockController:
                 ts - self._verify_since
             ) >= max(1.0, float(self._config.verify_hold_s) * 2.0):
                 self._record_failure("verify_failed", ts)
+            return
+
+        # A retry primed by a prior failure (state stays "lost_pending") must
+        # fire regardless of the current lock state. After a sweep-mode failure
+        # (unlocked_trace_timeout / start_relock_failed with no crossing) the
+        # device is unlocked, so the lock=True + "lost" trigger below never
+        # fires; without this the primed retry is discarded and the device is
+        # left sweeping/unlocked with its attempt budget unused (#10).
+        if self._state == "lost_pending" and self._retry_primed:
+            elapsed = self._lost_since is None or (
+                (ts - self._lost_since) >= float(self._config.trigger_hold_s)
+            )
+            if elapsed:
+                self._retry_primed = False
+                self._begin_attempt(ts, start_sweep)
             return
 
         lost_now = bool(lock) and indicator_state == "lost"
