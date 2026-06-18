@@ -96,6 +96,10 @@ class AutoRelockController:
         # though the device is unlocked (sweeping) and so does not satisfy the
         # normal lock=True + "lost" trigger.
         self._retry_primed = False
+        # The action tick() handed to the caller and is waiting on. Cleared by
+        # complete_action(), or by any out-of-band reset (disable/cooldown) so
+        # a late result can't resurrect a cancelled attempt.
+        self._pending_action: str | None = None
         self._attempts = 0
         self._last_trigger_at: float | None = None
         self._last_attempt_at: float | None = None
@@ -125,6 +129,7 @@ class AutoRelockController:
         self._verify_since = None
         self._verify_good_since = None
         self._retry_primed = False
+        self._pending_action = None
 
     def _enter_cooldown(self, now: float) -> None:
         self._reset_transient()
@@ -160,10 +165,13 @@ class AutoRelockController:
         self._verify_since = None
         self._verify_good_since = None
 
-    def _begin_attempt(self, now: float, start_sweep: Callable[[], None]) -> None:
+    def _begin_attempt(self, now: float) -> str | None:
+        """Decide to start a relock attempt. Returns the "sweep" action for the
+        caller to perform (outside any lock), or None if the attempt budget is
+        exhausted. No device I/O happens here."""
         if self._attempts >= int(self._config.max_attempts):
             self._record_failure("max_attempts_reached", now)
-            return
+            return None
         self._attempts += 1
         self._last_attempt_at = now
         self._emit_event(
@@ -172,13 +180,8 @@ class AutoRelockController:
             max_attempts=int(self._config.max_attempts),
             at=now,
         )
-        try:
-            start_sweep()
-        except Exception as exc:
-            self._record_failure(f"start_sweep_failed: {exc}", now)
-            return
-        self._wait_since = now
-        self._set_state("waiting_unlocked_trace")
+        self._pending_action = "sweep"
+        return "sweep"
 
     def tick(
         self,
@@ -186,10 +189,22 @@ class AutoRelockController:
         lock: bool,
         indicator_state: str | None,
         unlocked_trace_at: float | None,
-        start_sweep: Callable[[], None],
-        start_relock: Callable[[], None],
         now: float | None = None,
-    ) -> None:
+    ) -> str | None:
+        """Advance the state machine WITHOUT performing any device I/O.
+
+        Returns an action the caller must perform OUTSIDE the session locks,
+        then report back via complete_action():
+          "sweep"  -> start a sweep (stop the lock), then
+                      complete_action("sweep", ok, error)
+          "relock" -> run auto-lock-from-scan, then
+                      complete_action("relock", ok, error)
+          None     -> nothing to do this tick.
+
+        Keeping the blocking RPyC out of tick() lets the caller release
+        _state_lock before the relock sweep/scan, so status()/snapshot reads
+        don't stall during a relock.
+        """
         ts = float(now) if now is not None else time.time()
 
         if not self._config.enabled:
@@ -198,11 +213,11 @@ class AutoRelockController:
             self._cooldown_until = None
             self._last_error = None
             self._reset_transient()
-            return
+            return None
 
         if self._cooldown_until is not None and ts < self._cooldown_until:
             self._set_state("cooldown")
-            return
+            return None
         if self._state == "cooldown":
             self._cooldown_until = None
             self._set_state("idle")
@@ -213,22 +228,16 @@ class AutoRelockController:
                 and (self._wait_since is None or unlocked_trace_at >= self._wait_since)
             )
             if has_fresh_unlocked_trace:
-                try:
-                    start_relock()
-                except Exception as exc:
-                    self._record_failure(f"start_relock_failed: {exc}", ts)
-                    return
-                self._verify_since = ts
-                self._verify_good_since = None
-                self._wait_since = None
-                self._set_state("verifying")
-                return
+                # Hand the relock to the caller; the verifying transition is
+                # applied in complete_action() once the scan actually ran.
+                self._pending_action = "relock"
+                return "relock"
             if (
                 self._wait_since is not None
                 and (ts - self._wait_since) >= float(self._config.unlocked_trace_timeout_s)
             ):
                 self._record_failure("unlocked_trace_timeout", ts)
-            return
+            return None
 
         if self._state == "verifying":
             healthy = bool(lock) and (indicator_state not in {"lost"})
@@ -244,13 +253,13 @@ class AutoRelockController:
                         at=ts,
                     )
                     self._enter_cooldown(ts)
-                return
+                return None
             self._verify_good_since = None
             if self._verify_since is not None and (
                 ts - self._verify_since
             ) >= max(1.0, float(self._config.verify_hold_s) * 2.0):
                 self._record_failure("verify_failed", ts)
-            return
+            return None
 
         # A retry primed by a prior failure (state stays "lost_pending") must
         # fire regardless of the current lock state. After a sweep-mode failure
@@ -264,26 +273,59 @@ class AutoRelockController:
             )
             if elapsed:
                 self._retry_primed = False
-                self._begin_attempt(ts, start_sweep)
-            return
+                return self._begin_attempt(ts)
+            return None
 
         lost_now = bool(lock) and indicator_state == "lost"
         if lost_now:
             if self._lost_since is None:
                 self._lost_since = ts
                 self._set_state("lost_pending")
-                return
+                return None
             if (ts - self._lost_since) >= float(self._config.trigger_hold_s):
                 if self._last_trigger_at is None or self._attempts == 0:
                     self._last_trigger_at = ts
-                self._begin_attempt(ts, start_sweep)
-            else:
-                self._set_state("lost_pending")
-            return
+                return self._begin_attempt(ts)
+            self._set_state("lost_pending")
+            return None
 
         self._lost_since = None
         if self._state == "lost_pending":
             self._set_state("idle")
+        return None
+
+    def complete_action(
+        self,
+        action: str,
+        ok: bool,
+        error: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Apply the result of an action previously returned by tick().
+
+        The caller performs the (blocking) device I/O outside the locks, then
+        calls this. If the controller moved on in the meantime (disabled /
+        reconfigured / cooled down, all of which clear _pending_action), the
+        stale result is ignored so it can't resurrect a cancelled attempt.
+        """
+        if self._pending_action != action:
+            return
+        self._pending_action = None
+        ts = float(now) if now is not None else time.time()
+        if action == "sweep":
+            if not ok:
+                self._record_failure(f"start_sweep_failed: {error}", ts)
+                return
+            self._wait_since = ts
+            self._set_state("waiting_unlocked_trace")
+        elif action == "relock":
+            if not ok:
+                self._record_failure(f"start_relock_failed: {error}", ts)
+                return
+            self._verify_since = ts
+            self._verify_good_since = None
+            self._wait_since = None
+            self._set_state("verifying")
 
     def get_config(self) -> dict[str, Any]:
         return self._config.to_dict()

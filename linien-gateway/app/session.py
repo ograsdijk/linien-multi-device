@@ -1449,14 +1449,12 @@ class DeviceSession:
                 if isinstance(frame_lock_indicator, dict)
                 else None
             )
-            self.auto_relock.tick(
+            relock_action = self.auto_relock.tick(
                 lock=lock_value,
                 indicator_state=indicator_state
                 if isinstance(indicator_state, str)
                 else None,
                 unlocked_trace_at=self.plot_state.last_unlocked_trace_at,
-                start_sweep=self.stop_lock,
-                start_relock=_start_auto_relock,
             )
             # auto_relock.get_status() already returns a freshly-constructed
             # flat dict of primitives; no need to deepcopy it.
@@ -1464,6 +1462,26 @@ class DeviceSession:
             frame["auto_relock"] = auto_relock_status
             self.last_plot_frame = frame
             self.last_plot_timestamp = time.time()
+
+        # Perform the auto-relock device I/O OUTSIDE _state_lock so status()
+        # and snapshot reads don't stall during a (possibly multi-second)
+        # relock sweep/scan. complete_action() applies the result. (#26)
+        if relock_action is not None:
+            action_ok = True
+            action_error: str | None = None
+            try:
+                if relock_action == "sweep":
+                    self.stop_lock()
+                elif relock_action == "relock":
+                    _start_auto_relock()
+            except Exception as exc:  # noqa: BLE001 - recorded as a relock failure
+                action_ok = False
+                action_error = str(exc)
+            with self._state_lock:
+                self.auto_relock.complete_action(
+                    relock_action, action_ok, action_error
+                )
+                auto_relock_status = self.auto_relock.get_status()
 
         self._emit_lock_transition_log(
             lock_enabled=bool(lock_value),
