@@ -277,13 +277,12 @@ Then add a normal device in the web UI pointing to `127.0.0.1:18863` and click `
 
 See [docker/README.md](docker/README.md).
 
-> [!WARNING]
-> The gateway compose file bind-mounts `data/device_settings.json`, but that file does
-> not exist in the repo and is gitignored, so device-config persistence is currently
-> broken in the Docker stack (the first settings write fails with HTTP 500). As a
-> workaround, create an empty `docker/linien-multi-device/data/device_settings.json`
-> containing `{}` (forcing it past `.gitignore`) before starting the stack, or mount the
-> parent `data/` directory instead of the single file. See [Known issues](#known-issues).
+> [!NOTE]
+> The gateway compose file bind-mounts `data/device_settings.json`. A seed file
+> (`{}`) is committed so the mount targets a real file (otherwise Docker would create a
+> directory there), and the gateway falls back to a non-atomic write when the atomic
+> rename can't cross the bind-mount filesystem boundary — so device-config persistence
+> works in the Docker stack.
 
 Also note that the two Docker stacks are separate compose projects, so the gateway's
 default Postgres host (`127.0.0.1`) will not reach the Postgres container — point it at
@@ -307,77 +306,44 @@ reverse proxy. Do not expose it to untrusted networks.
 
 ## Known issues
 
-The list below was produced by a code audit; findings were independently verified. File
-references point at the root cause. Nothing here has been fixed yet.
+A code audit (findings independently verified) drove the fixes in this section.
 
-### Security (high / medium)
+### Addressed
 
-- **No auth + cleartext secrets over an open API.** The gateway has no auth, binds to
-  `0.0.0.0`, uses wildcard CORS with credentials, and echoes device SSH passwords
-  (`schemas.py` `DeviceOut.password`, `main.py` `list_devices`), the InfluxDB token
-  (`main.py:1132-1145`), and the Postgres password (`manual_lock_postgres.py`).
-  See [Security model](#security-model).
-- **`pickle.loads` of device payloads** — the live `to_plot` payload from the device is
-  unpickled (`session.py` ~`1213-1236`, via `linien_common.communication.unpack`). A
-  compromised device or RPyC channel could achieve RCE on the gateway.
-- **SSRF / credential-directed connection** — device host/credentials come unvalidated
-  from client-controlled records and are used for outbound TCP/SSH probes and RPyC
-  connects (`diagnosis.py`, `schemas.py` `DeviceIn`, `main.py` create/update device).
+- **`devices.json` write races + corrupt-file tolerance** — all mutations are serialized
+  under one process-wide lock, and reads tolerate a corrupt file. The underlying write
+  still goes through `linien_client`, so a crash *exactly* mid-write remains a small
+  residual risk (it is not made atomic here).
+- **connect/disconnect race** — `connect()` is serialized against `disconnect()` so a
+  disconnect can no longer be silently undone or leak a poll thread.
+- **Auto-relock retry** — a failed attempt now retries regardless of the live lock state
+  (it no longer abandons the device unlocked after a single sweep-mode failure).
+- **Diagnosis lock-state** — "lock likely held" is no longer reported when the FPGA
+  gateware is not loaded (now "lost"/"unknown" as appropriate).
+- **Installed entrypoint** honors `config.json` (apiHost/apiPort), matching `run.py`.
+- **Docker device-config persistence** — seed file + cross-filesystem write fallback (see
+  the [Docker](#docker) note).
+- **Logs WebSocket** auto-reconnects with backoff and no longer tears down on device-list
+  changes; **`request()`** reads the error body once (real error surfaces); **config
+  broadcasts** no longer clobber in-progress lock-indicator / auto-relock edits.
+- **CORS** no longer combines wildcard origin with credentials.
+- Various hygiene: store validation, little-endian stream bytes, dead-code removal, toast
+  a11y, boolean-param writes, sweep-bar pointer-cancel, simulator loop guard, numpy/uv
+  packaging note.
 
-### Concurrency & persistence (high / medium)
+### By design (documented, not changed)
 
-- **`devices.json` races and non-atomic writes** — `device_store.save_device`
-  (`device_store.py:66-72`) does an unlocked read-modify-write, and the underlying
-  `linien_client` writer rewrites the whole file with `open(path, 'w')` (no lock, no
-  temp+rename). Called concurrently from request threads, the status fan-out
-  (`main.py` `device_statuses`), and session poll threads, this can silently lose updates
-  and, on a crash mid-write, corrupt the file (load only catches `FileNotFoundError`).
-  `group_store` and `device_config_store` already use atomic temp+replace — `device_store`
-  is the outlier.
-- **Docker device-config persistence broken** — see the [Docker](#docker) warning above.
-- **connect/disconnect race** — `connect()` runs most of its work without a lock and can
-  clear the stop-event a concurrent `disconnect()` just set, resurrecting a torn-down
-  session (transient `connected=True` with `client=None`) and re-arming the poll thread
-  (`session.py` ~`994-1074`).
+- **No authentication; cleartext secrets on read; SSRF-by-config; `pickle.loads` of device
+  payloads.** These follow from the trusted-LAN deployment model and the upstream Linien
+  RPyC protocol. See [Security model](#security-model). Do not expose the gateway to
+  untrusted networks.
 
-### Correctness (medium)
+### Deferred (lower-severity follow-ups)
 
-- **Auto-relock single-attempt for common failures** — after a non-`verify_failed`
-  failure the device is left in sweep (`lock=False`), but the primed retry requires
-  `lock=True`, so the retry never fires and the remaining attempt budget is silently
-  abandoned (`auto_relock.py:148-153` vs `247-263`).
-- **Diagnosis over-claims "lock likely held"** — the crash branch reports the lock is
-  likely held without consulting `fpga_operating`; when the FPGA is not operating this
-  contradicts the probe's own gate (`diagnosis.py:266-289`).
-
-### Packaging / runtime (medium)
-
-- **`numpy>=2` + uv override hides a real conflict** — `linien-common 2.1.0` pins
-  `numpy<2`. Only the `[tool.uv]` override resolves it; `pip install .` fails with a
-  resolution error (`pyproject.toml`).
-- **Installed entrypoint ignores `config.json`** — `app.main:main` hardcodes
-  `0.0.0.0:8000` while `run.py` honors `config.json` (`main.py:1318-1327`).
-
-### Web (medium / low)
-
-- **Logs WebSocket never reconnects** after a transient drop (`ws.ts:68-82`,
-  `useLogsController.ts`), unlike the device stream which uses backoff reconnect.
-- **`request()` reads the response body twice** in its error path, masking the real error
-  with "body stream already read" (`api.ts:30-42`).
-- **`config_update` broadcasts can clobber in-progress edits** in the lock-indicator /
-  auto-relock panels (`LockIndicatorPanel.tsx`, `AutoRelockPanel.tsx`).
-
-### Lower-severity / hygiene
-
-Roughly 30 additional low/info findings were confirmed, including: non-atomic /
-loosely-validated config stores (`config.py`, `group_store.py`); WebSocket cleanup gaps
-and a session/lock-creation path that doesn't validate the device key
-(`main.py` stream/registry); a binary plot payload that uses native rather than
-little-endian byte order (`stream.py`); several dead-code spots (`usePlotFrameBuffer.ts`,
-`plotShared.ts` `seriesArrayLength`, sim helpers); UI nits (toast not announced to
-assistive tech; boolean params written as `1/0` in `OptimizationPanel`; sweep-bar
-pointer-cancel reverting to a stale range); and committed default DB credentials in the
-Postgres compose stack.
+- Cross-thread locking of a few session status scalars and moving the auto-relock RPyC
+  round-trips out of `_state_lock` (perf) — held back to keep the threading change minimal.
+- WebSocket cleanup on non-disconnect errors, device-key validation before session/lock
+  creation, and the optimization reset/stop-vs-status nit on the disabled automation flow.
 
 ## Known limitations
 
