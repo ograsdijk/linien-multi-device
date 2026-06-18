@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 import app.main as main
@@ -28,6 +30,11 @@ def test_device_stream_sends_snapshot_before_registered_messages(monkeypatch):
                 },
             }
 
+    # The handler now validates the key against device_store before opening
+    # the socket (rejects unknown keys without allocating a per-key lock).
+    monkeypatch.setattr(
+        main.device_store, "get_device", lambda _key: SimpleNamespace(key=_key)
+    )
     monkeypatch.setattr(main, "_get_session", lambda _key: DummySession())
 
     with TestClient(main.app) as client:
