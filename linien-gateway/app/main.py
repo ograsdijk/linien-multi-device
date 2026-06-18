@@ -487,6 +487,9 @@ def disconnect_device(key: str) -> dict:
 
 @app.get("/api/devices/{key}/status")
 def device_status(key: str) -> dict:
+    # Validate the key before lock_for() so requests for unknown keys can't
+    # allocate per-key locks that are never freed (unbounded growth). (#53)
+    _get_device_or_404(key)
     with session_registry.lock_for(key):
         session = _get_session(key)
         return session.status()
@@ -519,6 +522,8 @@ async def device_statuses() -> dict[str, dict]:
 
 @app.get("/api/devices/{key}/params")
 def device_params(key: str) -> list:
+    # Validate before lock_for() (see device_status). (#53)
+    _get_device_or_404(key)
     with session_registry.lock_for(key):
         session = _get_session(key)
         return session.param_metadata()
@@ -1199,18 +1204,45 @@ def clear_logs() -> dict:
 async def stream_logs(websocket: WebSocket) -> None:
     await websocket.accept()
     q = log_store.subscribe(maxsize=500)
+
+    async def _wait_for_disconnect() -> None:
+        # receive() raises WebSocketDisconnect when the client goes away,
+        # even during quiet periods when no log payloads are flowing.
+        try:
+            while True:
+                await websocket.receive()
+        except WebSocketDisconnect:
+            return
+
+    disconnect_task = asyncio.create_task(_wait_for_disconnect())
     try:
         while True:
-            payload = await q.get()
+            get_task = asyncio.create_task(q.get())
+            done, _pending = await asyncio.wait(
+                {get_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                # Client gone — stop promptly instead of blocking on q.get()
+                # until the next (maybe far-off) log arrives. (#23)
+                get_task.cancel()
+                break
+            payload = get_task.result()
             await websocket.send_json(payload)
     except WebSocketDisconnect:
         pass
     finally:
+        disconnect_task.cancel()
         log_store.unsubscribe(q)
 
 
 @app.websocket("/api/devices/{key}/stream")
 async def stream_device(websocket: WebSocket, key: str) -> None:
+    # Reject unknown keys before lock_for() so they can't allocate per-key
+    # locks that are never freed. (#53)
+    if device_store.get_device(key) is None:
+        await websocket.close(code=1008)
+        return
     with session_registry.lock_for(key):
         session = _get_session(key)
         snapshot = session.snapshot()
@@ -1297,6 +1329,11 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
                     except (ValueError, TypeError):
                         pass
     except WebSocketDisconnect:
+        pass
+    finally:
+        # Always unregister, not just on a clean WebSocketDisconnect — any
+        # receive error (e.g. a protocol error) must still release the
+        # connection + its sender task in the manager. (#22)
         await manager.unregister(key, websocket)
 
 

@@ -45,6 +45,10 @@ export const OptimizationPanel = memo(function OptimizationPanel({
   const failed = Boolean(params.optimization_failed);
   const improvement = toNumber(params.optimization_improvement, 0);
   const disabled = Boolean(params.pid_only_mode) || Boolean(optimizationTemporarilyDisabled);
+  // Recovery actions (reset a failed flag, stop/abort a stale running task)
+  // must stay usable even while optimization is temporarily disabled, so a
+  // stuck backend status can always be cleared. (#59)
+  const recoveryDisabled = Boolean(params.pid_only_mode);
   const disabledReasonText =
     disableReason ?? 'Temporarily disabled due to compatibility issue.';
 
@@ -104,7 +108,7 @@ export const OptimizationPanel = memo(function OptimizationPanel({
           variant="outline"
           color="red"
           onClick={() => onSetParam('optimization_failed', false, false)}
-          disabled={disabled}
+          disabled={recoveryDisabled}
         >
           Reset failed state
         </Button>
@@ -193,7 +197,7 @@ export const OptimizationPanel = memo(function OptimizationPanel({
           <Button
             variant="default"
             onClick={onAbortSelection}
-            disabled={disabled || selectionSubmitting}
+            disabled={recoveryDisabled || selectionSubmitting}
           >
             Abort
           </Button>
@@ -204,7 +208,7 @@ export const OptimizationPanel = memo(function OptimizationPanel({
           color="red"
           variant="light"
           onClick={() => onStopTask(false)}
-          disabled={disabled || Boolean(optimizationTemporarilyDisabled)}
+          disabled={recoveryDisabled}
         >
           Abort
         </Button>
@@ -212,7 +216,7 @@ export const OptimizationPanel = memo(function OptimizationPanel({
           color="green"
           variant="light"
           onClick={() => onStopTask(true)}
-          disabled={disabled || Boolean(optimizationTemporarilyDisabled)}
+          disabled={recoveryDisabled}
         >
           Use optimized
         </Button>

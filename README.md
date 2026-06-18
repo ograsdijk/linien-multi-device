@@ -338,12 +338,17 @@ A code audit (findings independently verified) drove the fixes in this section.
   RPyC protocol. See [Security model](#security-model). Do not expose the gateway to
   untrusted networks.
 
-### Deferred (lower-severity follow-ups)
+### Deferred (intentionally not changed)
 
-- Cross-thread locking of a few session status scalars and moving the auto-relock RPyC
-  round-trips out of `_state_lock` (perf) — held back to keep the threading change minimal.
-- WebSocket cleanup on non-disconnect errors, device-key validation before session/lock
-  creation, and the optimization reset/stop-vs-status nit on the disabled automation flow.
+- **Cross-thread locking of a few session status scalars** (e.g. `_logging_active_cache`)
+  — these are single-attribute reads/writes that are atomic under the CPython GIL, so the
+  worst case is a momentarily stale flag. Adding locks to the hot `status()` path is
+  net-negative; left as-is.
+- **Moving the auto-relock RPyC round-trips out of `_state_lock`** (perf during an active
+  relock) — doing this safely requires splitting the controller's `tick()` into a
+  decide-under-lock / act-outside-lock pair (any lock held across the RPyC reproduces the
+  same stall, since `status()` reads auto-relock state). Deferred as a focused follow-up;
+  it only affects latency during a relock sequence, not steady state.
 
 ## Known limitations
 
