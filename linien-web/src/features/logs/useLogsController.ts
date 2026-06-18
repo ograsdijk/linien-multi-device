@@ -374,6 +374,7 @@ export const useLogsController = (devices: Device[]) => {
     setLogAutoScroll,
     toasts,
     dismissToast,
+    pushToast,
     loadLogsTail,
     clearLogs,
     copyLogMessage,

@@ -83,6 +83,17 @@ export const api = {
   writeRegisters: (key: string) => request(`/devices/${key}/control/write_registers`, { method: 'POST' }),
   startLock: (key: string) => request(`/devices/${key}/control/start_lock`, { method: 'POST' }),
   startSweep: (key: string) => request(`/devices/${key}/control/start_sweep`, { method: 'POST' }),
+  startSweepSimultaneous: (deviceKeys: string[], sweepSpeed?: number) =>
+    request<{ started: string[]; skipped_unconnected: string[]; sweep_speed: number | null }>(
+      '/control/start_sweep',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          device_keys: deviceKeys,
+          sweep_speed: sweepSpeed ?? null,
+        }),
+      }
+    ),
   startAutolock: (key: string, x0: number, x1: number) =>
     request(`/devices/${key}/control/start_autolock`, {
       method: 'POST',

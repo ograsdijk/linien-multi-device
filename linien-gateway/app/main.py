@@ -59,6 +59,8 @@ from .schemas import (
     PostgresManualLockConfig,
     PostgresManualLockState,
     RangeSelection,
+    SimultaneousAcquireIn,
+    SimultaneousSweepIn,
     StopTask,
 )
 from .serializers import UNSERIALIZABLE, to_jsonable
@@ -643,6 +645,162 @@ def update_lock_indicator_config(key: str, payload: LockIndicatorConfig) -> dict
 def start_sweep(key: str) -> dict:
     session = _get_session(key)
     return _run_session_action(session.start_sweep)
+
+
+def _prepare_sweep(
+    session: DeviceSession, sweep_speed: int | None, restart_from_center: bool
+) -> None:
+    """Per-device setup before the synchronized trigger (timing not critical)."""
+    if sweep_speed is not None:
+        session.set_param("sweep_speed", int(sweep_speed), write_registers=False)
+    session.start_sweep()  # lock off, combined_offset=0, write_registers (loads speed)
+    if restart_from_center:
+        # Park the ramp at center, ready for the synchronized run=1 in phase 2.
+        session.set_csr_direct("logic_sweep_run", 0)
+
+
+@app.post("/api/control/start_sweep")
+async def start_sweep_simultaneous(body: SimultaneousSweepIn) -> dict:
+    """Trigger a sweep on an explicit set of devices at roughly the same time.
+
+    Connected devices are prepared individually (load sweep_speed, unlock, flush
+    registers, park at center), then a single tiny CSR write per device is fired
+    concurrently so the ramps restart from center together. Unconnected device
+    keys are skipped and reported. See the plan/docs: this delivers a roughly
+    simultaneous start with an aligned starting phase, not sub-ms phase-lock.
+    """
+    pairs = [(key, session_registry.get(key)) for key in body.device_keys]
+    connected = [
+        (key, session)
+        for key, session in pairs
+        if session is not None and session.control is not None
+    ]
+    skipped = [
+        key
+        for key, session in pairs
+        if session is None or session.control is None
+    ]
+
+    # Phase 1 — per-device setup (order/timing not critical).
+    try:
+        for _key, session in connected:
+            await asyncio.to_thread(
+                _prepare_sweep, session, body.sweep_speed, body.restart_from_center
+            )
+
+        # Phase 2 — synchronized trigger: one queued CSR write per device, fired
+        # concurrently to minimize dispatch skew.
+        if body.restart_from_center and connected:
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(session.set_csr_direct, "logic_sweep_run", 1)
+                    for _key, session in connected
+                )
+            )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    return {
+        "started": [key for key, _session in connected],
+        "skipped_unconnected": skipped,
+        "sweep_speed": body.sweep_speed,
+    }
+
+
+async def _trigger_and_acquire(
+    connected: list[tuple[str, DeviceSession]], timeout_s: float | None
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Stop, synchronously restart, then capture one trace per device.
+
+    Phase 1 parks every device's sweep at center (the "stop"). Phase 2 fires a
+    synchronized ``logic_sweep_run`` 0->1 edge across all of them (the "start at
+    roughly the same time"). Phase 3 captures each device's next complete sweep
+    frame. Devices keep sweeping afterward. Per-device failures land in
+    ``skipped`` rather than failing the whole batch.
+    """
+    traces: dict[str, Any] = {}
+    skipped: dict[str, str] = {}
+    if not connected:
+        return traces, skipped
+
+    # Phase 1 -- stop: prepare + park each at center (run=0). Reuses the same
+    # per-device setup as the simultaneous-sweep endpoint.
+    prepared: list[tuple[str, DeviceSession]] = []
+    for key, session in connected:
+        try:
+            await asyncio.to_thread(_prepare_sweep, session, None, True)
+            prepared.append((key, session))
+        except (ValueError, RuntimeError) as exc:
+            skipped[key] = str(exc)
+
+    # Phase 2 -- start together: synchronized run 0->1 across all devices.
+    await asyncio.gather(
+        *(
+            asyncio.to_thread(session.set_csr_direct, "logic_sweep_run", 1)
+            for _key, session in prepared
+        ),
+        return_exceptions=True,
+    )
+
+    # Phase 3 -- capture each device's next complete sweep frame.
+    async def _capture(key: str, session: DeviceSession):
+        try:
+            return key, await asyncio.to_thread(
+                session.wait_for_fresh_trace, timeout_s
+            )
+        except (ValueError, RuntimeError) as exc:
+            return key, exc
+
+    for key, outcome in await asyncio.gather(
+        *(_capture(key, session) for key, session in prepared)
+    ):
+        if isinstance(outcome, Exception):
+            skipped[key] = str(outcome)
+        else:
+            traces[key] = outcome
+    return traces, skipped
+
+
+@app.post("/api/devices/{key}/control/acquire_scan")
+async def acquire_scan(key: str) -> dict:
+    """Trigger one sweep on a single device and return that scan's trace.
+
+    Stops the sweep, restarts it from center, then returns the next complete
+    frame. The device keeps sweeping afterward.
+    """
+    session = _get_session(key)
+    traces, skipped = await _trigger_and_acquire([(key, session)], None)
+    if key in traces:
+        return traces[key]
+    raise HTTPException(
+        status_code=409, detail=skipped.get(key, "Failed to acquire trace")
+    )
+
+
+@app.post("/api/control/acquire_scan")
+async def acquire_scan_simultaneous(body: SimultaneousAcquireIn) -> dict:
+    """Trigger a synchronized sweep on a set of devices and return each trace.
+
+    All selected devices are stopped, then restarted from center at roughly the
+    same time, then each device's next complete sweep frame is captured. This
+    yields phase-aligned single-scan traces. Unconnected or timed-out devices
+    are reported under `skipped` instead of failing the whole batch.
+    """
+    pairs = [(key, session_registry.get(key)) for key in body.device_keys]
+    connected = [
+        (key, session)
+        for key, session in pairs
+        if session is not None and session.control is not None
+    ]
+    skipped: dict[str, str] = {
+        key: "unconnected"
+        for key, session in pairs
+        if session is None or session.control is None
+    }
+
+    traces, capture_skipped = await _trigger_and_acquire(connected, body.timeout_s)
+    skipped.update(capture_skipped)
+    return {"traces": traces, "skipped": skipped}
 
 
 @app.post("/api/devices/{key}/control/start_autolock")

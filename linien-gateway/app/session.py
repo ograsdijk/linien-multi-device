@@ -34,7 +34,7 @@ from .auto_lock_scan import (
 from .auto_relock import AutoRelockConfig, AutoRelockController
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
 from .manual_lock_record import ADC_SCALE, build_manual_lock_row
-from .plot_processing import PlotState, build_plot_frame
+from .plot_processing import PlotState, V, build_plot_frame
 from .serializers import UNSERIALIZABLE, to_jsonable
 from .stream import WebsocketManager
 
@@ -1717,6 +1717,109 @@ class DeviceSession:
             raise RuntimeError("Device not connected")
         with self._rpyc_lock:
             self.control.exposed_start_sweep()
+
+    def set_csr_direct(self, key: str, value: int) -> None:
+        """Directly write a single FPGA CSR (bypasses the write_registers diff cache).
+
+        Used to force a ``logic_sweep_run`` 0->1 edge so a device restarts its
+        sweep ramp from center. No-op on the simulator service.
+        """
+        if self.control is None:
+            raise RuntimeError("Device not connected")
+        with self._rpyc_lock:
+            self.control.exposed_set_csr_direct(key, value)
+
+    def _default_trace_timeout(self) -> float:
+        """Timeout for capturing one complete sweep trace.
+
+        On hardware each delivered frame spans one full sweep, so at slow
+        sweep speeds a fresh frame only arrives once per sweep period
+        (period ~= 2**sweep_speed / 3800 s). Scale the wait accordingly,
+        with a floor for fast sweeps and a ceiling so a hung device can't
+        block the request indefinitely.
+        """
+        try:
+            speed = int(self._read_param_fast("sweep_speed", 8) or 8)
+        except (TypeError, ValueError):
+            speed = 8
+        period = (2 ** max(0, min(15, speed))) / 3800.0
+        return max(3.0, min(30.0, 2.5 * period + 1.0))
+
+    def wait_for_fresh_trace(
+        self, timeout_s: float | None = None, skip_frames: int = 1
+    ) -> Dict[str, Any]:
+        """Wait for the next complete sweep frame and return that trace.
+
+        Call this right after (re)starting the sweep. ``skip_frames`` fresh
+        frames are skipped first so a partial frame captured across the restart
+        isn't returned -- the next complete sweep is returned instead. This does
+        not change device state.
+        """
+        if self.parameters is None or self.control is None:
+            raise RuntimeError("Device not connected")
+        if timeout_s is None:
+            timeout_s = self._default_trace_timeout()
+        needed = max(1, skip_frames + 1)
+        with self._state_lock:
+            last_ts = self.last_plot_timestamp
+        seen = 0
+        deadline = time.time() + max(0.5, timeout_s)
+        while time.time() < deadline:
+            with self._state_lock:
+                ts = self.last_plot_timestamp
+            if ts is not None and ts != last_ts:
+                last_ts = ts
+                seen += 1
+                if seen >= needed:
+                    return self._build_trace_snapshot(ts)
+            time.sleep(0.02)
+        raise RuntimeError("Timed out waiting for a sweep trace")
+
+    def _build_trace_snapshot(self, captured_at: float | None) -> Dict[str, Any]:
+        """Build a JSON-able single-scan trace from the cached unlocked frame."""
+        with self._state_lock:
+            plot_data = self.plot_state.last_plot_data
+            if plot_data is None or len(plot_data) < 3 or plot_data[2] is None:
+                raise RuntimeError("No unlocked trace available")
+            error_signal_1 = (
+                np.array(plot_data[0], copy=True) if plot_data[0] is not None else None
+            )
+            monitor_or_error_2 = (
+                np.array(plot_data[1], copy=True) if plot_data[1] is not None else None
+            )
+            combined_error = np.array(plot_data[2], copy=True)
+
+        dual_channel = bool(self._read_param_fast("dual_channel", False))
+        center = float(self._read_param_fast("sweep_center", 0.0) or 0.0)
+        amplitude = float(self._read_param_fast("sweep_amplitude", 1.0) or 1.0)
+        n_points = int(combined_error.shape[0])
+
+        def to_volts(arr: "np.ndarray | None") -> "list[float] | None":
+            if arr is None:
+                return None
+            # Match the volt scaling the UI applies to plot series.
+            return (np.asarray(arr, dtype=float) / V).tolist()
+
+        # Sweep voltage axis (same linear span the unlocked plot uses).
+        if n_points > 1:
+            x_axis = np.linspace(center - amplitude, center + amplitude, n_points).tolist()
+        else:
+            x_axis = [center]
+
+        return {
+            "timestamp": captured_at,
+            "lock": False,
+            "dual_channel": dual_channel,
+            "sweep_center": center,
+            "sweep_amplitude": amplitude,
+            "n_points": n_points,
+            "x": x_axis,
+            "x_unit": "V",
+            "combined_error": to_volts(combined_error),
+            "error_signal_1": to_volts(error_signal_1),
+            "error_signal_2": to_volts(monitor_or_error_2) if dual_channel else None,
+            "monitor_signal": to_volts(monitor_or_error_2) if not dual_channel else None,
+        }
 
     def start_autolock(self, x0: int, x1: int) -> None:
         if AUTOMATION_TEMP_DISABLED:

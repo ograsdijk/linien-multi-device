@@ -49,6 +49,34 @@ class RangeSelection(BaseModel):
     x1: int = Field(ge=0, le=2047)
 
 
+class SimultaneousSweepIn(BaseModel):
+    """Start a sweep on an explicit set of devices at roughly the same time.
+
+    Unconnected device keys are silently skipped (reported in the response).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    device_keys: list[str] = Field(min_length=1)
+    # 0..15; applied to ALL selected devices before starting. None = leave each as-is.
+    sweep_speed: Optional[int] = Field(default=None, ge=0, le=15)
+    # Force a logic_sweep_run 0->1 edge so every device restarts its ramp from center.
+    restart_from_center: bool = True
+
+
+class SimultaneousAcquireIn(BaseModel):
+    """Acquire one sweep trace from each of an explicit set of devices.
+
+    Non-intrusive: captures the next complete trace from devices that are
+    already sweeping. Unconnected/locked/timed-out devices are reported under
+    `skipped` rather than failing the whole batch.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    device_keys: list[str] = Field(min_length=1)
+    # Per-device wait for one complete sweep. None = auto from each sweep_speed.
+    timeout_s: Optional[float] = Field(default=None, gt=0, le=60)
+
+
 class AutoLockScanSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     half_range_v: float = Field(default=0.08, ge=0.0, le=2.0)

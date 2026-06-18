@@ -1,35 +1,12 @@
 import { memo } from 'react';
 import { Divider, Group, Select, Stack, Switch, Tabs, Text } from '@mantine/core';
 import { DeferredNumberInput } from './DeferredNumberInput';
+import { SWEEP_SPEED_OPTIONS } from '../features/devices/sweepSpeed';
 
 const MHz = 0x10000000 / 8;
 const Vpp = ((1 << 14) - 1) / 4;
 const OFFSET_SCALE = 8191;
 const FILTER_FREQ_MAX = 50_000_000;
-
-const SWEEP_SPEED_LABELS = [
-  '3.8 kHz',
-  '1.9 kHz',
-  '954 Hz',
-  '477 Hz',
-  '238 Hz',
-  '119 Hz',
-  '59 Hz',
-  '30 Hz',
-  '15 Hz',
-  '7.5 Hz',
-  '3.7 Hz',
-  '1.9 Hz',
-  '0.93 Hz',
-  '0.47 Hz',
-  '0.23 Hz',
-  '0.12 Hz',
-];
-
-const SWEEP_SPEED_OPTIONS = SWEEP_SPEED_LABELS.map((label, idx) => ({
-  value: String(idx),
-  label,
-}));
 
 const DEMOD_MULTIPLIER_OPTIONS = [1, 2, 3, 4, 5].map((value) => ({
   value: String(value),

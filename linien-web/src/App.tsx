@@ -28,6 +28,7 @@ import {
   IconDevices,
   IconPencil,
   IconPlus,
+  IconWaveSine,
   IconX,
 } from '@tabler/icons-react';
 import { useMantineColorScheme } from '@mantine/core';
@@ -37,6 +38,7 @@ import { DeviceWorkspace } from './components/DeviceWorkspace';
 import { DeviceOverviewCard } from './components/DeviceOverviewCard';
 import { AppHeaderControls } from './components/AppHeaderControls';
 import { GroupModulationSummary } from './components/GroupModulationSummary';
+import { SimultaneousSweepModal } from './components/SimultaneousSweepModal';
 import { ToastStack } from './components/ToastStack';
 import { useLogsController } from './features/logs/useLogsController';
 import { useLockSummary } from './features/locks/useLockSummary';
@@ -167,6 +169,7 @@ export function App() {
     }
   });
   const [lockPopoverOpen, setLockPopoverOpen] = useState(false);
+  const [simSweepOpen, setSimSweepOpen] = useState(false);
   const [draggingDeviceKey, setDraggingDeviceKey] = useState<string | null>(null);
   const [previewOrderKeys, setPreviewOrderKeys] = useState<string[] | null>(null);
   // Streaming-device tracking is now a mutable ref-backed Set instead of a
@@ -244,6 +247,7 @@ export function App() {
     setLogAutoScroll,
     toasts,
     dismissToast,
+    pushToast,
     loadLogsTail,
     clearLogs,
     copyLogMessage,
@@ -802,6 +806,14 @@ export function App() {
                   { value: '4', label: 'Cols: 4' },
                 ]}
               />
+              <Button
+                size="xs"
+                variant="light"
+                leftSection={<IconWaveSine size={14} />}
+                onClick={() => setSimSweepOpen(true)}
+              >
+                Sweep multiple…
+              </Button>
               <Button size="xs" variant="light" leftSection={<IconPlus size={14} />} onClick={openCreateGroup}>
                 New group
               </Button>
@@ -904,6 +916,13 @@ export function App() {
           </Button>
         </Group>
       </Modal>
+      <SimultaneousSweepModal
+        opened={simSweepOpen}
+        onClose={() => setSimSweepOpen(false)}
+        devices={orderedDevices}
+        statuses={deviceStatusMap}
+        pushToast={pushToast}
+      />
       <Suspense fallback={null}>
         <LogsModal
           opened={logsOpen}
