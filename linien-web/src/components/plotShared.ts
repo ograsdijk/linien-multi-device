@@ -212,17 +212,6 @@ export const writeSeriesInto = (
   return { hasFinite: false, min: Infinity, max: -Infinity };
 };
 
-export const seriesArrayLength = (value: unknown): number => {
-  if (Array.isArray(value)) return value.length;
-  if (ArrayBuffer.isView(value) && 'length' in (value as object)) {
-    return (value as unknown as ArrayLike<number>).length;
-  }
-  if (value && typeof value === 'object') {
-    return Object.keys(value as Record<string, unknown>).length;
-  }
-  return 0;
-};
-
 export type AxisTheme = { axis: string; grid: string; tick: string };
 
 const FALLBACK_AXIS_THEME: AxisTheme = {

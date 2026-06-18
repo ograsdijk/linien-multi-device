@@ -151,6 +151,15 @@ export const useLogsController = (devices: Device[]) => {
     (entries: UiLogEntry[]) => {
       if (entries.length === 0) return;
       const nowMs = Date.now();
+      // Prune stale cooldown fingerprints so the map can't grow unbounded
+      // over a long session.
+      const cooldown = toastCooldownRef.current;
+      const cooldownKeys = Object.keys(cooldown);
+      if (cooldownKeys.length > 256) {
+        for (const key of cooldownKeys) {
+          if (nowMs - cooldown[key] > TOAST_COOLDOWN_MS) delete cooldown[key];
+        }
+      }
       const seenIds = seenLogIdsRef.current;
       const accepted: LogRow[] = [];
       let sawError = false;
@@ -301,18 +310,69 @@ export const useLogsController = (devices: Device[]) => {
     navigator.clipboard.writeText(JSON.stringify(entry, null, 2)).catch(() => null);
   }, []);
 
+  // Keep a stable ref to the latest appendLogEntries so the logs WebSocket
+  // effect can run once (mount) instead of tearing the socket down and
+  // reopening it on every device-list change (rename/add/remove), which also
+  // dropped any buffered live entries.
+  const appendLogEntriesRef = useRef(appendLogEntries);
   useEffect(() => {
-    const socket = openLogsStream((message: LogsStreamMessage) => {
-      if (!message || message.type !== 'log' || !message.entry) return;
-      appendLogEntries([message.entry]);
-    });
-    socket.onopen = () => setLogsWsConnected(true);
-    socket.onclose = () => setLogsWsConnected(false);
-    socket.onerror = () => setLogsWsConnected(false);
-    return () => {
-      socket.close();
-    };
+    appendLogEntriesRef.current = appendLogEntries;
   }, [appendLogEntries]);
+
+  useEffect(() => {
+    const INITIAL_RECONNECT_DELAY_MS = 1000;
+    const MAX_RECONNECT_DELAY_MS = 5000;
+    let disposed = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    let reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+
+    const connect = () => {
+      if (disposed) return;
+      socket = openLogsStream((message: LogsStreamMessage) => {
+        if (!message || message.type !== 'log' || !message.entry) return;
+        appendLogEntriesRef.current([message.entry]);
+      });
+      const current = socket;
+      current.onopen = () => {
+        if (disposed || current !== socket) return;
+        reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+        setLogsWsConnected(true);
+      };
+      const handleDown = () => {
+        if (current !== socket) return;
+        setLogsWsConnected(false);
+        if (disposed || reconnectTimer !== null) return;
+        const delay = reconnectDelay;
+        reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY_MS);
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, delay);
+      };
+      current.onclose = handleDown;
+      current.onerror = handleDown;
+    };
+
+    connect();
+
+    return () => {
+      disposed = true;
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (socket) {
+        // Detach handlers so the intentional close can't schedule a reconnect.
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.close();
+        socket = null;
+      }
+    };
+    // Intentionally mount-once: live deps are read through refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!logsOpen) return;

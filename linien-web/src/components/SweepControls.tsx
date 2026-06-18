@@ -41,6 +41,11 @@ export const SweepControls = memo(function SweepControls({ params, onSetParam }:
   const [dragMode, setDragMode] = useState<'thumb' | 'bar' | null>(null);
   const rangeRef = useRef(range);
   const displayedRangeRef = useRef(range);
+  // Latest params-derived [min, max], refreshed every render, so a drag that
+  // is cancelled reverts to the CURRENT sweep range rather than the (possibly
+  // stale) values captured in the pointerdown closure.
+  const minMaxRef = useRef<[number, number]>([min, max]);
+  minMaxRef.current = [min, max];
   const draggingRef = useRef(false);
   const dragModeRef = useRef<'thumb' | 'bar' | null>(null);
   const dragCleanupRef = useRef<(() => void) | null>(null);
@@ -299,8 +304,9 @@ export const SweepControls = memo(function SweepControls({ params, onSetParam }:
       dragModeRef.current = null;
       clearDragVisualState();
       clearDragPublishState();
-      setRange([min, max]);
-      rangeRef.current = [min, max];
+      const current = minMaxRef.current;
+      setRange(current);
+      rangeRef.current = current;
     };
 
     dragCleanupRef.current = cleanup;

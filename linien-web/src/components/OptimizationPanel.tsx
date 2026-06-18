@@ -116,7 +116,7 @@ export const OptimizationPanel = memo(function OptimizationPanel({
         label="Optimize modulation frequency"
         checked={modFreqEnabled}
         onChange={(event) =>
-          onSetParam('optimization_mod_freq_enabled', event.currentTarget.checked ? 1 : 0, false)
+          onSetParam('optimization_mod_freq_enabled', event.currentTarget.checked, false)
         }
         disabled={disabled}
       />
@@ -139,7 +139,7 @@ export const OptimizationPanel = memo(function OptimizationPanel({
         label="Optimize modulation amplitude"
         checked={modAmpEnabled}
         onChange={(event) =>
-          onSetParam('optimization_mod_amp_enabled', event.currentTarget.checked ? 1 : 0, false)
+          onSetParam('optimization_mod_amp_enabled', event.currentTarget.checked, false)
         }
         disabled={disabled}
       />

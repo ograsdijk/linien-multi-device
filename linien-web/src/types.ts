@@ -193,6 +193,16 @@ export type StreamMessage =
   | ConfigUpdateMessage
   | ({ type: 'status' } & DeviceStatus);
 
+// Mirrors the gateway's Literal["disable","allow","prefer","require",
+// "verify-ca","verify-full"] (schemas.py PostgresManualLockConfig).
+export type PostgresSslMode =
+  | 'disable'
+  | 'allow'
+  | 'prefer'
+  | 'require'
+  | 'verify-ca'
+  | 'verify-full';
+
 export type PostgresManualLockConfig = {
   enabled: boolean;
   host: string;
@@ -200,7 +210,7 @@ export type PostgresManualLockConfig = {
   database: string;
   user: string;
   password: string;
-  sslmode: string;
+  sslmode: PostgresSslMode;
   connect_timeout_s: number;
 };
 
