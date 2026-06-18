@@ -24,6 +24,11 @@ linien-gateway = "app.main:main"
 [tool.setuptools.packages.find]
 namespaces = false
 
+# linien-common/linien-client 2.1.0 pin numpy<2, which conflicts with the
+# numpy>=2.0 dependency above. This override reconciles it, but it is uv-only:
+# a plain `pip install .` does NOT honor it and fails to resolve. Install the
+# gateway with uv (see the README), or relax the numpy pin to <2 if you must
+# use pip.
 [tool.uv]
 override-dependencies = [
   "numpy>=2",

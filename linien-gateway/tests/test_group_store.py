@@ -44,6 +44,49 @@ def test_load_groups_skips_invalid_entries(tmp_path: Path):
     assert groups[0].name == "valid"
 
 
+def test_load_groups_keeps_group_with_unknown_keys(tmp_path: Path):
+    # An extra/unknown field must not drop the whole group (it used to make
+    # Group(**item) raise TypeError).
+    path = tmp_path / "groups.json"
+    path.write_text(
+        """
+        {
+          "0": {"key": "abc", "name": "valid", "device_keys": ["d1"],
+                "auto_include": true, "future_field": 123}
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    groups = load_groups(path=path)
+
+    assert len(groups) == 1
+    assert groups[0].key == "abc"
+    assert groups[0].device_keys == ["d1"]
+    assert groups[0].auto_include is True
+
+
+def test_load_groups_coerces_bad_value_types(tmp_path: Path):
+    path = tmp_path / "groups.json"
+    path.write_text(
+        """
+        {
+          "0": {"key": "abc", "name": "valid", "device_keys": "not-a-list",
+                "auto_include": "yes"},
+          "1": {"key": "def", "name": "mixed", "device_keys": ["d1", 5, "d2"]}
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    groups = load_groups(path=path)
+
+    assert len(groups) == 2
+    assert groups[0].device_keys == []  # non-list coerced to empty
+    assert groups[0].auto_include is True  # truthy string -> True
+    assert groups[1].device_keys == ["d1", "d2"]  # non-str entries dropped
+
+
 def test_save_groups_roundtrip(tmp_path: Path):
     path = tmp_path / "groups.json"
     source = [Group(key="a1", name="All", device_keys=["d1"], auto_include=True)]

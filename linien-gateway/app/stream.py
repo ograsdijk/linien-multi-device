@@ -146,8 +146,11 @@ def encode_plot_frame_binary(frame: Dict[str, Any]) -> bytes:
             )
         else:
             continue
-        if arr.dtype != np.float32:
-            arr = arr.astype(np.float32, copy=False)
+        # Emit little-endian float32 explicitly: that is the documented wire
+        # format and what the client's Float32Array view assumes. On x86/ARM
+        # this matches the native dtype, so it is a no-op (copy=False).
+        if arr.dtype != np.dtype("<f4"):
+            arr = arr.astype("<f4", copy=False)
         if n_points == 0:
             n_points = int(arr.size)
         elif int(arr.size) != n_points:

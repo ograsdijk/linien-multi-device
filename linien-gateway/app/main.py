@@ -150,10 +150,15 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Linien Gateway", lifespan=lifespan)
 
+# allow_origins=["*"] together with allow_credentials=True is an invalid CORS
+# combination (browsers reject it) and needlessly widens cross-site reach. This
+# API uses no cookies/Authorization-credentialed requests, so credentials are
+# not needed; keep the open origin for the trusted-LAN deployment but drop
+# credentials. See the README "Security model" for the broader trust posture.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
