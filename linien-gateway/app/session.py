@@ -127,7 +127,9 @@ class DeviceSession:
         self.last_plot_timestamp: float | None = None
         self._poll_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._lock = threading.Lock()
+        # Reentrant: connect() holds it across its whole body, and the connect
+        # failure path re-enters it via _reset_connection_state().
+        self._lock = threading.RLock()
         self._rpyc_lock = threading.RLock()
         self._state_lock = threading.RLock()
         self._relock_action_lock = threading.Lock()
@@ -947,6 +949,7 @@ class DeviceSession:
         self, *, last_error: str | None = None, request_diagnosis: bool = False
     ) -> None:
         client_to_close: LinienClient | None = None
+        thread_to_join: threading.Thread | None = None
         with self._lock:
             self._stop_event.set()
             client_to_close = self.client
@@ -960,7 +963,19 @@ class DeviceSession:
             self._last_auto_relock_state = None
             self._param_metadata_cache = None
             self._logging_active_cache = None
+            thread_to_join = self._poll_thread
+            self._poll_thread = None
         self._disconnect_client_safely(client_to_close)
+        # Join the previous poll loop (best effort) so a torn-down session
+        # doesn't leave a thread running against a dead client. Never join
+        # ourselves — this can be reached from inside the poll thread via
+        # _handle_poll_failure().
+        if (
+            thread_to_join is not None
+            and thread_to_join is not threading.current_thread()
+            and thread_to_join.is_alive()
+        ):
+            thread_to_join.join(timeout=1.0)
         if request_diagnosis:
             # Unexpected drop (poll failure / failed connect): probe to find out why.
             self.request_diagnosis_probe()
@@ -992,86 +1007,97 @@ class DeviceSession:
         thread.start()
 
     def connect(self, autostart_server: bool = False) -> None:
+        # Hold _lock across the ENTIRE connect so a concurrent disconnect()
+        # (the only other _lock user) cannot interleave between the network
+        # connect and the poll-thread start. Without this, a disconnect that
+        # lands mid-connect was silently undone — connect went on to set
+        # connected=True, clear the stop event, and start a second poll thread
+        # against a client disconnect had just torn down. _lock is an RLock so
+        # the failure path's _reset_connection_state() can re-enter it.
         with self._lock:
             if self.connected or self.connecting:
                 return
             self.connecting = True
-        try:
-            client = LinienClient(self.device)
-            client.connect(
-                autostart_server=autostart_server,
-                use_parameter_cache=True,
-            )
-            self.client = client
-            self.control = client.control
-            self.parameters = client.parameters
-            self.param_cache = {}
-            self.param_cache_serialized = {}
-            self._param_metadata_cache = None
-            self.plot_state = PlotState()
-            with self._rpyc_lock:
-                self._sanitize_parameters_on_connect()
-                self._seed_or_replay_persistent_settings_locked()
-                try:
-                    self._apply_influx_logging_params_locked()
-                except Exception:  # noqa: BLE001 - optional logging setup path
-                    logger.warning(
-                        "Failed to apply influx logging parameter state for device=%s",
-                        self.device.key,
-                        exc_info=True,
-                    )
-                should_resume_logging = bool(
-                    self.influx_logging_state.get("enabled", False)
+            try:
+                client = LinienClient(self.device)
+                client.connect(
+                    autostart_server=autostart_server,
+                    use_parameter_cache=True,
                 )
-                resume_interval = max(
-                    0.1,
-                    float(
-                        self.influx_logging_state.get(
-                            "interval_s", DEFAULT_INFLUX_LOGGING_INTERVAL_S
-                        )
-                    ),
-                )
-                if should_resume_logging:
+                self.client = client
+                self.control = client.control
+                self.parameters = client.parameters
+                self.param_cache = {}
+                self.param_cache_serialized = {}
+                self._param_metadata_cache = None
+                self.plot_state = PlotState()
+                with self._rpyc_lock:
+                    self._sanitize_parameters_on_connect()
+                    self._seed_or_replay_persistent_settings_locked()
                     try:
-                        self.control.exposed_start_logging(resume_interval)
-                        self._logging_active_cache = True
-                    except Exception:  # noqa: BLE001 - optional resume path
+                        self._apply_influx_logging_params_locked()
+                    except Exception:  # noqa: BLE001 - optional logging setup path
                         logger.warning(
-                            "Failed to resume influx logging for device=%s",
+                            "Failed to apply influx logging parameter state for device=%s",
                             self.device.key,
                             exc_info=True,
                         )
-                        self._logging_active_cache = None
-                else:
-                    # Seed the cache once from the server so /statuses
-                    # has an authoritative value without polling RPyC
-                    # every 5 s.
-                    try:
-                        self._logging_active_cache = bool(
-                            self.control.exposed_get_logging_status()
-                        )
-                    except Exception:  # noqa: BLE001 - best effort seed
-                        self._logging_active_cache = None
-            self.connected = True
-            self.connecting = False
-            self.last_error = None
-            with self._state_lock:
-                self._last_connected_at = time.time()
-                self._diagnosis_cache = None
-                self._last_diagnosis_category = None
-                self._wants_diagnosis = False
-            self._register_callbacks()
-            self._stop_event.clear()
-            self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
-            self._poll_thread.start()
-        except (
-            ServerNotRunningException,
-            GeneralConnectionError,
-            InvalidServerVersionException,
-            RPYCAuthenticationException,
-            Exception,
-        ) as exc:
-            self._reset_connection_state(last_error=str(exc), request_diagnosis=True)
+                    should_resume_logging = bool(
+                        self.influx_logging_state.get("enabled", False)
+                    )
+                    resume_interval = max(
+                        0.1,
+                        float(
+                            self.influx_logging_state.get(
+                                "interval_s", DEFAULT_INFLUX_LOGGING_INTERVAL_S
+                            )
+                        ),
+                    )
+                    if should_resume_logging:
+                        try:
+                            self.control.exposed_start_logging(resume_interval)
+                            self._logging_active_cache = True
+                        except Exception:  # noqa: BLE001 - optional resume path
+                            logger.warning(
+                                "Failed to resume influx logging for device=%s",
+                                self.device.key,
+                                exc_info=True,
+                            )
+                            self._logging_active_cache = None
+                    else:
+                        # Seed the cache once from the server so /statuses
+                        # has an authoritative value without polling RPyC
+                        # every 5 s.
+                        try:
+                            self._logging_active_cache = bool(
+                                self.control.exposed_get_logging_status()
+                            )
+                        except Exception:  # noqa: BLE001 - best effort seed
+                            self._logging_active_cache = None
+                self.connected = True
+                self.connecting = False
+                self.last_error = None
+                with self._state_lock:
+                    self._last_connected_at = time.time()
+                    self._diagnosis_cache = None
+                    self._last_diagnosis_category = None
+                    self._wants_diagnosis = False
+                self._register_callbacks()
+                self._stop_event.clear()
+                self._poll_thread = threading.Thread(
+                    target=self._poll_loop, daemon=True
+                )
+                self._poll_thread.start()
+            except (
+                ServerNotRunningException,
+                GeneralConnectionError,
+                InvalidServerVersionException,
+                RPYCAuthenticationException,
+                Exception,
+            ) as exc:
+                self._reset_connection_state(
+                    last_error=str(exc), request_diagnosis=True
+                )
 
     def start_server(self) -> None:
         self.connect_async(autostart_server=True)
