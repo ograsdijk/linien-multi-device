@@ -318,6 +318,9 @@ A code audit (findings independently verified) drove the fixes in this section.
   disconnect can no longer be silently undone or leak a poll thread.
 - **Auto-relock retry** — a failed attempt now retries regardless of the live lock state
   (it no longer abandons the device unlocked after a single sweep-mode failure).
+- **Auto-relock no longer stalls reads** — the controller's `tick()` decides under
+  `_state_lock` and the blocking relock sweep/scan runs outside it, so `status()` /
+  snapshot reads don't block during a relock.
 - **Diagnosis lock-state** — "lock likely held" is no longer reported when the FPGA
   gateware is not loaded (now "lost"/"unknown" as appropriate).
 - **Installed entrypoint** honors `config.json` (apiHost/apiPort), matching `run.py`.
@@ -344,11 +347,6 @@ A code audit (findings independently verified) drove the fixes in this section.
   — these are single-attribute reads/writes that are atomic under the CPython GIL, so the
   worst case is a momentarily stale flag. Adding locks to the hot `status()` path is
   net-negative; left as-is.
-- **Moving the auto-relock RPyC round-trips out of `_state_lock`** (perf during an active
-  relock) — doing this safely requires splitting the controller's `tick()` into a
-  decide-under-lock / act-outside-lock pair (any lock held across the RPyC reproduces the
-  same stall, since `status()` reads auto-relock state). Deferred as a focused follow-up;
-  it only affects latency during a relock sequence, not steady state.
 
 ## Known limitations
 
