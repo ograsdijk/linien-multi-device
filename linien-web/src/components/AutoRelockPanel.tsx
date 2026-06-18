@@ -36,8 +36,14 @@ export const AutoRelockPanel = memo(function AutoRelockPanel({
 
   useEffect(() => {
     if (!config) return;
+    // Don't let an incoming config broadcast (often our own save echoed back
+    // over the websocket, or another client's update) clobber edits the user
+    // is in the middle of making. `dirty` is read fresh each time `config`
+    // changes, so it reflects whether the user was editing when this arrived.
+    if (dirty) return;
     setDraft(config);
     setDirty(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config]);
 
   const updateField = <K extends keyof AutoRelockConfig>(

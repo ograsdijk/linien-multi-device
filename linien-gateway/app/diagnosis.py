@@ -274,18 +274,30 @@ def classify_diagnosis(
         elif result.lock_bit == 0:
             lock_state = "unlocked"
             message = "linien-server is down; the FPGA is running but not locked."
-        else:
-            lock_state = "likely_held"
-            if result.lock_read_attempted:
-                detail = (
-                    "lock register unreadable — check that `devmem` and the FPGA "
-                    "manager are available on this image"
-                )
-            else:
-                detail = "lock register not read"
+        elif result.fpga_operating is False:
+            # The lock register could not be read because the gateware is not
+            # loaded (fpga_manager state != "operating"). With no gateware the
+            # FPGA cannot be holding the lock, so do NOT claim "likely held".
+            lock_state = "lost"
             message = (
-                "linien-server is down; the FPGA is still loaded, so the lock is "
-                f"likely still held ({detail})."
+                "linien-server is down and the FPGA gateware is not loaded "
+                "(fpga_manager state is not 'operating'), so the lock is lost."
+            )
+        elif result.fpga_operating is None:
+            # FPGA state could not be determined at all — stay honest.
+            lock_state = "unknown"
+            message = (
+                "linien-server is down; the FPGA state could not be read, so the "
+                "lock state is unknown."
+            )
+        else:
+            # FPGA gateware is loaded but the lock register itself was
+            # unreadable (e.g. devmem missing on this image).
+            lock_state = "likely_held"
+            message = (
+                "linien-server is down; the FPGA gateware is still loaded, so the "
+                "lock is likely still held (lock register unreadable — check that "
+                "`devmem` and the FPGA manager are available on this image)."
             )
 
     return {

@@ -73,10 +73,24 @@ def load_groups(path=GROUPS_PATH) -> List[Group]:
                 "Skipping group entry without valid name in %s: %r", path, item
             )
             continue
-        try:
-            groups.append(Group(**item))
-        except TypeError:
-            logger.warning("Skipping invalid group entry in %s: %r", path, item)
+        # Build from known fields only: tolerate unknown/extra keys (which
+        # would otherwise make Group(**item) raise TypeError and drop the
+        # whole group), and coerce the value types so a malformed
+        # device_keys/auto_include can't poison the dataclass.
+        raw_device_keys = item.get("device_keys", [])
+        device_keys = (
+            [k for k in raw_device_keys if isinstance(k, str)]
+            if isinstance(raw_device_keys, list)
+            else []
+        )
+        groups.append(
+            Group(
+                key=item["key"],
+                name=item["name"],
+                device_keys=device_keys,
+                auto_include=bool(item.get("auto_include", False)),
+            )
+        )
     return groups
 
 

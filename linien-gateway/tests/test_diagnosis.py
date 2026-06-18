@@ -75,25 +75,31 @@ def test_classify_crash_lock_confirmed_unlocked():
     assert d["lock_state"] == "unlocked"
 
 
-def test_classify_crash_lock_inferred_when_register_not_read():
-    # Read was never attempted (e.g. gateway restarted, since_connected unknown).
-    d = _classify(ProbeResult(False, True, 3600.0, True, None), since=None)
-    assert d["category"] == CATEGORY_SERVER_CRASHED
-    assert d["lock_state"] == "likely_held"
-    assert "likely" in d["message"].lower()
-    assert "not read" in d["message"].lower()
-
-
-def test_classify_crash_lock_inferred_when_register_unreadable():
-    # Read was attempted but failed (e.g. devmem missing) -> distinct wording.
-    result = ProbeResult(
-        False, True, 3600.0, True, None, lock_read_attempted=True
-    )
+def test_classify_crash_lock_likely_when_fpga_operating_but_register_unreadable():
+    # Gateware loaded but the lock register couldn't be read (e.g. devmem
+    # missing) -> lock is likely still held.
+    result = ProbeResult(False, True, 3600.0, True, None, lock_read_attempted=True)
     d = _classify(result, since=60.0)
     assert d["category"] == CATEGORY_SERVER_CRASHED
     assert d["lock_state"] == "likely_held"
     assert "unreadable" in d["message"].lower()
     assert "devmem" in d["message"].lower()
+
+
+def test_classify_crash_lock_lost_when_fpga_not_operating():
+    # Gateware is NOT loaded -> the FPGA cannot be holding the lock, so the
+    # classifier must not claim "likely held".
+    d = _classify(ProbeResult(False, True, 3600.0, False, None), since=60.0)
+    assert d["category"] == CATEGORY_SERVER_CRASHED
+    assert d["lock_state"] == "lost"
+    assert "not loaded" in d["message"].lower()
+
+
+def test_classify_crash_lock_unknown_when_fpga_state_unknown():
+    # FPGA state couldn't be determined at all -> stay honest.
+    d = _classify(ProbeResult(False, True, 3600.0, None, None), since=60.0)
+    assert d["category"] == CATEGORY_SERVER_CRASHED
+    assert d["lock_state"] == "unknown"
 
 
 # --- probe_device --------------------------------------------------------

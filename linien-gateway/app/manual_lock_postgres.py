@@ -18,6 +18,9 @@ except Exception:  # pragma: no cover - exercised through runtime status/message
     psycopg = None  # type: ignore
 
 LOCK_RESULT_POSTGRES_CONFIG_PATH = USER_DATA_PATH / "manual_lock_postgres.json"
+# How long to let the writer thread drain queued rows on shutdown before
+# giving up (pending lock results are lost past this).
+SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
 logger = logging.getLogger(__name__)
 PostgresEventCallback = Callable[[int, str, str, str, dict[str, Any]], None]
 CREATE_TABLE_SQL = """
@@ -182,7 +185,9 @@ class LockResultPostgresService:
     def stop(self) -> None:
         self._stop_event.set()
         if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=2.0)
+            # Give the worker time to drain queued rows before exiting; too
+            # short a timeout silently drops pending lock results on shutdown.
+            self._worker_thread.join(timeout=SHUTDOWN_DRAIN_TIMEOUT_S)
         self._worker_thread = None
         with self._lock:
             self._status.active = False
@@ -344,7 +349,9 @@ class LockResultPostgresService:
         with self._lock:
             self._status.dropped_count += 1
             self._status.last_error = error
-            self._status.active = False
+            # A queue-full drop is transient back-pressure, not a connection
+            # failure — keep `active` reflecting DB health (set by test/write)
+            # rather than flipping it False on every burst.
 
     def _emit_event(
         self,

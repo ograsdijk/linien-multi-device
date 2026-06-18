@@ -20,7 +20,12 @@ import type {
 
 const envBase = import.meta.env?.VITE_API_URL as string | undefined;
 const browserBase = typeof window !== 'undefined' ? `${window.location.origin}/api` : undefined;
-const API_BASE = envBase || browserBase || 'http://localhost:8000/api';
+// Trim trailing slashes so `${API_BASE}${path}` (path starts with "/") and the
+// ws-scheme rewrite in ws.ts don't produce a doubled slash.
+const API_BASE = (envBase || browserBase || 'http://localhost:8000/api').replace(
+  /\/+$/,
+  ''
+);
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -28,18 +33,25 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     ...options,
   });
   if (!res.ok) {
+    // The body can only be read once — read it as text, then try to parse the
+    // FastAPI `detail` out of it. Reading res.json() then res.text() throws
+    // "body stream already read" and masks the real error.
+    const raw = await res.text().catch(() => '');
     const contentType = res.headers.get('content-type') ?? '';
-    if (contentType.includes('application/json')) {
-      const payload = await res.json().catch(() => null);
-      if (payload && typeof payload.detail === 'string') {
-        throw new Error(payload.detail);
-      }
-      if (payload != null) {
-        throw new Error(JSON.stringify(payload));
+    let detail: string | null = null;
+    if (contentType.includes('application/json') && raw) {
+      try {
+        const payload = JSON.parse(raw);
+        if (payload && typeof payload.detail === 'string') {
+          detail = payload.detail;
+        } else if (payload != null) {
+          detail = JSON.stringify(payload);
+        }
+      } catch {
+        // Not valid JSON despite the header — fall back to the raw text.
       }
     }
-    const text = await res.text();
-    throw new Error(text || res.statusText);
+    throw new Error(detail || raw || res.statusText);
   }
   if (res.status === 204) {
     return undefined as T;

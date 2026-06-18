@@ -223,6 +223,9 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
           setAutoRelockConfig(msg.value as AutoRelockConfig);
           setAutoRelockError(null);
         }
+        // config_update is fully handled above; the store updater ignores it,
+        // so don't fall through to a dead onStateUpdate call.
+        return;
       }
       onStateUpdate(device.key, msg);
     },
@@ -306,11 +309,15 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     if (!hasAutolockSelectionParam && !hasOptimizationSelectionParam) {
       return;
     }
-    const backendMode = Boolean(state.params.autolock_selection)
-      ? 'autolock'
-      : Boolean(state.params.optimization_selection)
-      ? 'optimization'
-      : null;
+    // Ignore a backend-reported selection flag for a temporarily-disabled
+    // feature — otherwise a stale/echoed flag would freeze the plot in a
+    // selection mode the user can never exit (the feature's controls are off).
+    const backendMode =
+      Boolean(state.params.autolock_selection) && !autolockTemporarilyDisabled
+        ? 'autolock'
+        : Boolean(state.params.optimization_selection) && !optimizationTemporarilyDisabled
+        ? 'optimization'
+        : null;
     setSelectionMode((current) => (current === backendMode ? current : backendMode));
     if (backendMode === null) {
       setSelectionSubmitting(false);
@@ -320,6 +327,8 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
     hasOptimizationSelectionParam,
     state.params.autolock_selection,
     state.params.optimization_selection,
+    autolockTemporarilyDisabled,
+    optimizationTemporarilyDisabled,
   ]);
 
   const setParam = useCallback((

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from copy import copy
@@ -17,6 +18,8 @@ from rpyc.utils.authenticators import AuthenticationError
 
 from .model import SimulatorStatus, VirtualPdhModel
 from .parameters import MHZ_UNIT, VPP_UNIT, SimParameters
+
+logger = logging.getLogger(__name__)
 
 SERVER_VERSION = "2.1.0"
 
@@ -107,23 +110,24 @@ class VirtualLinienControlService(rpyc.Service):
             dt = max(1e-4, min(0.2, now - last_tick))
             last_tick = now
 
-            with self._sim_lock:
-                self.model.advance(dt, self.parameters)
-                if not bool(self.parameters.pause_acquisition.value):
-                    to_plot = self.model.build_plot(self.parameters)
-                    self.parameters.to_plot.value = pack(to_plot)
-                    self.parameters.signal_stats.value = self.model.build_signal_stats(to_plot)
-                    self.parameters.control_signal_history.value = {
-                        "times": [],
-                        "values": [],
-                        "slow_times": [],
-                        "slow_values": [],
-                    }
-                    self.parameters.monitor_signal_history.value = {"times": [], "values": []}
+            # Guard the whole tick: one bad frame must not kill the loop and
+            # silently freeze all plots while the device still reports
+            # connected.
+            try:
+                with self._sim_lock:
+                    self.model.advance(dt, self.parameters)
+                    if not bool(self.parameters.pause_acquisition.value):
+                        to_plot = self.model.build_plot(self.parameters)
+                        self.parameters.to_plot.value = pack(to_plot)
+                        self.parameters.signal_stats.value = self.model.build_signal_stats(
+                            to_plot
+                        )
 
-            if now - last_ping >= 1.0:
-                self.parameters.ping.value = int(self.parameters.ping.value) + 1
-                last_ping = now
+                if now - last_ping >= 1.0:
+                    self.parameters.ping.value = int(self.parameters.ping.value) + 1
+                    last_ping = now
+            except Exception:  # noqa: BLE001 - keep the sim loop alive
+                logger.exception("Simulation tick failed; continuing")
 
             time.sleep(self.frame_period_s)
 
@@ -233,13 +237,18 @@ class VirtualLinienControlService(rpyc.Service):
 
     def exposed_start_optimization(self, x0, x1, spectrum) -> None:
         _ = (x0, x1, spectrum)
+        # Flip-then-clear like the autolock stub above, so a real device's
+        # "running -> done" transition is mimicked instead of latching True.
         self.parameters.optimization_running.value = True
+        self.parameters.optimization_running.value = False
 
     def exposed_start_psd_acquisition(self) -> None:
         self.parameters.psd_acquisition_running.value = True
+        self.parameters.psd_acquisition_running.value = False
 
     def exposed_start_pid_optimization(self) -> None:
         self.parameters.psd_optimization_running.value = True
+        self.parameters.psd_optimization_running.value = False
 
     def exposed_start_sweep(self) -> None:
         with self._sim_lock:

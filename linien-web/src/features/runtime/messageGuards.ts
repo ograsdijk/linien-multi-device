@@ -37,6 +37,10 @@ export const isDeviceStatus = (value: unknown): value is DeviceStatus => {
   if (!isOptionalFiniteNumber(value.last_plot)) return false;
   if (value.logging_active != null && !isBoolean(value.logging_active)) return false;
   if (value.lock != null && !isBoolean(value.lock)) return false;
+  // Nested objects are asserted by the DeviceStatus type; reject obviously
+  // wrong shapes (a non-object/non-null) rather than passing them through.
+  if (value.diagnosis != null && !isObject(value.diagnosis)) return false;
+  if (value.auto_relock != null && !isObject(value.auto_relock)) return false;
   return true;
 };
 

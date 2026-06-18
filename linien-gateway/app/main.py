@@ -20,6 +20,8 @@ from linien_common.influxdb import InfluxDBCredentials
 
 from . import device_store, group_store
 from .config import (
+    get_api_host,
+    get_api_port,
     get_plot_stream_default_fps,
     get_plot_stream_drop_old_frames,
     get_plot_stream_max_fps_cap,
@@ -148,10 +150,15 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Linien Gateway", lifespan=lifespan)
 
+# allow_origins=["*"] together with allow_credentials=True is an invalid CORS
+# combination (browsers reject it) and needlessly widens cross-site reach. This
+# API uses no cookies/Authorization-credentialed requests, so credentials are
+# not needed; keep the open origin for the trusted-LAN deployment but drop
+# credentials. See the README "Security model" for the broader trust posture.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1316,10 +1323,14 @@ def serve_spa(path: str):
 
 
 def main() -> None:
+    # Honor config.json (apiHost/apiPort) like run.py, instead of hardcoding,
+    # so the installed `linien-gateway` console script and `python run.py`
+    # bind the same interface/port. (The Docker image passes --host/--port to
+    # uvicorn directly, so it is unaffected.)
     uvicorn.run(
         "app.main:app",
-        host="0.0.0.0",
-        port=8000,
+        host=get_api_host(),
+        port=get_api_port(),
         reload=False,
         # See run.py for the rationale; same flag for the no-reload
         # production-style invocation.

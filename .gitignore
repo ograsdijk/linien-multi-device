@@ -53,6 +53,10 @@ linien-gateway/*.egg-info/
 # Logs
 *.log
 device_settings.json
+# ...but the Docker stack needs a committed seed file to bind-mount (an empty
+# {}), otherwise Docker creates a directory at the mount path and persistence
+# breaks.
+!docker/linien-multi-device/data/device_settings.json
 
 # OS / Editor
 .DS_Store

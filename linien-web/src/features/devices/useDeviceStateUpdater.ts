@@ -75,8 +75,11 @@ export const useDeviceStateUpdater = () => {
         window.clearTimeout(timeoutIdRef.current);
         timeoutIdRef.current = null;
       }
+      // Flush any buffered param updates into the (module-level) store so a
+      // scheduled-but-not-yet-applied batch isn't silently dropped on unmount.
+      flushPendingParams();
     };
-  }, []);
+  }, [flushPendingParams]);
 
   return useCallback(
     (deviceKey: string, message: StreamMessage) => {

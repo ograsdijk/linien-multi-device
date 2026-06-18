@@ -34,6 +34,12 @@ const labelForDiagnosis = (
       if (diagnosis.lock_state === 'unlocked') {
         return { label: 'Server down · not locked', color: 'red' };
       }
+      if (diagnosis.lock_state === 'lost') {
+        return { label: 'Server down · lock lost', color: 'red' };
+      }
+      if (diagnosis.lock_state === 'unknown') {
+        return { label: 'Server down · state unknown', color: 'amber' };
+      }
       return { label: 'Server down · lock likely', color: 'amber' };
     default:
       return { label: 'Disconnected', color: 'dimmed' };
