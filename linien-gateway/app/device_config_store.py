@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,8 @@ from typing import Any
 from linien_client.device import Device
 
 from .path_utils import resolve_repo_path
+
+logger = logging.getLogger(__name__)
 
 CONFIG_AUTO_LOCK_SCAN = "auto_lock_scan_settings"
 CONFIG_LOCK_INDICATOR = "lock_indicator_config"
@@ -58,10 +61,25 @@ class DeviceConfigStore:
 
     def _write_to_disk_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
         payload = json.dumps(self._data, indent=2, sort_keys=True)
+        temp_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
         temp_path.write_text(payload, encoding="utf-8")
-        temp_path.replace(self._path)
+        try:
+            temp_path.replace(self._path)
+        except OSError:
+            # Atomic rename fails across filesystems — notably when the target
+            # is a single-file Docker bind mount (the temp file is on the
+            # container overlay, the target on the host fs -> EXDEV). Fall back
+            # to a direct (non-atomic) write so persistence still works there.
+            logger.warning(
+                "Atomic write of %s failed; falling back to direct write",
+                self._path,
+                exc_info=True,
+            )
+            try:
+                self._path.write_text(payload, encoding="utf-8")
+            finally:
+                temp_path.unlink(missing_ok=True)
 
     def get_device_configs(self, device_key: str) -> dict[str, Any]:
         with self._lock:
