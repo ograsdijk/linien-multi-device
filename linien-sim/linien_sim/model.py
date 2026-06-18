@@ -68,7 +68,6 @@ class VirtualPdhModel:
         self.pid_integrator = 0.0
         self.prev_error_v = 0.0
         self.last_effective_detuning_v = 0.0
-        self.last_error_v = 0.0
 
         self.ramp_remaining_v = 0.0
         self.ramp_rate_v_per_s = 0.0
@@ -385,24 +384,6 @@ class VirtualPdhModel:
             combined = -combined
         return np.asarray(combined, dtype=float)
 
-    def determine_target_slope_rising(self, params: Any) -> bool:
-        probe = max(self.linewidth_v * 0.01, 1e-4)
-        lower = float(
-            self._combined_error_signal(
-                -probe,
-                params,
-                apply_target_slope=False,
-            )
-        )
-        upper = float(
-            self._combined_error_signal(
-                probe,
-                params,
-                apply_target_slope=False,
-            )
-        )
-        return upper >= lower
-
     def _apply_ramp(self, dt_s: float) -> None:
         if abs(self.ramp_remaining_v) <= 1e-12 or abs(self.ramp_rate_v_per_s) <= 1e-12:
             return
@@ -473,7 +454,6 @@ class VirtualPdhModel:
             control = control_candidate
         self.control_output_v = _clip(control, -self.control_limit_v, self.control_limit_v)
         self.prev_error_v = error
-        self.last_error_v = error
         self.last_effective_detuning_v = effective_detuning_for_error
 
     def advance(self, dt_s: float, params: Any) -> None:
@@ -484,7 +464,6 @@ class VirtualPdhModel:
             self.pid_integrator *= 0.9
             self.control_output_v *= 0.85
             self.last_effective_detuning_v = self._laser_with_disturbance
-            self.last_error_v = 0.0
 
     def _build_unlocked_plot(self, params: Any) -> dict[str, np.ndarray]:
         center = float(params.sweep_center.value)
