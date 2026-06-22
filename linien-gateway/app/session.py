@@ -982,6 +982,11 @@ class DeviceSession:
         else:
             # Intentional disconnect: stop probing and drop any stale diagnosis.
             self._clear_diagnosis()
+        # Notify streaming clients of the disconnect so the UI flips back to its
+        # "Not connected" state immediately. Done after the diagnosis bookkeeping
+        # above so the published status reflects the final cleared/requested
+        # diagnosis state.
+        self._publish_status()
 
     def _handle_poll_failure(self, exc: Exception) -> None:
         logger.warning(
@@ -997,6 +1002,27 @@ class DeviceSession:
             details={"error": str(exc)},
         )
         self._reset_connection_state(last_error=str(exc), request_diagnosis=True)
+
+    def _publish_status(self) -> None:
+        """Broadcast the current status over the per-device stream.
+
+        Called on every connection-state transition so clients with an open
+        stream learn about connect/disconnect immediately, instead of waiting
+        for the next /statuses backstop poll (which is skipped for actively
+        streaming devices). publish() is non-blocking — it only schedules the
+        broadcast on the event loop — so this is safe to call while holding
+        self._lock or from the poll thread.
+        """
+        try:
+            self.manager.publish(
+                self.device.key, {"type": "status", **self.status()}
+            )
+        except Exception:  # noqa: BLE001 - status publish is best effort
+            logger.debug(
+                "Failed publishing status update device=%s",
+                self.device.key,
+                exc_info=True,
+            )
 
     def connect_async(self, autostart_server: bool = False) -> None:
         if self.connected or self.connecting:
@@ -1088,6 +1114,10 @@ class DeviceSession:
                     target=self._poll_loop, daemon=True
                 )
                 self._poll_thread.start()
+                # Tell streaming clients we're connected now. Without this the
+                # UI stays greyed-out ("Not connected") until a stream reopen
+                # or the next backstop poll, even as plot frames flow.
+                self._publish_status()
             except (
                 ServerNotRunningException,
                 GeneralConnectionError,
