@@ -53,6 +53,28 @@ logger = logging.getLogger(__name__)
 LOCK_RUNNING_REGISTER_ADDR = 0x4030443C
 FPGA_STATE_PATH = "/sys/class/fpga_manager/fpga0/state"
 
+# Ordered methods for reading the lock-status register over SSH. Both are pure
+# 32-bit register reads (mmap of /dev/mem): reading a status register has no
+# side effects and CANNOT disturb the loaded gateware — that is the
+# fpga_manager/bitstream path, which we never touch. `timeout 2` bounds a
+# possible AXI bus hang if the PL region is unmapped.
+#   1. busybox/standalone `devmem` — present on many images, fast.
+#   2. python3 /dev/mem mmap — fallback for images without `devmem`. python3 is
+#      always available because linien-server is itself a Python service. The
+#      one-liner reads exactly 4 bytes at the (page-aligned) register address;
+#      only bit 0 is used, so word endianness is irrelevant.
+_LOCK_BIT_DEVMEM_CMD = f"timeout 2 devmem {hex(LOCK_RUNNING_REGISTER_ADDR)}"
+_LOCK_BIT_PY_SCRIPT = (
+    "import mmap,os,struct;"
+    f"A={hex(LOCK_RUNNING_REGISTER_ADDR)};"
+    "P=mmap.PAGESIZE;b=A&~(P-1);"
+    "f=os.open('/dev/mem',os.O_RDONLY);"
+    "m=mmap.mmap(f,P,mmap.MAP_SHARED,mmap.PROT_READ,offset=b);"
+    "print('0x%08x'%struct.unpack('<I',m[A-b:A-b+4])[0])"
+)
+_LOCK_BIT_PY_CMD = f'timeout 2 python3 -c "{_LOCK_BIT_PY_SCRIPT}"'
+_LOCK_BIT_CMDS = (_LOCK_BIT_DEVMEM_CMD, _LOCK_BIT_PY_CMD)
+
 SSH_PORT = 22
 TCP_PROBE_TIMEOUT_S = 2.0
 SSH_CONNECT_TIMEOUT_S = 6.0
@@ -130,10 +152,18 @@ def _read_uptime_and_fpga(conn: Connection) -> tuple[float | None, bool | None]:
     return _parse_uptime_fpga(result.stdout or "")
 
 
-def _read_lock_bit(conn: Connection) -> int | None:
-    # `timeout 2` bounds a possible AXI bus hang if the PL region is unmapped.
-    cmd = f"timeout 2 devmem {hex(LOCK_RUNNING_REGISTER_ADDR)}"
-    result = conn.run(cmd, hide=True, warn=True, timeout=SSH_COMMAND_TIMEOUT_S)
+def _run_lock_bit_cmd(conn: Connection, cmd: str) -> int | None:
+    """Run one register-read command and return bit 0 of its value, or None.
+
+    None means "this method yielded nothing" — command missing (exit 127),
+    non-zero exit, empty/unparseable output, or a transport error — so the
+    caller can fall through to the next method.
+    """
+    try:
+        result = conn.run(cmd, hide=True, warn=True, timeout=SSH_COMMAND_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 - any transport/command error -> try next method
+        logger.debug("lock-bit command errored cmd=%r", cmd, exc_info=True)
+        return None
     if result.exited != 0:
         return None
     tokens = (result.stdout or "").strip().split()
@@ -144,6 +174,21 @@ def _read_lock_bit(conn: Connection) -> int | None:
     except ValueError:
         return None
     return value & 1
+
+
+def _read_lock_bit(conn: Connection) -> int | None:
+    """Read bit 0 of the FPGA lock-status register over SSH.
+
+    Tries `devmem`, then a python3 /dev/mem mmap read, returning on the first
+    method that yields a value. Both are pure register reads and cannot disturb
+    the loaded gateware. Returns None only if every method fails (register
+    genuinely unreadable on this image).
+    """
+    for cmd in _LOCK_BIT_CMDS:
+        bit = _run_lock_bit_cmd(conn, cmd)
+        if bit is not None:
+            return bit
+    return None
 
 
 def probe_device(
@@ -292,12 +337,14 @@ def classify_diagnosis(
             )
         else:
             # FPGA gateware is loaded but the lock register itself was
-            # unreadable (e.g. devmem missing on this image).
+            # unreadable — both the `devmem` and python3 /dev/mem read methods
+            # failed (e.g. /dev/mem not accessible to the SSH user).
             lock_state = "likely_held"
             message = (
                 "linien-server is down; the FPGA gateware is still loaded, so the "
-                "lock is likely still held (lock register unreadable — check that "
-                "`devmem` and the FPGA manager are available on this image)."
+                "lock is likely still held (lock register unreadable — neither "
+                "`devmem` nor a python3 /dev/mem read returned a value; check "
+                "/dev/mem access for the SSH user)."
             )
 
     return {

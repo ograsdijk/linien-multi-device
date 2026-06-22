@@ -177,6 +177,60 @@ def test_probe_skips_register_read_on_low_uptime(monkeypatch):
     assert result.lock_read_attempted is False
 
 
+def test_probe_falls_back_to_python_when_devmem_missing(monkeypatch):
+    # devmem absent (shell exit 127) -> python3 /dev/mem read supplies the bit.
+    monkeypatch.setattr(diagnosis, "_tcp_open", lambda *a, **k: False)
+
+    class _NoDevmemConn(_FakeConnection):
+        def run(self, cmd, **_kwargs):
+            self.commands.append(cmd)
+            if "uptime" in cmd:
+                return _FakeResult("3601.5 1234.5\n---\noperating\n")
+            if "devmem" in cmd:
+                return _FakeResult("", exited=127)
+            if "python3" in cmd:
+                return _FakeResult("0x00000001\n")
+            return _FakeResult("", exited=1)
+
+    monkeypatch.setattr(diagnosis, "Connection", _NoDevmemConn)
+    result = probe_device(_device(), seconds_since_last_connected=60.0)
+    assert result.lock_bit == 1
+    assert result.lock_read_attempted is True
+
+
+def test_probe_lock_bit_none_when_all_read_methods_fail(monkeypatch):
+    # Neither devmem nor python3 yields a value -> lock_bit None but the read
+    # was attempted (drives the "likely_held / unreadable" classification).
+    monkeypatch.setattr(diagnosis, "_tcp_open", lambda *a, **k: False)
+
+    class _NoReadConn(_FakeConnection):
+        def run(self, cmd, **_kwargs):
+            self.commands.append(cmd)
+            if "uptime" in cmd:
+                return _FakeResult("3601.5 1234.5\n---\noperating\n")
+            return _FakeResult("", exited=127)
+
+    monkeypatch.setattr(diagnosis, "Connection", _NoReadConn)
+    result = probe_device(_device(), seconds_since_last_connected=60.0)
+    assert result.fpga_operating is True
+    assert result.lock_bit is None
+    assert result.lock_read_attempted is True
+
+
+def test_read_lock_bit_tries_devmem_before_python():
+    # Ordering: devmem is consulted first; python3 only as a fallback.
+    class _OrderConn(_FakeConnection):
+        def run(self, cmd, **_kwargs):
+            self.commands.append(cmd)
+            return _FakeResult("0x00000000\n")  # both would parse to bit 0
+
+    conn = _OrderConn()
+    assert diagnosis._read_lock_bit(conn) == 0
+    # Only the first (devmem) method runs because it already returned a value.
+    assert len(conn.commands) == 1
+    assert "devmem" in conn.commands[0]
+
+
 def test_probe_auth_failure_marks_reachable_unknown(monkeypatch):
     monkeypatch.setattr(diagnosis, "_tcp_open", lambda *a, **k: False)
 
