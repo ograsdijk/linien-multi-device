@@ -31,22 +31,56 @@ def _encode_ws_payload(payload: Dict[str, Any]) -> str:
     directly without an intermediate `tolist()`.
     """
     try:
-        return orjson.dumps(payload, option=orjson.OPT_SERIALIZE_NUMPY).decode("utf-8")
+        return orjson.dumps(
+            payload,
+            default=_json_fallback_default,
+            option=orjson.OPT_SERIALIZE_NUMPY,
+        ).decode("utf-8")
     except TypeError:
         logger.warning(
             "orjson encode rejected payload, falling back to stdlib json. "
-            "Output may contain NaN/Infinity literals which the browser "
-            "cannot parse; treat as a data-quality bug.",
+            "Output may contain null substitutions for non-finite values; "
+            "treat as a data-quality bug.",
             exc_info=True,
         )
-        return json.dumps(payload, default=_json_fallback_default)
+        return json.dumps(
+            _json_sanitize(payload),
+            allow_nan=False,
+            default=_json_fallback_default,
+        )
+
+
+def _json_sanitize(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, np.ndarray):
+        return _json_sanitize(value.tolist())
+    if isinstance(value, dict):
+        return {str(key): _json_sanitize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_sanitize(item) for item in value]
+    return value
 
 
 def _json_fallback_default(value: Any) -> Any:
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return _json_sanitize(value.tolist())
+    if isinstance(value, np.bool_):
+        return bool(value)
     if isinstance(value, (np.floating,)):
-        return float(value)
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
     if isinstance(value, (np.integer,)):
         return int(value)
     raise TypeError(
@@ -55,6 +89,7 @@ def _json_fallback_default(value: Any) -> Any:
 
 
 # --- Plot frame encoders --------------------------------------------------
+
 #
 # Plot frames after #6 hold numpy arrays in their `series` dict. The two
 # encoders below diverge from here:

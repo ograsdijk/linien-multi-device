@@ -4,8 +4,10 @@ import logging
 import threading
 import time
 
+import numpy as np
+
 from app.plot_processing import SUMMARY_SERIES_KEYS
-from app.stream import ConnectionState, WebsocketManager
+from app.stream import ConnectionState, WebsocketManager, _encode_ws_payload
 
 
 class DummyWebSocket:
@@ -29,6 +31,56 @@ def _snapshot_state(state: ConnectionState) -> dict:
         "detail": state.detail,
         "last_plot": state.last_plot,
         "latest_plot_message": state.latest_plot_message,
+    }
+
+
+def test_encode_ws_payload_accepts_nested_numpy_scalars():
+    encoded = _encode_ws_payload(
+        {
+            "type": "status",
+            "value": np.float64(1.25),
+            "nested": {
+                "integer": np.int64(2),
+                "flag": np.bool_(True),
+                "array": np.array([1.0, 2.0], dtype=np.float64),
+            },
+        }
+    )
+
+    assert json.loads(encoded) == {
+        "type": "status",
+        "value": 1.25,
+        "nested": {
+            "integer": 2,
+            "flag": True,
+            "array": [1.0, 2.0],
+        },
+    }
+
+
+def test_encode_ws_payload_never_emits_non_finite_literals():
+    encoded = _encode_ws_payload(
+        {
+            "type": "plot_frame",
+            "value": np.float64(np.nan),
+            "nested": {
+                "positive": float("inf"),
+                "negative": np.float64(float("-inf")),
+                "array": np.array([0.0, np.nan, np.inf], dtype=np.float64),
+            },
+        }
+    )
+
+    assert "NaN" not in encoded
+    assert "Infinity" not in encoded
+    assert json.loads(encoded) == {
+        "type": "plot_frame",
+        "value": None,
+        "nested": {
+            "positive": None,
+            "negative": None,
+            "array": [0.0, None, None],
+        },
     }
 
 
