@@ -416,7 +416,10 @@ export const OverviewPlotPanel = forwardRef<
             width: key.includes('signal_strength') ? 1 : 1.5,
             points: POINT_STYLE,
             spanGaps: true,
-            show: true,
+            // Hidden until the first frame turns the right series on. Otherwise
+            // a never-connected device renders all series as flat lines at y=0
+            // (the zero-filled buffers) — most visibly the purple error_signal_2.
+            show: false,
           };
         }),
       ],

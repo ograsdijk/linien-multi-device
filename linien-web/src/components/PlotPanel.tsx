@@ -546,7 +546,10 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
             points: POINT_STYLE,
             spanGaps: true,
             class: style.legendHidden ? 'legend-hidden' : undefined,
-            show: true,
+            // Hidden until the first frame turns the right series on. Otherwise
+            // a never-connected device renders all series as flat lines at y=0
+            // (the zero-filled buffers) — most visibly the purple error_signal_2.
+            show: false,
           };
         }),
       ],
