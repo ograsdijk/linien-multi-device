@@ -16,7 +16,13 @@ import type {
   PostgresManualLockConfig,
   PostgresManualLockState,
   PostgresManualLockTestResult,
+  PsdTailResponse,
 } from './types';
+
+export type PsdStartOptions = {
+  algorithm?: number;
+  maxDecimation?: number;
+};
 
 const envBase = import.meta.env?.VITE_API_URL as string | undefined;
 const browserBase = typeof window !== 'undefined' ? `${window.location.origin}/api` : undefined;
@@ -199,6 +205,36 @@ export const api = {
   getLogsTail: (limit = 500) =>
     request<LogsTailResponse>(`/logs/tail?limit=${Math.max(1, Math.floor(limit))}`),
   clearLogs: () => request<{ ok: boolean; cleared: number }>('/logs', { method: 'DELETE' }),
+  startPsdAcquisition: (key: string, opts?: PsdStartOptions) =>
+    request(`/devices/${key}/control/start_psd_acquisition`, {
+      method: 'POST',
+      body: JSON.stringify({
+        algorithm: opts?.algorithm ?? null,
+        max_decimation: opts?.maxDecimation ?? null,
+      }),
+    }),
+  stopPsdAcquisition: (key: string) =>
+    request(`/devices/${key}/control/stop_psd_acquisition`, { method: 'POST' }),
+  startPsdAcquisitionMany: (deviceKeys: string[], opts?: PsdStartOptions) =>
+    request<{ started: string[]; skipped: Record<string, string> }>(
+      '/control/start_psd_acquisition',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          device_keys: deviceKeys,
+          algorithm: opts?.algorithm ?? null,
+          max_decimation: opts?.maxDecimation ?? null,
+        }),
+      }
+    ),
+  stopPsdAcquisitionMany: (deviceKeys: string[]) =>
+    request<{ stopped: string[]; skipped: Record<string, string> }>(
+      '/control/stop_psd_acquisition',
+      { method: 'POST', body: JSON.stringify({ device_keys: deviceKeys }) }
+    ),
+  getPsdTail: (limit = 200) =>
+    request<PsdTailResponse>(`/psd/tail?limit=${Math.max(1, Math.floor(limit))}`),
+  clearPsd: () => request<{ ok: boolean; cleared: number }>('/psd', { method: 'DELETE' }),
 };
 
 export const apiBase = API_BASE;

@@ -45,7 +45,8 @@ import { useLockSummary } from './features/locks/useLockSummary';
 import { usePostgresController } from './features/integrations/usePostgresController';
 import { useInfluxController } from './features/integrations/useInfluxController';
 import { useLockActions } from './features/locks/useLockActions';
-import { OVERVIEW_KEY, useDeviceCatalog } from './features/devices/useDeviceCatalog';
+import { OVERVIEW_KEY, PSD_KEY, useDeviceCatalog } from './features/devices/useDeviceCatalog';
+import { PsdTab } from './features/psd/PsdTab';
 import { deviceStatesStore } from './state/deviceStatesStore';
 import {
   parseDeviceListDragId,
@@ -727,6 +728,9 @@ export function App() {
               <Tabs.Tab value={OVERVIEW_KEY}>
                 <Text size="sm">Overview</Text>
               </Tabs.Tab>
+              <Tabs.Tab value={PSD_KEY}>
+                <Text size="sm">PSD</Text>
+              </Tabs.Tab>
               <SortableContext
                 items={groups.map((group) => toGroupTabDragId(group.key))}
                 strategy={horizontalListSortingStrategy}
@@ -837,6 +841,9 @@ export function App() {
                 </div>
               ))}
             </div>
+          </Tabs.Panel>
+          <Tabs.Panel value={PSD_KEY}>
+            <PsdTab devices={devices} deviceStatusMap={deviceStatusMap} />
           </Tabs.Panel>
           {groups.map((group) => {
             const groupDevices = groupDevicesMap.get(group.key) ?? [];

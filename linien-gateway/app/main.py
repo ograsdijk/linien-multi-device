@@ -36,6 +36,7 @@ from .diagnosis import DiagnosisProbe
 from .log_store import LogStore
 from .manual_lock_postgres import LockResultPostgresService
 from .path_utils import find_repo_root
+from .psd_store import PsdStore
 from .schemas import (
     AutoLockCalibrateRequest,
     AutoLockCalibrationResult,
@@ -57,12 +58,15 @@ from .schemas import (
     LoggingParamUpdate,
     LoggingStart,
     LogTailResponse,
+    DeviceKeysIn,
     ParamUpdate,
     PostgresManualLockConfig,
     PostgresManualLockState,
     RangeSelection,
     SimultaneousAcquireIn,
+    SimultaneousStartPsd,
     SimultaneousSweepIn,
+    StartPsdAcquisition,
     StopTask,
 )
 from .serializers import UNSERIALIZABLE, to_jsonable
@@ -77,6 +81,7 @@ manager = WebsocketManager(
 )
 lock_result_postgres = LockResultPostgresService()
 log_store = LogStore(max_entries=10_000, max_age_s=24.0 * 60.0 * 60.0)
+psd_store = PsdStore(max_entries=500, max_age_s=24.0 * 60.0 * 60.0)
 device_config_store = DeviceConfigStore()
 session_registry = SessionRegistry()
 diagnosis_probe = DiagnosisProbe(session_registry)
@@ -107,6 +112,7 @@ async def _startup() -> None:
     loop = asyncio.get_running_loop()
     manager.set_loop(loop)
     log_store.set_loop(loop)
+    psd_store.set_loop(loop)
     if hasattr(lock_result_postgres, "set_event_callback"):
         lock_result_postgres.set_event_callback(
             lambda level, source, code, message, details: _emit_log(
@@ -222,6 +228,14 @@ def _emit_log(
         device_key=device_key,
         details=details,
     )
+
+
+def _emit_psd(device_key: str, entry: dict[str, Any]) -> None:
+    # `entry` already carries device_key (set in DeviceSession._build_psd_payload),
+    # but normalize defensively so the stream is always keyed.
+    if not entry.get("device_key"):
+        entry = {**entry, "device_key": device_key}
+    psd_store.emit(entry)
 
 
 def _publish_config_update(device_key: str, config_name: str, value: dict) -> None:
@@ -370,6 +384,7 @@ def _session_for_device(device: Device) -> DeviceSession:
         )
         session.device = device
         session.set_log_event_callback(_emit_log)
+        session.set_psd_event_callback(_emit_psd)
         session.set_diagnosis_request_callback(diagnosis_probe.request)
         session.sync_configs_from_device()
         return session
@@ -1071,6 +1086,111 @@ def start_pid_optimization(key: str) -> dict:
     return _run_session_action(session.start_pid_optimization)
 
 
+@app.post("/api/devices/{key}/control/start_psd_acquisition")
+def start_psd_acquisition(
+    key: str, payload: StartPsdAcquisition | None = None
+) -> dict:
+    """Start a server-side broadband PSD measurement on one locked device.
+
+    Returns immediately; the device acquires in the background and streams
+    results over /api/psd/stream. 409 if the laser isn't locked.
+    """
+    session = _get_session(key)
+    opts = payload or StartPsdAcquisition()
+    result = _run_session_action(
+        lambda: session.start_psd_acquisition(opts.algorithm, opts.max_decimation)
+    )
+    _emit_log(
+        level=logging.INFO,
+        source="psd",
+        code="psd_acquisition_started",
+        message="PSD acquisition started",
+        device_key=key,
+    )
+    return result
+
+
+@app.post("/api/devices/{key}/control/stop_psd_acquisition")
+def stop_psd_acquisition(key: str) -> dict:
+    session = _get_session(key)
+    return _run_session_action(session.stop_psd_acquisition)
+
+
+@app.post("/api/control/start_psd_acquisition")
+async def start_psd_acquisition_simultaneous(body: SimultaneousStartPsd) -> dict:
+    """Start PSD measurements on a set of devices in parallel.
+
+    Each device runs the acquisition on its own CPU, so they are triggered
+    concurrently. Unconnected/unlocked devices land in `skipped` instead of
+    failing the whole batch.
+    """
+    pairs = [(key, session_registry.get(key)) for key in body.device_keys]
+    connected = [
+        (key, session)
+        for key, session in pairs
+        if session is not None and session.control is not None
+    ]
+    skipped: dict[str, str] = {
+        key: "unconnected"
+        for key, session in pairs
+        if session is None or session.control is None
+    }
+
+    async def _start(key: str, session: DeviceSession):
+        try:
+            await asyncio.to_thread(
+                session.start_psd_acquisition, body.algorithm, body.max_decimation
+            )
+            return key, None
+        except (ValueError, RuntimeError) as exc:
+            return key, str(exc)
+
+    started: list[str] = []
+    for key, outcome in await asyncio.gather(
+        *(_start(key, session) for key, session in connected)
+    ):
+        if outcome is None:
+            started.append(key)
+            _emit_log(
+                level=logging.INFO,
+                source="psd",
+                code="psd_acquisition_started",
+                message="PSD acquisition started",
+                device_key=key,
+            )
+        else:
+            skipped[key] = outcome
+    return {"started": started, "skipped": skipped}
+
+
+@app.post("/api/control/stop_psd_acquisition")
+async def stop_psd_acquisition_simultaneous(body: DeviceKeysIn) -> dict:
+    connected = [
+        (key, session)
+        for key in body.device_keys
+        if (session := session_registry.get(key)) is not None
+        and session.control is not None
+    ]
+
+    async def _stop(key: str, session: DeviceSession):
+        try:
+            await asyncio.to_thread(session.stop_psd_acquisition)
+            return key, None
+        except (ValueError, RuntimeError) as exc:
+            return key, str(exc)
+
+    stopped: list[str] = []
+    skipped: dict[str, str] = {}
+    for key, outcome in await asyncio.gather(
+        *(_stop(key, session) for key, session in connected)
+    ):
+        if outcome is None:
+            stopped.append(key)
+        else:
+            skipped[key] = outcome
+    return {"stopped": stopped, "skipped": skipped}
+
+
 @app.post("/api/devices/{key}/control/stop_lock")
 def stop_lock(key: str) -> dict:
     session = _get_session(key)
@@ -1198,6 +1318,49 @@ def get_logs_tail(limit: int = 500) -> dict:
 @app.delete("/api/logs")
 def clear_logs() -> dict:
     return {"ok": True, "cleared": log_store.clear()}
+
+
+@app.get("/api/psd/tail")
+def get_psd_tail(limit: int = 200) -> dict:
+    safe_limit = max(1, min(int(limit), 1_000))
+    return {"entries": psd_store.tail(limit=safe_limit)}
+
+
+@app.delete("/api/psd")
+def clear_psd() -> dict:
+    return {"ok": True, "cleared": psd_store.clear()}
+
+
+@app.websocket("/api/psd/stream")
+async def stream_psd(websocket: WebSocket) -> None:
+    await websocket.accept()
+    q = psd_store.subscribe(maxsize=500)
+
+    async def _wait_for_disconnect() -> None:
+        try:
+            while True:
+                await websocket.receive()
+        except WebSocketDisconnect:
+            return
+
+    disconnect_task = asyncio.create_task(_wait_for_disconnect())
+    try:
+        while True:
+            get_task = asyncio.create_task(q.get())
+            done, _pending = await asyncio.wait(
+                {get_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                get_task.cancel()
+                break
+            payload = get_task.result()
+            await websocket.send_json(payload)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        disconnect_task.cancel()
+        psd_store.unsubscribe(q)
 
 
 @app.websocket("/api/logs/stream")

@@ -1,5 +1,9 @@
 import { apiBase } from './api';
-import type { LogsStreamMessage, StreamMessage } from './types';
+import type {
+  LogsStreamMessage,
+  PsdStreamMessage,
+  StreamMessage,
+} from './types';
 import {
   registerLogsParser,
   registerStreamParser,
@@ -78,5 +82,24 @@ export function openLogsStream(onMessage: (msg: LogsStreamMessage) => void): Web
     socket.removeEventListener('close', handleClose);
   };
   socket.addEventListener('close', handleClose);
+  return socket;
+}
+
+// PSD events are low-rate (a handful per acquisition), so parse inline on the
+// main thread rather than routing through the stream worker.
+export function openPsdStream(onMessage: (msg: PsdStreamMessage) => void): WebSocket {
+  const wsBase = apiBase.replace(/^http/, 'ws');
+  const socket = new WebSocket(`${wsBase}/psd/stream`);
+  socket.onmessage = (event) => {
+    if (typeof event.data !== 'string') return;
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg && msg.type === 'psd' && msg.entry) {
+        onMessage(msg as PsdStreamMessage);
+      }
+    } catch {
+      // Ignore malformed frames.
+    }
+  };
   return socket;
 }
