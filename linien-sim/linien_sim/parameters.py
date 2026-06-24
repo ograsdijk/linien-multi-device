@@ -78,8 +78,11 @@ class SimParameters:
         self.to_plot = Parameter(sync=False)
         self.signal_stats = Parameter(sync=False, loggable=True)
         self.acquisition_raw_data = Parameter(sync=False, start=None)
-        self.psd_data_partial = Parameter(sync=False, start=None)
-        self.psd_data_complete = Parameter(sync=False, start=None)
+        # sync=True so the gateway's change-queue poll delivers PSD results
+        # (matches the real linien-server, where these are sync=True). The
+        # gateway reads to_plot by direct polling but PSD by callback.
+        self.psd_data_partial = Parameter(sync=True, start=None)
+        self.psd_data_complete = Parameter(sync=True, start=None)
         self.control_signal_history = Parameter(
             sync=False,
             start={"times": [], "values": [], "slow_times": [], "slow_values": []},
