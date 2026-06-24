@@ -77,6 +77,37 @@ class SimultaneousAcquireIn(BaseModel):
     timeout_s: Optional[float] = Field(default=None, gt=0, le=60)
 
 
+class DeviceKeysIn(BaseModel):
+    """A bare set of device keys for batch control actions."""
+
+    model_config = ConfigDict(extra="forbid")
+    device_keys: list[str] = Field(min_length=1)
+
+
+class StartPsdAcquisition(BaseModel):
+    """Start a server-side broadband PSD measurement on a single device.
+
+    The device must already be locked. None leaves the device's current value.
+    `algorithm`: 0 = Welch, 1 = LPSD. `max_decimation` trades run time for the
+    lowest resolvable frequency (higher = slower, reaches lower frequencies).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    algorithm: Optional[int] = Field(default=None, ge=0, le=1)
+    max_decimation: Optional[int] = Field(default=None, ge=1, le=32)
+
+
+class SimultaneousStartPsd(StartPsdAcquisition):
+    """Start a PSD measurement on an explicit set of devices in parallel.
+
+    Each device runs the acquisition on its own CPU, so the batch starts them
+    concurrently. Unconnected/unlocked devices are reported under `skipped`
+    rather than failing the whole batch.
+    """
+
+    device_keys: list[str] = Field(min_length=1)
+
+
 class AutoLockScanSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     half_range_v: float = Field(default=0.08, ge=0.0, le=2.0)

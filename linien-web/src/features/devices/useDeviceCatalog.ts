@@ -3,6 +3,7 @@ import { api } from '../../api';
 import type { Device, DeviceGroup } from '../../types';
 
 export const OVERVIEW_KEY = '__overview__';
+export const PSD_KEY = '__psd__';
 const DEVICE_ORDER_KEY = 'linien.deviceOrder';
 
 const arraysEqual = (a: string[], b: string[]): boolean =>
@@ -46,8 +47,10 @@ export const useDeviceCatalog = () => {
   }, [loadDevices, loadGroups]);
 
   useEffect(() => {
+    // OVERVIEW_KEY and PSD_KEY are always-present top-level tabs; never bounce
+    // off them just because there are no groups / no matching group.
     if (groups.length === 0) {
-      if (activeTabKey !== OVERVIEW_KEY) {
+      if (activeTabKey !== OVERVIEW_KEY && activeTabKey !== PSD_KEY) {
         setActiveTabKey(OVERVIEW_KEY);
       }
       return;
@@ -56,7 +59,11 @@ export const useDeviceCatalog = () => {
       setActiveTabKey(OVERVIEW_KEY);
       return;
     }
-    if (activeTabKey !== OVERVIEW_KEY && !groups.find((group) => group.key === activeTabKey)) {
+    if (
+      activeTabKey !== OVERVIEW_KEY &&
+      activeTabKey !== PSD_KEY &&
+      !groups.find((group) => group.key === activeTabKey)
+    ) {
       setActiveTabKey(OVERVIEW_KEY);
     }
   }, [activeTabKey, groups]);

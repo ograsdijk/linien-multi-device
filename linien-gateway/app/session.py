@@ -84,6 +84,42 @@ DEFAULT_INFLUX_LOGGING_INTERVAL_S = 1.0
 logger = logging.getLogger(__name__)
 
 
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def flo_to_max_decimation(
+    f_lo: float | None, min_dec: int = 8, max_dec: int = 24
+) -> int:
+    """Smallest decimation (multiple of 4) whose LPSD low-frequency edge reaches
+    ``f_lo``. The device sweeps decimations 0,4,8,… up to this value, so a higher
+    ``f_lo`` means a shallower (much faster) sweep.
+
+    LPSD ``fmin_d = (125e6 / 2^d) / 16384 * 10`` ≤ f_lo  ⟹  2^d ≥ 125e6·10 / (16384·f_lo).
+    """
+    if f_lo is None or f_lo <= 0:
+        return max_dec
+    need = 125e6 * 10.0 / (16384.0 * float(f_lo))
+    d = math.ceil(math.log2(need)) if need > 1.0 else 0
+    d = ((d + 3) // 4) * 4  # round up to a multiple of 4
+    return int(min(max(d, min_dec), max_dec))
+
+
 class DeviceSession:
     @staticmethod
     def _normalize_influx_param_names(value: Any) -> list[str]:
@@ -117,6 +153,9 @@ class DeviceSession:
         self._lock_result_postgres = lock_result_postgres_service
         self._log_event_callback = log_event_callback
         self._diagnosis_request_callback = diagnosis_request_callback
+        # Forwards decoded PSD measurements (partial + complete) out of the
+        # poll thread to the global PSD stream. Set via set_psd_event_callback.
+        self._psd_event_callback: Callable[[str, dict[str, Any]], None] | None = None
         self.client: LinienClient | None = None
         self.control = None
         self.parameters = None
@@ -356,6 +395,11 @@ class DeviceSession:
         self._log_event_callback = callback
         if hasattr(self.auto_relock, "set_event_hook"):
             self.auto_relock.set_event_hook(self._on_auto_relock_event)
+
+    def set_psd_event_callback(
+        self, callback: Callable[[str, dict[str, Any]], None] | None
+    ) -> None:
+        self._psd_event_callback = callback
 
     def set_diagnosis_request_callback(
         self, callback: Callable[[str], None] | None
@@ -1165,6 +1209,21 @@ class DeviceSession:
         for name, param in self.parameters:
             if name == "to_plot":
                 param.add_callback(self._on_to_plot)
+            elif name == "psd_data_partial":
+                # Surfaced via a dedicated callback (kept in IGNORED_PARAMS so
+                # the giant pickled blob never enters param_cache / the per-device
+                # param stream). psd_data_* are sync=True on the server, so the
+                # remote listener is already registered and these fire through the
+                # same poll loop as to_plot — no extra plumbing needed.
+                param.add_callback(
+                    lambda value: self._on_psd_data(value, complete=False),
+                    call_immediately=False,
+                )
+            elif name == "psd_data_complete":
+                param.add_callback(
+                    lambda value: self._on_psd_data(value, complete=True),
+                    call_immediately=False,
+                )
             else:
                 param.add_callback(
                     lambda value, n=name: self._on_param_changed(n, value),
@@ -1215,22 +1274,43 @@ class DeviceSession:
 
     def _snapshot_status_fields(
         self,
-    ) -> tuple[float | None, bool | None, dict[str, Any]]:
+    ) -> tuple[float | None, bool | None, dict[str, Any], dict[str, Any]]:
         """Cheap snapshot for status() polls.
 
         Avoids deep-copying the cached plot frame (multi-MB) and the
         serialized param cache. Only reads the small primitives that
         status() actually needs.
+
+        Also extracts the lock-indicator control metrics (computed per frame in
+        `lock_indicator.py`) so REST status can expose a scalar control voltage;
+        the values are otherwise only available over the plot WebSocket.
         """
         with self._state_lock:
             ts = self.last_plot_timestamp
             frame_lock: bool | None = None
+            control_mean_v: float | None = None
+            control_std_v: float | None = None
+            indicator_state: str | None = None
             if isinstance(self.last_plot_frame, dict):
                 fl = self.last_plot_frame.get("lock")
                 if isinstance(fl, bool):
                     frame_lock = fl
+                indicator = self.last_plot_frame.get("lock_indicator")
+                if isinstance(indicator, dict):
+                    state = indicator.get("state")
+                    if isinstance(state, str):
+                        indicator_state = state
+                    metrics = indicator.get("metrics")
+                    if isinstance(metrics, dict):
+                        control_mean_v = _coerce_float(metrics.get("control_mean_v"))
+                        control_std_v = _coerce_float(metrics.get("control_std_v"))
         auto_relock_status = self.auto_relock.get_status()
-        return ts, frame_lock, auto_relock_status
+        control_metrics = {
+            "control_mean_v": control_mean_v,
+            "control_std_v": control_std_v,
+            "lock_indicator_state": indicator_state,
+        }
+        return ts, frame_lock, auto_relock_status, control_metrics
 
     def _snapshot_auto_lock_traces(
         self,
@@ -1290,6 +1370,182 @@ class DeviceSession:
             type(maybe_plot).__name__,
         )
         return None
+
+    def _on_psd_data(self, value: Any, *, complete: bool) -> None:
+        """Decode a PSD payload from the server and forward it to the PSD stream.
+
+        Runs on the poll thread (psd_data_partial/psd_data_complete are
+        sync=True), so this must never raise. Strips the large raw `signals`
+        and stitches the per-decimation PSDs into one log-log-ready curve.
+        """
+        if value is None:
+            return
+        try:
+            payload = self._build_psd_payload(value, complete=complete)
+        except Exception:
+            logger.debug(
+                "Failed to process PSD data device=%s", self.device.key, exc_info=True
+            )
+            return
+        if payload is None:
+            return
+        callback = self._psd_event_callback
+        if callback is None:
+            return
+        try:
+            callback(self.device.key, payload)
+        except Exception:
+            logger.debug(
+                "PSD event callback failed device=%s", self.device.key, exc_info=True
+            )
+
+    def _build_psd_payload(
+        self, value: Any, *, complete: bool
+    ) -> dict[str, Any] | None:
+        decoded = self._decode_to_plot_payload(value)
+        if decoded is None:
+            return None
+        curve = self._stitch_psd_curve(decoded.get("psds"))
+        if not curve:
+            return None
+        return {
+            "device_key": self.device.key,
+            "uuid": decoded.get("uuid"),
+            "time": _coerce_float(decoded.get("time")),
+            "p": _coerce_int(decoded.get("p")),
+            "i": _coerce_int(decoded.get("i")),
+            "d": _coerce_int(decoded.get("d")),
+            # Band-limited integrated RMS of the error signal in Volts:
+            # sqrt(integral of ASD^2 over frequency). Physically meaningful and
+            # the right "total noise" figure, replacing the raw uncalibrated sum.
+            "rms_v": self._curve_rms(curve),
+            # Raw upstream sum (uncalibrated, arbitrary units); kept for export,
+            # not shown in the table.
+            "fitness": _coerce_float(decoded.get("fitness")),
+            "complete": bool(decoded.get("complete", complete)),
+            "curve": curve,
+        }
+
+    @staticmethod
+    def _clip_curve_to_band(
+        curve: list[dict[str, float]],
+        f_lo: float | None,
+        f_hi: float | None,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return (f, asd) arrays clipped to [f_lo, f_hi] with interpolated edges.
+
+        The endpoints are linearly interpolated so the band integral / peaking
+        metric don't depend on where the stitched samples happen to fall.
+        """
+        if not curve or len(curve) < 2:
+            return None
+        f = np.array([p["f"] for p in curve], dtype=np.float64)
+        asd = np.array([p["psd"] for p in curve], dtype=np.float64)
+        order = np.argsort(f)
+        f = f[order]
+        asd = asd[order]
+        lo = f[0] if f_lo is None else max(float(f_lo), f[0])
+        hi = f[-1] if f_hi is None else min(float(f_hi), f[-1])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return None
+        asd_lo = float(np.interp(lo, f, asd))
+        asd_hi = float(np.interp(hi, f, asd))
+        mask = (f > lo) & (f < hi)
+        fb = np.concatenate(([lo], f[mask], [hi]))
+        ab = np.concatenate(([asd_lo], asd[mask], [asd_hi]))
+        return fb, ab
+
+    @staticmethod
+    def _curve_rms(
+        curve: list[dict[str, float]],
+        f_lo: float | None = None,
+        f_hi: float | None = None,
+    ) -> float | None:
+        """Integrated RMS (V) from a stitched ASD curve: sqrt(∫ ASD^2 df).
+
+        `curve` is the ascending [{f, psd}] list where psd is amplitude spectral
+        density in V/Sqrt[Hz]. Restricted to [f_lo, f_hi] when given. Trapezoidal
+        integration over the (non-uniform, log-spaced) grid yields V^2; the
+        square root is the band-limited RMS in Volts.
+        """
+        clipped = DeviceSession._clip_curve_to_band(curve, f_lo, f_hi)
+        if clipped is None:
+            return None
+        f, asd = clipped
+        if f.size < 2:
+            return None
+        psd = asd**2  # power spectral density, V^2 / Hz
+        # Trapezoidal integral over the (non-uniform) frequency grid, computed
+        # directly to avoid numpy version differences around np.trapz.
+        variance = float(np.sum(np.diff(f) * 0.5 * (psd[:-1] + psd[1:])))
+        if not np.isfinite(variance) or variance < 0:
+            return None
+        return float(np.sqrt(variance))
+
+    @staticmethod
+    def _curve_peaking(
+        curve: list[dict[str, float]],
+        f_lo: float | None = None,
+        f_hi: float | None = None,
+    ) -> float | None:
+        """Servo-bump / gain-peaking metric: max(ASD)/median(ASD) within the band.
+
+        A tall narrow peak above the noise floor (a servo bump near the loop
+        bandwidth) yields a large ratio; a flat/smooth spectrum yields ~1.
+        """
+        clipped = DeviceSession._clip_curve_to_band(curve, f_lo, f_hi)
+        if clipped is None:
+            return None
+        _f, asd = clipped
+        if asd.size < 3:
+            return None
+        median = float(np.median(asd))
+        if median <= 0.0 or not np.isfinite(median):
+            return None
+        return float(np.max(asd) / median)
+
+    @staticmethod
+    def _stitch_psd_curve(psds: Any) -> list[dict[str, float]]:
+        """Stitch per-decimation (f, psd) segments into one ascending curve.
+
+        Ports the upstream PSDPlotWidget.plot_curve stitch: process decimations
+        high->low (low frequency first), trim each segment to f greater than the
+        highest frequency already plotted, and emit psd / V in V / Sqrt[Hz].
+        Adjacent segments connect naturally as a single line series.
+        """
+        if not isinstance(psds, dict) or not psds:
+            return []
+        try:
+            items = sorted(psds.items(), key=lambda kv: -int(kv[0]))
+        except (TypeError, ValueError):
+            return []
+        out: list[dict[str, float]] = []
+        highest_f = 0.0
+        for _decimation, segment in items:
+            try:
+                f_raw, psd_raw = segment
+            except (TypeError, ValueError):
+                continue
+            f = np.asarray(f_raw, dtype=np.float64)
+            psd = np.asarray(psd_raw, dtype=np.float64)
+            if f.size == 0 or psd.size != f.size:
+                continue
+            mask = f > highest_f
+            f = f[mask]
+            psd = psd[mask]
+            if f.size == 0:
+                continue
+            highest_f = float(f[-1])
+            scaled = psd / V
+            for f_val, psd_val in zip(f.tolist(), scaled.tolist()):
+                if (
+                    np.isfinite(f_val)
+                    and np.isfinite(psd_val)
+                    and f_val > 0.0
+                    and psd_val > 0.0
+                ):
+                    out.append({"f": float(f_val), "psd": float(psd_val)})
+        return out
 
     def _read_param_fast(self, name: str, default: Any = None) -> Any:
         """Read a parameter without holding `_rpyc_lock` when cached.
@@ -1549,12 +1805,16 @@ class DeviceSession:
         # (logging_start/stop, and the linien-client change queue).
         logging_active: bool | None = None
         lock_value: bool | None = None
+        psd_running: bool | None = None
         if self.connected:
             logging_active = self._logging_active_cache
             cached_lock = self._read_param_fast("lock")
             if cached_lock is not None:
                 lock_value = bool(cached_lock)
-        last_plot_timestamp, frame_lock, auto_relock_status = (
+            cached_psd = self._read_param_fast("psd_acquisition_running")
+            if cached_psd is not None:
+                psd_running = bool(cached_psd)
+        last_plot_timestamp, frame_lock, auto_relock_status, control_metrics = (
             self._snapshot_status_fields()
         )
         if lock_value is None and frame_lock is not None:
@@ -1568,6 +1828,14 @@ class DeviceSession:
             "last_plot": last_plot_timestamp,
             "logging_active": logging_active,
             "lock": lock_value,
+            # Mean/std control voltage (V) computed by the lock indicator. Lets a
+            # poller (e.g. the EC recenter servo) read the control signal over
+            # REST instead of subscribing to the plot stream. null when unlocked
+            # / no frame yet.
+            "control_mean_v": control_metrics["control_mean_v"],
+            "control_std_v": control_metrics["control_std_v"],
+            "lock_indicator_state": control_metrics["lock_indicator_state"],
+            "psd_running": psd_running,
             "auto_relock": auto_relock_status,
             "diagnosis": diagnosis,
         }
@@ -1965,6 +2233,37 @@ class DeviceSession:
             raise RuntimeError("Device not connected")
         with self._rpyc_lock:
             self.control.exposed_start_pid_optimization()
+
+    def start_psd_acquisition(
+        self,
+        algorithm: int | None = None,
+        max_decimation: int | None = None,
+    ) -> None:
+        """Trigger a server-side broadband PSD acquisition of the error signal.
+
+        The device must already be locked. The acquisition runs as a background
+        task on the device (sweeping decimations), so this returns immediately;
+        results stream back via the psd_data_* callbacks. Safe across the
+        numpy-pickle boundary because only scalar ints are sent and the result
+        flows server->gateway (NOT gated by AUTOMATION_TEMP_DISABLED).
+        """
+        if self.control is None or self.parameters is None:
+            raise RuntimeError("Device not connected")
+        with self._rpyc_lock:
+            if not bool(self.parameters.lock.value):
+                raise RuntimeError("Laser must be locked before a PSD measurement.")
+            if algorithm is not None:
+                self.parameters.psd_algorithm.value = int(algorithm)
+            if max_decimation is not None:
+                self.parameters.psd_acquisition_max_decimation.value = int(
+                    max_decimation
+                )
+            self.control.exposed_write_registers()
+            self.control.exposed_start_psd_acquisition()
+
+    def stop_psd_acquisition(self) -> None:
+        """Abort a running PSD acquisition (delegates to the generic task stop)."""
+        self.stop_task(use_new_parameters=False)
 
     def stop_lock(self) -> None:
         if self.parameters is None or self.control is None:

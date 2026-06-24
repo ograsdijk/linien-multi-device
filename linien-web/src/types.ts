@@ -41,6 +41,7 @@ export type DeviceStatus = {
   last_plot?: number | null;
   logging_active?: boolean | null;
   lock?: boolean | null;
+  psd_running?: boolean | null;
   auto_relock?: AutoRelockStatus | null;
   diagnosis?: DeviceDiagnosis | null;
 };
@@ -258,6 +259,40 @@ export type LogsTailResponse = {
 export type LogsStreamMessage = {
   type: 'log';
   entry: UiLogEntry;
+};
+
+// One point of a stitched PSD curve: frequency (Hz) and amplitude
+// (V / Sqrt[Hz]). Both are linear values; the plot renders them on log axes.
+export type PsdCurvePoint = {
+  f: number;
+  psd: number;
+};
+
+// One PSD measurement (partial or complete) as relayed by the gateway. The
+// large raw `signals` are stripped server-side; only the ready-to-plot curve
+// plus the PID gains / fitness metadata reach the browser.
+export type PsdMeasurement = {
+  device_key: string;
+  uuid: string;
+  time: number | null;
+  p: number | null;
+  i: number | null;
+  d: number | null;
+  // Band-limited integrated RMS of the error signal in Volts (sqrt(∫ASD²df)).
+  rms_v: number | null;
+  // Raw uncalibrated upstream sum; kept for export, not shown in the table.
+  fitness: number | null;
+  complete: boolean;
+  curve: PsdCurvePoint[];
+};
+
+export type PsdStreamMessage = {
+  type: 'psd';
+  entry: PsdMeasurement;
+};
+
+export type PsdTailResponse = {
+  entries: PsdMeasurement[];
 };
 
 export type ParamMeta = {
