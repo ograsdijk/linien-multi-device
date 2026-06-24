@@ -55,10 +55,14 @@ class SimulatorStatus:
 class VirtualPdhModel:
     def __init__(self, seed: int = 0) -> None:
         self.rng = np.random.default_rng(seed)
-        self.noise_sigma_v = 0.01
+        # Locked residual error noise is dominated by detuning jitter through the
+        # steep PDH slope, not the electronics floor. These give a locked
+        # error-signal std of ~1.5-2 mV (clearly quieter than the previous level,
+        # yet above the lock indicator's 1 mV "dead-trace" floor).
+        self.noise_sigma_v = 0.005
         self.drift_v_per_s = 0.0
         self.walk_sigma_v_sqrt_s = 0.003
-        self.detuning_jitter_v = 0.0002
+        self.detuning_jitter_v = 0.00012
 
         self.monitor_mode = "reflection"
         self.laser_detuning_v = 0.0
@@ -68,6 +72,17 @@ class VirtualPdhModel:
         self.pid_integrator = 0.0
         self.prev_error_v = 0.0
         self.last_effective_detuning_v = 0.0
+        # Physical actuator bandwidth: the control command reaches the actuator
+        # through a one-pole low-pass at this frequency. This sets the loop's
+        # phase lag, so the closed loop develops a servo bump and finally
+        # oscillates as the gains rise (a real, timestep-independent effect).
+        # Far above the ~20 Hz frame rate, so the live per-frame lock behaviour
+        # is unchanged; it only shapes the high-rate error spectrum / stability.
+        self.actuator_pole_hz = 2500.0
+        self.actuator_v = 0.0
+        # White error-noise floor for the PSD, as a sample-rate-INDEPENDENT
+        # amplitude spectral density (V/Sqrt[Hz]); see simulate_loop_series.
+        self.psd_white_asd_v = 1.5e-4
 
         self.ramp_remaining_v = 0.0
         self.ramp_rate_v_per_s = 0.0
@@ -157,6 +172,7 @@ class VirtualPdhModel:
         )
         # Preserve the lock handover operating point as PID feedforward bias.
         self.control_bias_v = self.control_output_v
+        self.actuator_v = self.control_output_v
         self.pid_integrator = 0.0
         self.prev_error_v = 0.0
         self.last_effective_detuning_v = self._laser_with_disturbance - (
@@ -405,7 +421,7 @@ class VirtualPdhModel:
 
     def _advance_pid(self, dt_s: float, params: Any) -> None:
         effective_detuning = self._laser_with_disturbance - (
-            self.control_output_v * self.actuator_gain
+            self.actuator_v * self.actuator_gain
         )
         effective_detuning_for_error = effective_detuning + (
             self.detuning_jitter_v * self.rng.normal()
@@ -453,6 +469,12 @@ class VirtualPdhModel:
             self.pid_integrator = i_candidate
             control = control_candidate
         self.control_output_v = _clip(control, -self.control_limit_v, self.control_limit_v)
+        # Actuator follows the control command through its one-pole bandwidth.
+        # At the ~20 Hz frame rate the pole is effectively instantaneous, so this
+        # leaves the live lock behaviour unchanged; it matters at the high sample
+        # rates used by simulate_error_series.
+        decay = math.exp(-2.0 * math.pi * max(1.0, self.actuator_pole_hz) * max(dt_s, 0.0))
+        self.actuator_v = decay * self.actuator_v + (1.0 - decay) * self.control_output_v
         self.prev_error_v = error
         self.last_effective_detuning_v = effective_detuning_for_error
 
@@ -463,7 +485,114 @@ class VirtualPdhModel:
         else:
             self.pid_integrator *= 0.9
             self.control_output_v *= 0.85
+            self.actuator_v *= 0.85
             self.last_effective_detuning_v = self._laser_with_disturbance
+
+    def _discriminator_slope(self, params: Any) -> float:
+        """Local d(error)/d(detuning) of the PDH discriminant at the lock point."""
+        d = max(self.linewidth_v * 0.05, 1e-4)
+        samples = self._combined_error_signal(np.array([d, -d], dtype=float), params)
+        return float((samples[0] - samples[1]) / (2.0 * d))
+
+    def simulate_loop_series(
+        self, params: Any, fs: float, n_samples: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run the closed loop at sample rate ``fs`` for ``n_samples`` and return
+        (residual_detuning, error) time series in volts.
+
+        Uses the SAME control law and gain scaling as `_advance_pid`, plus the
+        physical actuator pole, so the spectrum responds to P/I/D the way the
+        live lock does: the integrator suppresses low-frequency drift, a servo
+        bump grows near the loop bandwidth, and the loop oscillates once the
+        gains are too aggressive. Runs on local copies of the live state (the
+        live model keeps advancing independently).
+        """
+        n = int(n_samples)
+        fs = float(fs)
+        if n <= 0 or fs <= 0.0:
+            empty = np.zeros(max(0, n), dtype=float)
+            return empty, empty.copy()
+        # Anti-alias by oversampling low-rate bands then boxcar-decimating to fs,
+        # mimicking the device's per-decimation anti-alias filter. Without this,
+        # the servo bump near the actuator pole folds into bands whose Nyquist is
+        # below it, producing spurious steps where the stitched segments meet.
+        pole = max(1.0, self.actuator_pole_hz)
+        osr = 1
+        while (fs * osr) / 2.0 < 2.0 * pole and osr < 16:
+            osr *= 2
+        fs_int = fs * osr
+        n_int = n * osr
+        dt = 1.0 / fs_int
+        slope = self._discriminator_slope(params)
+        if abs(slope) < 1e-9:
+            slope = 1e-9 if slope >= 0 else -1e-9
+        kp = float(params.p.value) / 2200.0
+        ki = float(params.i.value) / 5000.0
+        kd = float(params.d.value) / 10000.0
+        gain = self.actuator_gain
+        climit = self.control_limit_v
+        bias = self.control_bias_v
+        decay = math.exp(-2.0 * math.pi * pole * dt)
+        if abs(ki) > 1e-9:
+            ilim = min(200.0, max(1.5, climit / abs(ki)))
+        else:
+            ilim = 1.5
+        laser = float(self._laser_with_disturbance)
+        act = float(self.actuator_v)
+        integ = float(self.pid_integrator)
+        prev_e = float(self.prev_error_v)
+        drift_step = self.drift_v_per_s * dt
+        walk_step = self.walk_sigma_v_sqrt_s * math.sqrt(dt)
+        # White error noise as a sample-rate-INDEPENDENT ASD, so every decimation
+        # shares the same floor and the segments stitch smoothly (a fixed
+        # per-sample std would make the floor scale as 1/sqrt(fs) -> big steps).
+        white_std = self.psd_white_asd_v * math.sqrt(fs_int / 2.0)
+        disc_w = max(self.linewidth_v, 1e-4)  # PDH discriminant capture half-width
+        wn = self.rng.standard_normal(n_int)
+        en = self.rng.standard_normal(n_int)
+        detun = np.empty(n_int, dtype=float)
+        err = np.empty(n_int, dtype=float)
+        for k in range(n_int):
+            laser += drift_step + walk_step * wn[k]
+            eff = laser - act * gain
+            detun[k] = eff
+            # Dispersive PDH discriminant: ~linear near resonance but rolls back
+            # toward zero far off it. An unstable loop therefore swings *through*
+            # resonance (a large oscillating error -> big PSD), instead of pinning
+            # at a DC rail (which would collapse the AC PSD). Still clipped to the
+            # +/-1 V ADC range.
+            disc = slope * eff / (1.0 + (eff / disc_w) ** 2)
+            e = disc + white_std * en[k]
+            if e > 1.0:
+                e = 1.0
+            elif e < -1.0:
+                e = -1.0
+            err[k] = e
+            i_cand = integ + e * dt
+            if i_cand > ilim:
+                i_cand = ilim
+            elif i_cand < -ilim:
+                i_cand = -ilim
+            deriv = (e - prev_e) / dt if kd != 0.0 else 0.0
+            control_candidate = bias + kp * e + ki * i_cand + kd * deriv
+            if (control_candidate > climit and e > 0.0) or (
+                control_candidate < -climit and e < 0.0
+            ):
+                u = bias + kp * e + ki * integ + kd * deriv  # hold integrator
+            else:
+                integ = i_cand
+                u = control_candidate
+            if u > climit:
+                u = climit
+            elif u < -climit:
+                u = -climit
+            act = decay * act + (1.0 - decay) * u
+            prev_e = e
+        if osr > 1:
+            # Boxcar anti-alias decimation down to the requested fs.
+            detun = detun.reshape(n, osr).mean(axis=1)
+            err = err.reshape(n, osr).mean(axis=1)
+        return detun, err
 
     def _build_unlocked_plot(self, params: Any) -> dict[str, np.ndarray]:
         center = float(params.sweep_center.value)

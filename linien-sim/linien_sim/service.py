@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+import random
+import string
 import threading
 import time
 from copy import copy
 from typing import Any
 
+import numpy as np
 import rpyc
 from linien_common.communication import (
     hash_username_and_password,
@@ -16,7 +19,7 @@ from linien_common.influxdb import InfluxDBCredentials
 from rpyc.core.protocol import Connection
 from rpyc.utils.authenticators import AuthenticationError
 
-from .model import SimulatorStatus, VirtualPdhModel
+from .model import ADC_SCALE, SimulatorStatus, VirtualPdhModel
 from .parameters import MHZ_UNIT, VPP_UNIT, SimParameters
 
 logger = logging.getLogger(__name__)
@@ -243,8 +246,122 @@ class VirtualLinienControlService(rpyc.Service):
         self.parameters.optimization_running.value = False
 
     def exposed_start_psd_acquisition(self) -> None:
+        # Real linien-server sweeps decimations on the FPGA and Welch/LPSDs the
+        # acquired error samples. The simulator mirrors that: per decimation it
+        # actually RUNS the closed loop at that sample rate (model.simulate_loop_
+        # series) and computes the PSD of the resulting error, so the spectrum
+        # genuinely responds to P/I/D (low-f suppression, servo bump, oscillation
+        # when too aggressive) and is consistent with the live lock.
+        existing = getattr(self, "_psd_thread", None)
+        if existing is not None and existing.is_alive():
+            return
+        self._psd_stop = threading.Event()
+        self._psd_thread = threading.Thread(
+            target=self._run_psd_acquisition, daemon=True
+        )
+        self._psd_thread.start()
+
+    def _psd_payload(self, uuid: str, psds: dict[int, Any], complete: bool) -> dict:
+        fitness = float(sum(float(np.sum(psd)) for _f, psd in psds.values()))
+        return {
+            "uuid": uuid,
+            "time": time.time(),
+            "p": self.parameters.p.value,
+            "i": self.parameters.i.value,
+            "d": self.parameters.d.value,
+            "psds": {dec: (f, psd) for dec, (f, psd) in psds.items()},
+            "fitness": fitness,
+            "complete": complete,
+        }
+
+    @staticmethod
+    def _welch_asd(
+        x: np.ndarray, fs: float, nperseg: int = 256
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """One-sided amplitude spectral density (V/Sqrt[Hz]) via Welch's method.
+
+        Density scaling + Hann window, matching the real server's
+        scipy.signal.welch(..., scaling='density') -> sqrt path. Pure numpy so
+        the simulator needs no scipy.
+        """
+        x = np.asarray(x, dtype=float)
+        nperseg = int(min(nperseg, x.size))
+        nperseg = max(8, nperseg - (nperseg % 2))
+        if x.size < nperseg:
+            f = np.fft.rfftfreq(max(2, x.size), d=1.0 / fs)
+            return f, np.zeros_like(f)
+        win = np.hanning(nperseg)
+        win_power = float(np.sum(win**2))
+        step = nperseg // 2
+        acc = None
+        count = 0
+        start = 0
+        while start + nperseg <= x.size:
+            seg = (x[start : start + nperseg] - np.mean(x[start : start + nperseg])) * win
+            spec = np.fft.rfft(seg)
+            psd = (np.abs(spec) ** 2) / (fs * win_power)
+            psd[1:-1] *= 2.0  # one-sided
+            acc = psd if acc is None else acc + psd
+            count += 1
+            start += step
+        Pxx = acc / max(1, count)
+        f = np.fft.rfftfreq(nperseg, d=1.0 / fs)
+        return f, np.sqrt(Pxx)
+
+    def _run_psd_acquisition(self) -> None:
         self.parameters.psd_acquisition_running.value = True
-        self.parameters.psd_acquisition_running.value = False
+        # Expose a stoppable handle on `task` so the gateway's stop_task path
+        # (task.exposed_stop) can abort a run, like the real PSDAcquisition.
+        stop_event = self._psd_stop
+
+        class _PsdTask:
+            def exposed_stop(self, use_new_parameters: bool = False) -> None:
+                stop_event.set()
+
+        self.parameters.task.value = _PsdTask()
+        try:
+            max_dec = int(self.parameters.psd_acquisition_max_decimation.value)
+            uuid = "".join(random.choice(string.ascii_lowercase) for _ in range(10))
+            decimations: list[int] = []
+            idx = 0
+            while idx <= max_dec:
+                decimations.append(idx)
+                idx += 4
+            psds: dict[int, Any] = {}
+            for dec in decimations:
+                if self._psd_stop.is_set():
+                    break
+                fs = 125e6 / (2 ** dec)
+                # Mimic the real device's per-decimation buffer-fill time
+                # (16384 samples at fs), capped so the slowest bands stay
+                # demo-usable instead of the real minutes.
+                acquire_s = min(16384.0 / fs, 12.0)
+                if self._psd_stop.wait(acquire_s):
+                    break
+                # Actually run the closed loop at this sample rate and PSD the
+                # resulting error -> genuinely gain-dependent spectrum.
+                with self._sim_lock:
+                    _detun, error = self.model.simulate_loop_series(
+                        self.parameters, fs, 16384
+                    )
+                f, asd_v = self._welch_asd(error, fs)
+                # Drop the DC bin; emit in counts/Sqrt[Hz] (the gateway divides
+                # by V=8192 to get V/Sqrt[Hz]), matching the real server.
+                f = f[1:]
+                asd_counts = asd_v[1:] * ADC_SCALE
+                psds[dec] = (f, asd_counts)
+                self.parameters.psd_data_partial.value = pack(
+                    self._psd_payload(uuid, psds, complete=False)
+                )
+            if not self._psd_stop.is_set():
+                complete = self._psd_payload(uuid, psds, complete=True)
+                self.parameters.psd_data_partial.value = pack(complete)
+                self.parameters.psd_data_complete.value = pack(complete)
+        except Exception:  # noqa: BLE001 - simulator helper, never crash the thread
+            logger.exception("PSD acquisition failed")
+        finally:
+            self.parameters.task.value = None
+            self.parameters.psd_acquisition_running.value = False
 
     def exposed_start_pid_optimization(self) -> None:
         self.parameters.psd_optimization_running.value = True
