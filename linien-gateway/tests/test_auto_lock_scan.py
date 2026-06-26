@@ -10,17 +10,16 @@ from app.auto_lock_scan import (
 )
 from app.schemas import AutoLockScanSettings as SchemaAutoLockScanSettings
 
-# Rough raw full-scale used to build test traces in *raw linien units* (the detector
-# no longer normalizes — see auto_lock_scan units note).
-SCALE = 8000.0
+# Traces are in PLOT units (the fixed ADC_SCALE/V display scale, ~±1 full scale) — the
+# same units the detector receives after session divides by ADC_SCALE.
 
 
 def _dispersive(n=2048, amplitude=0.3, width=0.05, center=0.0):
-    """A dispersive feature (rising zero-crossing at ``center`` for amplitude>0) in
-    raw units: negative lobe left, positive lobe right."""
+    """A dispersive feature (rising zero-crossing at ``center`` for amplitude>0):
+    negative lobe left, positive lobe right."""
     x = np.linspace(-1.0, 1.0, n)
     u = (x - center) / width
-    return (amplitude * SCALE) * u * np.exp(-0.5 * u**2)
+    return amplitude * u * np.exp(-0.5 * u**2)
 
 
 def _pdh_triplet(n=2048, carrier=0.4, sideband=0.15, width=0.03, sb_off=0.3):
@@ -46,14 +45,13 @@ def test_finds_rising_crossing_near_center():
     assert result.target_slope_rising is True
     assert abs(result.target_voltage) < 0.05
     assert result.pair_excursion > AutoLockScanSettings().error_min
-    # No modulation frequency supplied -> no Hz/V.
-    assert result.hz_per_v is None
+    assert result.hz_per_v is None  # no modulation frequency supplied
 
 
 def test_amplitude_floor_rejects_dead_trace():
     n = 2048
-    # Peak-to-peak ~40 raw, well below the default min_amplitude (100).
-    error = 20.0 * np.sin(np.linspace(0.0, 8.0 * np.pi, n))
+    # Peak-to-peak ~0.006, below the default min_amplitude (0.01).
+    error = 0.003 * np.sin(np.linspace(0.0, 8.0 * np.pi, n))
     with pytest.raises(ValueError, match="min_amplitude|lockable signal"):
         find_auto_lock_target(
             error_trace_v=error,
@@ -67,12 +65,11 @@ def test_amplitude_floor_rejects_dead_trace():
 def test_single_side_toggle_changes_acceptance():
     n = 2048
     x = np.linspace(-1.0, 1.0, n)
-    # Strong negative lobe on the left, weak positive lobe on the right (asymmetric).
     error = np.where(x < 0.0, _dispersive(n, amplitude=0.3, width=0.05), 0.0) + np.where(
         x >= 0.0, _dispersive(n, amplitude=0.04, width=0.05), 0.0
     )
 
-    strict = AutoLockScanSettings(error_min=1500.0, symmetry_min=0.6)
+    strict = AutoLockScanSettings(error_min=0.3, symmetry_min=0.6)
     with pytest.raises(ValueError):
         find_auto_lock_target(
             error_trace_v=error,
@@ -83,7 +80,7 @@ def test_single_side_toggle_changes_acceptance():
         )
 
     permissive = AutoLockScanSettings(
-        error_min=1500.0, symmetry_min=0.6, allow_single_side=True, single_error_min=500.0
+        error_min=0.3, symmetry_min=0.6, allow_single_side=True, single_error_min=0.1
     )
     result = find_auto_lock_target(
         error_trace_v=error,
@@ -92,12 +89,12 @@ def test_single_side_toggle_changes_acceptance():
         sweep_amplitude_v=1.0,
         settings=permissive,
     )
-    assert max(result.left_excursion, result.right_excursion) >= 500.0
+    assert max(result.left_excursion, result.right_excursion) >= 0.1
 
 
 def test_respects_preferred_slope():
     n = 2048
-    error = _dispersive(n, amplitude=0.3, width=0.08)  # rising at center
+    error = _dispersive(n, amplitude=0.3, width=0.08)
     with pytest.raises(ValueError):
         find_auto_lock_target(
             error_trace_v=error,
@@ -131,7 +128,6 @@ def test_pdh_mode_recovers_hz_per_v():
         preferred_slope_rising=True,
         modulation_frequency_hz=mod_hz,
     )
-    # Carrier selected (near center), sidebands at ±0.3 V -> Ω.
     assert abs(result.target_index - (n // 2)) < 40
     assert result.sideband_offset_v is not None
     assert 0.27 < result.sideband_offset_v < 0.33
@@ -160,22 +156,20 @@ def test_monitor_transmission_gates_and_passes():
     n = 2048
     x = np.linspace(-1.0, 1.0, n)
     error = _dispersive(n, amplitude=0.3, width=0.05)
-    monitor = 3000.0 * np.exp(-0.5 * (x / 0.1) ** 2)  # transmission peak at center
+    monitor = 0.7 * np.exp(-0.5 * (x / 0.1) ** 2)  # transmission peak at center
 
-    # Threshold below the peak -> accepted.
     ok = find_auto_lock_target(
         error_trace_v=error,
         monitor_trace_v=monitor,
         sweep_center_v=0.0,
         sweep_amplitude_v=1.0,
         settings=AutoLockScanSettings(
-            use_monitor=True, monitor_mode="locked_above", monitor_threshold=1000.0
+            use_monitor=True, monitor_mode="locked_above", monitor_threshold=0.1
         ),
         preferred_slope_rising=True,
     )
-    assert ok.monitor_level is not None and ok.monitor_level > 1000.0
+    assert ok.monitor_level is not None and ok.monitor_level > 0.1
 
-    # Threshold above the peak -> rejected.
     with pytest.raises(ValueError, match="monitor"):
         find_auto_lock_target(
             error_trace_v=error,
@@ -183,7 +177,7 @@ def test_monitor_transmission_gates_and_passes():
             sweep_center_v=0.0,
             sweep_amplitude_v=1.0,
             settings=AutoLockScanSettings(
-                use_monitor=True, monitor_mode="locked_above", monitor_threshold=5000.0
+                use_monitor=True, monitor_mode="locked_above", monitor_threshold=0.9
             ),
             preferred_slope_rising=True,
         )
@@ -193,7 +187,7 @@ def test_monitor_reflection_dip():
     n = 2048
     x = np.linspace(-1.0, 1.0, n)
     error = _dispersive(n, amplitude=0.3, width=0.05)
-    monitor = 3000.0 - 2800.0 * np.exp(-0.5 * (x / 0.1) ** 2)  # reflection dip at center
+    monitor = 0.7 - 0.65 * np.exp(-0.5 * (x / 0.1) ** 2)  # reflection dip at center
 
     ok = find_auto_lock_target(
         error_trace_v=error,
@@ -201,11 +195,11 @@ def test_monitor_reflection_dip():
         sweep_center_v=0.0,
         sweep_amplitude_v=1.0,
         settings=AutoLockScanSettings(
-            use_monitor=True, monitor_mode="locked_below", monitor_threshold=1500.0
+            use_monitor=True, monitor_mode="locked_below", monitor_threshold=0.3
         ),
         preferred_slope_rising=True,
     )
-    assert ok.monitor_level is not None and ok.monitor_level < 1500.0
+    assert ok.monitor_level is not None and ok.monitor_level < 0.3
 
     with pytest.raises(ValueError, match="monitor"):
         find_auto_lock_target(
@@ -214,7 +208,7 @@ def test_monitor_reflection_dip():
             sweep_center_v=0.0,
             sweep_amplitude_v=1.0,
             settings=AutoLockScanSettings(
-                use_monitor=True, monitor_mode="locked_below", monitor_threshold=100.0
+                use_monitor=True, monitor_mode="locked_below", monitor_threshold=0.01
             ),
             preferred_slope_rising=True,
         )
@@ -223,19 +217,18 @@ def test_monitor_reflection_dip():
 def test_monitor_selects_feature_with_signal():
     n = 2048
     x = np.linspace(-1.0, 1.0, n)
-    # Two equally strong rising features at -0.3 and +0.3.
     error = _dispersive(n, amplitude=0.3, width=0.04, center=-0.3) + _dispersive(
         n, amplitude=0.3, width=0.04, center=0.3
     )
     # Monitor peaks only at +0.3, so only that feature passes the locked_above gate.
-    monitor = 3000.0 * np.exp(-0.5 * ((x - 0.3) / 0.08) ** 2)
+    monitor = 0.7 * np.exp(-0.5 * ((x - 0.3) / 0.08) ** 2)
     result = find_auto_lock_target(
         error_trace_v=error,
         monitor_trace_v=monitor,
         sweep_center_v=0.0,
         sweep_amplitude_v=1.0,
         settings=AutoLockScanSettings(
-            use_monitor=True, monitor_mode="locked_above", monitor_threshold=1000.0
+            use_monitor=True, monitor_mode="locked_above", monitor_threshold=0.1
         ),
         preferred_slope_rising=True,
     )
@@ -251,7 +244,7 @@ def test_no_monitor_locks_on_error_alone():
         monitor_trace_v=None,
         sweep_center_v=0.0,
         sweep_amplitude_v=1.0,
-        settings=AutoLockScanSettings(use_monitor=True, monitor_threshold=1e9),
+        settings=AutoLockScanSettings(use_monitor=True, monitor_threshold=1.0),
         preferred_slope_rising=True,
     )
     assert result.monitor_level is None
@@ -281,12 +274,11 @@ def test_calibrate_derives_settings_that_lock():
         base=AutoLockScanSettings(),
         preferred_slope_rising=True,
     )
-    assert calib.amplitude > 1000.0  # raw units
+    assert calib.amplitude > 0.1  # plot units
     assert calib.settings.error_min > 0.0
     assert calib.settings.min_amplitude > 0.0
     assert calib.settings.symmetry_min > 0.4
     assert calib.settings.use_monitor is False
-    # The derived settings must actually lock the same feature.
     result = find_auto_lock_target(
         error_trace_v=error,
         monitor_trace_v=None,
@@ -302,7 +294,7 @@ def test_calibrate_monitor_sets_threshold():
     n = 2048
     x = np.linspace(-1.0, 1.0, n)
     error = _dispersive(n, amplitude=0.3, width=0.08)
-    monitor = 3000.0 * np.exp(-0.5 * (x / 0.12) ** 2)  # transmission peak
+    monitor = 0.7 * np.exp(-0.5 * (x / 0.12) ** 2)  # transmission peak
     calib = calibrate_auto_lock_settings(
         error_trace_v=error,
         monitor_trace_v=monitor,
@@ -315,6 +307,25 @@ def test_calibrate_monitor_sets_threshold():
     assert calib.settings.use_monitor is True
     assert calib.settings.monitor_mode == "locked_above"
     assert calib.settings.monitor_threshold > 0.0
+
+
+def test_calibrate_monitor_mode_mismatch_raises():
+    """The monitor is a safety check: if the configured mode contradicts the measured
+    peak/dip direction, calibration fails loudly rather than silently accepting."""
+    n = 2048
+    x = np.linspace(-1.0, 1.0, n)
+    error = _dispersive(n, amplitude=0.3, width=0.08)
+    monitor = 0.7 * np.exp(-0.5 * (x / 0.12) ** 2)  # peaks on resonance (transmission)
+    with pytest.raises(ValueError, match="HIGHER on resonance|locked_above"):
+        calibrate_auto_lock_settings(
+            error_trace_v=error,
+            monitor_trace_v=monitor,
+            sweep_center_v=0.0,
+            sweep_amplitude_v=1.0,
+            base=AutoLockScanSettings(monitor_mode="locked_below"),  # wrong for a peak
+            preferred_slope_rising=True,
+            include_monitor=True,
+        )
 
 
 def test_calibrate_rejects_flat_trace():

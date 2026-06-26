@@ -26,12 +26,12 @@ const DEFAULT_AUTO_LOCK_SETTINGS: AutoLockScanSettings = {
   use_monitor: false,
   monitor_mode: 'locked_above',
   half_range_sweep_v: 0.08,
-  error_min: 600,
+  error_min: 0.08,
   symmetry_min: 0.2,
-  single_error_min: 600,
-  min_amplitude: 100,
+  single_error_min: 0.1,
+  min_amplitude: 0.01,
   smooth_window_pts: 5,
-  monitor_threshold: 1000,
+  monitor_threshold: 0.1,
 };
 
 type LockingPanelProps = {
@@ -248,8 +248,8 @@ export const LockingPanel = memo(function LockingPanel({
                 </Text>
                 {calibrationResult ? (
                   <Text size="xs" c="dimmed">
-                    Captured (raw): amplitude=
-                    {calibrationResult.amplitude.toFixed(1)}
+                    Captured (norm.): amplitude=
+                    {calibrationResult.amplitude.toFixed(4)}
                     {' · '}feature width=
                     {calibrationResult.feature_half_width_v.toFixed(4)} V
                     {' · '}target={calibrationResult.target_voltage.toFixed(4)} V
@@ -302,11 +302,11 @@ export const LockingPanel = memo(function LockingPanel({
             </Group>
             <Group grow>
               <DeferredNumberInput
-                label="Error min (raw)"
+                label="Error min (norm.)"
                 value={autoLockSettings.error_min}
                 min={0}
-                step={10}
-                decimalScale={1}
+                step={0.01}
+                decimalScale={4}
                 onCommit={(value) =>
                   setAutoLockNumber(
                     'error_min',
@@ -331,11 +331,11 @@ export const LockingPanel = memo(function LockingPanel({
             </Group>
             <Group grow>
               <DeferredNumberInput
-                label="Min amplitude (raw)"
+                label="Min amplitude (norm.)"
                 value={autoLockSettings.min_amplitude}
                 min={0}
-                step={10}
-                decimalScale={1}
+                step={0.01}
+                decimalScale={4}
                 onCommit={(value) =>
                   setAutoLockNumber(
                     'min_amplitude',
@@ -344,11 +344,11 @@ export const LockingPanel = memo(function LockingPanel({
                 }
               />
               <DeferredNumberInput
-                label="Single error min (raw)"
+                label="Single error min (norm.)"
                 value={autoLockSettings.single_error_min}
                 min={0}
-                step={10}
-                decimalScale={1}
+                step={0.01}
+                decimalScale={4}
                 onCommit={(value) =>
                   setAutoLockNumber(
                     'single_error_min',
@@ -396,11 +396,11 @@ export const LockingPanel = memo(function LockingPanel({
                   }
                 />
                 <DeferredNumberInput
-                  label="Monitor threshold (raw)"
+                  label="Monitor threshold (norm.)"
                   value={autoLockSettings.monitor_threshold}
                   min={0}
-                  step={10}
-                  decimalScale={1}
+                  step={0.01}
+                  decimalScale={4}
                   onCommit={(value) =>
                     setAutoLockNumber(
                       'monitor_threshold',
@@ -423,8 +423,8 @@ export const LockingPanel = memo(function LockingPanel({
             {autoLockResult ? (
               <Text size="xs" c="dimmed">
                 target={autoLockResult.target_voltage.toFixed(4)} (idx {autoLockResult.target_index})
-                {' | '}score={autoLockResult.score.toFixed(1)} | pair=
-                {autoLockResult.pair_excursion.toFixed(1)}
+                {' | '}score={autoLockResult.score.toFixed(3)} | pair=
+                {autoLockResult.pair_excursion.toFixed(3)}
                 {autoLockResult.hz_per_v != null
                   ? ` | ${(autoLockResult.hz_per_v / 1e6).toFixed(3)} MHz/V`
                   : ''}

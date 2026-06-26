@@ -109,10 +109,11 @@ class SimultaneousStartPsd(StartPsdAcquisition):
 
 
 class AutoLockScanSettings(BaseModel):
-    # Amplitude thresholds are in RAW linien units (no normalization); half_range_sweep_v
-    # is sweep volts (x-axis). Defaults are rough placeholders — calibration sets real
-    # values. Field names/defaults must match the engine dataclass (auto_lock_scan.py);
-    # the parity test enforces this.
+    # Amplitude thresholds are in PLOT units (the fixed ADC_SCALE/V display scale, same as
+    # the plotted traces, ~±1 full scale); half_range_sweep_v is sweep volts (x-axis).
+    # Defaults are reasonable starting points — calibration sets real values. Field
+    # names/defaults must match the engine dataclass (auto_lock_scan.py); the parity test
+    # enforces this.
     model_config = ConfigDict(extra="forbid")
     signal_type: Literal["pdh", "dispersive"] = "pdh"
     allow_single_side: bool = False
@@ -123,25 +124,25 @@ class AutoLockScanSettings(BaseModel):
         description="Lobe-measurement window half-width, sweep volts (x-axis).",
     )
     error_min: float = Field(
-        default=600.0, ge=0.0, le=1e6,
-        description="Min feature peak-to-peak (raw linien).",
+        default=0.08, ge=0.0, le=4.0,
+        description="Min feature peak-to-peak (plot units).",
     )
     symmetry_min: float = Field(
         default=0.2, ge=0.0, le=1.0,
         description="Min weaker/stronger lobe ratio (dimensionless).",
     )
     single_error_min: float = Field(
-        default=600.0, ge=0.0, le=1e6,
-        description="Min stronger single lobe when single-side allowed (raw linien).",
+        default=0.1, ge=0.0, le=4.0,
+        description="Min stronger single lobe when single-side allowed (plot units).",
     )
     min_amplitude: float = Field(
-        default=100.0, ge=0.0, le=1e6,
-        description="Whole-trace dead-signal floor (raw linien).",
+        default=0.01, ge=0.0, le=4.0,
+        description="Whole-trace dead-signal floor (plot units).",
     )
     smooth_window_pts: int = Field(default=5, ge=1, le=301)
     monitor_threshold: float = Field(
-        default=1000.0, ge=0.0, le=1e6,
-        description="Monitor (PD) level at the lock point (raw linien, positive).",
+        default=0.1, ge=0.0, le=4.0,
+        description="Monitor (PD) level at the lock point (plot units, positive).",
     )
 
 

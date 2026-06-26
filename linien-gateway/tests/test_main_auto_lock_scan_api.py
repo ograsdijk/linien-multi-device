@@ -20,10 +20,10 @@ class DummyAutoLockSession:
             "target_index": 1024,
             "target_voltage": 0.01,
             "target_slope_rising": True,
-            "score": 900.0,
-            "left_excursion": 1500.0,
-            "right_excursion": 1600.0,
-            "pair_excursion": 3100.0,
+            "score": 0.9,
+            "left_excursion": 0.15,
+            "right_excursion": 0.16,
+            "pair_excursion": 0.31,
             "symmetry": 0.91,
             "monitor_level": None,
             "hz_per_v": None,
@@ -51,12 +51,12 @@ def test_auto_lock_scan_endpoint_passes_payload(monkeypatch):
         "use_monitor": False,
         "monitor_mode": "locked_above",
         "half_range_sweep_v": 0.12,
-        "error_min": 650.0,
+        "error_min": 0.1,
         "symmetry_min": 0.25,
-        "single_error_min": 700.0,
-        "min_amplitude": 120.0,
+        "single_error_min": 0.12,
+        "min_amplitude": 0.02,
         "smooth_window_pts": 7,
-        "monitor_threshold": 1200.0,
+        "monitor_threshold": 0.1,
     }
     response = client.post("/api/devices/test-device/control/auto_lock_scan", json=payload)
     assert response.status_code == 200
@@ -197,20 +197,20 @@ def test_calibrate_endpoint_returns_settings_and_diagnostics(monkeypatch):
             captured["allow_single_side"] = allow_single_side
             settings = AutoLockScanSettings(
                 half_range_sweep_v=0.13,
-                error_min=650.0,
+                error_min=0.18,
                 symmetry_min=0.7,
                 allow_single_side=allow_single_side,
                 use_monitor=include_monitor,
             )
             return AutoLockCalibration(
                 settings=settings,
-                amplitude=2400.0,
+                amplitude=0.36,
                 feature_half_width_v=0.1,
                 target_index=1024,
                 target_voltage=0.0,
                 target_slope_rising=True,
                 symmetry=1.0,
-                monitor_level=2000.0 if include_monitor else None,
+                monitor_level=0.6 if include_monitor else None,
                 hz_per_v=1.0e8,
                 detail="Calibrated from trace.",
             )
@@ -236,7 +236,7 @@ def test_calibrate_endpoint_returns_settings_and_diagnostics(monkeypatch):
     assert captured["allow_single_side"] is False
     assert body["settings"]["half_range_sweep_v"] == 0.13
     assert body["settings"]["use_monitor"] is True
-    assert body["amplitude"] == 2400.0
+    assert body["amplitude"] == 0.36
     assert body["hz_per_v"] == 1.0e8
     assert body["target_slope_rising"] is True
     assert body["detail"] == "Calibrated from trace."

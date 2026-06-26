@@ -2,15 +2,17 @@
 
 Units
 -----
-Amplitude thresholds and measured excursions are in **raw linien units** — exactly the
-values the device returns for the (combined) error and monitor signals, with no division
-or normalization. Only sweep-axis quantities use volts: ``half_range_sweep_v`` is a window
-width on the sweep voltage (x) axis, and ``target_voltage`` / ``sweep_*_v`` /
-``sideband_offset_v`` are sweep volts. ``symmetry_min`` is a dimensionless ratio; ``hz_per_v``
-is Hz per sweep volt.
+Amplitude thresholds and measured excursions are in **plot units** — the same fixed
+display scale the plot uses (the caller divides the error/monitor traces by ADC_SCALE,
+= ``plot_processing.V``, before calling in), so a threshold reads the same as the plotted
+y-axis (≈ ±1 full scale). This is a fixed scale, NOT per-trace normalization. Only sweep-axis
+quantities use sweep volts: ``half_range_sweep_v`` is a window width on the sweep voltage (x)
+axis, and ``target_voltage`` / ``sweep_*_v`` / ``sideband_offset_v`` are sweep volts.
+``symmetry_min`` is a dimensionless ratio; ``hz_per_v`` is Hz per sweep volt.
 
-Defaults for the amplitude thresholds are rough placeholders; per-device **calibration**
-(``calibrate_auto_lock_settings``) measures a known-good trace and sets the real values.
+Defaults for the amplitude thresholds are reasonable starting points; per-device
+**calibration** (``calibrate_auto_lock_settings``) measures a known-good trace and sets the
+real values.
 
 The error signal is a (possibly PDH) dispersive signal: a central carrier zero-crossing with
 two lobes, and — in PDH mode — two opposite-slope sideband crossings at ±Ω (the modulation
@@ -40,12 +42,12 @@ class AutoLockScanSettings:
     monitor_mode: str = "locked_above"  # "locked_above" (PD peak) | "locked_below" (PD dip)
     # Quantitative — calibration learns these (defaults are rough placeholders):
     half_range_sweep_v: float = 0.08  # lobe-measurement window half-width, sweep volts (x)
-    error_min: float = 600.0  # min feature peak-to-peak, raw linien
+    error_min: float = 0.08  # min feature peak-to-peak, plot units (fraction of full scale)
     symmetry_min: float = 0.2  # min weaker/stronger lobe ratio (dimensionless)
-    single_error_min: float = 600.0  # min stronger single lobe, raw linien
-    min_amplitude: float = 100.0  # whole-trace dead-signal floor, raw linien
+    single_error_min: float = 0.1  # min stronger single lobe, plot units
+    min_amplitude: float = 0.01  # whole-trace dead-signal floor, plot units
     smooth_window_pts: int = 5
-    monitor_threshold: float = 1000.0  # monitor (PD) level at the lock point, raw linien (+)
+    monitor_threshold: float = 0.1  # monitor (PD) level at the lock point, plot units (+)
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "AutoLockScanSettings":
@@ -113,6 +115,26 @@ def _moving_average(values: np.ndarray, window_pts: int) -> np.ndarray:
         width += 1
     kernel = np.ones(width, dtype=float) / float(width)
     return np.convolve(values, kernel, mode="same")
+
+
+def _monitor_baseline(monitor: np.ndarray) -> float:
+    """Off-resonance monitor level from the trace ends (decoupled from the feature
+    window, so a wide feature can't shrink the baseline region to nothing)."""
+    n = len(monitor)
+    edge = max(2, n // 10)
+    ends = np.concatenate((monitor[:edge], monitor[-edge:]))
+    return float(np.mean(ends)) if len(ends) else 0.0
+
+
+def _monitor_level_at(monitor: np.ndarray, anchor: int) -> float | None:
+    """Monitor level at the lock point: mean over a small fixed window at the crossing
+    (captures the on-resonance peak/dip without averaging in off-resonance baseline)."""
+    n = len(monitor)
+    w = max(2, n // 50)
+    lo = max(0, anchor - w)
+    hi = min(n, anchor + w + 1)
+    seg = monitor[lo:hi]
+    return float(np.mean(seg)) if len(seg) else None
 
 
 def _half_range_to_points(
@@ -287,6 +309,9 @@ def find_auto_lock_target(
     # Absent/disabled -> lock on the error signal alone (no error raised).
     use_monitor = bool(settings.use_monitor) and monitor is not None
     monitor_mode = str(settings.monitor_mode)
+    # Off-resonance monitor level (from the trace ends), used to score candidates by
+    # how far the monitor peaks/dips at the crossing relative to baseline.
+    monitor_baseline = _monitor_baseline(monitor) if monitor is not None else None
 
     half_range_pts = _half_range_to_points(
         settings.half_range_sweep_v, n_points, sweep_amplitude_v
@@ -365,11 +390,11 @@ def find_auto_lock_target(
                     slope_hint_rejects += 1
             continue
 
-        monitor_level: float | None = None
-        if monitor is not None:
-            window = monitor[left_start:right_end]
-            if len(window):
-                monitor_level = float(np.mean(window))
+        # Monitor level at the lock point: small window at the crossing (decoupled
+        # from the error-lobe half_range so a wide feature can't wash it out).
+        monitor_level = (
+            _monitor_level_at(monitor, anchor_idx) if monitor is not None else None
+        )
 
         if use_monitor:
             level = monitor_level if monitor_level is not None else 0.0
@@ -383,10 +408,16 @@ def find_auto_lock_target(
                     continue
 
         score = _candidate_score(pair_excursion, weaker)
-        if use_monitor and monitor_level is not None:
-            # Prefer the candidate whose monitor most strongly matches the mode.
-            signed = -monitor_level if monitor_mode == "locked_below" else monitor_level
-            score += _MONITOR_SCORE_WEIGHT * signed
+        if use_monitor and monitor_level is not None and monitor_baseline is not None:
+            # Rank by monitor CONTRAST vs baseline in the expected direction
+            # (transmission: higher than baseline; reflection: lower), not by the
+            # absolute level — a high/low background must not masquerade as a feature.
+            contrast = (
+                monitor_baseline - monitor_level
+                if monitor_mode == "locked_below"
+                else monitor_level - monitor_baseline
+            )
+            score += _MONITOR_SCORE_WEIGHT * contrast
 
         accepted.append(
             _Candidate(
@@ -724,39 +755,53 @@ def calibrate_auto_lock_settings(
 
     settings = dataclasses.replace(base)
     settings.half_range_sweep_v = half_range_sweep_v
-    settings.error_min = _clamp(factors.error_min_factor * pair, 0.0, 1e12)
+    settings.error_min = _clamp(factors.error_min_factor * pair, 0.0, 4.0)
     settings.symmetry_min = _clamp(factors.symmetry_margin * symmetry, 0.0, 0.9)
-    settings.min_amplitude = _clamp(factors.min_amplitude_factor * pair, 0.0, 1e12)
+    settings.min_amplitude = _clamp(factors.min_amplitude_factor * pair, 0.0, 4.0)
 
     settings.allow_single_side = bool(allow_single_side)
     if allow_single_side:
         settings.single_error_min = _clamp(
-            factors.single_error_min_factor * stronger, 0.0, 1e12
+            factors.single_error_min_factor * stronger, 0.0, 4.0
         )
 
     monitor_level: float | None = None
     settings.use_monitor = False
-    monitor_note = ""
     if include_monitor and monitor is not None:
-        left_start = max(0, anchor - half_range_pts)
-        right_end = min(n_points, anchor + 1 + half_range_pts)
-        window = monitor[left_start:right_end]
-        on_res = float(np.mean(window)) if len(window) else 0.0
-        # Off-resonance baseline: monitor away from the feature window.
-        mask = np.ones(n_points, dtype=bool)
-        mask[left_start:right_end] = False
-        baseline = float(np.mean(monitor[mask])) if bool(mask.any()) else on_res
+        # Small window at the lock point + baseline from the trace ends (decoupled
+        # from half_range so a wide feature can't collapse the baseline region).
+        on_res = _monitor_level_at(monitor, anchor)
+        on_res = on_res if on_res is not None else 0.0
+        baseline = _monitor_baseline(monitor)
         monitor_level = on_res
-        if abs(on_res - baseline) > 1e-9:
-            settings.use_monitor = True
-            settings.monitor_mode = str(base.monitor_mode)
-            settings.monitor_threshold = _clamp(
-                baseline + factors.monitor_threshold_factor * (on_res - baseline),
-                0.0,
-                1e12,
+        mode = str(base.monitor_mode)
+        # The monitor is a SAFETY check: the user asserts the correct feature's
+        # signature via monitor_mode. Don't auto-detect it — if the measured
+        # direction contradicts the configured mode, fail loudly (wrong mode, or
+        # calibrating on the wrong feature) rather than silently accepting it.
+        if abs(on_res - baseline) <= 1e-9:
+            raise ValueError(
+                "Monitor shows no contrast at the chosen feature (on-resonance level "
+                "equals the off-resonance baseline). Disable use_monitor or pick a "
+                "feature where the monitor actually peaks/dips."
             )
-        else:
-            monitor_note = " monitor shows no contrast at the feature, left disabled;"
+        if mode == "locked_above" and on_res < baseline:
+            raise ValueError(
+                "monitor_mode is 'locked_above' (transmission) but the monitor is LOWER "
+                "on resonance than off-resonance. Set monitor_mode to 'locked_below' "
+                "(reflection), or you may be calibrating on the wrong feature."
+            )
+        if mode == "locked_below" and on_res > baseline:
+            raise ValueError(
+                "monitor_mode is 'locked_below' (reflection) but the monitor is HIGHER "
+                "on resonance than off-resonance. Set monitor_mode to 'locked_above' "
+                "(transmission), or you may be calibrating on the wrong feature."
+            )
+        settings.use_monitor = True
+        settings.monitor_mode = mode
+        settings.monitor_threshold = _clamp(
+            baseline + factors.monitor_threshold_factor * (on_res - baseline), 0.0, 4.0
+        )
 
     target_voltage = _index_to_voltage(
         best_crossing_idx, n_points, float(sweep_center_v), float(sweep_amplitude_v)
@@ -793,9 +838,9 @@ def calibrate_auto_lock_settings(
         )
 
     detail = (
-        f"Calibrated from trace (raw linien units): amplitude={amplitude_pp:.1f}, "
+        f"Calibrated from trace (plot units): amplitude={amplitude_pp:.4f}, "
         f"feature half-width={feature_half_width_v:.4f} V, target={target_voltage:.4f} V, "
-        f"smooth={settings.smooth_window_pts} pts.{monitor_note}"
+        f"smooth={settings.smooth_window_pts} pts."
     )
 
     return AutoLockCalibration(

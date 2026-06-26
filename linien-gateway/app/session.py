@@ -696,9 +696,10 @@ class DeviceSession:
         # Validate the persisted/device-stored block through the same Pydantic
         # schema the HTTP boundary uses, so out-of-band writes (linien desktop
         # client, hand-edited config) can't smuggle out-of-range or wrong-typed
-        # values into the engine. The schema's AliasChoices also accept legacy
-        # ``_v`` keys and emit canonical names. On any failure, fall back to
-        # defaults rather than crashing the session.
+        # values into the engine. There are no legacy-key aliases: a block using
+        # old key names fails validation and falls back to defaults (the device
+        # must be recalibrated). On any failure, fall back to defaults rather
+        # than crashing the session.
         if isinstance(payload, dict):
             try:
                 payload = schemas.AutoLockScanSettings.model_validate(
@@ -863,7 +864,7 @@ class DeviceSession:
             preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
             modulation_raw = self.parameters.modulation_frequency.value
 
-        # Raw linien traces, no normalization (see auto_lock_scan units note).
+        # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
         return calibrate_auto_lock_settings(
             error_trace_v=error_trace,
             monitor_trace_v=monitor_trace,
@@ -1341,9 +1342,11 @@ class DeviceSession:
             monitor_trace_raw = self.plot_state.last_monitor_signal
         if error_trace_raw is None:
             raise RuntimeError("No error trace available")
-        error_trace = np.array(error_trace_raw, copy=True)
+        # Plot units: divide by ADC_SCALE (= plot_processing.V) so auto-lock thresholds
+        # read on the same fixed scale as the plotted traces (not per-trace normalized).
+        error_trace = np.array(error_trace_raw, copy=True) / ADC_SCALE
         monitor_trace = (
-            np.array(monitor_trace_raw, copy=True)
+            np.array(monitor_trace_raw, copy=True) / ADC_SCALE
             if monitor_trace_raw is not None
             else None
         )
@@ -1951,7 +1954,7 @@ class DeviceSession:
             preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
             modulation_raw = self.parameters.modulation_frequency.value
 
-        # Raw linien traces, no normalization (see auto_lock_scan units note).
+        # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
         result = find_auto_lock_target(
             error_trace_v=error_trace,
             monitor_trace_v=monitor_trace,
@@ -1986,7 +1989,7 @@ class DeviceSession:
             preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
             modulation_raw = self.parameters.modulation_frequency.value
 
-        # Raw linien traces, no normalization (see auto_lock_scan units note).
+        # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
         result = find_auto_lock_target(
             error_trace_v=error_trace,
             monitor_trace_v=monitor_trace,
