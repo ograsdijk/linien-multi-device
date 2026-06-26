@@ -55,6 +55,10 @@ class PlotState:
     control_std_history: List[float] = field(default_factory=list)
     combined_error_cache: List[np.ndarray] = field(default_factory=list)
     last_plot_data: Optional[List[np.ndarray]] = None
+    # The true monitor (transmission/reflection photodiode) signal, for auto-lock; None
+    # when the device has no monitor (e.g. channel B carries error_signal_2). Distinct
+    # from last_plot_data[1] (= monitor_or_error_signal_2, which can be a 2nd error signal).
+    last_monitor_signal: Optional[np.ndarray] = None
     last_unlocked_trace_at: float | None = None
     autolock_ref_spectrum: Optional[np.ndarray] = None
     last_lock_state: Optional[bool] = None
@@ -350,6 +354,10 @@ def build_plot_frame(
             monitor_or_error_signal_2,
             combined_error,
         ]
+        # Capture the *true* monitor (None when the device has no monitor signal) so
+        # auto-lock can do a transmission/reflection level check on it, rather than on
+        # monitor_or_error_signal_2 (which is error_signal_2 on dual-error devices).
+        state.last_monitor_signal = monitor_signal
         state.last_unlocked_trace_at = time.time()
 
         state.combined_error_cache.append(combined_error)

@@ -21,15 +21,17 @@ import { toClampedNumberOr, toFiniteNumberOr, toRoundedIntOr } from '../utils/nu
 import { DeferredNumberInput } from './DeferredNumberInput';
 
 const DEFAULT_AUTO_LOCK_SETTINGS: AutoLockScanSettings = {
-  half_range_sweep_v: 0.08,
-  crossing_max_frac: 0.03,
-  error_min_frac: 0.08,
-  symmetry_min: 0.2,
+  signal_type: 'pdh',
   allow_single_side: false,
-  single_error_min_frac: 0.1,
-  smooth_window_pts: 5,
   use_monitor: false,
-  monitor_contrast_min_frac: 0.03,
+  monitor_mode: 'locked_above',
+  half_range_sweep_v: 0.08,
+  error_min: 600,
+  symmetry_min: 0.2,
+  single_error_min: 600,
+  min_amplitude: 100,
+  smooth_window_pts: 5,
+  monitor_threshold: 1000,
 };
 
 type LockingPanelProps = {
@@ -246,15 +248,32 @@ export const LockingPanel = memo(function LockingPanel({
                 </Text>
                 {calibrationResult ? (
                   <Text size="xs" c="dimmed">
-                    Captured (normalised full-scale): amplitude=
-                    {calibrationResult.amplitude_v.toFixed(4)}
+                    Captured (raw): amplitude=
+                    {calibrationResult.amplitude.toFixed(1)}
                     {' · '}feature width=
-                    {calibrationResult.feature_half_width_v.toFixed(4)}
-                    {' · '}target={calibrationResult.target_voltage.toFixed(4)}
+                    {calibrationResult.feature_half_width_v.toFixed(4)} V
+                    {' · '}target={calibrationResult.target_voltage.toFixed(4)} V
+                    {calibrationResult.hz_per_v != null
+                      ? ` · ${(calibrationResult.hz_per_v / 1e6).toFixed(3)} MHz/V`
+                      : ''}
                   </Text>
                 ) : null}
               </Stack>
             ) : null}
+            <Select
+              label="Signal type"
+              data={[
+                { value: 'pdh', label: 'PDH (carrier + sidebands)' },
+                { value: 'dispersive', label: 'Dispersive (no sidebands)' },
+              ]}
+              value={autoLockSettings.signal_type}
+              onChange={(value) =>
+                updateAutoLockSettings((prev) => ({
+                  ...prev,
+                  signal_type: value === 'dispersive' ? 'dispersive' : 'pdh',
+                }))
+              }
+            />
             <Group grow>
               <DeferredNumberInput
                 label="Half range (sweep V)"
@@ -278,43 +297,23 @@ export const LockingPanel = memo(function LockingPanel({
                 parseCommit={(value) =>
                   toRoundedIntOr(value, DEFAULT_AUTO_LOCK_SETTINGS.smooth_window_pts, 1)
                 }
-                onCommit={(value) =>
-                  setAutoLockNumber(
-                    'smooth_window_pts',
-                    value
-                  )
-                }
+                onCommit={(value) => setAutoLockNumber('smooth_window_pts', value)}
               />
             </Group>
             <Group grow>
               <DeferredNumberInput
-                label="Crossing max (norm.)"
-                value={autoLockSettings.crossing_max_frac}
-                min={0.0001}
-                step={0.01}
-                decimalScale={4}
+                label="Error min (raw)"
+                value={autoLockSettings.error_min}
+                min={0}
+                step={10}
+                decimalScale={1}
                 onCommit={(value) =>
                   setAutoLockNumber(
-                    'crossing_max_frac',
-                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.crossing_max_frac)
+                    'error_min',
+                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.error_min)
                   )
                 }
               />
-              <DeferredNumberInput
-                label="Error min (norm.)"
-                value={autoLockSettings.error_min_frac}
-                min={0.0001}
-                step={0.01}
-                decimalScale={4}
-                onCommit={(value) =>
-                  setAutoLockNumber(
-                    'error_min_frac',
-                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.error_min_frac)
-                  )
-                }
-              />
-            </Group>
-            <Group grow>
               <DeferredNumberInput
                 label="Symmetry min"
                 value={autoLockSettings.symmetry_min}
@@ -329,16 +328,31 @@ export const LockingPanel = memo(function LockingPanel({
                   )
                 }
               />
+            </Group>
+            <Group grow>
               <DeferredNumberInput
-                label="Single error min (norm.)"
-                value={autoLockSettings.single_error_min_frac}
-                min={0.0001}
-                step={0.01}
-                decimalScale={4}
+                label="Min amplitude (raw)"
+                value={autoLockSettings.min_amplitude}
+                min={0}
+                step={10}
+                decimalScale={1}
                 onCommit={(value) =>
                   setAutoLockNumber(
-                    'single_error_min_frac',
-                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.single_error_min_frac)
+                    'min_amplitude',
+                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.min_amplitude)
+                  )
+                }
+              />
+              <DeferredNumberInput
+                label="Single error min (raw)"
+                value={autoLockSettings.single_error_min}
+                min={0}
+                step={10}
+                decimalScale={1}
+                onCommit={(value) =>
+                  setAutoLockNumber(
+                    'single_error_min',
+                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.single_error_min)
                   )
                 }
                 disabled={!autoLockSettings.allow_single_side}
@@ -365,19 +379,36 @@ export const LockingPanel = memo(function LockingPanel({
               }
             />
             {autoLockSettings.use_monitor ? (
-              <DeferredNumberInput
-                label="Monitor contrast min (norm.)"
-                value={autoLockSettings.monitor_contrast_min_frac}
-                min={0.0001}
-                step={0.01}
-                decimalScale={4}
-                onCommit={(value) =>
-                  setAutoLockNumber(
-                    'monitor_contrast_min_frac',
-                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.monitor_contrast_min_frac)
-                  )
-                }
-              />
+              <Group grow>
+                <Select
+                  label="Monitor mode"
+                  data={[
+                    { value: 'locked_above', label: 'Transmission (peak)' },
+                    { value: 'locked_below', label: 'Reflection (dip)' },
+                  ]}
+                  value={autoLockSettings.monitor_mode}
+                  onChange={(value) =>
+                    updateAutoLockSettings((prev) => ({
+                      ...prev,
+                      monitor_mode:
+                        value === 'locked_below' ? 'locked_below' : 'locked_above',
+                    }))
+                  }
+                />
+                <DeferredNumberInput
+                  label="Monitor threshold (raw)"
+                  value={autoLockSettings.monitor_threshold}
+                  min={0}
+                  step={10}
+                  decimalScale={1}
+                  onCommit={(value) =>
+                    setAutoLockNumber(
+                      'monitor_threshold',
+                      toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.monitor_threshold)
+                    )
+                  }
+                />
+              </Group>
             ) : null}
             <Button
               variant="light"
@@ -392,9 +423,11 @@ export const LockingPanel = memo(function LockingPanel({
             {autoLockResult ? (
               <Text size="xs" c="dimmed">
                 target={autoLockResult.target_voltage.toFixed(4)} (idx {autoLockResult.target_index})
-                {' | '}score={autoLockResult.score.toFixed(3)} | pair=
-                {autoLockResult.pair_excursion_v.toFixed(3)} | symmetry=
-                {autoLockResult.symmetry.toFixed(3)} (norm.)
+                {' | '}score={autoLockResult.score.toFixed(1)} | pair=
+                {autoLockResult.pair_excursion.toFixed(1)}
+                {autoLockResult.hz_per_v != null
+                  ? ` | ${(autoLockResult.hz_per_v / 1e6).toFixed(3)} MHz/V`
+                  : ''}
               </Text>
             ) : null}
           </Stack>

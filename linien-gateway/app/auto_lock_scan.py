@@ -1,24 +1,21 @@
 """Auto-lock target detection and calibration.
 
-Units convention for the ``*_v`` / ``*_frac`` suffixes
------------------------------------------------------
-Two distinct axes appear here; the suffix tells you which one:
+Units
+-----
+Amplitude thresholds and measured excursions are in **raw linien units** — exactly the
+values the device returns for the (combined) error and monitor signals, with no division
+or normalization. Only sweep-axis quantities use volts: ``half_range_sweep_v`` is a window
+width on the sweep voltage (x) axis, and ``target_voltage`` / ``sweep_*_v`` /
+``sideband_offset_v`` are sweep volts. ``symmetry_min`` is a dimensionless ratio; ``hz_per_v``
+is Hz per sweep volt.
 
-* ``*_sweep_v`` / ``target_voltage`` / ``sweep_*_v`` — **real sweep volts** on the
-  x-axis (the device sweep parameter axis). ``half_range_sweep_v`` is a window
-  *width* in these units; it is converted to sample points against
-  ``sweep_amplitude_v`` in :func:`_half_range_to_points`.
-* ``*_frac`` — **normalized full-scale error amplitude** on the y-axis. The error
-  (and monitor) trace is divided by ``ADC_SCALE`` before reaching this module, so
-  these live in roughly ``-1..+1``. Settings ``crossing_max_frac``, ``error_min_frac``,
-  ``single_error_min_frac``, ``monitor_contrast_min_frac`` and the calibration
-  ``min_amplitude_frac`` are all y-axis fractions.
+Defaults for the amplitude thresholds are rough placeholders; per-device **calibration**
+(``calibrate_auto_lock_settings``) measures a known-good trace and sets the real values.
 
-Note: the *output* result/calibration fields (``center_abs_v``, ``*_excursion_v``,
-``monitor_contrast_v``, ``amplitude_v``, ``feature_half_width_v``) retain a ``_v``
-suffix for API/back-compat reasons but are **also normalized full-scale (y-axis)**,
-except ``target_voltage`` / ``feature_half_width_v`` which describe the sweep axis.
-``symmetry_min`` is a dimensionless ratio (weaker/stronger lobe), not an axis value.
+The error signal is a (possibly PDH) dispersive signal: a central carrier zero-crossing with
+two lobes, and — in PDH mode — two opposite-slope sideband crossings at ±Ω (the modulation
+frequency). The monitor, when present, is a photodiode level (transmission peak or reflection
+dip) that confirms the lock sits on the right feature.
 """
 
 from __future__ import annotations
@@ -29,50 +26,35 @@ from typing import Any, Mapping
 
 import numpy as np
 
-
-# Old -> new field names, accepted on input so persisted device-param dicts and
-# any stale caller keep loading after the rename. See the Pydantic ``AliasChoices``
-# in schemas.py for the matching HTTP-boundary aliases.
-_LEGACY_KEY_MAP: dict[str, str] = {
-    "half_range_v": "half_range_sweep_v",
-    "crossing_max_v": "crossing_max_frac",
-    "error_min": "error_min_frac",
-    "single_error_min": "single_error_min_frac",
-    "monitor_contrast_min_v": "monitor_contrast_min_frac",
-}
+# Weight of the monitor level in the candidate score (a strong tie-breaker among
+# crossings that already pass the gates). Internal; not a user setting.
+_MONITOR_SCORE_WEIGHT = 0.5
 
 
 @dataclass
 class AutoLockScanSettings:
-    half_range_sweep_v: float = 0.08  # window half-width, real sweep volts (x)
-    crossing_max_frac: float = 0.03  # max |error| at crossing, normalized (y)
-    error_min_frac: float = 0.08  # min summed lobe excursion, normalized (y)
-    symmetry_min: float = 0.2  # min weaker/stronger lobe ratio (dimensionless)
+    # Qualitative — set by the user per device:
+    signal_type: str = "pdh"  # "pdh" (carrier + ±Ω sidebands) | "dispersive"
     allow_single_side: bool = False
-    single_error_min_frac: float = 0.1  # min single-lobe excursion, normalized (y)
-    smooth_window_pts: int = 5
     use_monitor: bool = False
-    monitor_contrast_min_frac: float = 0.03  # min monitor contrast, normalized (y)
+    monitor_mode: str = "locked_above"  # "locked_above" (PD peak) | "locked_below" (PD dip)
+    # Quantitative — calibration learns these (defaults are rough placeholders):
+    half_range_sweep_v: float = 0.08  # lobe-measurement window half-width, sweep volts (x)
+    error_min: float = 600.0  # min feature peak-to-peak, raw linien
+    symmetry_min: float = 0.2  # min weaker/stronger lobe ratio (dimensionless)
+    single_error_min: float = 600.0  # min stronger single lobe, raw linien
+    min_amplitude: float = 100.0  # whole-trace dead-signal floor, raw linien
+    smooth_window_pts: int = 5
+    monitor_threshold: float = 1000.0  # monitor (PD) level at the lock point, raw linien (+)
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "AutoLockScanSettings":
         if payload is None:
             return cls()
-        # Accept legacy ``_v`` keys (e.g. crossing_max_v) by mapping them onto the
-        # current field names; an explicit new-name value always wins over a legacy one.
-        remapped: dict[str, Any] = {}
-        for key, value in payload.items():
-            target = _LEGACY_KEY_MAP.get(key, key)
-            if target in payload and target != key:
-                continue  # new name also present -> prefer it
-            remapped[target] = value
         defaults = cls()
         values: dict[str, Any] = {}
         for name in defaults.__dataclass_fields__.keys():
-            if name not in remapped:
-                values[name] = getattr(defaults, name)
-                continue
-            values[name] = remapped[name]
+            values[name] = payload[name] if name in payload else getattr(defaults, name)
         return cls(**values)
 
 
@@ -82,12 +64,13 @@ class AutoLockScanResult:
     target_voltage: float
     target_slope_rising: bool
     score: float
-    center_abs_v: float
-    left_excursion_v: float
-    right_excursion_v: float
-    pair_excursion_v: float
+    left_excursion: float
+    right_excursion: float
+    pair_excursion: float
     symmetry: float
-    monitor_contrast_v: float | None
+    monitor_level: float | None
+    hz_per_v: float | None
+    sideband_offset_v: float | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,12 +78,13 @@ class AutoLockScanResult:
             "target_voltage": self.target_voltage,
             "target_slope_rising": self.target_slope_rising,
             "score": self.score,
-            "center_abs_v": self.center_abs_v,
-            "left_excursion_v": self.left_excursion_v,
-            "right_excursion_v": self.right_excursion_v,
-            "pair_excursion_v": self.pair_excursion_v,
+            "left_excursion": self.left_excursion,
+            "right_excursion": self.right_excursion,
+            "pair_excursion": self.pair_excursion,
             "symmetry": self.symmetry,
-            "monitor_contrast_v": self.monitor_contrast_v,
+            "monitor_level": self.monitor_level,
+            "hz_per_v": self.hz_per_v,
+            "sideband_offset_v": self.sideband_offset_v,
         }
 
 
@@ -110,12 +94,11 @@ class _Candidate:
     index_float: float
     score: float
     target_slope_rising: bool
-    center_abs_v: float
-    left_excursion_v: float
-    right_excursion_v: float
-    pair_excursion_v: float
+    left_excursion: float
+    right_excursion: float
+    pair_excursion: float
     symmetry: float
-    monitor_contrast_v: float | None
+    monitor_level: float | None
 
 
 def _sanitize_trace(values: np.ndarray) -> np.ndarray:
@@ -192,10 +175,14 @@ def _index_to_voltage(index: float, n_points: int, sweep_center_v: float, sweep_
 def _estimate_crossing(
     error_trace_v: np.ndarray,
     center_idx: int,
-) -> tuple[float, float]:
+) -> float:
+    """Sub-sample position of the zero crossing nearest ``center_idx``.
+
+    Linearly interpolates within a sign-change bracket; falls back to ``center_idx``
+    when there is no bracket (degenerate near-zero candidate)."""
     n_points = len(error_trace_v)
     if center_idx < 0 or center_idx >= n_points:
-        return 0.0, float(center_idx)
+        return float(center_idx)
 
     bracket_positions: list[float] = []
     for left_idx, right_idx in ((center_idx - 1, center_idx), (center_idx, center_idx + 1)):
@@ -215,11 +202,46 @@ def _estimate_crossing(
             bracket_positions.append(float(left_idx) + fraction)
 
     if bracket_positions:
-        best = min(bracket_positions, key=lambda item: abs(item - float(center_idx)))
-        # A valid sign-change bracket implies an interpolated zero crossing.
-        return 0.0, float(best)
+        return min(bracket_positions, key=lambda item: abs(item - float(center_idx)))
+    return float(center_idx)
 
-    return abs(float(error_trace_v[center_idx])), float(center_idx)
+
+def _sideband_offset_pts(
+    error: np.ndarray, anchor: int, carrier_rising: bool
+) -> float | None:
+    """Mean distance (in samples) from the carrier crossing to the nearest
+    opposite-slope (sideband) crossings on each side.
+
+    In PDH the ±Ω sideband error features cross zero exactly Ω from the carrier and
+    with the opposite slope, so this distance is the sample-equivalent of Ω."""
+    n = len(error)
+    left_idx: int | None = None
+    right_idx: int | None = None
+    for i in range(n - 1):
+        a = float(error[i])
+        b = float(error[i + 1])
+        rising = (a < 0.0 <= b) or (a <= 0.0 < b)
+        falling = (a > 0.0 >= b) or (a >= 0.0 > b)
+        if not (rising or falling):
+            continue
+        if rising == carrier_rising:
+            continue  # same slope as carrier -> not a sideband
+        idx = i if abs(a) <= abs(b) else i + 1
+        if idx < anchor:
+            if left_idx is None or idx > left_idx:
+                left_idx = idx  # nearest on the left
+        elif idx > anchor:
+            if right_idx is None or idx < right_idx:
+                right_idx = idx  # nearest on the right
+
+    offsets = []
+    if left_idx is not None and (anchor - left_idx) > 0:
+        offsets.append(anchor - left_idx)
+    if right_idx is not None and (right_idx - anchor) > 0:
+        offsets.append(right_idx - anchor)
+    if not offsets:
+        return None
+    return float(sum(offsets)) / float(len(offsets))
 
 
 def find_auto_lock_target(
@@ -230,6 +252,7 @@ def find_auto_lock_target(
     sweep_amplitude_v: float,
     settings: AutoLockScanSettings,
     preferred_slope_rising: bool | None = None,
+    modulation_frequency_hz: float | None = None,
 ) -> AutoLockScanResult:
     if error_trace_v is None:
         raise ValueError("No error trace available.")
@@ -244,11 +267,27 @@ def find_auto_lock_target(
         monitor_raw = _sanitize_trace(np.asarray(monitor_trace_v, dtype=float))
         if len(monitor_raw) != n_points:
             monitor_raw = None
-    if settings.use_monitor and monitor_raw is None:
-        raise ValueError("Monitor trace unavailable while use_monitor is enabled.")
 
     error = _moving_average(error_raw, settings.smooth_window_pts)
-    monitor = _moving_average(monitor_raw, settings.smooth_window_pts) if monitor_raw is not None else None
+    monitor = (
+        _moving_average(monitor_raw, settings.smooth_window_pts)
+        if monitor_raw is not None
+        else None
+    )
+
+    # Whole-trace dead-signal floor: is there any signal at all?
+    amplitude_pp = float(np.max(error) - np.min(error))
+    if amplitude_pp < float(settings.min_amplitude):
+        raise ValueError(
+            "No lockable signal: trace peak-to-peak is below min_amplitude "
+            f"({amplitude_pp:.1f} < {float(settings.min_amplitude):.1f})."
+        )
+
+    # Monitor is optional: only used when a real monitor trace exists AND it's enabled.
+    # Absent/disabled -> lock on the error signal alone (no error raised).
+    use_monitor = bool(settings.use_monitor) and monitor is not None
+    monitor_mode = str(settings.monitor_mode)
+
     half_range_pts = _half_range_to_points(
         settings.half_range_sweep_v, n_points, sweep_amplitude_v
     )
@@ -258,29 +297,20 @@ def find_auto_lock_target(
 
     accepted: list[_Candidate] = []
     slope_hint_rejects = 0
-    center_rejects = 0
     monitor_rejects = 0
-    evaluated = 0
     for center_idx in candidates:
-        center_abs_v, crossing_idx_float = _estimate_crossing(error, center_idx)
+        crossing_idx_float = _estimate_crossing(error, center_idx)
         anchor_idx = int(round(crossing_idx_float))
         if anchor_idx <= 0 or anchor_idx >= (n_points - 1):
             continue
-        evaluated += 1
 
         left_start = max(0, anchor_idx - half_range_pts)
         right_end = min(n_points, anchor_idx + 1 + half_range_pts)
-        left = error[left_start:anchor_idx]
-        right = error[anchor_idx + 1 : right_end]
-        if len(left) < 2 or len(right) < 2:
+        if (anchor_idx - left_start) < 2 or (right_end - (anchor_idx + 1)) < 2:
             continue
 
-        if center_abs_v > float(settings.crossing_max_frac):
-            center_rejects += 1
-            continue
-
-        # Shared with calibration via _excursions_for_slope so the two paths
-        # measure excursions identically and cannot drift.
+        # Shared with calibration via _excursions_for_slope so the two paths measure
+        # excursions identically and cannot drift.
         rising_left, rising_right = _excursions_for_slope(
             error, anchor_idx, half_range_pts, True
         )
@@ -296,67 +326,67 @@ def find_auto_lock_target(
             target_slope_rising = bool(preferred_slope_rising)
 
         if target_slope_rising:
-            left_excursion_v = rising_left
-            right_excursion_v = rising_right
+            left_excursion = rising_left
+            right_excursion = rising_right
         else:
-            left_excursion_v = falling_left
-            right_excursion_v = falling_right
+            left_excursion = falling_left
+            right_excursion = falling_right
 
-        stronger = max(left_excursion_v, right_excursion_v)
-        weaker = min(left_excursion_v, right_excursion_v)
-        pair_excursion_v = left_excursion_v + right_excursion_v
+        stronger = max(left_excursion, right_excursion)
+        weaker = min(left_excursion, right_excursion)
+        pair_excursion = left_excursion + right_excursion
         symmetry = weaker / stronger if stronger > 1e-12 else 0.0
 
         paired_ok = (
-            pair_excursion_v >= float(settings.error_min_frac)
+            pair_excursion >= float(settings.error_min)
             and symmetry >= float(settings.symmetry_min)
         )
         single_ok = (
             bool(settings.allow_single_side)
-            and stronger >= float(settings.single_error_min_frac)
+            and stronger >= float(settings.single_error_min)
         )
         if not (paired_ok or single_ok):
             if preferred_slope_rising is not None:
-                opposite_left = falling_left if target_slope_rising else rising_left
-                opposite_right = falling_right if target_slope_rising else rising_right
-                opposite_pair = opposite_left + opposite_right
-                opposite_stronger = max(opposite_left, opposite_right)
-                opposite_weaker = min(opposite_left, opposite_right)
-                opposite_symmetry = (
-                    opposite_weaker / opposite_stronger
-                    if opposite_stronger > 1e-12
-                    else 0.0
+                opp_left = falling_left if target_slope_rising else rising_left
+                opp_right = falling_right if target_slope_rising else rising_right
+                opp_stronger = max(opp_left, opp_right)
+                opp_weaker = min(opp_left, opp_right)
+                opp_pair = opp_left + opp_right
+                opp_symmetry = (
+                    opp_weaker / opp_stronger if opp_stronger > 1e-12 else 0.0
                 )
-                opposite_paired_ok = (
-                    opposite_pair >= float(settings.error_min_frac)
-                    and opposite_symmetry >= float(settings.symmetry_min)
-                )
-                opposite_single_ok = (
+                if (
+                    opp_pair >= float(settings.error_min)
+                    and opp_symmetry >= float(settings.symmetry_min)
+                ) or (
                     bool(settings.allow_single_side)
-                    and opposite_stronger >= float(settings.single_error_min_frac)
-                )
-                if opposite_paired_ok or opposite_single_ok:
+                    and opp_stronger >= float(settings.single_error_min)
+                ):
                     slope_hint_rejects += 1
             continue
 
-        monitor_contrast_v: float | None = None
+        monitor_level: float | None = None
         if monitor is not None:
-            left_monitor = monitor[left_start:anchor_idx]
-            right_monitor = monitor[anchor_idx + 1 : right_end]
-            if len(left_monitor) > 0 and len(right_monitor) > 0:
-                monitor_contrast_v = abs(
-                    float(np.mean(right_monitor) - np.mean(left_monitor))
-                )
+            window = monitor[left_start:right_end]
+            if len(window):
+                monitor_level = float(np.mean(window))
 
-        if settings.use_monitor:
-            contrast = monitor_contrast_v or 0.0
-            if contrast < float(settings.monitor_contrast_min_frac):
-                monitor_rejects += 1
-                continue
+        if use_monitor:
+            level = monitor_level if monitor_level is not None else 0.0
+            if monitor_mode == "locked_below":
+                if level > float(settings.monitor_threshold):
+                    monitor_rejects += 1
+                    continue
+            else:  # locked_above
+                if level < float(settings.monitor_threshold):
+                    monitor_rejects += 1
+                    continue
 
-        score = _candidate_score(pair_excursion_v, weaker, center_abs_v)
-        if settings.use_monitor and monitor_contrast_v is not None:
-            score += 0.2 * monitor_contrast_v
+        score = _candidate_score(pair_excursion, weaker)
+        if use_monitor and monitor_level is not None:
+            # Prefer the candidate whose monitor most strongly matches the mode.
+            signed = -monitor_level if monitor_mode == "locked_below" else monitor_level
+            score += _MONITOR_SCORE_WEIGHT * signed
 
         accepted.append(
             _Candidate(
@@ -364,15 +394,12 @@ def find_auto_lock_target(
                 index_float=float(crossing_idx_float),
                 score=float(score),
                 target_slope_rising=target_slope_rising,
-                center_abs_v=float(center_abs_v),
-                left_excursion_v=float(left_excursion_v),
-                right_excursion_v=float(right_excursion_v),
-                pair_excursion_v=float(pair_excursion_v),
+                left_excursion=float(left_excursion),
+                right_excursion=float(right_excursion),
+                pair_excursion=float(pair_excursion),
                 symmetry=float(symmetry),
-                monitor_contrast_v=(
-                    float(monitor_contrast_v)
-                    if monitor_contrast_v is not None
-                    else None
+                monitor_level=(
+                    float(monitor_level) if monitor_level is not None else None
                 ),
             )
         )
@@ -380,21 +407,30 @@ def find_auto_lock_target(
     if not accepted:
         if slope_hint_rejects > 0:
             raise ValueError(
-                "No valid PDH-like crossing passed thresholds for the current target slope. "
+                "No valid crossing passed thresholds for the current target slope. "
                 "Try toggling Target slope (rising/falling) or shifting demodulation phase by 180 degrees."
             )
-        if evaluated > 0 and center_rejects >= max(1, evaluated // 2):
+        if use_monitor and monitor_rejects > 0:
             raise ValueError(
-                "No valid PDH-like crossing passed thresholds because crossing_max_frac is too strict for this scan sampling. "
-                "Increase crossing_max_frac or reduce sweep span."
+                "No valid crossing passed thresholds because the monitor level did not meet monitor_threshold."
             )
-        if settings.use_monitor and monitor_rejects > 0:
-            raise ValueError(
-                "No valid PDH-like crossing passed thresholds because monitor contrast was below monitor_contrast_min_frac."
-            )
-        raise ValueError("No valid PDH-like crossing passed the configured thresholds.")
+        raise ValueError("No valid crossing passed the configured thresholds.")
 
     best = max(accepted, key=lambda item: item.score)
+
+    sideband_offset_v: float | None = None
+    hz_per_v: float | None = None
+    if str(settings.signal_type) == "pdh" and modulation_frequency_hz:
+        off_pts = _sideband_offset_pts(error, best.index, best.target_slope_rising)
+        if off_pts and off_pts > 0 and n_points > 1:
+            sideband_offset_v = float(off_pts) * (
+                2.0 * abs(float(sweep_amplitude_v)) / (n_points - 1)
+            )
+            if sideband_offset_v > 1e-12:
+                hz_per_v = float(modulation_frequency_hz) / sideband_offset_v
+            else:
+                sideband_offset_v = None
+
     target_voltage = _index_to_voltage(
         best.index_float,
         n_points,
@@ -406,65 +442,59 @@ def find_auto_lock_target(
         target_voltage=float(target_voltage),
         target_slope_rising=bool(best.target_slope_rising),
         score=float(best.score),
-        center_abs_v=float(best.center_abs_v),
-        left_excursion_v=float(best.left_excursion_v),
-        right_excursion_v=float(best.right_excursion_v),
-        pair_excursion_v=float(best.pair_excursion_v),
+        left_excursion=float(best.left_excursion),
+        right_excursion=float(best.right_excursion),
+        pair_excursion=float(best.pair_excursion),
         symmetry=float(best.symmetry),
-        monitor_contrast_v=(
-            float(best.monitor_contrast_v)
-            if best.monitor_contrast_v is not None
-            else None
+        monitor_level=(
+            float(best.monitor_level) if best.monitor_level is not None else None
+        ),
+        hz_per_v=(float(hz_per_v) if hz_per_v is not None else None),
+        sideband_offset_v=(
+            float(sideband_offset_v) if sideband_offset_v is not None else None
         ),
     )
 
 
 # ---------------------------------------------------------------------------
-# Calibration: derive auto-lock settings from a known-good PDH error trace.
+# Calibration: derive auto-lock settings from a known-good error trace.
 #
-# The user manually sweeps and centers a good PDH error signal, then asks the
-# gateway to learn from that exact trace. We measure the dominant dispersive
-# crossing the same way ``find_auto_lock_target`` selects it, then back out
-# every threshold as a fraction of what the reference actually showed, and
-# finally re-run ``find_auto_lock_target`` with the derived settings as a
-# self-check so we never persist settings that would not lock. Optional
-# features (monitor contrast, single-side acceptance) are only populated when
-# the user opts into them.
+# The user manually sweeps and centers a good error signal and sets the qualitative
+# settings (signal_type, use_monitor, monitor_mode, allow_single_side); calibration
+# measures the dominant dispersive crossing the same way find_auto_lock_target selects
+# it, then sets the quantitative thresholds as multipliers of what the reference showed,
+# and finally re-runs find_auto_lock_target with the derived settings as a self-check so
+# we never persist settings that would not lock.
 #
-# Units: the error signal here is the demodulated PDH signal normalised to
-# full scale (-1..+1), not volts (see the module docstring's units table). The
-# derived ``*_frac`` settings are y-axis fractions; ``half_range_sweep_v`` is a
-# width on the real sweep-volt x-axis.
+# Units: raw linien values (no normalization); see the module docstring.
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class AutoLockCalibrationFactors:
-    error_min_frac: float = 0.5
-    single_error_min_frac: float = 0.5
-    crossing_max_frac: float = 0.1
+    error_min_factor: float = 0.5
+    single_error_min_factor: float = 0.5
     half_range_margin: float = 1.3
     symmetry_margin: float = 0.7
-    monitor_contrast_frac: float = 0.5
-    # Enable the monitor gate only when left/right contrast exceeds this
-    # fraction of the monitor's own peak-to-peak amplitude (a symmetric monitor
-    # has ~zero contrast and must be left disabled).
-    monitor_floor_frac: float = 0.1
-    # Dead-trace guard in normalised full-scale units (~noise level). The
-    # self-check is the real "is this a lockable feature?" gate.
-    min_amplitude_frac: float = 0.01
+    # min_amplitude (the live dead-trace floor) as a fraction of the feature's
+    # measured peak-to-peak — a dead/noise trace won't have a feature this tall.
+    min_amplitude_factor: float = 0.3
+    # monitor_threshold placed this fraction of the way from the off-resonance
+    # baseline to the on-resonance level (0.5 = midpoint).
+    monitor_threshold_factor: float = 0.5
 
 
 @dataclass
 class AutoLockCalibration:
     settings: AutoLockScanSettings
-    amplitude_v: float
+    amplitude: float
     feature_half_width_v: float
     target_index: int
     target_voltage: float
     target_slope_rising: bool
     symmetry: float
-    monitor_contrast_v: float | None
+    monitor_level: float | None
+    hz_per_v: float | None
     detail: str
 
 
@@ -472,11 +502,10 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return float(min(max(float(value), lo), hi))
 
 
-def _candidate_score(pair_excursion_v: float, weaker: float, center_abs_v: float) -> float:
-    """Base crossing-quality score shared by detection and calibration so the
-    two never rank crossings differently (the monitor bonus is added by the
-    detector on top of this)."""
-    return pair_excursion_v + (0.25 * weaker) - (2.0 * center_abs_v)
+def _candidate_score(pair_excursion: float, weaker: float) -> float:
+    """Crossing-quality score shared by detection and calibration so the two never
+    rank crossings differently (the monitor term is added by the detector on top)."""
+    return pair_excursion + (0.25 * weaker)
 
 
 def _excursions_for_slope(
@@ -590,6 +619,7 @@ def calibrate_auto_lock_settings(
     preferred_slope_rising: bool | None = None,
     include_monitor: bool = False,
     allow_single_side: bool = False,
+    modulation_frequency_hz: float | None = None,
     factors: AutoLockCalibrationFactors | None = None,
 ) -> AutoLockCalibration:
     """Derive a full ``AutoLockScanSettings`` from a known-good error trace."""
@@ -617,14 +647,13 @@ def calibrate_auto_lock_settings(
         else None
     )
 
-    # Peak-to-peak amplitude of the (smoothed) trace. Use true min/max, not
-    # percentiles: a sharp feature occupies few points, so p2/p98 would clip it
-    # to ~0 and wrongly report "no signal". Smoothing already tames spikes.
+    # Peak-to-peak amplitude of the (smoothed) trace. True min/max, not percentiles:
+    # a sharp feature occupies few points, so p2/p98 would clip it to ~0.
     amplitude_pp = max(0.0, float(np.max(error) - np.min(error)))
-    if amplitude_pp < float(factors.min_amplitude_frac):
+    if amplitude_pp <= 1e-9:
         raise ValueError(
-            "No PDH-like signal detected on the current trace (amplitude below "
-            "noise floor). Center a good error signal before calibrating."
+            "No signal detected on the current trace. Center a good error signal "
+            "before calibrating."
         )
 
     candidates = _extract_crossing_candidates(error)
@@ -637,9 +666,8 @@ def calibrate_auto_lock_settings(
     best_anchor = 0
     best_crossing_idx = 0.0
     best_slope = True
-    best_center_abs_v = 0.0
     for center_idx in candidates:
-        center_abs_v, crossing_idx_float = _estimate_crossing(error, center_idx)
+        crossing_idx_float = _estimate_crossing(error, center_idx)
         anchor = int(round(crossing_idx_float))
         if anchor <= 0 or anchor >= (n_points - 1):
             continue
@@ -649,17 +677,15 @@ def calibrate_auto_lock_settings(
         pair = left_exc + right_exc
         if pair <= 0.0:
             continue
-        # Select the same crossing find_auto_lock_target would: rank by its
-        # score objective (pair + 0.25*weaker - 2*center_abs_v), not by a
-        # different key, so the calibrated anchor matches the locked one.
+        # Rank by the same objective find_auto_lock_target uses, so the calibrated
+        # anchor matches the locked one.
         weaker = min(left_exc, right_exc)
-        score = _candidate_score(pair, weaker, center_abs_v)
+        score = _candidate_score(pair, weaker)
         if best_score is None or score > best_score:
             best_score = score
             best_anchor = anchor
             best_crossing_idx = crossing_idx_float
             best_slope = slope
-            best_center_abs_v = center_abs_v
 
     if best_score is None:
         raise ValueError("No usable dispersive crossing found on the current trace.")
@@ -667,8 +693,8 @@ def calibrate_auto_lock_settings(
     anchor = best_anchor
     slope_rising = best_slope
 
-    # Feature half-width -> half_range_sweep_v. Search out to half the trace
-    # (bounded by the lobe's own zero crossing) so wide features are not truncated.
+    # Feature half-width -> half_range_sweep_v. Search out to half the trace (bounded
+    # by the lobe's own zero crossing) so wide features are not truncated.
     left_off, right_off = _peak_offsets(
         error, anchor, (n_points // 2) - 1, slope_rising
     )
@@ -683,8 +709,8 @@ def calibrate_auto_lock_settings(
         factors.half_range_margin * feature_half_width_v, 0.001, 2.0
     )
 
-    # Re-measure excursions over the derived window so the calibrated
-    # thresholds match what find_auto_lock_target will later see.
+    # Re-measure excursions over the derived window so the calibrated thresholds
+    # match what find_auto_lock_target will later see.
     half_range_pts = _half_range_to_points(
         half_range_sweep_v, n_points, sweep_amplitude_v
     )
@@ -698,56 +724,39 @@ def calibrate_auto_lock_settings(
 
     settings = dataclasses.replace(base)
     settings.half_range_sweep_v = half_range_sweep_v
-    settings.error_min_frac = _clamp(factors.error_min_frac * pair, 0.0001, 4.0)
-    # Derive from amplitude, but never below the chosen anchor's own residual,
-    # so find_auto_lock_target cannot reject the very crossing we calibrated to.
-    settings.crossing_max_frac = _clamp(
-        max(factors.crossing_max_frac * amplitude_pp, best_center_abs_v * 1.5),
-        0.0001,
-        2.0,
-    )
+    settings.error_min = _clamp(factors.error_min_factor * pair, 0.0, 1e12)
     settings.symmetry_min = _clamp(factors.symmetry_margin * symmetry, 0.0, 0.9)
+    settings.min_amplitude = _clamp(factors.min_amplitude_factor * pair, 0.0, 1e12)
 
     settings.allow_single_side = bool(allow_single_side)
     if allow_single_side:
-        settings.single_error_min_frac = _clamp(
-            factors.single_error_min_frac * stronger, 0.0001, 4.0
+        settings.single_error_min = _clamp(
+            factors.single_error_min_factor * stronger, 0.0, 1e12
         )
 
-    monitor_contrast_v: float | None = None
+    monitor_level: float | None = None
     settings.use_monitor = False
     monitor_note = ""
     if include_monitor and monitor is not None:
         left_start = max(0, anchor - half_range_pts)
         right_end = min(n_points, anchor + 1 + half_range_pts)
-        left_monitor = monitor[left_start:anchor]
-        right_monitor = monitor[anchor + 1 : right_end]
-        if len(left_monitor) and len(right_monitor):
-            monitor_contrast_v = abs(
-                float(np.mean(right_monitor) - np.mean(left_monitor))
-            )
-        # Only enable the monitor gate when contrast is real relative to the
-        # monitor's amplitude *in the same local window*; a symmetric monitor
-        # (≈zero contrast), or a globally-large-but-locally-flat one, would
-        # otherwise get a misleading threshold. Measuring locally keeps the
-        # gate decision consistent with where the lock actually sits.
-        window_monitor = monitor[left_start:right_end]
-        monitor_pp = (
-            max(0.0, float(np.max(window_monitor) - np.min(window_monitor)))
-            if len(window_monitor)
-            else 0.0
-        )
-        if (
-            monitor_contrast_v is not None
-            and monitor_contrast_v > factors.monitor_floor_frac * monitor_pp
-            and monitor_contrast_v > 0.0
-        ):
+        window = monitor[left_start:right_end]
+        on_res = float(np.mean(window)) if len(window) else 0.0
+        # Off-resonance baseline: monitor away from the feature window.
+        mask = np.ones(n_points, dtype=bool)
+        mask[left_start:right_end] = False
+        baseline = float(np.mean(monitor[mask])) if bool(mask.any()) else on_res
+        monitor_level = on_res
+        if abs(on_res - baseline) > 1e-9:
             settings.use_monitor = True
-            settings.monitor_contrast_min_frac = _clamp(
-                factors.monitor_contrast_frac * monitor_contrast_v, 0.0001, 4.0
+            settings.monitor_mode = str(base.monitor_mode)
+            settings.monitor_threshold = _clamp(
+                baseline + factors.monitor_threshold_factor * (on_res - baseline),
+                0.0,
+                1e12,
             )
         else:
-            monitor_note = " monitor contrast too low to use, left disabled;"
+            monitor_note = " monitor shows no contrast at the feature, left disabled;"
 
     target_voltage = _index_to_voltage(
         best_crossing_idx, n_points, float(sweep_center_v), float(sweep_amplitude_v)
@@ -764,43 +773,40 @@ def calibrate_auto_lock_settings(
             sweep_amplitude_v=float(sweep_amplitude_v),
             settings=settings,
             preferred_slope_rising=preferred_slope_rising,
+            modulation_frequency_hz=modulation_frequency_hz,
         )
     except ValueError as exc:
         raise ValueError(
             "Calibration could not converge on the trace's dominant feature "
-            f"({exc}). Adjust the sweep so the good PDH crossing is the "
-            "strongest one, then calibrate again."
+            f"({exc}). Adjust the sweep so the good crossing is the strongest one, "
+            "then calibrate again."
         ) from exc
-    # "Same crossing" tolerance: a zero crossing is a sharp, single-point
-    # feature, so the calibrated and detected anchors should differ by at most
-    # a few points (smoothing jitter). It must NOT scale with half_range_pts —
-    # a wide feature would otherwise make the guard accept a different crossing.
+    # "Same crossing" tolerance: a zero crossing is a sharp, single-point feature,
+    # so the calibrated and detected anchors should differ by at most a few points
+    # (smoothing jitter). It must NOT scale with half_range_pts.
     converge_tol = max(8, 2 * int(settings.smooth_window_pts))
     if abs(check.target_index - anchor) > converge_tol:
         raise ValueError(
             "Calibration could not converge on the trace's dominant feature "
-            "(the detector selected a different crossing). Adjust the sweep so "
-            "the good PDH crossing is the strongest one, then calibrate again."
+            "(the detector selected a different crossing). Adjust the sweep so the "
+            "good crossing is the strongest one, then calibrate again."
         )
 
     detail = (
-        f"Calibrated from trace (normalised full-scale): "
-        f"amplitude={amplitude_pp:.4f}, "
-        f"feature half-width={feature_half_width_v:.4f}, "
-        f"target={target_voltage:.4f}, smooth={settings.smooth_window_pts} pts."
-        f"{monitor_note}"
+        f"Calibrated from trace (raw linien units): amplitude={amplitude_pp:.1f}, "
+        f"feature half-width={feature_half_width_v:.4f} V, target={target_voltage:.4f} V, "
+        f"smooth={settings.smooth_window_pts} pts.{monitor_note}"
     )
 
     return AutoLockCalibration(
         settings=settings,
-        amplitude_v=float(amplitude_pp),
+        amplitude=float(amplitude_pp),
         feature_half_width_v=float(feature_half_width_v),
         target_index=int(anchor),
         target_voltage=float(target_voltage),
         target_slope_rising=bool(slope_rising),
         symmetry=float(symmetry),
-        monitor_contrast_v=(
-            float(monitor_contrast_v) if monitor_contrast_v is not None else None
-        ),
+        monitor_level=(float(monitor_level) if monitor_level is not None else None),
+        hz_per_v=(float(check.hz_per_v) if check.hz_per_v is not None else None),
         detail=detail,
     )
