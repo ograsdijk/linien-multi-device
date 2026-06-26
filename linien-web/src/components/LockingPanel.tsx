@@ -21,15 +21,15 @@ import { toClampedNumberOr, toFiniteNumberOr, toRoundedIntOr } from '../utils/nu
 import { DeferredNumberInput } from './DeferredNumberInput';
 
 const DEFAULT_AUTO_LOCK_SETTINGS: AutoLockScanSettings = {
-  half_range_v: 0.08,
-  crossing_max_v: 0.03,
-  error_min: 0.08,
+  half_range_sweep_v: 0.08,
+  crossing_max_frac: 0.03,
+  error_min_frac: 0.08,
   symmetry_min: 0.2,
   allow_single_side: false,
-  single_error_min: 0.1,
+  single_error_min_frac: 0.1,
   smooth_window_pts: 5,
   use_monitor: false,
-  monitor_contrast_min_v: 0.03,
+  monitor_contrast_min_frac: 0.03,
 };
 
 type LockingPanelProps = {
@@ -257,15 +257,15 @@ export const LockingPanel = memo(function LockingPanel({
             ) : null}
             <Group grow>
               <DeferredNumberInput
-                label="Half range (norm.)"
-                value={autoLockSettings.half_range_v}
+                label="Half range (sweep V)"
+                value={autoLockSettings.half_range_sweep_v}
                 min={0.001}
                 step={0.01}
                 decimalScale={3}
                 onCommit={(value) =>
                   setAutoLockNumber(
-                    'half_range_v',
-                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.half_range_v)
+                    'half_range_sweep_v',
+                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.half_range_sweep_v)
                   )
                 }
               />
@@ -289,27 +289,27 @@ export const LockingPanel = memo(function LockingPanel({
             <Group grow>
               <DeferredNumberInput
                 label="Crossing max (norm.)"
-                value={autoLockSettings.crossing_max_v}
+                value={autoLockSettings.crossing_max_frac}
                 min={0.0001}
                 step={0.01}
                 decimalScale={4}
                 onCommit={(value) =>
                   setAutoLockNumber(
-                    'crossing_max_v',
-                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.crossing_max_v)
+                    'crossing_max_frac',
+                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.crossing_max_frac)
                   )
                 }
               />
               <DeferredNumberInput
                 label="Error min (norm.)"
-                value={autoLockSettings.error_min}
+                value={autoLockSettings.error_min_frac}
                 min={0.0001}
                 step={0.01}
                 decimalScale={4}
                 onCommit={(value) =>
                   setAutoLockNumber(
-                    'error_min',
-                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.error_min)
+                    'error_min_frac',
+                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.error_min_frac)
                   )
                 }
               />
@@ -331,14 +331,14 @@ export const LockingPanel = memo(function LockingPanel({
               />
               <DeferredNumberInput
                 label="Single error min (norm.)"
-                value={autoLockSettings.single_error_min}
+                value={autoLockSettings.single_error_min_frac}
                 min={0.0001}
                 step={0.01}
                 decimalScale={4}
                 onCommit={(value) =>
                   setAutoLockNumber(
-                    'single_error_min',
-                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.single_error_min)
+                    'single_error_min_frac',
+                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.single_error_min_frac)
                   )
                 }
                 disabled={!autoLockSettings.allow_single_side}
@@ -367,14 +367,14 @@ export const LockingPanel = memo(function LockingPanel({
             {autoLockSettings.use_monitor ? (
               <DeferredNumberInput
                 label="Monitor contrast min (norm.)"
-                value={autoLockSettings.monitor_contrast_min_v}
+                value={autoLockSettings.monitor_contrast_min_frac}
                 min={0.0001}
                 step={0.01}
                 decimalScale={4}
                 onCommit={(value) =>
                   setAutoLockNumber(
-                    'monitor_contrast_min_v',
-                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.monitor_contrast_min_v)
+                    'monitor_contrast_min_frac',
+                    toFiniteNumberOr(value, DEFAULT_AUTO_LOCK_SETTINGS.monitor_contrast_min_frac)
                   )
                 }
               />

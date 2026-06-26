@@ -796,7 +796,7 @@ class DeviceSession:
         *,
         include_monitor: bool,
         allow_single_side: bool,
-        min_amplitude_v: float | None = None,
+        min_amplitude_frac: float | None = None,
     ) -> AutoLockCalibration:
         """Derive auto-lock settings from the current (good) PDH error trace.
 
@@ -844,8 +844,8 @@ class DeviceSession:
             else None
         )
         factors = (
-            AutoLockCalibrationFactors(min_amplitude_v=float(min_amplitude_v))
-            if min_amplitude_v is not None
+            AutoLockCalibrationFactors(min_amplitude_frac=float(min_amplitude_frac))
+            if min_amplitude_frac is not None
             else None
         )
         return calibrate_auto_lock_settings(
@@ -1874,7 +1874,7 @@ class DeviceSession:
     ) -> dict[str, Any]:
         """Run the auto-lock target finder against the latest trace WITHOUT locking.
 
-        Same detection/criteria as auto_lock_from_scan (crossing_max_v, error_min,
+        Same detection/criteria as auto_lock_from_scan (crossing_max_frac, error_min_frac,
         symmetry_min, optional single-side / monitor contrast), but it does not touch
         sweep_center or start the lock. Returns the best candidate (AutoLockScanResult
         dict); raises ValueError if no crossing meets the criteria. Read-only — it does

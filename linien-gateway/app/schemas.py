@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 class DeviceIn(BaseModel):
@@ -109,16 +109,58 @@ class SimultaneousStartPsd(StartPsdAcquisition):
 
 
 class AutoLockScanSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    half_range_v: float = Field(default=0.08, ge=0.0, le=2.0)
-    crossing_max_v: float = Field(default=0.03, ge=0.0, le=2.0)
-    error_min: float = Field(default=0.08, ge=0.0, le=4.0)
-    symmetry_min: float = Field(default=0.2, ge=0.0, le=1.0)
+    # populate_by_name + AliasChoices(new, old) accept both the current field name
+    # and the legacy ``_v`` key, so persisted configs / stale clients keep working.
+    # model_dump() emits the new (canonical) name, so the persist path rewrites
+    # legacy blocks to new keys automatically. See auto_lock_scan.py for the
+    # axis/units convention (``_sweep_v`` = real sweep volts x; ``_frac`` = y).
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    half_range_sweep_v: float = Field(
+        default=0.08,
+        ge=0.0,
+        le=2.0,
+        validation_alias=AliasChoices("half_range_sweep_v", "half_range_v"),
+        description="Lobe window half-width in real sweep volts (x-axis).",
+    )
+    crossing_max_frac: float = Field(
+        default=0.03,
+        ge=0.0,
+        le=2.0,
+        validation_alias=AliasChoices("crossing_max_frac", "crossing_max_v"),
+        description="Max |error| at the crossing, normalized full-scale (y-axis).",
+    )
+    error_min_frac: float = Field(
+        default=0.08,
+        ge=0.0,
+        le=4.0,
+        validation_alias=AliasChoices("error_min_frac", "error_min"),
+        description="Min summed lobe excursion, normalized full-scale (y-axis).",
+    )
+    symmetry_min: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description="Min weaker/stronger lobe ratio (dimensionless).",
+    )
     allow_single_side: bool = False
-    single_error_min: float = Field(default=0.1, ge=0.0, le=4.0)
+    single_error_min_frac: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=4.0,
+        validation_alias=AliasChoices("single_error_min_frac", "single_error_min"),
+        description="Min single-lobe excursion, normalized full-scale (y-axis).",
+    )
     smooth_window_pts: int = Field(default=5, ge=1, le=301)
     use_monitor: bool = False
-    monitor_contrast_min_v: float = Field(default=0.03, ge=0.0, le=4.0)
+    monitor_contrast_min_frac: float = Field(
+        default=0.03,
+        ge=0.0,
+        le=4.0,
+        validation_alias=AliasChoices(
+            "monitor_contrast_min_frac", "monitor_contrast_min_v"
+        ),
+        description="Min monitor L/R contrast, normalized full-scale (y-axis).",
+    )
 
 
 class AutoLockScanResult(BaseModel):
@@ -137,12 +179,18 @@ class AutoLockScanResult(BaseModel):
 
 
 class AutoLockCalibrateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
     include_monitor: bool = False
     allow_single_side: bool = False
     # Optional override of the dead-trace amplitude floor (normalised full-scale,
     # not volts). Lets unusually weak-but-clean signals be calibrated.
-    min_amplitude_v: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    min_amplitude_frac: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        validation_alias=AliasChoices("min_amplitude_frac", "min_amplitude_v"),
+        description="Dead-trace amplitude floor, normalized full-scale (y-axis).",
+    )
 
 
 class AutoLockCalibrationResult(BaseModel):

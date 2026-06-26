@@ -1,3 +1,5 @@
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -7,6 +9,7 @@ from app.auto_lock_scan import (
     calibrate_auto_lock_settings,
     find_auto_lock_target,
 )
+from app.schemas import AutoLockScanSettings as SchemaAutoLockScanSettings
 
 
 def _dispersive_trace(n_points: int = 2048, amplitude: float = 0.3, width: float = 0.1):
@@ -46,7 +49,7 @@ def test_auto_lock_scan_single_side_toggle_changes_acceptance():
 
     strict_settings = AutoLockScanSettings(
         allow_single_side=False,
-        error_min=0.12,
+        error_min_frac=0.12,
         symmetry_min=0.6,
     )
     with pytest.raises(ValueError):
@@ -60,8 +63,8 @@ def test_auto_lock_scan_single_side_toggle_changes_acceptance():
 
     permissive_settings = AutoLockScanSettings(
         allow_single_side=True,
-        single_error_min=0.09,
-        error_min=0.12,
+        single_error_min_frac=0.09,
+        error_min_frac=0.12,
         symmetry_min=0.6,
     )
     result = find_auto_lock_target(
@@ -127,8 +130,8 @@ def test_auto_lock_scan_handles_steep_crossing_with_strict_center_threshold():
         sweep_center_v=0.0,
         sweep_amplitude_v=1.0,
         settings=AutoLockScanSettings(
-            crossing_max_v=0.01,
-            error_min=0.2,
+            crossing_max_frac=0.01,
+            error_min_frac=0.2,
             symmetry_min=0.2,
             smooth_window_pts=1,
         ),
@@ -150,10 +153,10 @@ def test_auto_lock_scan_reports_slope_hint_when_only_opposite_slope_passes():
             sweep_center_v=0.0,
             sweep_amplitude_v=1.0,
             settings=AutoLockScanSettings(
-                error_min=0.1,
+                error_min_frac=0.1,
                 symmetry_min=0.2,
                 allow_single_side=True,
-                single_error_min=0.08,
+                single_error_min_frac=0.08,
             ),
             preferred_slope_rising=False,
         )
@@ -175,10 +178,10 @@ def test_calibrate_derives_settings_that_lock_the_feature():
     # Amplitude is a few tenths of a volt; feature half-width tracks `width`.
     assert 0.3 < calib.amplitude_v < 0.45
     assert 0.07 < calib.feature_half_width_v < 0.14
-    assert 0.1 < calib.settings.half_range_v < 0.2
+    assert 0.1 < calib.settings.half_range_sweep_v < 0.2
     # Thresholds are fractions of what the reference actually showed.
-    assert 0.12 < calib.settings.error_min < 0.22
-    assert calib.settings.crossing_max_v < calib.settings.error_min
+    assert 0.12 < calib.settings.error_min_frac < 0.22
+    assert calib.settings.crossing_max_frac < calib.settings.error_min_frac
     assert calib.settings.symmetry_min > 0.5
     # Optional features stay off unless requested.
     assert calib.settings.use_monitor is False
@@ -238,7 +241,7 @@ def test_calibrate_monitor_option():
     )
     assert calib.settings.use_monitor is True
     assert calib.monitor_contrast_v is not None and calib.monitor_contrast_v > 0.0
-    assert calib.settings.monitor_contrast_min_v > 0.0
+    assert calib.settings.monitor_contrast_min_frac > 0.0
 
 
 def test_calibrate_monitor_zero_contrast_leaves_monitor_off():
@@ -276,7 +279,7 @@ def test_calibrate_single_side_option():
         allow_single_side=True,
     )
     assert calib.settings.allow_single_side is True
-    assert calib.settings.single_error_min > 0.0
+    assert calib.settings.single_error_min_frac > 0.0
 
 
 def test_calibrate_self_check_rejects_unlockable_trace():
@@ -339,13 +342,13 @@ def test_calibrate_wide_feature_not_truncated():
         preferred_slope_rising=True,
     )
     assert calib.feature_half_width_v > 0.27
-    assert calib.settings.half_range_v > 0.3
+    assert calib.settings.half_range_sweep_v > 0.3
 
 
 def test_calibrate_baseline_offset_does_not_inflate_half_range():
     # A downward baseline tilt on the left (never crossing back through zero)
     # must not pull the lobe-peak search out to the far edge and balloon
-    # half_range_v toward its 2.0 clamp.
+    # half_range_sweep_v toward its 2.0 clamp.
     n_points = 2048
     x = np.linspace(-1.0, 1.0, n_points)
     feature = _dispersive_trace(n_points, amplitude=0.3, width=0.1)
@@ -363,7 +366,7 @@ def test_calibrate_baseline_offset_does_not_inflate_half_range():
     # The real feature half-width is ~0.1; allow margin but reject the
     # baseline-driven blow-up (which produced ~0.9 width / ~1.2 half_range).
     assert calib.feature_half_width_v < 0.3
-    assert calib.settings.half_range_v < 0.4
+    assert calib.settings.half_range_sweep_v < 0.4
 
 
 def test_calibrate_sharp_narrow_feature_not_false_rejected():
@@ -380,7 +383,7 @@ def test_calibrate_sharp_narrow_feature_not_false_rejected():
         preferred_slope_rising=True,
     )
     assert calib.amplitude_v > 0.3
-    assert calib.settings.error_min > 0.0
+    assert calib.settings.error_min_frac > 0.0
 
 
 def test_calibrate_min_amplitude_override_allows_small_signal():
@@ -406,6 +409,44 @@ def test_calibrate_min_amplitude_override_allows_small_signal():
         sweep_amplitude_v=1.0,
         base=AutoLockScanSettings(),
         preferred_slope_rising=True,
-        factors=AutoLockCalibrationFactors(min_amplitude_v=0.001),
+        factors=AutoLockCalibrationFactors(min_amplitude_frac=0.001),
     )
-    assert calib.settings.error_min > 0.0
+    assert calib.settings.error_min_frac > 0.0
+
+
+def test_engine_and_schema_settings_stay_in_parity():
+    """The engine dataclass and the Pydantic boundary model must declare the
+    same field names and defaults, so the two definitions cannot drift."""
+    engine_fields = {f.name: f.default for f in dataclasses.fields(AutoLockScanSettings)}
+    schema_fields = {
+        name: info.default
+        for name, info in SchemaAutoLockScanSettings.model_fields.items()
+    }
+    assert engine_fields.keys() == schema_fields.keys()
+    assert engine_fields == schema_fields
+
+
+def test_from_mapping_accepts_legacy_v_keys():
+    """Legacy ``_v`` keys map onto the current field names so persisted device
+    configs keep loading after the rename."""
+    settings = AutoLockScanSettings.from_mapping(
+        {
+            "half_range_v": 0.2,
+            "crossing_max_v": 0.05,
+            "error_min": 0.15,
+            "single_error_min": 0.11,
+            "monitor_contrast_min_v": 0.04,
+        }
+    )
+    assert settings.half_range_sweep_v == 0.2
+    assert settings.crossing_max_frac == 0.05
+    assert settings.error_min_frac == 0.15
+    assert settings.single_error_min_frac == 0.11
+    assert settings.monitor_contrast_min_frac == 0.04
+
+
+def test_from_mapping_prefers_new_key_over_legacy():
+    settings = AutoLockScanSettings.from_mapping(
+        {"crossing_max_v": 0.05, "crossing_max_frac": 0.09}
+    )
+    assert settings.crossing_max_frac == 0.09

@@ -126,15 +126,17 @@ export type AutoRelockState = {
 };
 
 export type AutoLockScanSettings = {
-  half_range_v: number;
-  crossing_max_v: number;
-  error_min: number;
+  // Units: *_sweep_v are real sweep volts (x-axis); *_frac are normalized
+  // full-scale error amplitude (y-axis); symmetry_min is a dimensionless ratio.
+  half_range_sweep_v: number;
+  crossing_max_frac: number;
+  error_min_frac: number;
   symmetry_min: number;
   allow_single_side: boolean;
-  single_error_min: number;
+  single_error_min_frac: number;
   smooth_window_pts: number;
   use_monitor: boolean;
-  monitor_contrast_min_v: number;
+  monitor_contrast_min_frac: number;
 };
 
 export type AutoLockScanResult = {
@@ -155,7 +157,7 @@ export type AutoLockCalibrateRequest = {
   include_monitor: boolean;
   allow_single_side: boolean;
   // Optional override of the dead-trace amplitude floor (normalised full-scale).
-  min_amplitude_v?: number;
+  min_amplitude_frac?: number;
 };
 
 export type AutoLockCalibrationResult = {

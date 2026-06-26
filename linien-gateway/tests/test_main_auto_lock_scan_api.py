@@ -45,15 +45,15 @@ def test_auto_lock_scan_endpoint_passes_payload(monkeypatch):
     client = TestClient(main.app)
 
     payload = {
-        "half_range_v": 0.12,
-        "crossing_max_v": 0.03,
-        "error_min": 0.1,
+        "half_range_sweep_v": 0.12,
+        "crossing_max_frac": 0.03,
+        "error_min_frac": 0.1,
         "symmetry_min": 0.25,
         "allow_single_side": True,
-        "single_error_min": 0.12,
+        "single_error_min_frac": 0.12,
         "smooth_window_pts": 7,
         "use_monitor": False,
-        "monitor_contrast_min_v": 0.02,
+        "monitor_contrast_min_frac": 0.02,
     }
     response = client.post("/api/devices/test-device/control/auto_lock_scan", json=payload)
     assert response.status_code == 200
@@ -62,6 +62,37 @@ def test_auto_lock_scan_endpoint_passes_payload(monkeypatch):
     assert body["target_slope_rising"] is True
     assert dummy.last_payload == payload
     assert dummy.last_settings_payload == payload
+
+
+def test_auto_lock_scan_endpoint_accepts_legacy_v_keys(monkeypatch):
+    """Legacy ``_v`` settings keys still validate (AliasChoices) and are
+    canonicalized to the new field names before reaching the session."""
+    dummy = DummyAutoLockSession()
+    device = type("Device", (), {"key": "test-device", "name": "test-device", "parameters": {}})()
+    monkeypatch.setattr(main.device_store, "get_device", lambda _key: device)
+    monkeypatch.setattr(main.device_store, "save_device", lambda _device: None)
+    monkeypatch.setattr(main.device_config_store, "set_config", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(main, "_session_for_device", lambda _device: dummy)
+    client = TestClient(main.app)
+
+    legacy_payload = {
+        "half_range_v": 0.12,
+        "crossing_max_v": 0.03,
+        "error_min": 0.1,
+        "single_error_min": 0.12,
+        "monitor_contrast_min_v": 0.02,
+    }
+    response = client.post(
+        "/api/devices/test-device/control/auto_lock_scan", json=legacy_payload
+    )
+    assert response.status_code == 200
+    # The session received canonical new keys, not the legacy ones.
+    assert dummy.last_settings_payload["half_range_sweep_v"] == 0.12
+    assert dummy.last_settings_payload["crossing_max_frac"] == 0.03
+    assert dummy.last_settings_payload["error_min_frac"] == 0.1
+    assert dummy.last_settings_payload["single_error_min_frac"] == 0.12
+    assert dummy.last_settings_payload["monitor_contrast_min_frac"] == 0.02
+    assert "half_range_v" not in dummy.last_settings_payload
 
 
 def test_auto_lock_scan_endpoint_maps_runtime_error(monkeypatch):
@@ -169,15 +200,15 @@ def test_calibrate_endpoint_returns_settings_and_diagnostics(monkeypatch):
 
     class CalibratingSession:
         def calibrate_auto_lock_settings(
-            self, *, include_monitor, allow_single_side, min_amplitude_v=None
+            self, *, include_monitor, allow_single_side, min_amplitude_frac=None
         ):
             captured["include_monitor"] = include_monitor
             captured["allow_single_side"] = allow_single_side
-            captured["min_amplitude_v"] = min_amplitude_v
+            captured["min_amplitude_frac"] = min_amplitude_frac
             settings = AutoLockScanSettings(
-                half_range_v=0.13,
-                error_min=0.18,
-                crossing_max_v=0.036,
+                half_range_sweep_v=0.13,
+                error_min_frac=0.18,
+                crossing_max_frac=0.036,
                 symmetry_min=0.7,
                 allow_single_side=allow_single_side,
                 use_monitor=include_monitor,
@@ -213,13 +244,13 @@ def test_calibrate_endpoint_returns_settings_and_diagnostics(monkeypatch):
     body = response.json()
     assert captured["include_monitor"] is True
     assert captured["allow_single_side"] is False
-    assert body["settings"]["half_range_v"] == 0.13
+    assert body["settings"]["half_range_sweep_v"] == 0.13
     assert body["settings"]["use_monitor"] is True
     assert body["amplitude_v"] == 0.36
     assert body["target_slope_rising"] is True
     assert body["detail"] == "Calibrated from trace."
     # The derived settings were persisted through the normal update path.
-    assert captured["settings_payload"]["half_range_v"] == 0.13
+    assert captured["settings_payload"]["half_range_sweep_v"] == 0.13
 
 
 def test_calibrate_endpoint_maps_value_error(monkeypatch):

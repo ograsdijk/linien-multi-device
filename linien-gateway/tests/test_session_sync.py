@@ -75,7 +75,7 @@ def test_sync_config_does_not_reset_when_device_config_unchanged():
         {
             "lock_indicator_config": dict(lock_cfg),
             "auto_relock_config": dict(relock_cfg),
-            "auto_lock_scan_settings": {"half_range_v": 0.5},
+            "auto_lock_scan_settings": {"half_range_sweep_v": 0.5},
             "influx_logging_state": {"enabled": True, "interval_s": 1.0},
         }
     )
@@ -84,7 +84,7 @@ def test_sync_config_does_not_reset_when_device_config_unchanged():
     relock_spy = _ConfigSpy(relock_cfg)
     session.lock_indicator = lock_spy  # type: ignore[assignment]
     session.auto_relock = relock_spy  # type: ignore[assignment]
-    session.auto_lock_scan_settings = {"half_range_v": 0.5}
+    session.auto_lock_scan_settings = {"half_range_sweep_v": 0.5}
     session.influx_logging_state = {"enabled": True, "interval_s": 1.0}
 
     session.sync_lock_indicator_config_from_device()

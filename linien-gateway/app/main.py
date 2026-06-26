@@ -969,7 +969,7 @@ def calibrate_auto_lock_scan(key: str, payload: AutoLockCalibrateRequest) -> dic
         calibration = session.calibrate_auto_lock_settings(
             include_monitor=payload.include_monitor,
             allow_single_side=payload.allow_single_side,
-            min_amplitude_v=payload.min_amplitude_v,
+            min_amplitude_frac=payload.min_amplitude_frac,
         )
     except RuntimeError as exc:
         _emit_log(
