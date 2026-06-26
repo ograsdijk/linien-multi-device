@@ -130,8 +130,9 @@ export type AutoRelockState = {
 };
 
 export type AutoLockScanSettings = {
-  // Amplitude thresholds are in raw linien units (no normalization); half_range_sweep_v
-  // is sweep volts (x-axis); symmetry_min is a dimensionless ratio.
+  // Amplitude thresholds are in plot units (the fixed ADC_SCALE display scale, same as the
+  // plotted traces, ~±1 full scale; NOT per-trace normalized). half_range_sweep_v is sweep
+  // volts (x-axis); symmetry_min is a dimensionless ratio.
   signal_type: "pdh" | "dispersive";
   allow_single_side: boolean;
   use_monitor: boolean;

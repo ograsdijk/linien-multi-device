@@ -338,3 +338,110 @@ def test_calibrate_rejects_flat_trace():
             sweep_amplitude_v=1.0,
             base=AutoLockScanSettings(),
         )
+
+
+def test_calibrate_flat_monitor_raises():
+    # A flat monitor has no contrast at the feature; calibration must fail loudly
+    # (the median baseline equals the on-resonance level — no fabricated contrast).
+    n = 2048
+    error = _dispersive(n, amplitude=0.3, width=0.08)
+    monitor = np.full(n, 0.5)
+    with pytest.raises(ValueError, match="peak above|contrast"):
+        calibrate_auto_lock_settings(
+            error_trace_v=error,
+            monitor_trace_v=monitor,
+            sweep_center_v=0.0,
+            sweep_amplitude_v=1.0,
+            base=AutoLockScanSettings(monitor_mode="locked_above"),
+            preferred_slope_rising=True,
+            include_monitor=True,
+        )
+
+
+def test_monitor_rejects_wrong_side_candidate():
+    # Two rising features; the stronger ERROR feature (-0.3) sits where the monitor DIPS
+    # below baseline (wrong side), the weaker (+0.3) where it PEAKS. Even with a low/mis-set
+    # absolute threshold, the wrong-side reject must keep the lock off the dip feature.
+    n = 2048
+    x = np.linspace(-1.0, 1.0, n)
+    error = _dispersive(n, amplitude=0.4, width=0.04, center=-0.3) + _dispersive(
+        n, amplitude=0.25, width=0.04, center=0.3
+    )
+    monitor = (
+        0.5
+        + 0.3 * np.exp(-0.5 * ((x - 0.3) / 0.06) ** 2)
+        - 0.3 * np.exp(-0.5 * ((x + 0.3) / 0.06) ** 2)
+    )
+    result = find_auto_lock_target(
+        error_trace_v=error,
+        monitor_trace_v=monitor,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=AutoLockScanSettings(
+            use_monitor=True, monitor_mode="locked_above", monitor_threshold=0.1
+        ),
+        preferred_slope_rising=True,
+    )
+    assert result.target_voltage > 0.2  # picked the +0.3 peak, not the stronger-error dip
+
+
+def test_calibrate_edge_feature_baseline_robust():
+    # Feature near the left trace end: the median baseline must not be contaminated by the
+    # feature (the old mean-of-ends baseline would have flipped the direction).
+    n = 2048
+    x = np.linspace(-1.0, 1.0, n)
+    error = _dispersive(n, amplitude=0.3, width=0.05, center=-0.85)
+    monitor = 0.1 + 0.6 * np.exp(-0.5 * ((x + 0.85) / 0.08) ** 2)  # transmission peak
+    calib = calibrate_auto_lock_settings(
+        error_trace_v=error,
+        monitor_trace_v=monitor,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        base=AutoLockScanSettings(monitor_mode="locked_above"),
+        preferred_slope_rising=True,
+        include_monitor=True,
+    )
+    assert calib.settings.use_monitor is True
+    assert calib.settings.monitor_mode == "locked_above"
+
+
+def test_calibrate_narrow_monitor_dip_captured():
+    # A very narrow dip must be captured by the directional extremum (not washed by a
+    # fixed-window mean), so the threshold sits well below baseline.
+    n = 2048
+    x = np.linspace(-1.0, 1.0, n)
+    error = _dispersive(n, amplitude=0.3, width=0.08)
+    monitor = 0.7 - 0.6 * np.exp(-0.5 * (x / 0.01) ** 2)  # width ~0.01 (≪ half_range)
+    calib = calibrate_auto_lock_settings(
+        error_trace_v=error,
+        monitor_trace_v=monitor,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        base=AutoLockScanSettings(monitor_mode="locked_below"),
+        preferred_slope_rising=True,
+        include_monitor=True,
+    )
+    assert calib.settings.use_monitor is True
+    assert calib.settings.monitor_threshold < 0.6  # captured the deep dip, not stuck at baseline
+
+
+def test_calibrate_monitor_aware_anchor():
+    # Error is strongest at -0.3 but the monitor (the safety signal of the correct feature)
+    # peaks at +0.3. Calibration must pick the monitor-consistent crossing and converge,
+    # not abort with "could not converge".
+    n = 2048
+    x = np.linspace(-1.0, 1.0, n)
+    error = _dispersive(n, amplitude=0.32, width=0.04, center=-0.3) + _dispersive(
+        n, amplitude=0.3, width=0.04, center=0.3
+    )
+    monitor = 0.1 + 0.6 * np.exp(-0.5 * ((x - 0.3) / 0.06) ** 2)
+    calib = calibrate_auto_lock_settings(
+        error_trace_v=error,
+        monitor_trace_v=monitor,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        base=AutoLockScanSettings(monitor_mode="locked_above"),
+        preferred_slope_rising=True,
+        include_monitor=True,
+    )
+    assert calib.target_voltage > 0.2

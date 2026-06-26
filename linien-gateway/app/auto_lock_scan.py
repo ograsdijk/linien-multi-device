@@ -118,23 +118,29 @@ def _moving_average(values: np.ndarray, window_pts: int) -> np.ndarray:
 
 
 def _monitor_baseline(monitor: np.ndarray) -> float:
-    """Off-resonance monitor level from the trace ends (decoupled from the feature
-    window, so a wide feature can't shrink the baseline region to nothing)."""
-    n = len(monitor)
-    edge = max(2, n // 10)
-    ends = np.concatenate((monitor[:edge], monitor[-edge:]))
-    return float(np.mean(ends)) if len(ends) else 0.0
+    """Off-resonance monitor level: the MEDIAN of the whole trace. Features occupy a
+    minority of points, so the median is the background level — and it is immune both to
+    the smoothing edge artifact (only a few end samples are biased) and to where the
+    feature sits (no dependence on the trace ends)."""
+    return float(np.median(monitor)) if len(monitor) else 0.0
 
 
-def _monitor_level_at(monitor: np.ndarray, anchor: int) -> float | None:
-    """Monitor level at the lock point: mean over a small fixed window at the crossing
-    (captures the on-resonance peak/dip without averaging in off-resonance baseline)."""
+def _monitor_on_resonance(
+    monitor: np.ndarray, anchor: int, window_pts: int, locked_above: bool
+) -> float | None:
+    """On-resonance monitor level at the lock point: the directional EXTREMUM over a
+    feature-sized window at the crossing — ``max`` for a transmission peak
+    (``locked_above``), ``min`` for a reflection dip (``locked_below``). Using the
+    extremum (not a mean) captures the true peak/dip depth regardless of feature width;
+    the window is bounded so it can't span the whole trace."""
     n = len(monitor)
-    w = max(2, n // 50)
+    w = max(2, min(int(window_pts), n // 8))
     lo = max(0, anchor - w)
     hi = min(n, anchor + w + 1)
     seg = monitor[lo:hi]
-    return float(np.mean(seg)) if len(seg) else None
+    if not len(seg):
+        return None
+    return float(np.max(seg)) if locked_above else float(np.min(seg))
 
 
 def _half_range_to_points(
@@ -302,15 +308,16 @@ def find_auto_lock_target(
     if amplitude_pp < float(settings.min_amplitude):
         raise ValueError(
             "No lockable signal: trace peak-to-peak is below min_amplitude "
-            f"({amplitude_pp:.1f} < {float(settings.min_amplitude):.1f})."
+            f"({amplitude_pp:.4f} < {float(settings.min_amplitude):.4f})."
         )
 
     # Monitor is optional: only used when a real monitor trace exists AND it's enabled.
     # Absent/disabled -> lock on the error signal alone (no error raised).
     use_monitor = bool(settings.use_monitor) and monitor is not None
     monitor_mode = str(settings.monitor_mode)
-    # Off-resonance monitor level (from the trace ends), used to score candidates by
-    # how far the monitor peaks/dips at the crossing relative to baseline.
+    locked_above = monitor_mode != "locked_below"
+    # Robust off-resonance baseline (median), used to (a) reject candidates on the wrong
+    # side of baseline and (b) score by how far the monitor peaks/dips at the crossing.
     monitor_baseline = _monitor_baseline(monitor) if monitor is not None else None
 
     half_range_pts = _half_range_to_points(
@@ -390,33 +397,40 @@ def find_auto_lock_target(
                     slope_hint_rejects += 1
             continue
 
-        # Monitor level at the lock point: small window at the crossing (decoupled
-        # from the error-lobe half_range so a wide feature can't wash it out).
+        # On-resonance monitor level: directional extremum over a feature-sized window.
         monitor_level = (
-            _monitor_level_at(monitor, anchor_idx) if monitor is not None else None
+            _monitor_on_resonance(monitor, anchor_idx, half_range_pts, locked_above)
+            if monitor is not None
+            else None
         )
+        # Contrast vs the robust baseline, positive when the monitor deviates in the
+        # mode's direction (transmission: above baseline; reflection: below).
+        contrast = None
+        if monitor_level is not None and monitor_baseline is not None:
+            contrast = (
+                monitor_level - monitor_baseline
+                if locked_above
+                else monitor_baseline - monitor_level
+            )
 
         if use_monitor:
             level = monitor_level if monitor_level is not None else 0.0
-            if monitor_mode == "locked_below":
-                if level > float(settings.monitor_threshold):
-                    monitor_rejects += 1
-                    continue
-            else:  # locked_above
-                if level < float(settings.monitor_threshold):
-                    monitor_rejects += 1
-                    continue
+            # (1) absolute level must clear the threshold ...
+            absolute_ok = (
+                level >= float(settings.monitor_threshold)
+                if locked_above
+                else level <= float(settings.monitor_threshold)
+            )
+            # (2) ... and the monitor must be on the correct side of baseline, so a
+            # mis-set/low threshold can't admit a wrong-side crossing.
+            if not (absolute_ok and (contrast is not None and contrast > 0.0)):
+                monitor_rejects += 1
+                continue
 
         score = _candidate_score(pair_excursion, weaker)
-        if use_monitor and monitor_level is not None and monitor_baseline is not None:
-            # Rank by monitor CONTRAST vs baseline in the expected direction
-            # (transmission: higher than baseline; reflection: lower), not by the
-            # absolute level — a high/low background must not masquerade as a feature.
-            contrast = (
-                monitor_baseline - monitor_level
-                if monitor_mode == "locked_below"
-                else monitor_level - monitor_baseline
-            )
+        if use_monitor and contrast is not None:
+            # Rank by monitor contrast, not absolute level — a high/low background
+            # must not masquerade as a feature.
             score += _MONITOR_SCORE_WEIGHT * contrast
 
         accepted.append(
@@ -497,7 +511,7 @@ def find_auto_lock_target(
 # and finally re-runs find_auto_lock_target with the derived settings as a self-check so
 # we never persist settings that would not lock.
 #
-# Units: raw linien values (no normalization); see the module docstring.
+# Units: plot units (see the module docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -513,6 +527,10 @@ class AutoLockCalibrationFactors:
     # monitor_threshold placed this fraction of the way from the off-resonance
     # baseline to the on-resonance level (0.5 = midpoint).
     monitor_threshold_factor: float = 0.5
+    # Minimum monitor on-resonance contrast (deviation from baseline) to accept the
+    # monitor, as a fraction of the monitor's full peak-to-peak. Below this the monitor
+    # has no usable feature at the lock point and is rejected.
+    monitor_min_contrast_frac: float = 0.2
 
 
 @dataclass
@@ -693,6 +711,13 @@ def calibrate_auto_lock_settings(
 
     coarse_pts = max(4, min(n_points // 8, (n_points // 2) - 1))
 
+    # Make coarse anchor selection monitor-aware (same objective the detector uses) so the
+    # calibrated crossing matches the one the detector will later pick — otherwise the
+    # self-check can flip to a different crossing and spuriously fail to converge.
+    cal_use_monitor = include_monitor and monitor is not None
+    cal_locked_above = str(base.monitor_mode) != "locked_below"
+    cal_baseline = _monitor_baseline(monitor) if cal_use_monitor else None
+
     best_score: float | None = None
     best_anchor = 0
     best_crossing_idx = 0.0
@@ -712,6 +737,15 @@ def calibrate_auto_lock_settings(
         # anchor matches the locked one.
         weaker = min(left_exc, right_exc)
         score = _candidate_score(pair, weaker)
+        if cal_baseline is not None:
+            on_res = _monitor_on_resonance(monitor, anchor, coarse_pts, cal_locked_above)
+            if on_res is not None:
+                contrast = (
+                    on_res - cal_baseline
+                    if cal_locked_above
+                    else cal_baseline - on_res
+                )
+                score += _MONITOR_SCORE_WEIGHT * contrast
         if best_score is None or score > best_score:
             best_score = score
             best_anchor = anchor
@@ -768,34 +802,34 @@ def calibrate_auto_lock_settings(
     monitor_level: float | None = None
     settings.use_monitor = False
     if include_monitor and monitor is not None:
-        # Small window at the lock point + baseline from the trace ends (decoupled
-        # from half_range so a wide feature can't collapse the baseline region).
-        on_res = _monitor_level_at(monitor, anchor)
+        mode = str(base.monitor_mode)
+        locked_above = mode != "locked_below"
+        # On-resonance extremum over the feature window + robust median baseline.
+        on_res = _monitor_on_resonance(monitor, anchor, half_range_pts, locked_above)
         on_res = on_res if on_res is not None else 0.0
         baseline = _monitor_baseline(monitor)
         monitor_level = on_res
-        mode = str(base.monitor_mode)
-        # The monitor is a SAFETY check: the user asserts the correct feature's
-        # signature via monitor_mode. Don't auto-detect it — if the measured
-        # direction contradicts the configured mode, fail loudly (wrong mode, or
-        # calibrating on the wrong feature) rather than silently accepting it.
-        if abs(on_res - baseline) <= 1e-9:
+        # Directional contrast: positive when the monitor deviates the way monitor_mode
+        # expects (peak above baseline / dip below).
+        contrast = (on_res - baseline) if locked_above else (baseline - on_res)
+        monitor_pp = max(0.0, float(np.max(monitor) - np.min(monitor)))
+        # The monitor is a SAFETY check: the user asserts the feature's signature via
+        # monitor_mode. Wrong direction or too-weak contrast -> fail loudly rather than
+        # silently accepting it (don't auto-detect the direction).
+        if contrast <= 0.0:
+            other = "locked_below" if locked_above else "locked_above"
+            verb = "peak above" if locked_above else "dip below"
             raise ValueError(
-                "Monitor shows no contrast at the chosen feature (on-resonance level "
-                "equals the off-resonance baseline). Disable use_monitor or pick a "
-                "feature where the monitor actually peaks/dips."
+                f"monitor_mode is '{mode}' but the monitor does not {verb} the "
+                f"off-resonance baseline on resonance. Set monitor_mode to '{other}', "
+                "or you may be calibrating on the wrong feature."
             )
-        if mode == "locked_above" and on_res < baseline:
+        if contrast < factors.monitor_min_contrast_frac * monitor_pp:
             raise ValueError(
-                "monitor_mode is 'locked_above' (transmission) but the monitor is LOWER "
-                "on resonance than off-resonance. Set monitor_mode to 'locked_below' "
-                "(reflection), or you may be calibrating on the wrong feature."
-            )
-        if mode == "locked_below" and on_res > baseline:
-            raise ValueError(
-                "monitor_mode is 'locked_below' (reflection) but the monitor is HIGHER "
-                "on resonance than off-resonance. Set monitor_mode to 'locked_above' "
-                "(transmission), or you may be calibrating on the wrong feature."
+                "Monitor contrast at the chosen feature is too weak "
+                f"({contrast:.4f} < {factors.monitor_min_contrast_frac:.2f} * "
+                f"{monitor_pp:.4f}). Disable use_monitor or pick a feature where the "
+                "monitor clearly peaks/dips."
             )
         settings.use_monitor = True
         settings.monitor_mode = mode
