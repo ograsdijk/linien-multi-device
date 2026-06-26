@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Any, Dict, List
 
 import numpy as np
+from pydantic import ValidationError
 from linien_client.connection import LinienClient
 from linien_client.device import Device
 from linien_client.exceptions import (
@@ -24,6 +25,7 @@ from linien_common.communication import unpack
 from linien_common.influxdb import InfluxDBCredentials
 
 from . import device_store
+from . import schemas
 from .auto_lock_scan import (
     AutoLockCalibration,
     AutoLockCalibrationFactors,
@@ -685,9 +687,27 @@ class DeviceSession:
             if isinstance(parameters, dict)
             else None
         )
-        settings = AutoLockScanSettings.from_mapping(
-            payload if isinstance(payload, dict) else None
-        )
+        # Validate the persisted/device-stored block through the same Pydantic
+        # schema the HTTP boundary uses, so out-of-band writes (linien desktop
+        # client, hand-edited config) can't smuggle out-of-range or wrong-typed
+        # values into the engine. The schema's AliasChoices also accept legacy
+        # ``_v`` keys and emit canonical names. On any failure, fall back to
+        # defaults rather than crashing the session.
+        if isinstance(payload, dict):
+            try:
+                payload = schemas.AutoLockScanSettings.model_validate(
+                    payload
+                ).model_dump()
+            except ValidationError as exc:
+                logger.warning(
+                    "Ignoring invalid stored auto_lock_scan_settings for device %s: %s",
+                    getattr(self.device, "key", "?"),
+                    exc,
+                )
+                payload = None
+        else:
+            payload = None
+        settings = AutoLockScanSettings.from_mapping(payload)
         return settings.__dict__.copy()
 
     def _initial_auto_relock_config(self) -> dict[str, Any]:
