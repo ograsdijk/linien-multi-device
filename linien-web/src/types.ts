@@ -130,17 +130,20 @@ export type AutoRelockState = {
 };
 
 export type AutoLockScanSettings = {
-  // Units: *_sweep_v are real sweep volts (x-axis); *_frac are normalized
-  // full-scale error amplitude (y-axis); symmetry_min is a dimensionless ratio.
-  half_range_sweep_v: number;
-  crossing_max_frac: number;
-  error_min_frac: number;
-  symmetry_min: number;
+  // Amplitude thresholds are in plot units (the fixed ADC_SCALE display scale, same as the
+  // plotted traces, ~±1 full scale; NOT per-trace normalized). half_range_sweep_v is sweep
+  // volts (x-axis); symmetry_min is a dimensionless ratio.
+  signal_type: "pdh" | "dispersive";
   allow_single_side: boolean;
-  single_error_min_frac: number;
-  smooth_window_pts: number;
   use_monitor: boolean;
-  monitor_contrast_min_frac: number;
+  monitor_mode: "locked_above" | "locked_below";
+  half_range_sweep_v: number;
+  error_min: number;
+  symmetry_min: number;
+  single_error_min: number;
+  min_amplitude: number;
+  smooth_window_pts: number;
+  monitor_threshold: number;
 };
 
 export type AutoLockScanResult = {
@@ -148,31 +151,31 @@ export type AutoLockScanResult = {
   target_voltage: number;
   target_slope_rising: boolean;
   score: number;
-  center_abs_v: number;
-  left_excursion_v: number;
-  right_excursion_v: number;
-  pair_excursion_v: number;
+  left_excursion: number;
+  right_excursion: number;
+  pair_excursion: number;
   symmetry: number;
-  monitor_contrast_v?: number | null;
+  monitor_level?: number | null;
+  hz_per_v?: number | null;
+  sideband_offset_v?: number | null;
   detail?: string | null;
 };
 
 export type AutoLockCalibrateRequest = {
   include_monitor: boolean;
   allow_single_side: boolean;
-  // Optional override of the dead-trace amplitude floor (normalised full-scale).
-  min_amplitude_frac?: number;
 };
 
 export type AutoLockCalibrationResult = {
   settings: AutoLockScanSettings;
-  amplitude_v: number;
+  amplitude: number;
   feature_half_width_v: number;
   target_index: number;
   target_voltage: number;
   target_slope_rising: boolean;
   symmetry: number;
-  monitor_contrast_v?: number | null;
+  monitor_level?: number | null;
+  hz_per_v?: number | null;
   detail?: string | null;
 };
 

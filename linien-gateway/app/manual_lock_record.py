@@ -11,6 +11,14 @@ MOD_AMP_SCALE = ((1 << 14) - 1) / 4
 OFFSET_SCALE = 8191.0
 
 
+def modulation_raw_to_hz(modulation_raw: float) -> float:
+    """Convert a raw ``modulation_frequency`` register value to Hz.
+
+    Single source of truth for the conversion (also used by the auto-lock Hz/V
+    derivation in session.py)."""
+    return (float(modulation_raw) / MOD_HZ_UNIT) * 1_000_000.0
+
+
 def _to_float(value: Any) -> float | None:
     if isinstance(value, bool):
         return 1.0 if value else 0.0
@@ -65,9 +73,7 @@ def build_manual_lock_row(
 
     modulation_raw = _to_float(params.get("modulation_frequency"))
     modulation_hz = (
-        None
-        if modulation_raw is None
-        else (modulation_raw / MOD_HZ_UNIT) * 1_000_000.0
+        None if modulation_raw is None else modulation_raw_to_hz(modulation_raw)
     )
 
     modulation_amplitude_raw = _to_float(params.get("modulation_amplitude"))

@@ -28,14 +28,13 @@ from . import device_store
 from . import schemas
 from .auto_lock_scan import (
     AutoLockCalibration,
-    AutoLockCalibrationFactors,
     AutoLockScanSettings,
     calibrate_auto_lock_settings,
     find_auto_lock_target,
 )
 from .auto_relock import AutoRelockConfig, AutoRelockController
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
-from .manual_lock_record import ADC_SCALE, build_manual_lock_row
+from .manual_lock_record import ADC_SCALE, build_manual_lock_row, modulation_raw_to_hz
 from .plot_processing import PlotState, V, build_plot_frame
 from .serializers import UNSERIALIZABLE, to_jsonable
 from .stream import WebsocketManager
@@ -697,9 +696,10 @@ class DeviceSession:
         # Validate the persisted/device-stored block through the same Pydantic
         # schema the HTTP boundary uses, so out-of-band writes (linien desktop
         # client, hand-edited config) can't smuggle out-of-range or wrong-typed
-        # values into the engine. The schema's AliasChoices also accept legacy
-        # ``_v`` keys and emit canonical names. On any failure, fall back to
-        # defaults rather than crashing the session.
+        # values into the engine. There are no legacy-key aliases: a block using
+        # old key names fails validation and falls back to defaults (the device
+        # must be recalibrated). On any failure, fall back to defaults rather
+        # than crashing the session.
         if isinstance(payload, dict):
             try:
                 payload = schemas.AutoLockScanSettings.model_validate(
@@ -823,7 +823,6 @@ class DeviceSession:
         *,
         include_monitor: bool,
         allow_single_side: bool,
-        min_amplitude_frac: float | None = None,
     ) -> AutoLockCalibration:
         """Derive auto-lock settings from the current (good) PDH error trace.
 
@@ -857,34 +856,21 @@ class DeviceSession:
 
         with self._state_lock:
             base = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
-        with self._rpyc_lock:
-            if bool(self.parameters.lock.value):
-                raise RuntimeError("Device is already locked. Start sweep first.")
-            sweep_center = float(self.parameters.sweep_center.value)
-            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
-            preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
+        sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz = (
+            self._snapshot_sweep_params(require_unlocked=True)
+        )
 
-        error_trace_v = np.asarray(error_trace, dtype=float) / ADC_SCALE
-        monitor_trace_v = (
-            np.asarray(monitor_trace, dtype=float) / ADC_SCALE
-            if monitor_trace is not None
-            else None
-        )
-        factors = (
-            AutoLockCalibrationFactors(min_amplitude_frac=float(min_amplitude_frac))
-            if min_amplitude_frac is not None
-            else None
-        )
+        # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
         return calibrate_auto_lock_settings(
-            error_trace_v=error_trace_v,
-            monitor_trace_v=monitor_trace_v,
+            error_trace_v=error_trace,
+            monitor_trace_v=monitor_trace,
             sweep_center_v=sweep_center,
             sweep_amplitude_v=sweep_amplitude,
             base=base,
             preferred_slope_rising=preferred_slope_rising,
             include_monitor=include_monitor,
             allow_single_side=allow_single_side,
-            factors=factors,
+            modulation_frequency_hz=modulation_frequency_hz,
         )
 
     def get_auto_relock_state(self) -> dict[str, Any]:
@@ -1347,16 +1333,53 @@ class DeviceSession:
             if plot_data is None or len(plot_data) < 3:
                 raise RuntimeError("No unlocked trace available")
             error_trace_raw = plot_data[2]
-            monitor_trace_raw = plot_data[1]
+            # The *true* monitor (None if the device has no monitor signal), not
+            # last_plot_data[1] which is monitor_or_error_signal_2.
+            monitor_trace_raw = self.plot_state.last_monitor_signal
         if error_trace_raw is None:
             raise RuntimeError("No error trace available")
-        error_trace = np.array(error_trace_raw, copy=True)
+        # Plot units: divide by ADC_SCALE (= plot_processing.V) so auto-lock thresholds
+        # read on the same fixed scale as the plotted traces (not per-trace normalized).
+        error_trace = np.array(error_trace_raw, copy=True) / ADC_SCALE
         monitor_trace = (
-            np.array(monitor_trace_raw, copy=True)
+            np.array(monitor_trace_raw, copy=True) / ADC_SCALE
             if monitor_trace_raw is not None
             else None
         )
         return error_trace, monitor_trace
+
+    @staticmethod
+    def _mod_freq_to_hz(raw: Any) -> float | None:
+        """Modulation frequency: raw device units -> Hz, or None if unusable
+        (non-numeric / non-finite / <= 0, so the PDH Hz/V step is skipped)."""
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value <= 0.0:
+            return None
+        return modulation_raw_to_hz(value)
+
+    def _snapshot_sweep_params(
+        self, *, require_unlocked: bool = False
+    ) -> tuple[float, float, bool, float | None]:
+        """Read the sweep params + modulation frequency the auto-lock paths need, in
+        one rpyc-lock acquisition. With ``require_unlocked`` it first refuses if the
+        device is already locked. Returns
+        (sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz)."""
+        with self._rpyc_lock:
+            if require_unlocked and bool(self.parameters.lock.value):
+                raise RuntimeError("Device is already locked. Start sweep first.")
+            sweep_center = float(self.parameters.sweep_center.value)
+            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
+            preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
+            modulation_raw = self.parameters.modulation_frequency.value
+        return (
+            sweep_center,
+            sweep_amplitude,
+            preferred_slope_rising,
+            self._mod_freq_to_hz(modulation_raw),
+        )
 
     def _snapshot_manual_lock_sources(
         self,
@@ -1926,12 +1949,12 @@ class DeviceSession:
     ) -> dict[str, Any]:
         """Run the auto-lock target finder against the latest trace WITHOUT locking.
 
-        Same detection/criteria as auto_lock_from_scan (crossing_max_frac, error_min_frac,
-        symmetry_min, optional single-side / monitor contrast), but it does not touch
+        Same detection/criteria as auto_lock_from_scan (error_min, symmetry_min,
+        min_amplitude, optional single-side / monitor level), but it does not touch
         sweep_center or start the lock. Returns the best candidate (AutoLockScanResult
-        dict); raises ValueError if no crossing meets the criteria. Read-only — it does
-        not persist settings. Intended for orchestration: probe, adjust the offset
-        (e.g. NLTL), and re-probe before committing to a lock.
+        dict, incl. hz_per_v in PDH mode); raises ValueError if no crossing meets the
+        criteria. Read-only — it does not persist settings. Intended for orchestration:
+        probe, adjust the offset (e.g. NLTL), and re-probe before committing to a lock.
         """
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
@@ -1942,24 +1965,19 @@ class DeviceSession:
                 settings = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
             else:
                 settings = AutoLockScanSettings.from_mapping(settings_payload)
-        with self._rpyc_lock:
-            sweep_center = float(self.parameters.sweep_center.value)
-            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
-            preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
-
-        error_trace_v = np.asarray(error_trace, dtype=float) / ADC_SCALE
-        monitor_trace_v = (
-            np.asarray(monitor_trace, dtype=float) / ADC_SCALE
-            if monitor_trace is not None
-            else None
+        sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz = (
+            self._snapshot_sweep_params()
         )
+
+        # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
         result = find_auto_lock_target(
-            error_trace_v=error_trace_v,
-            monitor_trace_v=monitor_trace_v,
+            error_trace_v=error_trace,
+            monitor_trace_v=monitor_trace,
             sweep_center_v=sweep_center,
             sweep_amplitude_v=sweep_amplitude,
             settings=settings,
             preferred_slope_rising=preferred_slope_rising,
+            modulation_frequency_hz=modulation_frequency_hz,
         )
         return result.to_dict()
 
@@ -1978,26 +1996,19 @@ class DeviceSession:
             else:
                 settings = AutoLockScanSettings.from_mapping(settings_payload)
                 self.auto_lock_scan_settings = settings.__dict__.copy()
-        with self._rpyc_lock:
-            if bool(self.parameters.lock.value):
-                raise RuntimeError("Device is already locked. Start sweep first.")
-            sweep_center = float(self.parameters.sweep_center.value)
-            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
-            preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
-
-        error_trace_v = np.asarray(error_trace, dtype=float) / ADC_SCALE
-        monitor_trace_v = (
-            np.asarray(monitor_trace, dtype=float) / ADC_SCALE
-            if monitor_trace is not None
-            else None
+        sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz = (
+            self._snapshot_sweep_params(require_unlocked=True)
         )
+
+        # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
         result = find_auto_lock_target(
-            error_trace_v=error_trace_v,
-            monitor_trace_v=monitor_trace_v,
+            error_trace_v=error_trace,
+            monitor_trace_v=monitor_trace,
             sweep_center_v=sweep_center,
             sweep_amplitude_v=sweep_amplitude,
             settings=settings,
             preferred_slope_rising=preferred_slope_rising,
+            modulation_frequency_hz=modulation_frequency_hz,
         )
 
         with self._rpyc_lock:

@@ -969,7 +969,6 @@ def calibrate_auto_lock_scan(key: str, payload: AutoLockCalibrateRequest) -> dic
         calibration = session.calibrate_auto_lock_settings(
             include_monitor=payload.include_monitor,
             allow_single_side=payload.allow_single_side,
-            min_amplitude_frac=payload.min_amplitude_frac,
         )
     except RuntimeError as exc:
         _emit_log(
@@ -1004,22 +1003,24 @@ def calibrate_auto_lock_scan(key: str, payload: AutoLockCalibrateRequest) -> dic
         message="Auto-lock settings calibrated from trace.",
         device_key=key,
         details={
-            "amplitude_v": calibration.amplitude_v,
+            "amplitude": calibration.amplitude,
             "feature_half_width_v": calibration.feature_half_width_v,
             "target_voltage": calibration.target_voltage,
+            "hz_per_v": calibration.hz_per_v,
             "include_monitor": payload.include_monitor,
             "allow_single_side": payload.allow_single_side,
         },
     )
     return {
         "settings": settings_payload,
-        "amplitude_v": calibration.amplitude_v,
+        "amplitude": calibration.amplitude,
         "feature_half_width_v": calibration.feature_half_width_v,
         "target_index": calibration.target_index,
         "target_voltage": calibration.target_voltage,
         "target_slope_rising": calibration.target_slope_rising,
         "symmetry": calibration.symmetry,
-        "monitor_contrast_v": calibration.monitor_contrast_v,
+        "monitor_level": calibration.monitor_level,
+        "hz_per_v": calibration.hz_per_v,
         "detail": calibration.detail,
     }
 
