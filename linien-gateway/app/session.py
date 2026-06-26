@@ -45,6 +45,13 @@ from .stream import WebsocketManager
 # object when `_cached_value` is absent on the RemoteParameter.
 _UNSET = object()
 
+# How stale the plot stream may get (seconds since the last frame) before
+# status() flags `stalled` while auto-relock is enabled. Comfortably above the
+# normal plot-poll cadence so ordinary jitter never trips it. The auto-relock
+# state machine only advances on frame arrival (see tick() call site), so a
+# stalled stream means the controller is frozen and not actually guarding the lock.
+AUTO_RELOCK_STREAM_STALL_S = 5.0
+
 IGNORED_PARAMS = {
     "to_plot",
     "signal_stats",
@@ -1755,6 +1762,13 @@ class DeviceSession:
                 if isinstance(frame_lock_indicator, dict)
                 else None
             )
+            # NOTE: tick() is driven ONLY from this plot-frame handler — there is
+            # no independent timer. All auto-relock holds/timeouts (trigger_hold_s,
+            # verify_hold_s, unlocked_trace_timeout_s) therefore only advance when a
+            # frame arrives. If the plot stream stalls entirely, the controller
+            # freezes and cannot self-detect "frames stopped". That case is surfaced
+            # to operators via the stream_age_s / stalled fields in status() (the
+            # REST poll, which keeps updating while the websocket frames have ceased).
             relock_action = self.auto_relock.tick(
                 lock=lock_value,
                 indicator_state=indicator_state
@@ -1841,6 +1855,19 @@ class DeviceSession:
             lock_value = frame_lock
         with self._state_lock:
             diagnosis = self._diagnosis_cache
+        # Stream-stall visibility. The auto-relock state machine only advances on
+        # plot-frame arrival, so a stale stream means it is frozen. Surfaced here
+        # (REST status) rather than in the websocket frame, because during a stall
+        # the frames are exactly what has stopped. `stalled` is only meaningful
+        # while auto-relock is enabled.
+        stream_age_s: float | None = None
+        if last_plot_timestamp is not None:
+            stream_age_s = max(0.0, time.time() - float(last_plot_timestamp))
+        stalled = bool(
+            auto_relock_status.get("enabled")
+            and stream_age_s is not None
+            and stream_age_s > AUTO_RELOCK_STREAM_STALL_S
+        )
         return {
             "connected": self.connected,
             "connecting": self.connecting,
@@ -1857,6 +1884,11 @@ class DeviceSession:
             "lock_indicator_state": control_metrics["lock_indicator_state"],
             "psd_running": psd_running,
             "auto_relock": auto_relock_status,
+            # Seconds since the last plot frame (null if none yet), and whether the
+            # stream is stale enough that auto-relock (if enabled) is effectively
+            # frozen. See AUTO_RELOCK_STREAM_STALL_S.
+            "stream_age_s": stream_age_s,
+            "stalled": stalled,
             "diagnosis": diagnosis,
         }
 

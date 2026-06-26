@@ -43,6 +43,10 @@ export type DeviceStatus = {
   lock?: boolean | null;
   psd_running?: boolean | null;
   auto_relock?: AutoRelockStatus | null;
+  // Seconds since the last plot frame (null if none yet), and whether the stream
+  // is stale enough that auto-relock (if enabled) is effectively frozen.
+  stream_age_s?: number | null;
+  stalled?: boolean;
   diagnosis?: DeviceDiagnosis | null;
 };
 

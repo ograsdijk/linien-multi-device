@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 from app.auto_relock import AutoRelockConfig
 from app.lock_indicator import LockIndicatorConfig
-from app.session import DeviceSession
+from app.session import AUTO_RELOCK_STREAM_STALL_S, DeviceSession
 from app.stream import WebsocketManager
 
 
@@ -181,6 +182,41 @@ def test_snapshot_returns_copies_of_cached_state():
     assert session.param_cache_serialized["nested"]["value"] == 1
     assert session.last_plot_frame["series"]["combined_error"][0] == 0.1
     assert snapshot["status"]["last_plot"] == 123.0
+
+
+def test_status_flags_stalled_when_stream_stale_and_auto_relock_enabled():
+    session = _make_session({})
+    session.auto_relock.set_enabled(True)
+    # Last frame is older than the stall threshold.
+    session.last_plot_timestamp = time.time() - (AUTO_RELOCK_STREAM_STALL_S + 5.0)
+
+    status = session.status()
+
+    assert status["stalled"] is True
+    assert status["stream_age_s"] is not None
+    assert status["stream_age_s"] > AUTO_RELOCK_STREAM_STALL_S
+
+
+def test_status_not_stalled_when_stream_fresh():
+    session = _make_session({})
+    session.auto_relock.set_enabled(True)
+    session.last_plot_timestamp = time.time()
+
+    status = session.status()
+
+    assert status["stalled"] is False
+    assert status["stream_age_s"] is not None
+    assert status["stream_age_s"] < AUTO_RELOCK_STREAM_STALL_S
+
+
+def test_status_not_stalled_when_auto_relock_disabled():
+    session = _make_session({})
+    # Auto-relock disabled by default; a stale stream must NOT read as stalled.
+    session.last_plot_timestamp = time.time() - (AUTO_RELOCK_STREAM_STALL_S + 5.0)
+
+    status = session.status()
+
+    assert status["stalled"] is False
 
 
 def test_config_accessors_hold_state_lock():

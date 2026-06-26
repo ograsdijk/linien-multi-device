@@ -16,6 +16,10 @@ const DEFAULT_AUTO_RELOCK_CONFIG: AutoRelockConfig = {
 type AutoRelockPanelProps = {
   config?: AutoRelockConfig | null;
   status?: AutoRelockStatus | null;
+  // True when the plot stream has stalled while auto-relock is enabled — the
+  // state machine only advances on frame arrival, so a stalled stream means it
+  // is frozen and not actually guarding the lock.
+  stalled?: boolean;
   saving?: boolean;
   error?: string | null;
   onSaveConfig?: (config: AutoRelockConfig) => Promise<void>;
@@ -24,6 +28,7 @@ type AutoRelockPanelProps = {
 export const AutoRelockPanel = memo(function AutoRelockPanel({
   config,
   status,
+  stalled,
   saving,
   error,
   onSaveConfig,
@@ -79,6 +84,11 @@ export const AutoRelockPanel = memo(function AutoRelockPanel({
         {status?.max_attempts ?? draft.max_attempts} | cooldown=
         {(status?.cooldown_remaining_s ?? 0).toFixed(1)}s
       </Text>
+      {stalled ? (
+        <Text size="xs" c="orange">
+          Plot stream stalled — auto-relock is frozen and not guarding the lock.
+        </Text>
+      ) : null}
       <Switch
         label="Enable auto relock"
         checked={draft.enabled}

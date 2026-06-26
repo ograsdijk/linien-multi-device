@@ -97,6 +97,7 @@ type RightPanelProps = {
   lockIndicatorSnapshot?: LockIndicatorSnapshot | null;
   autoRelockConfig?: AutoRelockConfig | null;
   autoRelockStatus?: AutoRelockStatus | null;
+  autoRelockStalled?: boolean;
   autoRelockSaving?: boolean;
   autoRelockError?: string | null;
   onSaveAutoRelockConfig?: (config: AutoRelockConfig) => Promise<void>;
@@ -188,6 +189,7 @@ export function RightPanel(props: RightPanelProps) {
             <AutoRelockPanel
               config={props.autoRelockConfig}
               status={props.autoRelockStatus}
+              stalled={props.autoRelockStalled}
               saving={props.autoRelockSaving}
               error={props.autoRelockError}
               onSaveConfig={props.onSaveAutoRelockConfig}

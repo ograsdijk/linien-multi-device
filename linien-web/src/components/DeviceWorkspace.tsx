@@ -603,6 +603,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             lockIndicatorSnapshot={lockIndicator}
             autoRelockConfig={autoRelockConfig}
             autoRelockStatus={autoRelockStatus ?? state.status?.auto_relock ?? null}
+            autoRelockStalled={Boolean(state.status?.stalled)}
             autoRelockSaving={autoRelockSaving}
             autoRelockError={autoRelockError}
             onSaveAutoRelockConfig={handleSaveAutoRelockConfig}
