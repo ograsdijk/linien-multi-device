@@ -34,7 +34,7 @@ from .auto_lock_scan import (
 )
 from .auto_relock import AutoRelockConfig, AutoRelockController
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
-from .manual_lock_record import ADC_SCALE, MOD_HZ_UNIT, build_manual_lock_row
+from .manual_lock_record import ADC_SCALE, build_manual_lock_row, modulation_raw_to_hz
 from .plot_processing import PlotState, V, build_plot_frame
 from .serializers import UNSERIALIZABLE, to_jsonable
 from .stream import WebsocketManager
@@ -856,13 +856,9 @@ class DeviceSession:
 
         with self._state_lock:
             base = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
-        with self._rpyc_lock:
-            if bool(self.parameters.lock.value):
-                raise RuntimeError("Device is already locked. Start sweep first.")
-            sweep_center = float(self.parameters.sweep_center.value)
-            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
-            preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
-            modulation_raw = self.parameters.modulation_frequency.value
+        sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz = (
+            self._snapshot_sweep_params(require_unlocked=True)
+        )
 
         # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
         return calibrate_auto_lock_settings(
@@ -874,7 +870,7 @@ class DeviceSession:
             preferred_slope_rising=preferred_slope_rising,
             include_monitor=include_monitor,
             allow_single_side=allow_single_side,
-            modulation_frequency_hz=self._mod_freq_to_hz(modulation_raw),
+            modulation_frequency_hz=modulation_frequency_hz,
         )
 
     def get_auto_relock_state(self) -> dict[str, Any]:
@@ -1354,15 +1350,36 @@ class DeviceSession:
 
     @staticmethod
     def _mod_freq_to_hz(raw: Any) -> float | None:
-        """Modulation frequency: raw device units -> Hz (None if unusable). Mirrors
-        manual_lock_record's conversion."""
+        """Modulation frequency: raw device units -> Hz, or None if unusable
+        (non-numeric / non-finite / <= 0, so the PDH Hz/V step is skipped)."""
         try:
             value = float(raw)
         except (TypeError, ValueError):
             return None
         if not math.isfinite(value) or value <= 0.0:
             return None
-        return (value / MOD_HZ_UNIT) * 1_000_000.0
+        return modulation_raw_to_hz(value)
+
+    def _snapshot_sweep_params(
+        self, *, require_unlocked: bool = False
+    ) -> tuple[float, float, bool, float | None]:
+        """Read the sweep params + modulation frequency the auto-lock paths need, in
+        one rpyc-lock acquisition. With ``require_unlocked`` it first refuses if the
+        device is already locked. Returns
+        (sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz)."""
+        with self._rpyc_lock:
+            if require_unlocked and bool(self.parameters.lock.value):
+                raise RuntimeError("Device is already locked. Start sweep first.")
+            sweep_center = float(self.parameters.sweep_center.value)
+            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
+            preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
+            modulation_raw = self.parameters.modulation_frequency.value
+        return (
+            sweep_center,
+            sweep_amplitude,
+            preferred_slope_rising,
+            self._mod_freq_to_hz(modulation_raw),
+        )
 
     def _snapshot_manual_lock_sources(
         self,
@@ -1948,11 +1965,9 @@ class DeviceSession:
                 settings = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
             else:
                 settings = AutoLockScanSettings.from_mapping(settings_payload)
-        with self._rpyc_lock:
-            sweep_center = float(self.parameters.sweep_center.value)
-            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
-            preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
-            modulation_raw = self.parameters.modulation_frequency.value
+        sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz = (
+            self._snapshot_sweep_params()
+        )
 
         # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
         result = find_auto_lock_target(
@@ -1962,7 +1977,7 @@ class DeviceSession:
             sweep_amplitude_v=sweep_amplitude,
             settings=settings,
             preferred_slope_rising=preferred_slope_rising,
-            modulation_frequency_hz=self._mod_freq_to_hz(modulation_raw),
+            modulation_frequency_hz=modulation_frequency_hz,
         )
         return result.to_dict()
 
@@ -1981,13 +1996,9 @@ class DeviceSession:
             else:
                 settings = AutoLockScanSettings.from_mapping(settings_payload)
                 self.auto_lock_scan_settings = settings.__dict__.copy()
-        with self._rpyc_lock:
-            if bool(self.parameters.lock.value):
-                raise RuntimeError("Device is already locked. Start sweep first.")
-            sweep_center = float(self.parameters.sweep_center.value)
-            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
-            preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
-            modulation_raw = self.parameters.modulation_frequency.value
+        sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz = (
+            self._snapshot_sweep_params(require_unlocked=True)
+        )
 
         # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
         result = find_auto_lock_target(
@@ -1997,7 +2008,7 @@ class DeviceSession:
             sweep_amplitude_v=sweep_amplitude,
             settings=settings,
             preferred_slope_rising=preferred_slope_rising,
-            modulation_frequency_hz=self._mod_freq_to_hz(modulation_raw),
+            modulation_frequency_hz=modulation_frequency_hz,
         )
 
         with self._rpyc_lock:
