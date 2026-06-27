@@ -22,7 +22,13 @@ Linien laser-lock devices from one interface.
     flow are currently compatibility-disabled — see [Known limitations](#known-limitations).
 - Lock quality tooling:
   - configurable lock indicator (error / control / monitor based),
+  - per-frame signal statistics (mean/std control voltage, error and monitor stats)
+    exposed over REST `status()` and the plot stream — computed whenever the device is
+    locked, independent of the lock indicator (so disabling the indicator does not hide
+    the control-voltage readout used for orchestration / recentering),
   - auto-relock controller with configurable trigger / verify / cooldown behavior.
+- Broadband PSD (power-spectral-density) noise-spectrum acquisition: a server-side
+  measurement on locked devices, streamed live to a viewer and tailable over REST.
 - Connection-drop diagnosis: when a device drops, the gateway probes it out-of-band
   (TCP + SSH) to classify the cause (crash vs reboot vs unreachable) and infer whether
   the hardware lock is likely still held.
@@ -47,8 +53,9 @@ Linien laser-lock devices from one interface.
   owns the RPyC connection to the Linien server, a background poll thread, the persistent
   settings snapshot, and the per-device lock/auto-relock/diagnosis state.
 - The web UI talks to the gateway over a REST API (`/api/...`) for control and over
-  per-device WebSockets (`/api/devices/{key}/stream`) for live plot/status frames. A
-  separate WebSocket (`/api/logs/stream`) carries structured log events.
+  per-device WebSockets (`/api/devices/{key}/stream`) for live plot/status frames.
+  Separate WebSockets carry structured log events (`/api/logs/stream`) and live PSD
+  noise-spectrum results (`/api/psd/stream`).
 - Plot frames can be sent as JSON or, when the client requests `binary=1`, as a compact
   binary frame decoded in a Web Worker (`src/workers/streamParserWorker.ts`).
 - Interactive API docs are available at `/docs` (FastAPI / OpenAPI) when the gateway is
@@ -173,6 +180,23 @@ A per-device controller that re-establishes a lost lock. It is configured with
 trigger / verify / cooldown behavior and exposes its state over REST and in the live
 stream. Auto-relock-driven locks are logged to Postgres with `lock_source = "auto_relock"`.
 
+## PSD (noise spectrum)
+
+A server-side broadband power-spectral-density measurement of the locked error/control
+signal, surfaced in the web UI as a noise-spectrum viewer.
+
+- **Start / stop (single device)** — `POST /api/devices/{key}/control/start_psd_acquisition`
+  (optional body: `algorithm`, `max_decimation`) and
+  `POST /api/devices/{key}/control/stop_psd_acquisition`. Start returns immediately and
+  `409`s if the laser isn't locked; the device acquires in the background.
+- **Start / stop (simultaneous)** — `POST /api/control/start_psd_acquisition` and
+  `POST /api/control/stop_psd_acquisition` over a set of device keys, triggered in
+  parallel; unconnected/unlocked devices land in `skipped` rather than failing the batch.
+- **Live results** — streamed over `ws /api/psd/stream` and reflected per device in
+  `status()` as `psd_running`.
+- **History** — `GET /api/psd/tail` (recent results, `limit` query param) and
+  `DELETE /api/psd` to clear.
+
 ## Connection diagnosis
 
 When a device's RPyC connection drops, a background probe (`app/diagnosis.py`) classifies
@@ -200,6 +224,7 @@ needs SSH access to the Red Pitaya. Note that the gateway does **not** auto-reco
   - `binary` — `1` to receive binary plot frames (decoded in the stream-parser worker).
   - control message `{ "type": "set_max_fps", "value": N }` retunes the rate live.
 - Logs stream: `ws /api/logs/stream`.
+- PSD stream: `ws /api/psd/stream` (live noise-spectrum results — see [PSD](#psd-noise-spectrum)).
 
 ## Optional Postgres lock logging
 
