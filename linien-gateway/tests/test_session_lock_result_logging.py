@@ -114,36 +114,34 @@ def test_write_lock_result_logs_rejected_as_error():
 
 def test_lock_indicator_transition_emits_lost_and_acquired():
     session, events = _build_session(postgres_service=None)
-    snapshot_lost = {
-        "state": "lost",
-        "reasons": ["error_std_too_low"],
-        "metrics": {"error_std_v": 1e-4, "control_mean_v": 0.2},
-    }
-    snapshot_locked = {
-        "state": "locked",
-        "reasons": [],
-        "metrics": {"error_std_v": 2e-3, "control_mean_v": 0.01},
-    }
+    snapshot_lost = {"state": "lost", "reasons": ["error_std_too_low"]}
+    stats_lost = {"error_std_v": 1e-4, "control_mean_v": 0.2}
+    snapshot_locked = {"state": "locked", "reasons": []}
+    stats_locked = {"error_std_v": 2e-3, "control_mean_v": 0.01}
 
     session._emit_lock_transition_log(
         lock_enabled=True,
         indicator_state="marginal",
-        indicator_snapshot={"state": "marginal", "reasons": [], "metrics": {}},
+        indicator_snapshot={"state": "marginal", "reasons": []},
+        signal_stats={},
     )
     session._emit_lock_transition_log(
         lock_enabled=True,
         indicator_state="lost",
         indicator_snapshot=snapshot_lost,
+        signal_stats=stats_lost,
     )
     session._emit_lock_transition_log(
         lock_enabled=True,
         indicator_state="lost",
         indicator_snapshot=snapshot_lost,
+        signal_stats=stats_lost,
     )
     session._emit_lock_transition_log(
         lock_enabled=True,
         indicator_state="locked",
         indicator_snapshot=snapshot_locked,
+        signal_stats=stats_locked,
     )
 
     lost = [entry for entry in events if entry["code"] == "lock_lost"]
@@ -152,6 +150,8 @@ def test_lock_indicator_transition_emits_lost_and_acquired():
     assert len(acquired) == 1
     assert lost[0]["level"] == logging.ERROR
     assert acquired[0]["level"] == logging.INFO
+    # logged metrics come from the signal stats, not the indicator snapshot
+    assert lost[0]["details"]["metrics"]["control_mean_v"] == 0.2
 
 
 def test_auto_relock_state_transition_logs_key_stages_once():

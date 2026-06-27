@@ -30,10 +30,8 @@ def test_status_exposes_control_metrics_from_cached_frame() -> None:
     session = _make_session()
     session.last_plot_frame = {
         "lock": True,
-        "lock_indicator": {
-            "state": "locked",
-            "metrics": {"control_mean_v": 0.125, "control_std_v": 0.004},
-        },
+        "lock_indicator": {"state": "locked"},
+        "signal_stats": {"control_mean_v": 0.125, "control_std_v": 0.004},
     }
 
     status = session.status()
@@ -42,6 +40,23 @@ def test_status_exposes_control_metrics_from_cached_frame() -> None:
     assert status["control_std_v"] == 0.004
     assert status["lock_indicator_state"] == "locked"
     assert status["lock"] is True
+
+
+def test_status_exposes_control_metrics_when_indicator_disabled() -> None:
+    """Regression: disabling the lock indicator must not hide the control
+    voltage. Stats live in signal_stats, independent of the indicator."""
+    session = _make_session()
+    session.last_plot_frame = {
+        "lock": True,
+        "lock_indicator": {"state": "unknown", "reasons": ["disabled"]},
+        "signal_stats": {"control_mean_v": 0.2, "control_std_v": 0.005},
+    }
+
+    status = session.status()
+
+    assert status["control_mean_v"] == 0.2
+    assert status["control_std_v"] == 0.005
+    assert status["lock_indicator_state"] == "unknown"
 
 
 def test_status_control_metrics_null_without_frame() -> None:
@@ -59,10 +74,8 @@ def test_status_coerces_non_finite_control_mean_to_null() -> None:
     session = _make_session()
     session.last_plot_frame = {
         "lock": True,
-        "lock_indicator": {
-            "state": "locked",
-            "metrics": {"control_mean_v": float("nan"), "control_std_v": None},
-        },
+        "lock_indicator": {"state": "locked"},
+        "signal_stats": {"control_mean_v": float("nan"), "control_std_v": None},
     }
 
     status = session.status()

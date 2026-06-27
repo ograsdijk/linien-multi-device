@@ -6,6 +6,7 @@ import pickle
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import asdict
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any, Dict, List
@@ -36,6 +37,7 @@ from .auto_relock import AutoRelockConfig, AutoRelockController
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
 from .manual_lock_record import ADC_SCALE, build_manual_lock_row, modulation_raw_to_hz
 from .plot_processing import PlotState, V, build_plot_frame
+from .signal_stats import SignalStats, compute_signal_stats
 from .serializers import UNSERIALIZABLE, to_jsonable
 from .stream import WebsocketManager
 
@@ -492,10 +494,9 @@ class DeviceSession:
 
     @staticmethod
     def _compact_indicator_metrics(
-        indicator_snapshot: dict[str, Any],
+        signal_stats: dict[str, Any],
     ) -> dict[str, Any]:
-        metrics = indicator_snapshot.get("metrics")
-        if not isinstance(metrics, dict):
+        if not isinstance(signal_stats, dict):
             return {}
         keys = (
             "error_std_v",
@@ -504,7 +505,7 @@ class DeviceSession:
             "control_std_v",
             "monitor_mean_v",
         )
-        return {key: metrics.get(key) for key in keys if key in metrics}
+        return {key: signal_stats.get(key) for key in keys if key in signal_stats}
 
     def _emit_lock_transition_log(
         self,
@@ -512,6 +513,7 @@ class DeviceSession:
         lock_enabled: bool,
         indicator_state: str | None,
         indicator_snapshot: dict[str, Any],
+        signal_stats: dict[str, Any],
     ) -> None:
         previous_state = self._last_lock_indicator_state
         self._last_lock_indicator_state = indicator_state
@@ -529,7 +531,7 @@ class DeviceSession:
                 if isinstance(indicator_snapshot.get("reasons"), list)
                 else []
             ),
-            "metrics": self._compact_indicator_metrics(indicator_snapshot),
+            "metrics": self._compact_indicator_metrics(signal_stats),
         }
         if indicator_state == "lost":
             self._emit_log_event(
@@ -1313,10 +1315,12 @@ class DeviceSession:
                     state = indicator.get("state")
                     if isinstance(state, str):
                         indicator_state = state
-                    metrics = indicator.get("metrics")
-                    if isinstance(metrics, dict):
-                        control_mean_v = _coerce_float(metrics.get("control_mean_v"))
-                        control_std_v = _coerce_float(metrics.get("control_std_v"))
+                # Control voltage comes from the indicator-independent signal
+                # stats so it survives the indicator being disabled.
+                stats = self.last_plot_frame.get("signal_stats")
+                if isinstance(stats, dict):
+                    control_mean_v = _coerce_float(stats.get("control_mean_v"))
+                    control_std_v = _coerce_float(stats.get("control_std_v"))
         auto_relock_status = self.auto_relock.get_status()
         control_metrics = {
             "control_mean_v": control_mean_v,
@@ -1765,6 +1769,12 @@ class DeviceSession:
         # remain correct without the series payload.
         needs_series = required_detail is not None or auto_relock_active
 
+        # Raw signal statistics are independent of the lock indicator: computed
+        # here whenever locked (means are meaningless while sweeping) and surfaced
+        # via frame["signal_stats"] so status()/logs see them even when the
+        # indicator is disabled. The indicator consumes them for its thresholds.
+        signal_stats = compute_signal_stats(to_plot) if lock_value else SignalStats()
+
         with self._state_lock:
             frame = build_plot_frame(
                 to_plot,
@@ -1775,9 +1785,10 @@ class DeviceSession:
             )
             if frame is None:
                 return
+            frame["signal_stats"] = asdict(signal_stats)
             frame_lock_indicator = self.lock_indicator.update(
                 lock=lock_value,
-                to_plot=to_plot,
+                stats=signal_stats,
             )
             frame["lock_indicator"] = frame_lock_indicator
             indicator_state = (
@@ -1834,6 +1845,7 @@ class DeviceSession:
             indicator_snapshot=(
                 frame_lock_indicator if isinstance(frame_lock_indicator, dict) else {}
             ),
+            signal_stats=asdict(signal_stats),
         )
         self._emit_auto_relock_state_transition_log(auto_relock_status)
 
