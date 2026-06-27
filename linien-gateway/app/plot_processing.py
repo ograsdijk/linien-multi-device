@@ -15,7 +15,7 @@ from linien_common.common import (
     update_signal_history,
 )
 
-V = 8192
+from .signal_stats import ADC_SCALE as V  # single source of truth for ADC counts/volt
 
 # Source of truth for the series keys that `build_plot_frame` populates when
 # called with detail="summary". `stream.filter_plot_frame` MUST use this same

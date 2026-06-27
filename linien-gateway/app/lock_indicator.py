@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-ADC_SCALE = 8192.0
+from .signal_stats import SignalStats
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -38,21 +38,6 @@ def _as_int(value: Any, default: int) -> int:
         return int(round(float(value)))
     except (TypeError, ValueError):
         return default
-
-def _plot_array(to_plot: Mapping[str, Any] | None, name: str) -> np.ndarray | None:
-    if not isinstance(to_plot, Mapping):
-        return None
-    values = to_plot.get(name)
-    if values is None:
-        return None
-    try:
-        arr = np.asarray(values, dtype=float)
-    except Exception:
-        return None
-    if arr.ndim != 1 or arr.size == 0:
-        return None
-    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
 
 @dataclass
 class LockIndicatorConfig:
@@ -130,12 +115,9 @@ class LockIndicatorConfig:
 
 @dataclass
 class LockIndicatorMetrics:
-    error_std_v: float | None = None
-    error_mean_abs_v: float | None = None
-    control_std_v: float | None = None
-    control_mean_v: float | None = None
-    control_range_counts: float | None = None
-    monitor_mean_v: float | None = None
+    """Indicator-owned state. Raw signal stats live in ``SignalStats`` and are
+    surfaced separately (``frame["signal_stats"]``), not here."""
+
     control_stuck_s: float = 0.0
     control_rail_s: float = 0.0
 
@@ -207,7 +189,7 @@ class LockIndicatorEvaluator:
         self,
         *,
         lock: bool,
-        to_plot: Mapping[str, Any] | None,
+        stats: SignalStats,
         now: float | None = None,
     ) -> dict[str, Any]:
         ts = float(now) if now is not None else time.time()
@@ -228,33 +210,27 @@ class LockIndicatorEvaluator:
             self._set_state("unknown")
             return self._snapshot()
 
-        error = _plot_array(to_plot, "error_signal")
-        control = _plot_array(to_plot, "control_signal")
-        monitor = _plot_array(to_plot, "monitor_signal")
+        # Signal presence is derived from the stats: a field is None iff the
+        # source signal was absent from the frame (see compute_signal_stats).
+        error_present = stats.error_std_v is not None
+        control_present = stats.control_mean_v is not None
+        monitor_present = stats.monitor_mean_v is not None
 
         bad_reasons: list[str] = []
         hard_fail = False
         metrics = LockIndicatorMetrics()
 
-        if error is not None:
-            metrics.error_std_v = float(np.std(error) / ADC_SCALE)
-            metrics.error_mean_abs_v = abs(float(np.mean(error) / ADC_SCALE))
-        elif cfg.use_error:
+        if not error_present and cfg.use_error:
             bad_reasons.append("missing_error_signal")
 
-        if control is not None:
-            control_mean_v = float(np.mean(control) / ADC_SCALE)
-            control_std_v = float(np.std(control) / ADC_SCALE)
-            control_range_counts = float(np.max(control) - np.min(control))
-            metrics.control_mean_v = control_mean_v
-            metrics.control_std_v = control_std_v
-            metrics.control_range_counts = control_range_counts
+        if control_present:
             if cfg.use_control:
+                control_range_counts = float(stats.control_range_counts or 0.0)
                 if control_range_counts <= float(cfg.control_stuck_delta_counts):
                     self._control_stuck_duration_s += dt
                 else:
                     self._control_stuck_duration_s = 0.0
-                if abs(control_mean_v) >= float(cfg.control_rail_threshold_v):
+                if abs(stats.control_mean_v) >= float(cfg.control_rail_threshold_v):
                     self._control_rail_duration_s += dt
                 else:
                     self._control_rail_duration_s = 0.0
@@ -274,29 +250,25 @@ class LockIndicatorEvaluator:
         metrics.control_stuck_s = float(self._control_stuck_duration_s)
         metrics.control_rail_s = float(self._control_rail_duration_s)
 
-        if cfg.use_error and error is not None:
-            if metrics.error_mean_abs_v is not None and metrics.error_mean_abs_v > float(cfg.error_mean_abs_max_v):
+        if cfg.use_error and error_present:
+            if stats.error_mean_abs_v is not None and stats.error_mean_abs_v > float(cfg.error_mean_abs_max_v):
                 bad_reasons.append("error_mean_out_of_range")
-            if float(cfg.error_std_min_v) > 0 and metrics.error_std_v is not None:
-                if metrics.error_std_v < float(cfg.error_std_min_v):
+            if float(cfg.error_std_min_v) > 0 and stats.error_std_v is not None:
+                if stats.error_std_v < float(cfg.error_std_min_v):
                     bad_reasons.append("error_std_too_low")
-            if float(cfg.error_std_max_v) > 0 and metrics.error_std_v is not None:
-                if metrics.error_std_v > float(cfg.error_std_max_v):
+            if float(cfg.error_std_max_v) > 0 and stats.error_std_v is not None:
+                if stats.error_std_v > float(cfg.error_std_max_v):
                     bad_reasons.append("error_std_too_high")
 
         if cfg.use_monitor:
-            if monitor is None:
+            if not monitor_present:
                 bad_reasons.append("missing_monitor_signal")
+            elif cfg.monitor_mode == "locked_above":
+                if stats.monitor_mean_v < float(cfg.monitor_threshold_v):
+                    bad_reasons.append("monitor_below_threshold")
             else:
-                metrics.monitor_mean_v = float(np.mean(monitor) / ADC_SCALE)
-                if cfg.monitor_mode == "locked_above":
-                    if metrics.monitor_mean_v < float(cfg.monitor_threshold_v):
-                        bad_reasons.append("monitor_below_threshold")
-                else:
-                    if metrics.monitor_mean_v > float(cfg.monitor_threshold_v):
-                        bad_reasons.append("monitor_above_threshold")
-        elif monitor is not None:
-            metrics.monitor_mean_v = float(np.mean(monitor) / ADC_SCALE)
+                if stats.monitor_mean_v > float(cfg.monitor_threshold_v):
+                    bad_reasons.append("monitor_above_threshold")
 
         self._metrics = metrics
         self._reasons = bad_reasons

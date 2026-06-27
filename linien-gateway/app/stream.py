@@ -111,8 +111,8 @@ def _json_fallback_default(value: Any) -> Any:
 #   0         4       magic 'PLOT' (0x504C4F54), big-endian
 #   4         4       header JSON length (uint32 BE)
 #   8         N       header JSON (utf-8) — series_names, n_points, lock_indicator,
-#                     auto_relock, lock, dual_channel, signal_power, stats,
-#                     lock_target, x_label, x_unit, type
+#                     signal_stats, auto_relock, lock, dual_channel, signal_power,
+#                     stats, lock_target, x_label, x_unit, type
 #   8 + N     0..3    zero padding to next 4-byte boundary
 #   ...       4*K*P   K = len(series_names), P = n_points,
 #                     little-endian Float32 values, series in declared order
@@ -206,6 +206,7 @@ def encode_plot_frame_binary(frame: Dict[str, Any]) -> bytes:
         "lock": bool(frame.get("lock")),
         "dual_channel": bool(frame.get("dual_channel")),
         "lock_indicator": frame.get("lock_indicator"),
+        "signal_stats": frame.get("signal_stats"),
         "auto_relock": frame.get("auto_relock"),
         "signal_power": frame.get("signal_power"),
         "stats": frame.get("stats"),

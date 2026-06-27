@@ -68,16 +68,22 @@ export type LockIndicatorConfig = {
   monitor_threshold_v: number;
 };
 
+// Raw per-frame signal statistics (null when the source signal is absent or
+// the device is unlocked). Computed independently of the lock indicator.
+export type SignalStats = {
+  control_mean_v?: number | null;
+  control_std_v?: number | null;
+  control_range_counts?: number | null;
+  error_std_v?: number | null;
+  error_mean_abs_v?: number | null;
+  monitor_mean_v?: number | null;
+};
+
 export type LockIndicatorSnapshot = {
   state: 'unknown' | 'locked' | 'marginal' | 'lost';
   reasons: string[];
+  // Indicator-owned state only. Raw signal stats live in PlotFrame.signal_stats.
   metrics: {
-    error_std_v?: number | null;
-    error_mean_abs_v?: number | null;
-    control_std_v?: number | null;
-    control_mean_v?: number | null;
-    control_range_counts?: number | null;
-    monitor_mean_v?: number | null;
     control_stuck_s: number;
     control_rail_s: number;
   };
@@ -95,6 +101,7 @@ export type PlotFrame = {
   series: Record<string, Array<number | null> | Float32Array>;
   signal_power: { channel1?: number | null; channel2?: number | null };
   stats: { error_std?: number | null; control_std?: number | null };
+  signal_stats?: SignalStats;
   lock_indicator?: LockIndicatorSnapshot;
   auto_relock?: AutoRelockStatus;
   lock_target?: number | null;
