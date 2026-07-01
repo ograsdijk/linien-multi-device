@@ -73,6 +73,12 @@ class AutoLockScanResult:
     monitor_level: float | None
     hz_per_v: float | None
     sideband_offset_v: float | None
+    # PDH discriminator slope at the carrier zero-crossing, in error plot-units
+    # (ADC-full-scale, 8192 cts = 1) per MHz. Combines the error-curve steepness
+    # on the sweep axis with the sideband-derived hz_per_v. None unless PDH with a
+    # known modulation frequency and a resolvable slope. An in-loop frequency
+    # error is then error_std_v / discriminator_slope_v_per_mhz [MHz].
+    discriminator_slope_v_per_mhz: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,6 +93,7 @@ class AutoLockScanResult:
             "monitor_level": self.monitor_level,
             "hz_per_v": self.hz_per_v,
             "sideband_offset_v": self.sideband_offset_v,
+            "discriminator_slope_v_per_mhz": self.discriminator_slope_v_per_mhz,
         }
 
 
@@ -232,6 +239,44 @@ def _estimate_crossing(
     if bracket_positions:
         return min(bracket_positions, key=lambda item: abs(item - float(center_idx)))
     return float(center_idx)
+
+
+def _crossing_slope_v_per_v(
+    error: np.ndarray,
+    crossing_idx_float: float,
+    half_range_pts: int,
+    sweep_amplitude_v: float,
+) -> float | None:
+    """Error-signal slope at the carrier zero-crossing, in error plot-units per
+    sweep-volt (the PDH discriminator gain on the sweep axis).
+
+    Fits a line over the linear region straddling the crossing (a window narrower
+    than the lobe extrema at ~``half_range_pts``, which would flatten the fit).
+    Returns None if the window is too small or the sweep axis is degenerate."""
+    n = len(error)
+    amplitude = abs(float(sweep_amplitude_v))
+    if n < 4 or amplitude <= 1e-9:
+        return None
+    anchor = int(round(crossing_idx_float))
+    # Stay inside the lobes: half the feature half-range keeps the fit on the
+    # linear part of the dispersive curve.
+    w = max(2, int(half_range_pts) // 2)
+    lo = max(0, anchor - w)
+    hi = min(n, anchor + w + 1)
+    if hi - lo < 3:
+        return None
+    x = np.arange(lo, hi, dtype=float)
+    y = error[lo:hi].astype(float)
+    try:
+        slope_per_sample = float(np.polyfit(x, y, 1)[0])
+    except Exception:  # noqa: BLE001 - degenerate fit -> no slope
+        return None
+    if not np.isfinite(slope_per_sample):
+        return None
+    volt_per_sample = 2.0 * amplitude / (n - 1)
+    if volt_per_sample <= 0.0:
+        return None
+    return slope_per_sample / volt_per_sample
 
 
 def _sideband_offset_pts(
@@ -465,6 +510,7 @@ def find_auto_lock_target(
 
     sideband_offset_v: float | None = None
     hz_per_v: float | None = None
+    discriminator_slope_v_per_mhz: float | None = None
     if str(settings.signal_type) == "pdh" and modulation_frequency_hz:
         off_pts = _sideband_offset_pts(error, best.index, best.target_slope_rising)
         if off_pts and off_pts > 0 and n_points > 1:
@@ -475,6 +521,16 @@ def find_auto_lock_target(
                 hz_per_v = float(modulation_frequency_hz) / sideband_offset_v
             else:
                 sideband_offset_v = None
+        if hz_per_v is not None and hz_per_v > 0.0:
+            # Discriminator gain: error-curve steepness on the sweep axis
+            # [err/sweep-V] divided by the sideband frequency calibration
+            # [Hz/sweep-V] gives err/Hz; ×1e6 -> err per MHz. Magnitude only
+            # (sign is the lock-slope direction, irrelevant for a noise std).
+            s_err = _crossing_slope_v_per_v(
+                error, best.index_float, half_range_pts, float(sweep_amplitude_v)
+            )
+            if s_err is not None and s_err != 0.0:
+                discriminator_slope_v_per_mhz = abs(s_err) / hz_per_v * 1.0e6
 
     target_voltage = _index_to_voltage(
         best.index_float,
@@ -497,6 +553,11 @@ def find_auto_lock_target(
         hz_per_v=(float(hz_per_v) if hz_per_v is not None else None),
         sideband_offset_v=(
             float(sideband_offset_v) if sideband_offset_v is not None else None
+        ),
+        discriminator_slope_v_per_mhz=(
+            float(discriminator_slope_v_per_mhz)
+            if discriminator_slope_v_per_mhz is not None
+            else None
         ),
     )
 
