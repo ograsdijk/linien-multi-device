@@ -104,6 +104,21 @@ def _coerce_float(value: Any) -> float | None:
     return out if math.isfinite(out) else None
 
 
+def _lock_error_mhz(
+    error_std_v: float | None, slope_v_per_mhz: float | None
+) -> float | None:
+    """In-loop lock error [MHz] = error-signal std / discriminator slope.
+
+    None unless both inputs are finite and the slope is a usable magnitude."""
+    if error_std_v is None or slope_v_per_mhz is None:
+        return None
+    if not math.isfinite(error_std_v) or not math.isfinite(slope_v_per_mhz):
+        return None
+    if slope_v_per_mhz <= 0.0:
+        return None
+    return abs(error_std_v) / slope_v_per_mhz
+
+
 def _coerce_int(value: Any) -> int | None:
     if value is None:
         return None
@@ -208,6 +223,11 @@ class DeviceSession:
         # server-side state route through this session, so the cache stays
         # authoritative.
         self._logging_active_cache: bool | None = None
+        # PDH discriminator slope (error plot-units per MHz) from the last
+        # auto-lock scan. Slowly-varying calibration; combined with the live
+        # per-frame error_std_v it yields the in-loop lock error in MHz. Reset
+        # on disconnect so a stale slope isn't reported after a reconnect.
+        self._discriminator_slope_v_per_mhz: float | None = None
         # Out-of-band connection diagnosis (populated by DiagnosisProbe while
         # disconnected). `_wants_diagnosis` gates re-probing so intentionally
         # disconnected devices are not probed forever.
@@ -1022,6 +1042,7 @@ class DeviceSession:
             self._last_auto_relock_state = None
             self._param_metadata_cache = None
             self._logging_active_cache = None
+            self._discriminator_slope_v_per_mhz = None
             thread_to_join = self._poll_thread
             self._poll_thread = None
         self._disconnect_client_safely(client_to_close)
@@ -1305,7 +1326,9 @@ class DeviceSession:
             frame_lock: bool | None = None
             control_mean_v: float | None = None
             control_std_v: float | None = None
+            error_std_v: float | None = None
             indicator_state: str | None = None
+            slope_v_per_mhz = self._discriminator_slope_v_per_mhz
             if isinstance(self.last_plot_frame, dict):
                 fl = self.last_plot_frame.get("lock")
                 if isinstance(fl, bool):
@@ -1315,16 +1338,20 @@ class DeviceSession:
                     state = indicator.get("state")
                     if isinstance(state, str):
                         indicator_state = state
-                # Control voltage comes from the indicator-independent signal
-                # stats so it survives the indicator being disabled.
+                # Control/error stats come from the indicator-independent signal
+                # stats so they survive the indicator being disabled.
                 stats = self.last_plot_frame.get("signal_stats")
                 if isinstance(stats, dict):
                     control_mean_v = _coerce_float(stats.get("control_mean_v"))
                     control_std_v = _coerce_float(stats.get("control_std_v"))
+                    error_std_v = _coerce_float(stats.get("error_std_v"))
         auto_relock_status = self.auto_relock.get_status()
         control_metrics = {
             "control_mean_v": control_mean_v,
             "control_std_v": control_std_v,
+            "error_std_v": error_std_v,
+            "discriminator_slope_v_per_mhz": slope_v_per_mhz,
+            "lock_error_mhz": _lock_error_mhz(error_std_v, slope_v_per_mhz),
             "lock_indicator_state": indicator_state,
         }
         return ts, frame_lock, auto_relock_status, control_metrics
@@ -1786,6 +1813,14 @@ class DeviceSession:
             if frame is None:
                 return
             frame["signal_stats"] = asdict(signal_stats)
+            # Surface the discriminator slope (last auto-lock scan) and the
+            # derived in-loop lock error alongside the per-frame stats so the
+            # plot stream carries everything the UI needs without a REST poll.
+            slope_v_per_mhz = self._discriminator_slope_v_per_mhz
+            frame["discriminator_slope_v_per_mhz"] = slope_v_per_mhz
+            frame["lock_error_mhz"] = _lock_error_mhz(
+                signal_stats.error_std_v, slope_v_per_mhz
+            )
             frame_lock_indicator = self.lock_indicator.update(
                 lock=lock_value,
                 stats=signal_stats,
@@ -1916,6 +1951,15 @@ class DeviceSession:
             # / no frame yet.
             "control_mean_v": control_metrics["control_mean_v"],
             "control_std_v": control_metrics["control_std_v"],
+            # Error-signal std (error plot-units, a.u.), the PDH discriminator
+            # slope from the last auto-lock scan (a.u./MHz), and the derived
+            # in-loop lock error (MHz = error_std_v / slope). lock_error_mhz is
+            # null when unlocked or no slope has been measured.
+            "error_std_v": control_metrics["error_std_v"],
+            "discriminator_slope_v_per_mhz": control_metrics[
+                "discriminator_slope_v_per_mhz"
+            ],
+            "lock_error_mhz": control_metrics["lock_error_mhz"],
             "lock_indicator_state": control_metrics["lock_indicator_state"],
             "psd_running": psd_running,
             "auto_relock": auto_relock_status,
@@ -2027,6 +2071,16 @@ class DeviceSession:
             self.parameters.sweep_center.value = float(result.target_voltage)
             self.control.exposed_write_registers()
             self.control.exposed_start_lock()
+
+        # Cache the discriminator slope measured on this scan so status()/plot
+        # frames can report the in-loop lock error in MHz. Only overwrite when the
+        # scan resolved one (PDH + known modulation frequency); keep the previous
+        # value otherwise rather than blanking a good calibration.
+        if result.discriminator_slope_v_per_mhz is not None:
+            with self._state_lock:
+                self._discriminator_slope_v_per_mhz = float(
+                    result.discriminator_slope_v_per_mhz
+                )
 
         payload = result.to_dict()
         payload["detail"] = "Auto-lock started from scan."

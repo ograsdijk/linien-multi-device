@@ -207,6 +207,8 @@ def encode_plot_frame_binary(frame: Dict[str, Any]) -> bytes:
         "dual_channel": bool(frame.get("dual_channel")),
         "lock_indicator": frame.get("lock_indicator"),
         "signal_stats": frame.get("signal_stats"),
+        "discriminator_slope_v_per_mhz": frame.get("discriminator_slope_v_per_mhz"),
+        "lock_error_mhz": frame.get("lock_error_mhz"),
         "auto_relock": frame.get("auto_relock"),
         "signal_power": frame.get("signal_power"),
         "stats": frame.get("stats"),

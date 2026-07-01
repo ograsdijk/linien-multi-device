@@ -136,6 +136,41 @@ def test_pdh_mode_recovers_hz_per_v():
     assert 0.9 * expected < result.hz_per_v < 1.1 * expected
 
 
+def test_pdh_mode_recovers_discriminator_slope():
+    n = 2048
+    error = _pdh_triplet(n, carrier=0.4, sideband=0.15, width=0.03, sb_off=0.3)
+    result = find_auto_lock_target(
+        error_trace_v=error,
+        monitor_trace_v=None,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=AutoLockScanSettings(signal_type="pdh"),
+        preferred_slope_rising=True,
+        modulation_frequency_hz=30.0e6,
+    )
+    # D = |error-curve slope [a.u./V]| / hz_per_v [Hz/V] * 1e6 -> a.u./MHz.
+    # The synthetic carrier slope is ~A/width = 13.3 a.u./V and hz_per_v ~ 1e8
+    # Hz/V, so D ~ 0.13 a.u./MHz (smoothing/window lower it somewhat).
+    assert result.discriminator_slope_v_per_mhz is not None
+    assert 0.03 < result.discriminator_slope_v_per_mhz < 0.4
+
+
+def test_discriminator_slope_none_without_modulation_frequency():
+    n = 2048
+    error = _pdh_triplet(n)
+    result = find_auto_lock_target(
+        error_trace_v=error,
+        monitor_trace_v=None,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=AutoLockScanSettings(signal_type="pdh"),
+        preferred_slope_rising=True,
+        modulation_frequency_hz=None,
+    )
+    assert result.hz_per_v is None
+    assert result.discriminator_slope_v_per_mhz is None
+
+
 def test_dispersive_mode_skips_hz_per_v():
     n = 2048
     error = _pdh_triplet(n)
