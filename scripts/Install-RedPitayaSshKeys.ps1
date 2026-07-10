@@ -4,9 +4,7 @@
 
 .DESCRIPTION
     Uses only the built-in Windows OpenSSH tools (ssh.exe and ssh-keygen.exe).
-    No additional software or PowerShell modules are required.
-
-    Accepts either -Hosts or -HostFile. Creates a passwordless ED25519 key if
+    Accepts either -Hosts or -HostFile, creates a passwordless ED25519 key if
     needed, installs it idempotently, and verifies passwordless login.
 #>
 
@@ -156,9 +154,31 @@ if (-not $publicKey) {
     throw "The public key file is empty: $publicKeyPath"
 }
 
-# Single-line POSIX shell command. The public key is supplied on stdin and
-# normalized with tr so Windows CR/LF characters cannot corrupt authorized_keys.
-$remoteInstallCommand = 'umask 077; mkdir -p "$HOME/.ssh"; touch "$HOME/.ssh/authorized_keys"; key=$(cat | tr -d "\r\n"); if grep -qxF "$key" "$HOME/.ssh/authorized_keys"; then echo key=already_present; else printf "%s\n" "$key" >> "$HOME/.ssh/authorized_keys"; echo key=installed; fi; chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/authorized_keys"'
+# OpenSSH public keys normally contain no single quote. Reject one rather than
+# risking incorrect shell quoting.
+if ($publicKey.Contains("'")) {
+    throw "The public key contains an unexpected single-quote character."
+}
+
+# Build an LF-only script and send it to `sh -s`. Embedding the public key in a
+# quoted assignment prevents its trailing comment (for example
+# CENTREX-cavity@centrex) from being interpreted as a command or filename.
+$remoteInstallScript = @(
+    'set -eu'
+    'umask 077'
+    'mkdir -p "$HOME/.ssh"'
+    'touch "$HOME/.ssh/authorized_keys"'
+    "key='$publicKey'"
+    'if grep -qxF "$key" "$HOME/.ssh/authorized_keys"; then'
+    '    echo key=already_present'
+    'else'
+    '    printf "%s\n" "$key" >> "$HOME/.ssh/authorized_keys"'
+    '    echo key=installed'
+    'fi'
+    'chmod 700 "$HOME/.ssh"'
+    'chmod 600 "$HOME/.ssh/authorized_keys"'
+) -join "`n"
+$remoteInstallScript += "`n"
 
 $results = foreach ($target in $targets) {
     Write-Host "`n[$target] Installing key for $User..." -ForegroundColor Cyan
@@ -171,13 +191,13 @@ $results = foreach ($target in $targets) {
         "-o", "PubkeyAuthentication=no",
         "-o", "PreferredAuthentications=password,keyboard-interactive",
         "$User@$target",
-        $remoteInstallCommand
+        "sh", "-s"
     )
 
     $installResult = Invoke-NativeCommand `
         -FilePath $ssh.Source `
         -ArgumentList $installArgs `
-        -StandardInput ($publicKey + "`n")
+        -StandardInput $remoteInstallScript
 
     if ($installResult.Output) {
         $installResult.Output | ForEach-Object { Write-Host "  $_" }
