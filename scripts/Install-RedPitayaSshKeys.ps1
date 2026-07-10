@@ -154,15 +154,10 @@ if (-not $publicKey) {
     throw "The public key file is empty: $publicKeyPath"
 }
 
-# OpenSSH public keys normally contain no single quote. Reject one rather than
-# risking incorrect shell quoting.
 if ($publicKey.Contains("'")) {
     throw "The public key contains an unexpected single-quote character."
 }
 
-# Build an LF-only script and send it to `sh -s`. Embedding the public key in a
-# quoted assignment prevents its trailing comment (for example
-# CENTREX-cavity@centrex) from being interpreted as a command or filename.
 $remoteInstallScript = @(
     'set -eu'
     'umask 077'
@@ -178,7 +173,6 @@ $remoteInstallScript = @(
     'chmod 700 "$HOME/.ssh"'
     'chmod 600 "$HOME/.ssh/authorized_keys"'
 ) -join "`n"
-$remoteInstallScript += "`n"
 
 $results = foreach ($target in $targets) {
     Write-Host "`n[$target] Installing key for $User..." -ForegroundColor Cyan
@@ -191,7 +185,7 @@ $results = foreach ($target in $targets) {
         "-o", "PubkeyAuthentication=no",
         "-o", "PreferredAuthentications=password,keyboard-interactive",
         "$User@$target",
-        "sh", "-s"
+        "tr -d '\r' | sh -s"
     )
 
     $installResult = Invoke-NativeCommand `
