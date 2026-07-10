@@ -8,12 +8,6 @@
 
     Accepts either -Hosts or -HostFile. Creates a passwordless ED25519 key if
     needed, installs it idempotently, and verifies passwordless login.
-
-.EXAMPLE
-    .\scripts\Install-RedPitayaSshKeys.ps1 -Hosts 192.168.1.2,192.168.1.3
-
-.EXAMPLE
-    .\scripts\Install-RedPitayaSshKeys.ps1 -HostFile .\red-pitayas.txt
 #>
 
 [CmdletBinding(DefaultParameterSetName = "Hosts")]
@@ -54,7 +48,11 @@ function Invoke-NativeCommand {
         [string]$FilePath,
 
         [Parameter(Mandatory = $true)]
-        [string[]]$ArgumentList
+        [string[]]$ArgumentList,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$StandardInput
     )
 
     $oldErrorActionPreference = $ErrorActionPreference
@@ -69,7 +67,13 @@ function Invoke-NativeCommand {
             $PSNativeCommandUseErrorActionPreference = $false
         }
 
-        $output = @(& $FilePath @ArgumentList 2>&1)
+        if ($PSBoundParameters.ContainsKey("StandardInput")) {
+            $output = @($StandardInput | & $FilePath @ArgumentList 2>&1)
+        }
+        else {
+            $output = @(& $FilePath @ArgumentList 2>&1)
+        }
+
         $exitCode = $LASTEXITCODE
     }
     finally {
@@ -152,33 +156,28 @@ if (-not $publicKey) {
     throw "The public key file is empty: $publicKeyPath"
 }
 
-$publicKeyBase64 = [Convert]::ToBase64String(
-    [System.Text.Encoding]::UTF8.GetBytes($publicKey)
-)
+# Single-line POSIX shell command. The public key is supplied on stdin and
+# normalized with tr so Windows CR/LF characters cannot corrupt authorized_keys.
+$remoteInstallCommand = 'umask 077; mkdir -p "$HOME/.ssh"; touch "$HOME/.ssh/authorized_keys"; key=$(cat | tr -d "\r\n"); if grep -qxF "$key" "$HOME/.ssh/authorized_keys"; then echo key=already_present; else printf "%s\n" "$key" >> "$HOME/.ssh/authorized_keys"; echo key=installed; fi; chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/authorized_keys"'
 
 $results = foreach ($target in $targets) {
     Write-Host "`n[$target] Installing key for $User..." -ForegroundColor Cyan
     Write-Host "Enter the Red Pitaya password if prompted (factory default: root)." -ForegroundColor DarkGray
 
-    $remoteInstallCommand = "umask 077; mkdir -p `"`$HOME/.ssh`"; touch `"`$HOME/.ssh/authorized_keys`"; key=`"`$(printf '%s' '$publicKeyBase64' | base64 -d)`"; if grep -qxF `"`$key`" `"`$HOME/.ssh/authorized_keys`"; then echo key=already_present; else printf '%s\n' `"`$key`" >> `"`$HOME/.ssh/authorized_keys`"; echo key=installed; fi; chmod 700 `"`$HOME/.ssh`"; chmod 600 `"`$HOME/.ssh/authorized_keys`""
-
-    # Force password authentication for the installation step. This prevents
-    # existing local keys from being tried first and avoids "too many
-    # authentication failures" or a rejected-key loop before the password prompt.
     $installArgs = @(
         "-p", "$Port",
         "-o", "ConnectTimeout=$ConnectTimeoutSeconds",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "PubkeyAuthentication=no",
         "-o", "PreferredAuthentications=password,keyboard-interactive",
-        "-o", "NumberOfPasswordPrompts=3",
         "$User@$target",
         $remoteInstallCommand
     )
 
     $installResult = Invoke-NativeCommand `
         -FilePath $ssh.Source `
-        -ArgumentList $installArgs
+        -ArgumentList $installArgs `
+        -StandardInput ($publicKey + "`n")
 
     if ($installResult.Output) {
         $installResult.Output | ForEach-Object { Write-Host "  $_" }
