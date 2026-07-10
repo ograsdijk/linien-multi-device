@@ -6,27 +6,14 @@
     Uses only the built-in Windows OpenSSH tools (ssh.exe and ssh-keygen.exe).
     No additional software or PowerShell modules are required.
 
-    The script accepts either a list of hosts with -Hosts or a text file with
-    -HostFile. It creates a passwordless ED25519 key if the requested key does
-    not already exist, installs the public key idempotently on each Red Pitaya,
-    and verifies passwordless login.
-
-    The default Red Pitaya username is root. During initial installation,
-    ssh.exe prompts for the device password once per host. The factory-default
-    password is root.
+    Accepts either -Hosts or -HostFile. Creates a passwordless ED25519 key if
+    needed, installs it idempotently, and verifies passwordless login.
 
 .EXAMPLE
-    .\scripts\Install-RedPitayaSshKeys.ps1 `
-        -Hosts 192.168.1.2,192.168.1.3
+    .\scripts\Install-RedPitayaSshKeys.ps1 -Hosts 192.168.1.2,192.168.1.3
 
 .EXAMPLE
-    .\scripts\Install-RedPitayaSshKeys.ps1 `
-        -HostFile .\red-pitayas.txt
-
-.EXAMPLE
-    .\scripts\Install-RedPitayaSshKeys.ps1 `
-        -Hosts 192.168.1.2 `
-        -KeyPath "$env:USERPROFILE\.ssh\linien_redpitaya_ed25519"
+    .\scripts\Install-RedPitayaSshKeys.ps1 -HostFile .\red-pitayas.txt
 #>
 
 [CmdletBinding(DefaultParameterSetName = "Hosts")]
@@ -39,7 +26,6 @@ param(
     [string]$HostFile,
 
     [string]$User = "root",
-
     [string]$KeyPath = "$env:USERPROFILE\.ssh\id_ed25519",
 
     [ValidateRange(1, 65535)]
@@ -60,6 +46,56 @@ if (-not $ssh) {
 $sshKeygen = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
 if (-not $sshKeygen) {
     throw "ssh-keygen.exe was not found. Enable the built-in Windows OpenSSH Client feature."
+}
+
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$ArgumentList,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$StandardInput
+    )
+
+    # PowerShell 7 may turn a native program's stderr into ErrorRecord objects.
+    # SSH normally writes password prompts and host-key notices to stderr, so
+    # those messages must not terminate the script.
+    $oldErrorActionPreference = $ErrorActionPreference
+    $hasNativePreference = Test-Path variable:PSNativeCommandUseErrorActionPreference
+    if ($hasNativePreference) {
+        $oldNativePreference = $PSNativeCommandUseErrorActionPreference
+    }
+
+    try {
+        $ErrorActionPreference = "Continue"
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+
+        if ($PSBoundParameters.ContainsKey("StandardInput")) {
+            $output = @($StandardInput | & $FilePath @ArgumentList 2>&1)
+        }
+        else {
+            $output = @(& $FilePath @ArgumentList 2>&1)
+        }
+
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $oldNativePreference
+        }
+    }
+
+    [pscustomobject]@{
+        Output   = $output
+        ExitCode = $exitCode
+    }
 }
 
 if ($PSCmdlet.ParameterSetName -eq "File") {
@@ -95,11 +131,13 @@ if (-not (Test-Path -LiteralPath $KeyPath)) {
     Write-Host "Creating passwordless ED25519 key:" -ForegroundColor Cyan
     Write-Host "  $KeyPath"
 
-    # The quoted empty string is passed to ssh-keygen as an empty passphrase.
-    & $sshKeygen.Source -q -t ed25519 -f $KeyPath -N '""'
+    $keygenResult = Invoke-NativeCommand `
+        -FilePath $sshKeygen.Source `
+        -ArgumentList @("-q", "-t", "ed25519", "-f", $KeyPath, "-N", "")
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "ssh-keygen failed with exit code $LASTEXITCODE."
+    if ($keygenResult.ExitCode -ne 0) {
+        $details = ($keygenResult.Output -join [Environment]::NewLine)
+        throw "ssh-keygen failed with exit code $($keygenResult.ExitCode).`n$details"
     }
 }
 else {
@@ -110,8 +148,12 @@ else {
 if (-not (Test-Path -LiteralPath $publicKeyPath)) {
     Write-Host "Public key file is missing; recreating it from the private key..." -ForegroundColor Yellow
 
-    $derivedPublicKey = & $sshKeygen.Source -y -f $KeyPath
-    if ($LASTEXITCODE -ne 0 -or -not $derivedPublicKey) {
+    $deriveResult = Invoke-NativeCommand `
+        -FilePath $sshKeygen.Source `
+        -ArgumentList @("-y", "-f", $KeyPath)
+
+    $derivedPublicKey = ($deriveResult.Output -join "`n").Trim()
+    if ($deriveResult.ExitCode -ne 0 -or -not $derivedPublicKey) {
         throw "Could not derive the public key from $KeyPath."
     }
 
@@ -144,54 +186,56 @@ $results = foreach ($target in $targets) {
     Write-Host "Enter the Red Pitaya password if prompted (factory default: root)." -ForegroundColor DarkGray
 
     $installArgs = @(
-        "-p", $Port
-        "-o", "ConnectTimeout=$ConnectTimeoutSeconds"
-        "-o", "StrictHostKeyChecking=accept-new"
-        "$User@$target"
+        "-p", "$Port",
+        "-o", "ConnectTimeout=$ConnectTimeoutSeconds",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "$User@$target",
         $remoteInstallCommand
     )
 
-    $installOutput = $publicKey | & $ssh.Source @installArgs 2>&1
-    $installExitCode = $LASTEXITCODE
+    $installResult = Invoke-NativeCommand `
+        -FilePath $ssh.Source `
+        -ArgumentList $installArgs `
+        -StandardInput $publicKey
 
-    if ($installOutput) {
-        $installOutput | ForEach-Object { Write-Host "  $_" }
+    if ($installResult.Output) {
+        $installResult.Output | ForEach-Object { Write-Host "  $_" }
     }
 
-    if ($installExitCode -ne 0) {
-        Write-Host "[$target] Key installation failed with exit code $installExitCode." -ForegroundColor Red
+    if ($installResult.ExitCode -ne 0) {
+        Write-Host "[$target] Key installation failed with exit code $($installResult.ExitCode)." -ForegroundColor Red
 
         [pscustomobject]@{
             Host         = $target
             Install      = "Failed"
             Verification = "Not run"
-            ExitCode     = $installExitCode
+            ExitCode     = $installResult.ExitCode
         }
-
         continue
     }
 
     Write-Host "[$target] Verifying passwordless login..." -ForegroundColor Cyan
 
     $verifyArgs = @(
-        "-p", $Port
-        "-i", $KeyPath
-        "-o", "IdentitiesOnly=yes"
-        "-o", "BatchMode=yes"
-        "-o", "ConnectTimeout=$ConnectTimeoutSeconds"
-        "-o", "StrictHostKeyChecking=accept-new"
-        "$User@$target"
+        "-p", "$Port",
+        "-i", $KeyPath,
+        "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=$ConnectTimeoutSeconds",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "$User@$target",
         "printf 'SSH_KEY_OK\n'"
     )
 
-    $verifyOutput = & $ssh.Source @verifyArgs 2>&1
-    $verifyExitCode = $LASTEXITCODE
+    $verifyResult = Invoke-NativeCommand `
+        -FilePath $ssh.Source `
+        -ArgumentList $verifyArgs
 
-    if ($verifyOutput) {
-        $verifyOutput | ForEach-Object { Write-Host "  $_" }
+    if ($verifyResult.Output) {
+        $verifyResult.Output | ForEach-Object { Write-Host "  $_" }
     }
 
-    if ($verifyExitCode -eq 0 -and ($verifyOutput -join "`n") -match "SSH_KEY_OK") {
+    if ($verifyResult.ExitCode -eq 0 -and ($verifyResult.Output -join "`n") -match "SSH_KEY_OK") {
         Write-Host "[$target] Passwordless SSH verified." -ForegroundColor Green
         $verification = "Success"
         $overallExitCode = 0
@@ -199,7 +243,7 @@ $results = foreach ($target in $targets) {
     else {
         Write-Host "[$target] Key was installed, but passwordless verification failed." -ForegroundColor Red
         $verification = "Failed"
-        $overallExitCode = $verifyExitCode
+        $overallExitCode = $verifyResult.ExitCode
     }
 
     [pscustomobject]@{
