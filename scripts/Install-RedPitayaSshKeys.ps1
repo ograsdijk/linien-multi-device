@@ -54,16 +54,9 @@ function Invoke-NativeCommand {
         [string]$FilePath,
 
         [Parameter(Mandatory = $true)]
-        [string[]]$ArgumentList,
-
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$StandardInput
+        [string[]]$ArgumentList
     )
 
-    # PowerShell 7 may turn a native program's stderr into ErrorRecord objects.
-    # SSH normally writes password prompts and host-key notices to stderr, so
-    # those messages must not terminate the script.
     $oldErrorActionPreference = $ErrorActionPreference
     $hasNativePreference = Test-Path variable:PSNativeCommandUseErrorActionPreference
     if ($hasNativePreference) {
@@ -76,13 +69,7 @@ function Invoke-NativeCommand {
             $PSNativeCommandUseErrorActionPreference = $false
         }
 
-        if ($PSBoundParameters.ContainsKey("StandardInput")) {
-            $output = @($StandardInput | & $FilePath @ArgumentList 2>&1)
-        }
-        else {
-            $output = @(& $FilePath @ArgumentList 2>&1)
-        }
-
+        $output = @(& $FilePath @ArgumentList 2>&1)
         $exitCode = $LASTEXITCODE
     }
     finally {
@@ -131,9 +118,11 @@ if (-not (Test-Path -LiteralPath $KeyPath)) {
     Write-Host "Creating passwordless ED25519 key:" -ForegroundColor Cyan
     Write-Host "  $KeyPath"
 
+    # PowerShell 5.1 needs the quoted empty string to preserve the empty
+    # passphrase argument when calling a native executable.
     $keygenResult = Invoke-NativeCommand `
         -FilePath $sshKeygen.Source `
-        -ArgumentList @("-q", "-t", "ed25519", "-f", $KeyPath, "-N", "")
+        -ArgumentList @("-q", "-t", "ed25519", "-f", $KeyPath, "-N", '""')
 
     if ($keygenResult.ExitCode -ne 0) {
         $details = ($keygenResult.Output -join [Environment]::NewLine)
@@ -165,25 +154,17 @@ if (-not $publicKey) {
     throw "The public key file is empty: $publicKeyPath"
 }
 
-$remoteInstallCommand = @'
-set -e
-umask 077
-mkdir -p "$HOME/.ssh"
-touch "$HOME/.ssh/authorized_keys"
-IFS= read -r key
-if grep -qxF "$key" "$HOME/.ssh/authorized_keys"; then
-    echo "key=already_present"
-else
-    printf '%s\n' "$key" >> "$HOME/.ssh/authorized_keys"
-    echo "key=installed"
-fi
-chmod 700 "$HOME/.ssh"
-chmod 600 "$HOME/.ssh/authorized_keys"
-'@
+# Base64 contains only shell-safe characters. Passing the key this way avoids
+# piping Windows CRLF data into SSH and avoids multiline Bash command parsing.
+$publicKeyBase64 = [Convert]::ToBase64String(
+    [System.Text.Encoding]::UTF8.GetBytes($publicKey)
+)
 
 $results = foreach ($target in $targets) {
     Write-Host "`n[$target] Installing key for $User..." -ForegroundColor Cyan
     Write-Host "Enter the Red Pitaya password if prompted (factory default: root)." -ForegroundColor DarkGray
+
+    $remoteInstallCommand = "umask 077; mkdir -p `"`$HOME/.ssh`"; touch `"`$HOME/.ssh/authorized_keys`"; key=`"`$(printf '%s' '$publicKeyBase64' | base64 -d)`"; if grep -qxF `"`$key`" `"`$HOME/.ssh/authorized_keys`"; then echo key=already_present; else printf '%s\n' `"`$key`" >> `"`$HOME/.ssh/authorized_keys`"; echo key=installed; fi; chmod 700 `"`$HOME/.ssh`"; chmod 600 `"`$HOME/.ssh/authorized_keys`""
 
     $installArgs = @(
         "-p", "$Port",
@@ -195,8 +176,7 @@ $results = foreach ($target in $targets) {
 
     $installResult = Invoke-NativeCommand `
         -FilePath $ssh.Source `
-        -ArgumentList $installArgs `
-        -StandardInput $publicKey
+        -ArgumentList $installArgs
 
     if ($installResult.Output) {
         $installResult.Output | ForEach-Object { Write-Host "  $_" }
