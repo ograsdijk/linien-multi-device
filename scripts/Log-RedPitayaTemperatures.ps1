@@ -120,17 +120,31 @@ $remoteCommand = @'
 set -e
 
 sensor_dir=""
+fallback_dir=""
+candidate_count=0
 
 for candidate in /sys/bus/iio/devices/iio:device*; do
     if [ -r "$candidate/in_temp0_raw" ] &&
        [ -r "$candidate/in_temp0_scale" ]; then
-        sensor_dir="$candidate"
-        break
+        candidate_count=$((candidate_count + 1))
+        fallback_dir="$candidate"
+
+        if [ -r "$candidate/name" ] &&
+           grep -qi 'xadc' "$candidate/name"; then
+            sensor_dir="$candidate"
+            break
+        fi
     fi
 done
 
+# Older Red Pitaya images may expose no useful IIO name. Falling back is safe
+# only when exactly one device provides temperature attributes.
+if [ -z "$sensor_dir" ] && [ "$candidate_count" -eq 1 ]; then
+    sensor_dir="$fallback_dir"
+fi
+
 if [ -z "$sensor_dir" ]; then
-    echo "No readable XADC temperature sensor was found." >&2
+    echo "No unambiguous readable XADC temperature sensor was found." >&2
     exit 20
 fi
 

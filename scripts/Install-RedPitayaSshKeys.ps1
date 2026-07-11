@@ -149,14 +149,33 @@ if (-not (Test-Path -LiteralPath $publicKeyPath)) {
     Set-Content -LiteralPath $publicKeyPath -Value $derivedPublicKey -Encoding ascii
 }
 
-$publicKey = (Get-Content -LiteralPath $publicKeyPath -Raw).Trim()
-if (-not $publicKey) {
-    throw "The public key file is empty: $publicKeyPath"
+$publicKeyLines = @(Get-Content -LiteralPath $publicKeyPath |
+        Where-Object { $_.Trim() })
+if ($publicKeyLines.Count -ne 1) {
+    throw "The public key file must contain exactly one non-empty line: $publicKeyPath"
 }
 
-if ($publicKey.Contains("'")) {
-    throw "The public key contains an unexpected single-quote character."
+$publicKeyFields = @($publicKeyLines[0].Trim() -split '\s+')
+$supportedKeyTypes = @(
+    "ssh-ed25519"
+    "ssh-rsa"
+    "ecdsa-sha2-nistp256"
+    "ecdsa-sha2-nistp384"
+    "ecdsa-sha2-nistp521"
+    "sk-ssh-ed25519@openssh.com"
+    "sk-ecdsa-sha2-nistp256@openssh.com"
+)
+
+if (
+    $publicKeyFields.Count -lt 2 -or
+    $publicKeyFields[0] -notin $supportedKeyTypes -or
+    $publicKeyFields[1] -notmatch '^[A-Za-z0-9+/]+={0,2}$'
+) {
+    throw "The public key file does not contain a supported OpenSSH public key: $publicKeyPath"
 }
+
+# Comments are not needed for authentication and may contain shell metacharacters.
+$publicKey = "$($publicKeyFields[0]) $($publicKeyFields[1])"
 
 $remoteInstallScript = @(
     'set -eu'
@@ -175,42 +194,6 @@ $remoteInstallScript = @(
 ) -join "`n"
 
 $results = foreach ($target in $targets) {
-    Write-Host "`n[$target] Installing key for $User..." -ForegroundColor Cyan
-    Write-Host "Enter the Red Pitaya password if prompted (factory default: root)." -ForegroundColor DarkGray
-
-    $installArgs = @(
-        "-p", "$Port",
-        "-o", "ConnectTimeout=$ConnectTimeoutSeconds",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "PubkeyAuthentication=no",
-        "-o", "PreferredAuthentications=password,keyboard-interactive",
-        "$User@$target",
-        "tr -d '\r' | sh -s"
-    )
-
-    $installResult = Invoke-NativeCommand `
-        -FilePath $ssh.Source `
-        -ArgumentList $installArgs `
-        -StandardInput $remoteInstallScript
-
-    if ($installResult.Output) {
-        $installResult.Output | ForEach-Object { Write-Host "  $_" }
-    }
-
-    if ($installResult.ExitCode -ne 0) {
-        Write-Host "[$target] Key installation failed with exit code $($installResult.ExitCode)." -ForegroundColor Red
-
-        [pscustomobject]@{
-            Host         = $target
-            Install      = "Failed"
-            Verification = "Not run"
-            ExitCode     = $installResult.ExitCode
-        }
-        continue
-    }
-
-    Write-Host "[$target] Verifying passwordless login..." -ForegroundColor Cyan
-
     $verifyArgs = @(
         "-p", "$Port",
         "-i", $KeyPath,
@@ -221,6 +204,60 @@ $results = foreach ($target in $targets) {
         "$User@$target",
         "printf 'SSH_KEY_OK\n'"
     )
+
+    Write-Host "`n[$target] Checking for the existing key..." -ForegroundColor Cyan
+    $initialVerifyResult = Invoke-NativeCommand `
+        -FilePath $ssh.Source `
+        -ArgumentList $verifyArgs
+
+    $keyAlreadyWorks = (
+        $initialVerifyResult.ExitCode -eq 0 -and
+        ($initialVerifyResult.Output -join "`n") -match "SSH_KEY_OK"
+    )
+
+    if ($keyAlreadyWorks) {
+        Write-Host "[$target] Key is already installed and working." -ForegroundColor Green
+        $installStatus = "Already present"
+    }
+    else {
+        Write-Host "[$target] Installing key for $User..." -ForegroundColor Cyan
+        Write-Host "Enter the Red Pitaya password if prompted (factory default: root)." -ForegroundColor DarkGray
+
+        $installArgs = @(
+            "-p", "$Port",
+            "-o", "ConnectTimeout=$ConnectTimeoutSeconds",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "PubkeyAuthentication=no",
+            "-o", "PreferredAuthentications=password,keyboard-interactive",
+            "$User@$target",
+            "tr -d '\r' | sh -s"
+        )
+
+        $installResult = Invoke-NativeCommand `
+            -FilePath $ssh.Source `
+            -ArgumentList $installArgs `
+            -StandardInput $remoteInstallScript
+
+        if ($installResult.Output) {
+            $installResult.Output | ForEach-Object { Write-Host "  $_" }
+        }
+
+        if ($installResult.ExitCode -ne 0) {
+            Write-Host "[$target] Key installation failed with exit code $($installResult.ExitCode)." -ForegroundColor Red
+
+            [pscustomobject]@{
+                Host         = $target
+                Install      = "Failed"
+                Verification = "Not run"
+                ExitCode     = $installResult.ExitCode
+            }
+            continue
+        }
+
+        $installStatus = "Success"
+    }
+
+    Write-Host "[$target] Verifying passwordless login..." -ForegroundColor Cyan
 
     $verifyResult = Invoke-NativeCommand `
         -FilePath $ssh.Source `
@@ -236,14 +273,19 @@ $results = foreach ($target in $targets) {
         $overallExitCode = 0
     }
     else {
-        Write-Host "[$target] Key was installed, but passwordless verification failed." -ForegroundColor Red
+        Write-Host "[$target] Passwordless key verification failed." -ForegroundColor Red
         $verification = "Failed"
-        $overallExitCode = $verifyResult.ExitCode
+        $overallExitCode = if ($verifyResult.ExitCode -ne 0) {
+            $verifyResult.ExitCode
+        }
+        else {
+            2
+        }
     }
 
     [pscustomobject]@{
         Host         = $target
-        Install      = "Success"
+        Install      = $installStatus
         Verification = $verification
         ExitCode     = $overallExitCode
     }
