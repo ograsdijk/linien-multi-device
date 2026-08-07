@@ -40,6 +40,7 @@ export const isDeviceStatus = (value: unknown): value is DeviceStatus => {
   // Nested objects are asserted by the DeviceStatus type; reject obviously
   // wrong shapes (a non-object/non-null) rather than passing them through.
   if (value.diagnosis != null && !isObject(value.diagnosis)) return false;
+  if (value.recovery != null && !isObject(value.recovery)) return false;
   if (value.auto_relock != null && !isObject(value.auto_relock)) return false;
   return true;
 };

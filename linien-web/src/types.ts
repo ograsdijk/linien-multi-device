@@ -34,6 +34,22 @@ export type DeviceDiagnosis = {
   seconds_since_last_connected?: number | null;
 };
 
+export type DeviceRecovery = {
+  operation_id: string;
+  action: 'reboot';
+  phase:
+    | 'queued'
+    | 'dispatching'
+    | 'waiting_for_boot'
+    | 'host_online'
+    | 'completed'
+    | 'failed'
+    | 'cancelled';
+  started_at: number;
+  updated_at: number;
+  error?: string | null;
+};
+
 export type DeviceStatus = {
   connected: boolean;
   connecting: boolean;
@@ -48,6 +64,7 @@ export type DeviceStatus = {
   stream_age_s?: number | null;
   stalled?: boolean;
   diagnosis?: DeviceDiagnosis | null;
+  recovery?: DeviceRecovery | null;
 };
 
 export type LockIndicatorConfig = {

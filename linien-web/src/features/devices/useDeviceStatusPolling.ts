@@ -43,6 +43,20 @@ const sameDiagnosis = (
   );
 };
 
+const sameRecovery = (
+  a: DeviceStatus['recovery'] | null | undefined,
+  b: DeviceStatus['recovery'] | null | undefined
+) => {
+  if (a === b) return true;
+  if (!a || !b) return !a && !b;
+  return (
+    a.operation_id === b.operation_id &&
+    a.phase === b.phase &&
+    a.updated_at === b.updated_at &&
+    a.error === b.error
+  );
+};
+
 const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceStatus) => {
   if (!a) return false;
   return (
@@ -53,7 +67,8 @@ const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceStatus) =
     a.logging_active === b.logging_active &&
     a.lock === b.lock &&
     sameAutoRelock(a.auto_relock, b.auto_relock) &&
-    sameDiagnosis(a.diagnosis, b.diagnosis)
+    sameDiagnosis(a.diagnosis, b.diagnosis) &&
+    sameRecovery(a.recovery, b.recovery)
   );
 };
 

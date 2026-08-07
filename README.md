@@ -317,9 +317,10 @@ the Postgres host/network explicitly.
 
 This is an internal lab tool and currently assumes a fully trusted network:
 
-- **No authentication or authorization** on any REST/WebSocket endpoint. Anyone who can
-  reach the port can control every device (start/stop lock, write FPGA registers, shut
-  down the linien-server).
+- **No general authentication or authorization** on REST/WebSocket endpoints. Remote
+  Red Pitaya reboot is the exception: it requires `LINIEN_REBOOT_ADMIN_TOKEN` at gateway
+  runtime and the same value in `X-Linien-Admin-Token`. Without it, reboot is disabled.
+  Anyone who can reach the port can still use the other device controls.
 - The documented configuration **binds to `0.0.0.0`** and CORS is `allow_origins=["*"]`
   with `allow_credentials=True`.
 - Secrets are **returned in cleartext**: `GET /api/devices` includes each device's
@@ -361,8 +362,9 @@ A code audit (findings independently verified) drove the fixes in this section.
 
 ### By design (documented, not changed)
 
-- **No authentication; cleartext secrets on read; SSRF-by-config; `pickle.loads` of device
-  payloads.** These follow from the trusted-LAN deployment model and the upstream Linien
+- **No general authentication; cleartext secrets on read; SSRF-by-config; `pickle.loads`
+  of device payloads.** Remote reboot has a dedicated admin token, but the remaining
+  controls follow the trusted-LAN deployment model and the upstream Linien
   RPyC protocol. See [Security model](#security-model). Do not expose the gateway to
   untrusted networks.
 

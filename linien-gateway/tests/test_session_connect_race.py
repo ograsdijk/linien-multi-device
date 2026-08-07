@@ -73,3 +73,41 @@ def test_reset_from_inside_poll_thread_does_not_self_join():
 
     assert completed.wait(timeout=5.0), "self-join or deadlock in poll-thread reset path"
     assert session.connected is False
+
+
+def test_connect_async_reserves_connecting_before_thread_starts(monkeypatch):
+    session = _make_session()
+
+    class Thread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            assert session.connecting is True
+
+    monkeypatch.setattr("app.session.threading.Thread", Thread)
+
+    session.connect_async()
+
+    assert session.connecting is True
+
+
+def test_reboot_rejected_after_connect_is_reserved(monkeypatch):
+    session = _make_session()
+
+    class Thread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("app.session.threading.Thread", Thread)
+    session.connect_async()
+
+    try:
+        session.start_reboot()
+    except RuntimeError as exc:
+        assert str(exc) == "Cannot reboot while the device is connecting"
+    else:
+        raise AssertionError("reboot should be rejected while connecting")

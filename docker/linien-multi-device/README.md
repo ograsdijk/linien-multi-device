@@ -13,6 +13,7 @@ This stack is intentionally separate from `docker/postgres`.
 ## Start
 
 ```powershell
+$env:LINIEN_REBOOT_ADMIN_TOKEN = "replace-with-a-long-random-value"
 docker compose -f docker/linien-multi-device/docker-compose.yml up -d --build
 ```
 
@@ -35,3 +36,4 @@ docker compose -f docker/linien-multi-device/docker-compose.yml down
 
 - Postgres is not included in this compose file.
 - To use Postgres lock logging, run `docker/postgres` separately (or point to any external Postgres instance).
+- `LINIEN_REBOOT_ADMIN_TOKEN` is a runtime secret used only to authorize Red Pitaya reboot requests. If omitted, remote reboot is disabled. Do not place it in a `VITE_*` variable because those values are embedded in the public web bundle.

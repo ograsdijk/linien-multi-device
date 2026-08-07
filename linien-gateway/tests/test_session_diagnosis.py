@@ -38,6 +38,16 @@ def test_apply_diagnosis_is_returned_in_status():
     assert session.status()["diagnosis"] == d
 
 
+def test_apply_diagnosis_publishes_status(monkeypatch):
+    session = _make_session()
+    published: list[bool] = []
+    monkeypatch.setattr(session, "_publish_status", lambda: published.append(True))
+
+    session.apply_diagnosis(_diagnosis())
+
+    assert published == [True]
+
+
 def test_apply_diagnosis_emits_log_only_on_category_change():
     events: list[tuple] = []
     session = _make_session()
@@ -73,6 +83,18 @@ def test_request_probe_invokes_injected_callback():
 
     assert calls == ["dev-1"]
     assert session.wants_diagnosis() is True
+
+
+def test_request_probe_is_suppressed_during_recovery():
+    calls: list[str] = []
+    session = _make_session()
+    session.set_diagnosis_request_callback(calls.append)
+    session._recovery = {"phase": "waiting_for_boot"}
+
+    session.request_diagnosis_probe()
+
+    assert calls == []
+    assert session.wants_diagnosis() is False
 
 
 def test_reset_with_request_diagnosis_enqueues_probe():

@@ -39,6 +39,8 @@ from paramiko.ssh_exception import (
     SSHException,
 )
 
+from .ssh import open_ssh_connection
+
 if TYPE_CHECKING:
     from .session_registry import SessionRegistry
 
@@ -75,9 +77,7 @@ _LOCK_BIT_PY_SCRIPT = (
 _LOCK_BIT_PY_CMD = f'timeout 2 python3 -c "{_LOCK_BIT_PY_SCRIPT}"'
 _LOCK_BIT_CMDS = (_LOCK_BIT_DEVMEM_CMD, _LOCK_BIT_PY_CMD)
 
-SSH_PORT = 22
 TCP_PROBE_TIMEOUT_S = 2.0
-SSH_CONNECT_TIMEOUT_S = 6.0
 SSH_COMMAND_TIMEOUT_S = 5.0
 # A board up longer than this is assumed not to have rebooted since we lost the
 # connection. Used as the reboot/crash discriminator.
@@ -213,16 +213,8 @@ def probe_device(
         )
 
     # 2. SSH probe for uptime / FPGA state / (gated) lock register.
-    username = getattr(device, "username", "root") or "root"
-    password = getattr(device, "password", "") or ""
     try:
-        with Connection(
-            host,
-            user=username,
-            port=SSH_PORT,
-            connect_timeout=SSH_CONNECT_TIMEOUT_S,
-            connect_kwargs={"password": password},
-        ) as conn:
+        with open_ssh_connection(device, Connection) as conn:
             uptime_s, fpga_operating = _read_uptime_and_fpga(conn)
             lock_bit: int | None = None
             # Only trust the lock register when a reboot is ruled out: the

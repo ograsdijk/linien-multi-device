@@ -82,6 +82,14 @@ export const api = {
   deleteGroup: (key: string) => request(`/groups/${key}`, { method: 'DELETE' }),
   connectDevice: (key: string) => request(`/devices/${key}/connect`, { method: 'POST' }),
   startServer: (key: string) => request(`/devices/${key}/control/start_server`, { method: 'POST' }),
+  rebootDevice: (key: string, adminToken: string) =>
+    request<{ ok: boolean; operation_id: string }>(`/devices/${key}/control/reboot`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Linien-Admin-Token': adminToken,
+      },
+    }),
   disconnectDevice: (key: string) => request(`/devices/${key}/disconnect`, { method: 'POST' }),
   getStatus: (key: string) => request<DeviceStatus>(`/devices/${key}/status`),
   listStatuses: () => request<Record<string, DeviceStatus>>('/devices/statuses'),
