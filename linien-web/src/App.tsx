@@ -700,6 +700,9 @@ export function App() {
             onShutdownServer={async (key) => {
               await api.shutdownServer(key);
             }}
+            onRebootDevice={async (key, adminToken) => {
+              await api.rebootDevice(key, adminToken);
+            }}
           />
         </AppShell.Navbar>
       ) : null}

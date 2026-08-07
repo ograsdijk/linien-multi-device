@@ -1,7 +1,7 @@
 import { useMemo, useState, type CSSProperties } from 'react';
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { ActionIcon, Button, Card, Group, Modal, Select, Stack, Text, TextInput } from '@mantine/core';
+import { ActionIcon, Button, Card, Group, Modal, PasswordInput, Select, Stack, Text, TextInput } from '@mantine/core';
 import {
   IconChevronLeft,
   IconDevices,
@@ -56,6 +56,7 @@ type DeviceListProps = {
   onConnect: (key: string) => Promise<void>;
   onDisconnect: (key: string) => Promise<void>;
   onShutdownServer: (key: string) => Promise<void>;
+  onRebootDevice: (key: string, adminToken: string) => Promise<void>;
 };
 
 type SortableDeviceCardProps = {
@@ -75,6 +76,7 @@ type SortableDeviceCardProps = {
   onConnect: (key: string) => Promise<void>;
   onDisconnect: (key: string) => Promise<void>;
   onRequestShutdown: (device: Device) => void;
+  onRequestReboot: (device: Device) => void;
 };
 
 function SortableDeviceCard({
@@ -94,6 +96,7 @@ function SortableDeviceCard({
   onConnect,
   onDisconnect,
   onRequestShutdown,
+  onRequestReboot,
 }: SortableDeviceCardProps) {
   const {
     attributes,
@@ -135,6 +138,19 @@ function SortableDeviceCard({
   });
   const autoRelockDisplay = resolveRelockTag(autoRelock);
   const connectionDisplay = resolveConnectionDisplay(status);
+  const recovery = status?.recovery;
+  const recoveryActive = Boolean(
+    recovery && !['completed', 'failed', 'cancelled'].includes(recovery.phase)
+  );
+  const recoveryLabel = recoveryActive
+    ? recovery?.phase === 'host_online'
+      ? 'Board online'
+      : recovery?.phase === 'waiting_for_boot'
+        ? 'Rebooting'
+        : 'Sending reboot'
+    : recovery?.phase === 'failed'
+      ? `Reboot failed: ${recovery.error ?? 'unknown error'}`
+      : null;
   const wrapperStyle: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -172,6 +188,7 @@ function SortableDeviceCard({
                 color="orange"
                 aria-label={`Edit ${device.name || 'device'}`}
                 onClick={() => onEdit(device)}
+                disabled={recoveryActive}
               >
                 <IconPencil size={12} />
               </ActionIcon>
@@ -183,6 +200,11 @@ function SortableDeviceCard({
               <Text size="xs" c="dimmed">{connectionDisplay.tooltip}</Text>
             ) : status?.last_error ? (
               <Text size="xs" c="red">{status.last_error}</Text>
+            ) : null}
+            {recoveryLabel ? (
+              <Text size="xs" c={recovery?.phase === 'failed' ? 'red' : 'orange'}>
+                {recoveryLabel}
+              </Text>
             ) : null}
           </div>
           <Group gap={6} align="center">
@@ -229,7 +251,7 @@ function SortableDeviceCard({
             onClick={() => {
               void onStartServer(device.key);
             }}
-            disabled={connected}
+            disabled={Boolean(connected) || Boolean(connecting) || recoveryActive}
           >
             Start server
           </Button>
@@ -250,7 +272,7 @@ function SortableDeviceCard({
                 color="red"
                 variant="subtle"
                 onClick={() => onRequestShutdown(device)}
-                disabled={!connected}
+                disabled={!connected || recoveryActive}
               >
                 Shutdown
               </Button>
@@ -263,10 +285,20 @@ function SortableDeviceCard({
               onClick={() => {
                 void onConnect(device.key);
               }}
+              disabled={Boolean(connecting) || recoveryActive}
             >
               Connect
             </Button>
           )}
+          <Button
+            size="xs"
+            color="red"
+            variant="outline"
+            onClick={() => onRequestReboot(device)}
+            disabled={Boolean(connecting) || recoveryActive}
+          >
+            {recoveryActive ? 'Rebooting' : 'Reboot board'}
+          </Button>
         </Group>
         <ActionIcon
           size="sm"
@@ -276,6 +308,7 @@ function SortableDeviceCard({
           onClick={() => {
             void onDelete(device.key);
           }}
+          disabled={recoveryActive}
           style={{ position: 'absolute', right: 8, bottom: 8 }}
         >
           <IconTrash size={14} />
@@ -305,17 +338,26 @@ export function DeviceList({
   onConnect,
   onDisconnect,
   onShutdownServer,
+  onRebootDevice,
 }: DeviceListProps) {
   const [opened, setOpened] = useState(false);
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [form, setForm] = useState({ ...emptyForm });
   const [shutdownDevice, setShutdownDevice] = useState<Device | null>(null);
+  const [rebootDevice, setRebootDevice] = useState<Device | null>(null);
+  const [rebootAdminToken, setRebootAdminToken] = useState('');
+  const [rebootSubmitting, setRebootSubmitting] = useState(false);
+  const [rebootError, setRebootError] = useState<string | null>(null);
   const activeSet = useMemo(() => new Set(activeKeys), [activeKeys]);
   const sortable = sortMode === 'manual';
   const connectableDevices = useMemo(
     () => devices.filter((device) => {
       const status = statuses[device.key];
-      return !status?.connected && !status?.connecting;
+      const recovery = status?.recovery;
+      const recoveryActive = Boolean(
+        recovery && !['completed', 'failed', 'cancelled'].includes(recovery.phase)
+      );
+      return !status?.connected && !status?.connecting && !recoveryActive;
     }),
     [devices, statuses]
   );
@@ -361,6 +403,29 @@ export function DeviceList({
     const key = shutdownDevice.key;
     setShutdownDevice(null);
     await onShutdownServer(key);
+  };
+
+  const confirmReboot = async () => {
+    if (!rebootDevice || rebootSubmitting) return;
+    const key = rebootDevice.key;
+    setRebootSubmitting(true);
+    setRebootError(null);
+    try {
+      await onRebootDevice(key, rebootAdminToken);
+      setRebootDevice(null);
+      setRebootAdminToken('');
+    } catch (error) {
+      setRebootError(error instanceof Error ? error.message : 'Failed to request reboot');
+    } finally {
+      setRebootSubmitting(false);
+    }
+  };
+
+  const closeRebootModal = () => {
+    if (rebootSubmitting) return;
+    setRebootDevice(null);
+    setRebootAdminToken('');
+    setRebootError(null);
   };
 
   const connectAll = async () => {
@@ -442,6 +507,7 @@ export function DeviceList({
               onConnect={onConnect}
               onDisconnect={onDisconnect}
               onRequestShutdown={setShutdownDevice}
+              onRequestReboot={setRebootDevice}
             />
           ))}
         </SortableContext>
@@ -500,6 +566,48 @@ export function DeviceList({
             </Button>
             <Button color="orange" onClick={handleSubmit}>
               Save
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+      <Modal
+        opened={rebootDevice !== null}
+        onClose={closeRebootModal}
+        title="Reboot Red Pitaya?"
+        centered
+      >
+        <Stack>
+          <Text size="sm">
+            This will reboot <strong>{rebootDevice?.name || rebootDevice?.key || 'this device'}</strong> and
+            destroy any lock currently held by the FPGA. Linien server will not be started automatically.
+          </Text>
+          {rebootDevice && ['locked', 'likely_held'].includes(
+            statuses[rebootDevice.key]?.diagnosis?.lock_state ?? ''
+          ) ? (
+            <Text size="sm" c="red" fw={700}>
+              The FPGA may still be holding the lock. Rebooting will lose it.
+            </Text>
+          ) : null}
+          <PasswordInput
+            label="Reboot admin token"
+            value={rebootAdminToken}
+            onChange={(event) => setRebootAdminToken(event.currentTarget.value)}
+            disabled={rebootSubmitting}
+          />
+          {rebootError ? <Text size="sm" c="red">{rebootError}</Text> : null}
+          <Group justify="flex-end">
+            <Button variant="default" onClick={closeRebootModal} disabled={rebootSubmitting}>
+              Cancel
+            </Button>
+            <Button
+              color="red"
+              onClick={() => {
+                void confirmReboot();
+              }}
+              loading={rebootSubmitting}
+              disabled={!rebootAdminToken}
+            >
+              Reboot board
             </Button>
           </Group>
         </Stack>

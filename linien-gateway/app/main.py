@@ -4,13 +4,14 @@ import asyncio
 import json
 import logging
 import math
+import secrets
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, List
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +26,7 @@ from .config import (
     get_plot_stream_default_fps,
     get_plot_stream_drop_old_frames,
     get_plot_stream_max_fps_cap,
+    get_reboot_admin_token,
 )
 from .device_config_store import (
     CONFIG_AUTO_LOCK_SCAN,
@@ -175,6 +177,48 @@ app.add_middleware(
 # Does NOT touch WebSocket frames -- those use uvicorn's
 # ws_per_message_deflate, configured separately in run.py / main().
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+def _active_recovery_key(key: str) -> str | None:
+    session = session_registry.get(key)
+    recovery_active = getattr(session, "recovery_active", None)
+    if callable(recovery_active) and recovery_active():
+        return key
+    return None
+
+
+def _ensure_no_active_recovery(keys: list[str]) -> None:
+    active_key = next(
+        (key for key in keys if _active_recovery_key(key) is not None), None
+    )
+    if active_key is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Device recovery is running for {active_key}",
+        )
+
+
+@app.middleware("http")
+async def reject_device_mutations_during_recovery(request, call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        parts = request.url.path.strip("/").split("/")
+        if len(parts) >= 3 and parts[:2] == ["api", "devices"]:
+            key = parts[2]
+            suffix = "/".join(parts[3:])
+            if suffix not in {
+                "control/reboot",
+                "control/auto_lock_candidates",
+            }:
+                try:
+                    _ensure_no_active_recovery([key])
+                except HTTPException as exc:
+                    from fastapi.responses import JSONResponse
+
+                    return JSONResponse(
+                        status_code=exc.status_code,
+                        content={"detail": exc.detail},
+                    )
+    return await call_next(request)
 
 
 def _resolve_web_dist_dir() -> Path:
@@ -417,12 +461,15 @@ def create_device(payload: DeviceIn) -> DeviceOut:
 @app.patch("/api/devices/{key}", response_model=DeviceOut)
 def update_device(key: str, payload: DevicePatch) -> DeviceOut:
     device = _get_device_or_404(key)
-    data = payload.model_dump(exclude_unset=True)
-    for field, value in data.items():
-        setattr(device, field, value)
-    device_store.save_device(device)
-    session = _session_for_device(device)
-    session.device = device
+    with session_registry.lock_for(key):
+        session = _session_for_device(device)
+        if session.recovery_active():
+            raise HTTPException(status_code=409, detail="Device recovery is running")
+        data = payload.model_dump(exclude_unset=True)
+        for field, value in data.items():
+            setattr(device, field, value)
+        device_store.save_device(device)
+        session.device = device
     return DeviceOut(**device.__dict__)
 
 
@@ -432,6 +479,7 @@ def delete_device(key: str) -> dict:
     with session_registry.lock_for(key):
         session = session_registry.remove(key)
         if session is not None:
+            session.cancel_recovery(removed=True, wait=True)
             session.disconnect()
     device_store.remove_device(device)
     device_config_store.remove_device(key)
@@ -488,7 +536,10 @@ def delete_group(key: str) -> dict:
 def connect_device(key: str) -> dict:
     session = _get_session(key)
     with session_registry.lock_for(key):
-        session.connect_async()
+        try:
+            session.connect_async()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
     return {"ok": True}
 
 
@@ -496,7 +547,10 @@ def connect_device(key: str) -> dict:
 def disconnect_device(key: str) -> dict:
     session = _get_session(key)
     with session_registry.lock_for(key):
-        session.disconnect()
+        try:
+            session.disconnect()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
     return {"ok": True}
 
 
@@ -568,8 +622,38 @@ def write_registers(key: str) -> dict:
 def start_server(key: str) -> dict:
     session = _get_session(key)
     with session_registry.lock_for(key):
-        session.start_server()
+        try:
+            session.start_server()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
     return {"ok": True}
+
+
+def _require_reboot_admin_token(supplied_token: str | None) -> None:
+    expected_token = get_reboot_admin_token()
+    if expected_token is None:
+        raise HTTPException(status_code=503, detail="Device reboot is not configured")
+    if supplied_token is None:
+        raise HTTPException(status_code=401, detail="Admin token required")
+    if not secrets.compare_digest(supplied_token, expected_token):
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+
+@app.post("/api/devices/{key}/control/reboot", status_code=202)
+def reboot_device(
+    key: str,
+    response: Response,
+    admin_token: str | None = Header(default=None, alias="X-Linien-Admin-Token"),
+) -> dict:
+    _require_reboot_admin_token(admin_token)
+    session = _get_session(key)
+    with session_registry.lock_for(key):
+        try:
+            recovery = session.start_reboot()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+    response.headers["Cache-Control"] = "no-store"
+    return {"ok": True, "operation_id": recovery["operation_id"]}
 
 
 @app.post("/api/devices/{key}/control/start_lock")
@@ -696,6 +780,7 @@ async def start_sweep_simultaneous(body: SimultaneousSweepIn) -> dict:
     keys are skipped and reported. See the plan/docs: this delivers a roughly
     simultaneous start with an aligned starting phase, not sub-ms phase-lock.
     """
+    _ensure_no_active_recovery(body.device_keys)
     pairs = [(key, session_registry.get(key)) for key in body.device_keys]
     connected = [
         (key, session)
@@ -813,6 +898,7 @@ async def acquire_scan_simultaneous(body: SimultaneousAcquireIn) -> dict:
     yields phase-aligned single-scan traces. Unconnected or timed-out devices
     are reported under `skipped` instead of failing the whole batch.
     """
+    _ensure_no_active_recovery(body.device_keys)
     pairs = [(key, session_registry.get(key)) for key in body.device_keys]
     connected = [
         (key, session)
@@ -1125,6 +1211,7 @@ async def start_psd_acquisition_simultaneous(body: SimultaneousStartPsd) -> dict
     concurrently. Unconnected/unlocked devices land in `skipped` instead of
     failing the whole batch.
     """
+    _ensure_no_active_recovery(body.device_keys)
     pairs = [(key, session_registry.get(key)) for key in body.device_keys]
     connected = [
         (key, session)
@@ -1166,6 +1253,7 @@ async def start_psd_acquisition_simultaneous(body: SimultaneousStartPsd) -> dict
 
 @app.post("/api/control/stop_psd_acquisition")
 async def stop_psd_acquisition_simultaneous(body: DeviceKeysIn) -> dict:
+    _ensure_no_active_recovery(body.device_keys)
     connected = [
         (key, session)
         for key in body.device_keys

@@ -5,6 +5,7 @@ import math
 import pickle
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import asdict
 from copy import deepcopy
@@ -34,6 +35,7 @@ from .auto_lock_scan import (
     find_auto_lock_target,
 )
 from .auto_relock import AutoRelockConfig, AutoRelockController
+from .device_recovery import RecoveryCancelled, reboot_device
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
 from .manual_lock_record import ADC_SCALE, build_manual_lock_row, modulation_raw_to_hz
 from .plot_processing import PlotState, V, build_plot_frame
@@ -78,6 +80,7 @@ NORMALIZED_PARAMS_ON_CONNECT = (
 )
 PERSISTENT_SETTINGS_SNAPSHOT_KEY = "linien_settings_snapshot"
 PERSISTENT_SETTINGS_SNAPSHOT_VERSION = 1
+RECOVERY_STATE_KEY = "gateway_recovery"
 EXTRA_PERSISTENT_SETTINGS = {
     # Upstream linien-server 2.1.0 does not mark this as restorable, but it is a
     # user setting that controls the sign of the PID gains written to the FPGA.
@@ -235,6 +238,26 @@ class DeviceSession:
         self._diagnosis_cache: dict[str, Any] | None = None
         self._last_diagnosis_category: str | None = None
         self._wants_diagnosis: bool = False
+        persisted_recovery = self._device_parameters().get(RECOVERY_STATE_KEY)
+        self._recovery: dict[str, Any] | None = (
+            dict(persisted_recovery) if isinstance(persisted_recovery, dict) else None
+        )
+        if self._recovery and self._recovery.get("phase") not in {
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            self._recovery = {
+                **self._recovery,
+                "phase": "failed",
+                "updated_at": time.time(),
+                "error": "Gateway restarted before reboot verification completed",
+            }
+            self._device_parameters()[RECOVERY_STATE_KEY] = dict(self._recovery)
+            device_store.save_device(self.device)
+        self._recovery_cancel = threading.Event()
+        self._recovery_thread: threading.Thread | None = None
+        self._removed = False
 
     @staticmethod
     def _utc_now_iso() -> str:
@@ -450,6 +473,13 @@ class DeviceSession:
     def request_diagnosis_probe(self) -> None:
         """Mark this session for out-of-band diagnosis and enqueue a probe."""
         with self._state_lock:
+            recovery = self._recovery
+            if recovery and recovery.get("phase") not in {
+                "completed",
+                "failed",
+                "cancelled",
+            }:
+                return
             self._wants_diagnosis = True
         callback = self._diagnosis_request_callback
         if callback is None:
@@ -469,7 +499,12 @@ class DeviceSession:
         """Store a probe result (called from the DiagnosisProbe worker)."""
         category = diagnosis.get("category")
         with self._state_lock:
-            if self.connected:
+            recovery = self._recovery
+            recovery_active = bool(
+                recovery
+                and recovery.get("phase") not in {"completed", "failed", "cancelled"}
+            )
+            if self.connected or recovery_active:
                 # Reconnected between scheduling and probing — drop stale result.
                 return
             previous = self._last_diagnosis_category
@@ -483,6 +518,137 @@ class DeviceSession:
                 message=str(diagnosis.get("message", "Connection diagnosis updated.")),
                 details=diagnosis,
             )
+        self._publish_status()
+
+    def _recovery_active(self) -> bool:
+        with self._state_lock:
+            recovery = self._recovery
+            return bool(
+                recovery
+                and recovery.get("phase") not in {"completed", "failed", "cancelled"}
+            )
+
+    def recovery_active(self) -> bool:
+        return self._recovery_active()
+
+    def _set_recovery_phase(
+        self, operation_id: str, phase: str, error: str | None = None
+    ) -> bool:
+        with self._state_lock:
+            if self._recovery is None or self._recovery.get("operation_id") != operation_id:
+                return False
+            if self._recovery.get("phase") in {"completed", "failed", "cancelled"}:
+                return False
+            if self._recovery_cancel.is_set() or self._removed:
+                return False
+            self._recovery = {
+                **self._recovery,
+                "phase": phase,
+                "updated_at": time.time(),
+                "error": error,
+            }
+            self._persist_recovery_locked()
+        self._publish_status()
+        return True
+
+    def _persist_recovery_locked(self) -> None:
+        if self._removed:
+            return
+        parameters = self._device_parameters()
+        if self._recovery is None:
+            parameters.pop(RECOVERY_STATE_KEY, None)
+        else:
+            parameters[RECOVERY_STATE_KEY] = dict(self._recovery)
+        device_store.save_device(self.device)
+
+    def start_reboot(self) -> dict[str, Any]:
+        with self._lock:
+            with self._state_lock:
+                if self._recovery_active():
+                    raise RuntimeError("A device recovery operation is already running")
+                if self.connecting:
+                    raise RuntimeError("Cannot reboot while the device is connecting")
+                if self._removed:
+                    raise RuntimeError("Device has been removed")
+                operation_id = str(uuid.uuid4())
+                now = time.time()
+                self._recovery = {
+                    "operation_id": operation_id,
+                    "action": "reboot",
+                    "phase": "queued",
+                    "started_at": now,
+                    "updated_at": now,
+                    "error": None,
+                }
+                self._persist_recovery_locked()
+                self._recovery_cancel.clear()
+                self._wants_diagnosis = False
+                self._diagnosis_cache = None
+                self._last_diagnosis_category = None
+            worker = threading.Thread(
+                target=self._run_reboot, args=(operation_id,), daemon=True
+            )
+            self._recovery_thread = worker
+            worker.start()
+        self._publish_status()
+        return dict(self._recovery)
+
+    def _run_reboot(self, operation_id: str) -> None:
+        try:
+            def update_phase(phase: str) -> None:
+                if not self._set_recovery_phase(operation_id, phase):
+                    raise RecoveryCancelled()
+                if phase == "dispatching":
+                    self._reset_connection_state(last_error=None, request_diagnosis=False)
+
+            reboot_device(
+                self.device,
+                update_phase,
+                self._recovery_cancel.is_set,
+            )
+            if not self._set_recovery_phase(operation_id, "completed"):
+                return
+            self._reset_connection_state(last_error=None, request_diagnosis=False)
+            self._emit_log_event(
+                level=logging.INFO,
+                source="recovery",
+                code="device_reboot_completed",
+                message="Red Pitaya reboot completed.",
+                details={"operation_id": operation_id},
+            )
+        except RecoveryCancelled:
+            return
+        except Exception as exc:
+            if self._set_recovery_phase(operation_id, "failed", str(exc)):
+                self._emit_log_event(
+                    level=logging.ERROR,
+                    source="recovery",
+                    code="device_reboot_failed",
+                    message="Red Pitaya reboot failed.",
+                    details={"operation_id": operation_id, "error": str(exc)},
+                )
+
+    def cancel_recovery(self, *, removed: bool = False, wait: bool = False) -> None:
+        self._recovery_cancel.set()
+        with self._state_lock:
+            recovery = self._recovery
+            if recovery and recovery.get("phase") not in {
+                "completed",
+                "failed",
+                "cancelled",
+            }:
+                self._recovery = {
+                    **recovery,
+                    "phase": "cancelled",
+                    "updated_at": time.time(),
+                    "error": None,
+                }
+                self._persist_recovery_locked()
+            if removed:
+                self._removed = True
+        worker = self._recovery_thread
+        if wait and worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=7.0)
 
     def _on_auto_relock_event(self, event: str, payload: dict[str, Any]) -> None:
         if event == "attempt":
@@ -1105,14 +1271,18 @@ class DeviceSession:
             )
 
     def connect_async(self, autostart_server: bool = False) -> None:
-        if self.connected or self.connecting:
-            return
-        thread = threading.Thread(
-            target=self.connect, args=(autostart_server,), daemon=True
-        )
-        thread.start()
+        with self._lock:
+            if self._recovery_active():
+                raise RuntimeError("Cannot connect while device recovery is running")
+            if self.connected or self.connecting:
+                return
+            self.connecting = True
+            thread = threading.Thread(
+                target=self.connect, args=(autostart_server, True), daemon=True
+            )
+            thread.start()
 
-    def connect(self, autostart_server: bool = False) -> None:
+    def connect(self, autostart_server: bool = False, reserved: bool = False) -> None:
         # Hold _lock across the ENTIRE connect so a concurrent disconnect()
         # (the only other _lock user) cannot interleave between the network
         # connect and the poll-thread start. Without this, a disconnect that
@@ -1121,7 +1291,10 @@ class DeviceSession:
         # against a client disconnect had just torn down. _lock is an RLock so
         # the failure path's _reset_connection_state() can re-enter it.
         with self._lock:
-            if self.connected or self.connecting:
+            if self._recovery_active():
+                self.connecting = False
+                raise RuntimeError("Cannot connect while device recovery is running")
+            if self.connected or (self.connecting and not reserved):
                 return
             self.connecting = True
             try:
@@ -1213,6 +1386,8 @@ class DeviceSession:
         self.connect_async(autostart_server=True)
 
     def disconnect(self) -> None:
+        if self._recovery_active():
+            raise RuntimeError("Cannot disconnect while device recovery is running")
         self._reset_connection_state(last_error=self.last_error)
 
     def _poll_loop(self) -> None:
@@ -1925,6 +2100,7 @@ class DeviceSession:
             lock_value = frame_lock
         with self._state_lock:
             diagnosis = self._diagnosis_cache
+            recovery = dict(self._recovery) if self._recovery is not None else None
         # Stream-stall visibility. The auto-relock state machine only advances on
         # plot-frame arrival, so a stale stream means it is frozen. Surfaced here
         # (REST status) rather than in the websocket frame, because during a stall
@@ -1969,6 +2145,7 @@ class DeviceSession:
             "stream_age_s": stream_age_s,
             "stalled": stalled,
             "diagnosis": diagnosis,
+            "recovery": recovery,
         }
 
     def set_param(self, name: str, value: Any, write_registers: bool) -> None:
@@ -2439,6 +2616,8 @@ class DeviceSession:
                     task.exposed_stop()
 
     def shutdown_server(self) -> None:
+        if self._recovery_active():
+            raise RuntimeError("Cannot shut down the server while device recovery is running")
         if self.control is None:
             raise RuntimeError("Device not connected")
         with self._rpyc_lock:
