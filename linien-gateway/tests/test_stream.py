@@ -305,3 +305,94 @@ def test_reliable_messages_are_not_dropped():
         await manager.unregister("dev-a", ws)
 
     asyncio.run(run())
+
+
+class ClosableWebSocket(DummyWebSocket):
+    """DummyWebSocket that records close() — DummyWebSocket has no close."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
+    async def close(self, code: int = 1000) -> None:
+        self.closed = True
+
+
+def test_queue_full_closes_socket_so_the_client_reconnects():
+    """A dropped subscriber must be closed, not just unregistered.
+
+    Leaving the socket open strands the browser on a connection that can
+    never receive another frame: the stream endpoint stays parked in its
+    receive loop, no close event reaches the client, and the client's
+    reconnect only fires on close. The plot silently freezes until reload.
+    """
+
+    async def scenario():
+        manager = WebsocketManager(reliable_queue_size=10)
+        manager.set_loop(asyncio.get_running_loop())
+        websocket = ClosableWebSocket()
+        # Block the sender task so the reliable queue actually fills.
+        websocket.release_send.clear()
+        await manager.register("dev", websocket, detail="full", accept=False)
+        for index in range(40):
+            await manager.broadcast(
+                "dev", {"type": "param_update", "name": f"p{index}", "value": index}
+            )
+        return manager, websocket
+
+    manager, websocket = asyncio.run(scenario())
+    assert manager.peek_required_detail("dev") is None
+    assert websocket.closed is True
+
+
+def test_sender_loop_failure_closes_socket():
+    class ExplodingWebSocket(ClosableWebSocket):
+        async def send_text(self, payload: str) -> None:
+            raise RuntimeError("connection reset")
+
+    async def scenario():
+        manager = WebsocketManager(reliable_queue_size=10)
+        manager.set_loop(asyncio.get_running_loop())
+        websocket = ExplodingWebSocket()
+        await manager.register("dev", websocket, detail="full", accept=False)
+        await manager.broadcast("dev", {"type": "status", "connected": True})
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if websocket.closed:
+                break
+        return manager, websocket
+
+    manager, websocket = asyncio.run(scenario())
+    assert websocket.closed is True
+    assert manager.peek_required_detail("dev") is None
+
+
+def test_send_initial_queues_through_the_sender_task():
+    async def scenario():
+        manager = WebsocketManager(reliable_queue_size=10)
+        manager.set_loop(asyncio.get_running_loop())
+        websocket = ClosableWebSocket()
+        await manager.register("dev", websocket, detail="full", accept=False)
+        assert await manager.send_initial(
+            "dev", websocket, {"type": "status", "connected": True}
+        )
+        # A status published immediately after registration (the connect race)
+        # must be delivered too, and must arrive after the snapshot.
+        await manager.broadcast("dev", {"type": "status", "connected": False})
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(websocket.sent) >= 2:
+                break
+        return websocket
+
+    websocket = asyncio.run(scenario())
+    assert [message["connected"] for message in websocket.sent] == [True, False]
+
+
+def test_send_initial_reports_false_for_unregistered_connection():
+    async def scenario():
+        manager = WebsocketManager(reliable_queue_size=10)
+        manager.set_loop(asyncio.get_running_loop())
+        return await manager.send_initial("dev", ClosableWebSocket(), {"type": "status"})
+
+    assert asyncio.run(scenario()) is False

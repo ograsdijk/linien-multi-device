@@ -1478,9 +1478,6 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
     if device_store.get_device(key) is None:
         await websocket.close(code=1008)
         return
-    with session_registry.lock_for(key):
-        session = _get_session(key)
-        snapshot = session.snapshot()
     max_fps = None
     detail = websocket.query_params.get("detail") or "full"
     if detail not in {"summary", "full"}:
@@ -1500,44 +1497,61 @@ async def stream_device(websocket: WebSocket, key: str) -> None:
     binary = binary_param == "1" or binary_param.lower() == "true"
     await websocket.accept()
 
-    async def safe_send_initial(payload: dict) -> bool:
-        try:
-            from .stream import (
-                _encode_ws_payload,
-                encode_plot_frame_binary,
-                encode_plot_frame_json,
-            )
-            if payload.get("type") == "plot_frame":
-                if binary:
-                    await websocket.send_bytes(encode_plot_frame_binary(payload))
-                else:
-                    await websocket.send_text(encode_plot_frame_json(payload))
-            else:
-                await websocket.send_text(_encode_ws_payload(payload))
-            return True
-        except WebSocketDisconnect:
-            return False
-
-    for name, value in snapshot.get("params", {}).items():
-        encoded = to_jsonable(value)
-        if encoded is UNSERIALIZABLE:
-            continue
-        if not await safe_send_initial(
-            {"type": "param_update", "name": name, "value": encoded}
-        ):
-            return
-    if snapshot.get("plot_frame") is not None:
-        plot_frame = manager.filter_plot_frame(snapshot["plot_frame"], detail)
-        if not await safe_send_initial(plot_frame):
-            return
-    if not await safe_send_initial({"type": "status", **snapshot.get("status", {})}):
-        return
-
+    # Register BEFORE sending the snapshot. The handshake payload used to be
+    # written directly to the socket first, which left a window (previously
+    # ~90 sequential sends wide) in which anything published by the session —
+    # notably the status published by connect() — was dropped on the floor.
+    # Plot frames self-heal on the next frame, but status is only published on
+    # transitions and the client's backstop poll skips streaming devices, so a
+    # lost "connected" left the UI greyed out as "Not connected" indefinitely
+    # while frames flowed behind it.
+    #
+    # Registering first means those publishes queue behind the snapshot
+    # instead. `send_initial` routes the snapshot through the same per-
+    # connection sender task as broadcasts, so there is still exactly one
+    # writer on the socket and ordering is preserved.
     await manager.register(
         key, websocket, max_fps=max_fps, detail=detail, binary=binary, accept=False
     )
 
+    async def safe_send_initial(payload: dict) -> bool:
+        try:
+            return await manager.send_initial(key, websocket, payload)
+        except WebSocketDisconnect:
+            return False
+
     try:
+        # Snapshot after registering (see above). Taken later than the
+        # registration, so it is never older than anything already queued.
+        try:
+            with session_registry.lock_for(key):
+                snapshot = _get_session(key).snapshot()
+        except HTTPException:
+            # Device deleted between the check above and here.
+            return
+
+        params_payload: dict[str, Any] = {}
+        for name, value in snapshot.get("params", {}).items():
+            encoded = to_jsonable(value)
+            if encoded is UNSERIALIZABLE:
+                continue
+            params_payload[name] = encoded
+        # One coalesced message rather than one per parameter — see
+        # DeviceSession._publish_param_snapshot.
+        if params_payload:
+            if not await safe_send_initial(
+                {"type": "param_snapshot", "params": params_payload}
+            ):
+                return
+        if snapshot.get("plot_frame") is not None:
+            plot_frame = manager.filter_plot_frame(snapshot["plot_frame"], detail)
+            if not await safe_send_initial(plot_frame):
+                return
+        if not await safe_send_initial(
+            {"type": "status", **snapshot.get("status", {})}
+        ):
+            return
+
         while True:
             raw = await websocket.receive_text()
             # Best-effort control channel: clients can send
