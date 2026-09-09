@@ -76,13 +76,3 @@ def test_main_entrypoint_binds_from_config(monkeypatch):
 
     assert captured == {"host": "0.0.0.0", "port": 9999}
 
-
-def test_reboot_admin_token_comes_from_environment(monkeypatch):
-    monkeypatch.delenv("LINIEN_REBOOT_ADMIN_TOKEN", raising=False)
-    assert config.get_reboot_admin_token() is None
-
-    monkeypatch.setenv("LINIEN_REBOOT_ADMIN_TOKEN", "   ")
-    assert config.get_reboot_admin_token() is None
-
-    monkeypatch.setenv("LINIEN_REBOOT_ADMIN_TOKEN", "  secret  ")
-    assert config.get_reboot_admin_token() == "secret"

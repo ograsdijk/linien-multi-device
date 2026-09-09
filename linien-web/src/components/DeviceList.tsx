@@ -1,7 +1,7 @@
 import { useMemo, useState, type CSSProperties } from 'react';
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { ActionIcon, Button, Card, Group, Modal, PasswordInput, Select, Stack, Text, TextInput } from '@mantine/core';
+import { ActionIcon, Button, Card, Group, Modal, Select, Stack, Text, TextInput } from '@mantine/core';
 import {
   IconChevronLeft,
   IconDevices,
@@ -56,7 +56,7 @@ type DeviceListProps = {
   onConnect: (key: string) => Promise<void>;
   onDisconnect: (key: string) => Promise<void>;
   onShutdownServer: (key: string) => Promise<void>;
-  onRebootDevice: (key: string, adminToken: string) => Promise<void>;
+  onRebootDevice: (key: string) => Promise<void>;
 };
 
 type SortableDeviceCardProps = {
@@ -345,7 +345,6 @@ export function DeviceList({
   const [form, setForm] = useState({ ...emptyForm });
   const [shutdownDevice, setShutdownDevice] = useState<Device | null>(null);
   const [rebootDevice, setRebootDevice] = useState<Device | null>(null);
-  const [rebootAdminToken, setRebootAdminToken] = useState('');
   const [rebootSubmitting, setRebootSubmitting] = useState(false);
   const [rebootError, setRebootError] = useState<string | null>(null);
   const activeSet = useMemo(() => new Set(activeKeys), [activeKeys]);
@@ -411,9 +410,8 @@ export function DeviceList({
     setRebootSubmitting(true);
     setRebootError(null);
     try {
-      await onRebootDevice(key, rebootAdminToken);
+      await onRebootDevice(key);
       setRebootDevice(null);
-      setRebootAdminToken('');
     } catch (error) {
       setRebootError(error instanceof Error ? error.message : 'Failed to request reboot');
     } finally {
@@ -424,7 +422,6 @@ export function DeviceList({
   const closeRebootModal = () => {
     if (rebootSubmitting) return;
     setRebootDevice(null);
-    setRebootAdminToken('');
     setRebootError(null);
   };
 
@@ -588,12 +585,6 @@ export function DeviceList({
               The FPGA may still be holding the lock. Rebooting will lose it.
             </Text>
           ) : null}
-          <PasswordInput
-            label="Reboot admin token"
-            value={rebootAdminToken}
-            onChange={(event) => setRebootAdminToken(event.currentTarget.value)}
-            disabled={rebootSubmitting}
-          />
           {rebootError ? <Text size="sm" c="red">{rebootError}</Text> : null}
           <Group justify="flex-end">
             <Button variant="default" onClick={closeRebootModal} disabled={rebootSubmitting}>
@@ -605,7 +596,6 @@ export function DeviceList({
                 void confirmReboot();
               }}
               loading={rebootSubmitting}
-              disabled={!rebootAdminToken}
             >
               Reboot board
             </Button>

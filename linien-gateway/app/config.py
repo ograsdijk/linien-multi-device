@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -77,10 +76,3 @@ def get_plot_stream_drop_old_frames() -> bool:
         return value
     return DEFAULT_PLOT_STREAM_DROP_OLD_FRAMES
 
-
-def get_reboot_admin_token() -> str | None:
-    value = os.getenv("LINIEN_REBOOT_ADMIN_TOKEN")
-    if value is None:
-        return None
-    value = value.strip()
-    return value or None

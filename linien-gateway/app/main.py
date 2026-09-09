@@ -4,14 +4,13 @@ import asyncio
 import json
 import logging
 import math
-import secrets
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, List
 
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,7 +25,6 @@ from .config import (
     get_plot_stream_default_fps,
     get_plot_stream_drop_old_frames,
     get_plot_stream_max_fps_cap,
-    get_reboot_admin_token,
 )
 from .device_config_store import (
     CONFIG_AUTO_LOCK_SCAN,
@@ -629,23 +627,8 @@ def start_server(key: str) -> dict:
     return {"ok": True}
 
 
-def _require_reboot_admin_token(supplied_token: str | None) -> None:
-    expected_token = get_reboot_admin_token()
-    if expected_token is None:
-        raise HTTPException(status_code=503, detail="Device reboot is not configured")
-    if supplied_token is None:
-        raise HTTPException(status_code=401, detail="Admin token required")
-    if not secrets.compare_digest(supplied_token, expected_token):
-        raise HTTPException(status_code=403, detail="Invalid admin token")
-
-
 @app.post("/api/devices/{key}/control/reboot", status_code=202)
-def reboot_device(
-    key: str,
-    response: Response,
-    admin_token: str | None = Header(default=None, alias="X-Linien-Admin-Token"),
-) -> dict:
-    _require_reboot_admin_token(admin_token)
+def reboot_device(key: str, response: Response) -> dict:
     session = _get_session(key)
     with session_registry.lock_for(key):
         try:
