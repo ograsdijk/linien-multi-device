@@ -192,6 +192,12 @@ class DeviceSession:
         self.last_error: str | None = None
         self.last_plot_frame: Dict[str, Any] | None = None
         self.last_plot_timestamp: float | None = None
+        # Set while _register_callbacks() replays every parameter with
+        # call_immediately=True. Suppresses the ~90 individual param_update
+        # publishes that burst would otherwise push into each subscriber's
+        # bounded reliable queue; one coalesced param_snapshot is published
+        # instead once registration finishes.
+        self._suppress_param_publish = False
         self._poll_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         # Reentrant: connect() holds it across its whole body, and the connect
@@ -1414,7 +1420,33 @@ class DeviceSession:
             except Exception as exc:
                 self._handle_poll_failure(exc)
 
+    def _publish_param_snapshot(self) -> None:
+        """Publish the whole serialized param cache as a single message.
+
+        Replaces the per-parameter publish storm at connect time. Each
+        subscriber's reliable queue is bounded (and a full queue drops the
+        connection), so bursting ~90 messages through it on every connect
+        risked evicting live subscribers.
+        """
+        with self._state_lock:
+            params = dict(self.param_cache_serialized)
+        if not params:
+            return
+        self.manager.publish(
+            self.device.key, {"type": "param_snapshot", "params": params}
+        )
+
     def _register_callbacks(self) -> None:
+        if self.parameters is None:
+            return
+        self._suppress_param_publish = True
+        try:
+            self._add_parameter_callbacks()
+        finally:
+            self._suppress_param_publish = False
+        self._publish_param_snapshot()
+
+    def _add_parameter_callbacks(self) -> None:
         if self.parameters is None:
             return
         for name, param in self.parameters:
@@ -1457,6 +1489,10 @@ class DeviceSession:
             return
         with self._state_lock:
             self.param_cache_serialized[name] = encoded
+        if self._suppress_param_publish:
+            # Connect-time replay; _publish_param_snapshot() emits the whole
+            # cache as one message once registration completes.
+            return
         self.manager.publish(
             self.device.key,
             {"type": "param_update", "name": name, "value": encoded},

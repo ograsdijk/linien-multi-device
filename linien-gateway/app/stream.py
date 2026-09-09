@@ -359,6 +359,46 @@ class WebsocketManager:
         with contextlib.suppress(asyncio.CancelledError):
             await sender_task
 
+    async def drop(self, device_key: str, websocket: WebSocket) -> None:
+        """Unregister a connection AND close its socket.
+
+        `unregister` alone only removes the connection from the broadcast
+        set — it leaves the TCP connection open. The stream endpoint is
+        parked on `receive_text()`, so an unregistered-but-open socket never
+        returns from the endpoint and the browser never sees a close event.
+        The client's reconnect-with-backoff is driven entirely by `onclose`,
+        so it would sit forever on a socket that can no longer receive a
+        single frame — the plot silently freezes until the page is reloaded.
+
+        Every failure path must therefore close the socket, so the client
+        notices and reconnects.
+        """
+        await self.unregister(device_key, websocket)
+        with contextlib.suppress(Exception):
+            await websocket.close()
+
+    async def send_initial(
+        self, device_key: str, websocket: WebSocket, message: Dict[str, Any]
+    ) -> bool:
+        """Queue a handshake message through the connection's sender task.
+
+        Handshake payloads must go through the same queue as broadcasts so a
+        connection can be registered *before* its snapshot is sent (closing
+        the window where a status published mid-handshake is dropped) without
+        two writers interleaving on one socket.
+        """
+        with self._connections_lock:
+            state = self._connections.get(device_key, {}).get(websocket)
+        if state is None:
+            return False
+        try:
+            state.reliable_queue.put_nowait(message)
+        except asyncio.QueueFull:
+            await self.drop(device_key, websocket)
+            return False
+        state.wake_event.set()
+        return True
+
     async def broadcast(self, device_key: str, message: Dict[str, Any]) -> None:
         with self._connections_lock:
             connections = list(self._connections.get(device_key, {}).items())
@@ -395,7 +435,8 @@ class WebsocketManager:
             except asyncio.QueueFull:
                 stale.append(websocket)
         for websocket in stale:
-            await self.unregister(device_key, websocket)
+            # Close, don't just unregister — see `drop`.
+            await self.drop(device_key, websocket)
 
     def peek_required_detail(self, device_key: str) -> str | None:
         """Return the highest detail level required by any current subscriber.
@@ -465,7 +506,13 @@ class WebsocketManager:
         except asyncio.CancelledError:
             raise
         except Exception:
-            await self.unregister(device_key, websocket)
+            logger.warning(
+                "Websocket sender loop failed for device=%s; dropping connection",
+                device_key,
+                exc_info=True,
+            )
+            # Close, don't just unregister — see `drop`.
+            await self.drop(device_key, websocket)
 
     def _dequeue_next(self, state: ConnectionState) -> Dict[str, Any] | None:
         try:

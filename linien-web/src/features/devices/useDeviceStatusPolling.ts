@@ -3,6 +3,13 @@ import { api } from '../../api';
 import type { Device, DeviceStatus } from '../../types';
 import { isDeviceStatus } from '../runtime/messageGuards';
 import { deviceStatesStore } from '../../state/deviceStatesStore';
+import { isStreamFresh } from './streamFreshness';
+
+// How long a streaming device may go without a plot frame before the backstop
+// poll stops trusting its stream. Frames arrive continuously (up to 60/s) for
+// a connected device, so any gap this long means the stream is not delivering
+// and its status must come from the poll instead.
+const STREAM_STALE_MS = 10000;
 
 type UseDeviceStatusPollingArgs = {
   devices: Device[];
@@ -122,7 +129,10 @@ export const useDeviceStatusPolling = ({
               | undefined;
           }> = [];
           for (const device of currentDevices) {
-            if (skip?.has(device.key)) {
+            // Only defer to the stream while it is actually delivering
+            // frames. A silent-but-open stream must not suppress the poll —
+            // see streamFreshness.
+            if (skip?.has(device.key) && isStreamFresh(device.key, STREAM_STALE_MS)) {
               continue;
             }
             const status = statuses[device.key];

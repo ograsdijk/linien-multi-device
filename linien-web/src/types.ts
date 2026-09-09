@@ -223,6 +223,9 @@ export type ConfigUpdateMessage = {
 
 export type StreamMessage =
   | { type: 'param_update'; name: string; value: any }
+  // Coalesced form of many param_update messages, sent on stream handshake
+  // and on device connect. See DeviceSession._publish_param_snapshot.
+  | { type: 'param_snapshot'; params: Record<string, any> }
   | PlotFrame
   | ConfigUpdateMessage
   | ({ type: 'status' } & DeviceStatus);

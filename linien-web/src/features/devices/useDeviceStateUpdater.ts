@@ -128,6 +128,21 @@ export const useDeviceStateUpdater = () => {
         return;
       }
 
+      if (message.type === 'param_snapshot') {
+        // Same pending-map path as param_update so the whole snapshot lands
+        // in one coalesced flush instead of one store write per parameter.
+        let deviceMap = pendingParamsRef.current.get(deviceKey);
+        if (!deviceMap) {
+          deviceMap = new Map();
+          pendingParamsRef.current.set(deviceKey, deviceMap);
+        }
+        for (const [name, value] of Object.entries(message.params)) {
+          deviceMap.set(name, value);
+        }
+        schedule();
+        return;
+      }
+
       if (message.type === 'status') {
         deviceStatesStore.updateDevice(deviceKey, (prev) => ({
           ...prev,

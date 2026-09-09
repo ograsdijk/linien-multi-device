@@ -66,6 +66,11 @@ export const parseStreamMessage = (value: unknown): StreamMessage | null => {
     return value as StreamMessage;
   }
 
+  if (value.type === 'param_snapshot') {
+    if (!isObject(value.params)) return null;
+    return value as StreamMessage;
+  }
+
   if (value.type === 'status') {
     if (!isDeviceStatus(value)) return null;
     return value as StreamMessage;

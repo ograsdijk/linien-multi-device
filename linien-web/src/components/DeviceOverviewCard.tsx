@@ -13,6 +13,7 @@ import { useInViewport } from '../hooks/useInViewport';
 import { OverviewPlotPanel, type OverviewPlotPanelHandle } from './OverviewPlotPanel';
 import { ThrottledStatusRow } from './ThrottledStatusRow';
 import { resolveConnectionDisplay } from '../features/connection/connectionState';
+import { markStreamFrame } from '../features/devices/streamFreshness';
 import { resolveLockDisplay } from '../features/locks/lockState';
 import { type DeviceStateEntry, useDeviceStateSlice } from '../state/deviceStatesStore';
 
@@ -136,6 +137,8 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
   const onMessage = useCallback(
     (msg: StreamMessage) => {
       if (msg.type === 'plot_frame') {
+        // Proof the stream is alive; the status backstop poll consults this.
+        markStreamFrame(device.key);
         const throttleMs = plotThrottleMsRef.current;
         if (throttleMs > 0) {
           const now = performance.now();

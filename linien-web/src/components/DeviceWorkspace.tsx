@@ -20,6 +20,7 @@ import { RightPanel } from './RightPanel';
 import { ThrottledStatusRow } from './ThrottledStatusRow';
 import { SweepControls } from './SweepControls';
 import { useDeviceStateEntry } from '../state/deviceStatesStore';
+import { markStreamFrame } from '../features/devices/streamFreshness';
 
 // Compare lock-indicator snapshots by the fields downstream UI reads.
 // Avoids forcing a render when the backend sends a fresh indicator
@@ -187,6 +188,8 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
   const onMessage = useCallback(
     (msg: StreamMessage) => {
       if (msg.type === 'plot_frame') {
+        // Proof the stream is alive; the status backstop poll consults this.
+        markStreamFrame(device.key);
         latestFrameRef.current = msg;
         // During selection (autolock / optimization range pick) the
         // plot freezes -- skip pushing new frames to uPlot. When the
