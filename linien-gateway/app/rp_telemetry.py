@@ -356,6 +356,17 @@ def read_telemetry_sync(
 # --- systemd unit --------------------------------------------------------
 
 
+def _shell_single_quote(value: str) -> str:
+    """Make `value` safe inside single quotes in a POSIX shell command.
+
+    The unit text is embedded in the command that crosses SSH, so anything the
+    remote shell would reinterpret has to be neutralised. Also strips CR: the
+    unit must reach the board with LF endings or every setting parses with a
+    trailing carriage return and systemd rejects the file.
+    """
+    return value.replace("\r", "").replace("'", "'\"'\"'")
+
+
 def render_service_unit(port: int = DEFAULT_TELEMETRY_PORT) -> str:
     return f"""[Unit]
 Description=Red Pitaya telemetry (Zynq die temperature)
@@ -1189,11 +1200,18 @@ class RpTelemetryManager:
                 # Piped into `tee` rather than `cat > path`: a shell redirect
                 # is performed by the *calling* shell, so `sudo -n cat > path`
                 # would try to create the unit file as the unprivileged user.
+                #
+                # `printf` of a single-quoted one-liner rather than a heredoc:
+                # the command crosses SSH and is re-parsed by whatever login
+                # shell the board uses, and a heredoc body is sensitive to how
+                # that shell handles the embedded newlines. A CR reaching the
+                # file makes every value invalid ("Type=simple\r"), which
+                # systemd reports only as "bad unit file setting".
                 tee = self._privileged(device, f"tee {SERVICE_UNIT_PATH}")
                 written = self._ssh_run(
                     conn,
                     device,
-                    f"cat <<'RPTEOF' | {tee} > /dev/null\n{unit}RPTEOF",
+                    f"printf '%s' '{_shell_single_quote(unit)}' | {tee} > /dev/null",
                     privileged=False,
                 )
                 if self._failed(written):
@@ -1201,8 +1219,30 @@ class RpTelemetryManager:
                         f"Could not write the systemd unit: {self._detail(written)}"
                     )
 
+                # systemd parses the unit at daemon-reload; ask it directly
+                # whether the file it now holds is usable. Without this the only
+                # symptom is `systemctl start` failing with "bad unit file
+                # setting", which names neither the setting nor the reason.
+                self._ssh_run(conn, device, "systemctl daemon-reload")
+                load = self._ssh_run(
+                    conn,
+                    device,
+                    f"systemctl show -p LoadState -p LoadError --value {SERVICE_NAME}",
+                )
+                load_output = (getattr(load, "stdout", "") or "").strip()
+                if "not-found" in load_output or "bad-setting" in load_output or (
+                    load_output and not load_output.startswith("loaded")
+                ):
+                    dumped = self._ssh_run(
+                        conn, device, f"cat -A {SERVICE_UNIT_PATH}", privileged=False
+                    )
+                    raise RuntimeError(
+                        "systemd rejected the unit file "
+                        f"({load_output or 'no LoadState'}). "
+                        f"File as written: {self._detail(dumped)[:300]}"
+                    )
+
                 for command, failure in (
-                    ("systemctl daemon-reload", "systemctl daemon-reload failed"),
                     (f"systemctl enable {SERVICE_NAME}", "Could not enable the service"),
                     (f"systemctl restart {SERVICE_NAME}", "Could not start the service"),
                 ):

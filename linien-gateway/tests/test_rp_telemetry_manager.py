@@ -791,6 +791,70 @@ def test_install_runs_the_full_flow_and_verifies(bundled_binary, monkeypatch):
     assert manager.status_fields("dev-1")["rp_temperature_c"] == 48.0
 
 
+def test_the_unit_is_written_without_carriage_returns(bundled_binary, monkeypatch):
+    """A CR in the unit makes every value invalid ("Type=simple\r").
+
+    systemd reports that only as "bad unit file setting", naming neither the
+    setting nor the reason, so it must be impossible to send one.
+    """
+    device = make_device()
+    connection = FakeConnection(
+        {
+            "sha256sum": _sha_response(bundled_binary),
+            "is-active": FakeResult(stdout="active\n"),
+            "LoadState": FakeResult(stdout="loaded\n\n"),
+        }
+    )
+    manager, *_ = _install_manager(device, connection)
+    monkeypatch.setattr(
+        rpt,
+        "read_telemetry_sync",
+        lambda *a, **k: rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=48.0),
+    )
+    monkeypatch.setattr(
+        rpt,
+        "render_service_unit",
+        lambda port=0: "[Unit]\r\nDescription=x\r\n\r\n[Service]\r\nType=simple\r\n",
+    )
+
+    manager.install(device)
+
+    write = next(c for c in connection.commands if rpt.SERVICE_UNIT_PATH in c)
+    assert "\r" not in write
+    assert "Type=simple" in write
+
+
+def test_install_reports_a_unit_systemd_refuses_to_load(bundled_binary):
+    """Turn "bad unit file setting" into something that names the problem."""
+    device = make_device()
+    connection = FakeConnection(
+        {
+            "sha256sum": _sha_response(bundled_binary),
+            "LoadState": FakeResult(stdout="bad-setting\nInvalid argument\n"),
+            "cat -A": FakeResult(stdout="[Unit]^M$\nType=simple^M$\n"),
+        }
+    )
+    manager, _saved, _published, logs = _install_manager(device, connection)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        manager.install(device)
+
+    message = str(excinfo.value)
+    assert "systemd rejected the unit file" in message
+    # The file as systemd actually sees it, control characters made visible.
+    assert "^M" in message
+    assert any(e["code"] == "rp_telemetry_install_failed" for e in logs)
+    # A rejected unit must not be recorded as installed.
+    assert rpt.DEVICE_PARAM_KEY not in device.parameters
+
+
+def test_a_shell_hostile_unit_cannot_break_out_of_the_command():
+    quoted = rpt._shell_single_quote("Description=it's here\nExecStart=/bin/x\n")
+    # Embedded single quotes are neutralised, so the unit text can never
+    # terminate the quoting and run as a command of its own.
+    assert "'\"'\"'" in quoted
+
+
 def test_install_is_idempotent(bundled_binary, monkeypatch):
     device = make_device()
     connection = FakeConnection(
