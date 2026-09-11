@@ -86,6 +86,7 @@ REMOTE_STAGE_PATH = "/usr/local/bin/.rp-telemetry.new"
 REMOTE_UPLOAD_PATH = "/tmp/rp-telemetry.upload"
 SERVICE_NAME = "rp-telemetry.service"
 SERVICE_UNIT_PATH = f"/etc/systemd/system/{SERVICE_NAME}"
+SERVICE_UNIT_STAGE_PATH = f"{SERVICE_UNIT_PATH}.new"
 SSH_COMMAND_TIMEOUT_S = 20.0
 # `Type=simple` means systemd reports the unit active as soon as the process is
 # forked -- before it has bind()/listen()ed. The post-install protocol check is
@@ -359,12 +360,22 @@ def read_telemetry_sync(
 def _shell_single_quote(value: str) -> str:
     """Make `value` safe inside single quotes in a POSIX shell command.
 
-    The unit text is embedded in the command that crosses SSH, so anything the
-    remote shell would reinterpret has to be neutralised. Also strips CR: the
-    unit must reach the board with LF endings or every setting parses with a
-    trailing carriage return and systemd rejects the file.
+    The text is embedded in the command that crosses SSH, so anything the
+    remote shell would reinterpret has to be neutralised. Quoting only -- the
+    content is normalised separately (see `_normalize_unit`) so that what is
+    sent and what is verified afterwards are the same bytes.
     """
-    return value.replace("\r", "").replace("'", "'\"'\"'")
+    return value.replace("'", "'\"'\"'")
+
+
+def _normalize_unit(unit: str) -> str:
+    """LF-only unit text.
+
+    A carriage return makes every value invalid ("Type=simple\r"), which
+    systemd reports only as "bad unit file setting". Applied once, before both
+    the write and the read-back comparison.
+    """
+    return unit.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def render_service_unit(port: int = DEFAULT_TELEMETRY_PORT) -> str:
@@ -1164,7 +1175,7 @@ class RpTelemetryManager:
                 f"Could not read the bundled rp-telemetry binary at {binary}: {exc}"
             ) from exc
         digest = hashlib.sha256(payload).hexdigest()
-        unit = render_service_unit(self._port)
+        unit = _normalize_unit(render_service_unit(self._port))
 
         try:
             with self._open_ssh(device) as conn:
@@ -1195,6 +1206,10 @@ class RpTelemetryManager:
                     raise RuntimeError(
                         f"Could not install the binary: {self._detail(moved)}"
                     )
+                # Same reasoning as the unit file below: an unflushed executable
+                # that survives a power loss as NULs would fail to exec, and the
+                # checksum we verified was of the upload, before the rename.
+                self._ssh_run(conn, device, "sync")
                 self._ssh_run(conn, device, f"rm -f {REMOTE_UPLOAD_PATH}")
 
                 # Piped into `tee` rather than `cat > path`: a shell redirect
@@ -1207,7 +1222,7 @@ class RpTelemetryManager:
                 # that shell handles the embedded newlines. A CR reaching the
                 # file makes every value invalid ("Type=simple\r"), which
                 # systemd reports only as "bad unit file setting".
-                tee = self._privileged(device, f"tee {SERVICE_UNIT_PATH}")
+                tee = self._privileged(device, f"tee {SERVICE_UNIT_STAGE_PATH}")
                 written = self._ssh_run(
                     conn,
                     device,
@@ -1218,6 +1233,24 @@ class RpTelemetryManager:
                     raise RuntimeError(
                         f"Could not write the systemd unit: {self._detail(written)}"
                     )
+                # Flush before renaming, and again after. Without this the file
+                # can exist at the right size with its contents still in page
+                # cache; a board that loses power or resets before writeback
+                # comes back with a NUL-filled file, which systemd reports only
+                # as "bad unit file setting". Observed on real hardware.
+                self._ssh_run(conn, device, "sync")
+                moved_unit = self._ssh_run(
+                    conn, device, f"mv -f {SERVICE_UNIT_STAGE_PATH} {SERVICE_UNIT_PATH}"
+                )
+                if self._failed(moved_unit):
+                    raise RuntimeError(
+                        f"Could not install the systemd unit: {self._detail(moved_unit)}"
+                    )
+                self._ssh_run(conn, device, "sync")
+
+                mismatch = self._verify_remote_file(conn, device, SERVICE_UNIT_PATH, unit)
+                if mismatch is not None:
+                    raise RuntimeError(mismatch)
 
                 # systemd parses the unit at daemon-reload; ask it directly
                 # whether the file it now holds is usable. Without this the only
@@ -1363,6 +1396,43 @@ class RpTelemetryManager:
             "temperature_c": reading.temperature_c,
         }
 
+    def _verify_remote_file(
+        self, conn: Any, device: Any, path: str, expected: str
+    ) -> str | None:
+        """Read `path` back off the board and compare. None when it matches.
+
+        Catches anything that corrupts the file between writing and reading --
+        a short write, a NUL-filled page-cache casualty, a shell that mangled
+        the content -- at the point of install, rather than leaving systemd to
+        report it later as an unexplained "bad unit file setting".
+        """
+        digest = hashlib.sha256(expected.encode("utf-8")).hexdigest()
+        checked = self._ssh_run(conn, device, f"sha256sum {path}", privileged=False)
+        if not self._failed(checked):
+            remote = (getattr(checked, "stdout", "") or "").split()
+            if remote and remote[0] == digest:
+                return None
+            dumped = self._ssh_run(conn, device, f"cat -A {path}", privileged=False)
+            return (
+                f"{path} does not match what was written "
+                f"(contents as stored: {self._detail(dumped)[:300]})"
+            )
+        # Minimal images may lack sha256sum; fall back to a size check, which
+        # still catches truncation though not corruption.
+        sized = self._ssh_run(conn, device, f"wc -c < {path}", privileged=False)
+        if self._failed(sized):
+            return f"Could not read back {path} to verify it."
+        try:
+            remote_size = int((getattr(sized, "stdout", "") or "").strip())
+        except ValueError:
+            return f"Could not read back {path} to verify it."
+        expected_size = len(expected.encode("utf-8"))
+        if remote_size != expected_size:
+            return (
+                f"{path} is truncated ({remote_size} of {expected_size} bytes)."
+            )
+        return None
+
     def _service_journal(self, device: Any, conn: Any = None) -> str:
         """Last few journal lines for the unit. Never raises; "" when unknown.
 
@@ -1445,6 +1515,7 @@ class RpTelemetryManager:
                 self._ssh_run(conn, device, f"systemctl stop {SERVICE_NAME}")
                 self._ssh_run(conn, device, f"systemctl disable {SERVICE_NAME}")
                 self._ssh_run(conn, device, f"rm -f {SERVICE_UNIT_PATH}")
+                self._ssh_run(conn, device, f"rm -f {SERVICE_UNIT_STAGE_PATH}")
                 self._ssh_run(conn, device, "systemctl daemon-reload")
                 # Leftovers from an install that died between the staging
                 # copy and the atomic rename, or before its own cleanup: a

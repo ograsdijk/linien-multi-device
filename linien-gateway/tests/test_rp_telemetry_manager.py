@@ -741,6 +741,29 @@ def _sha_response(binary):
     return FakeResult(stdout=f"{digest}  /tmp/rp-telemetry.upload\n")
 
 
+def _unit_text(port=rpt.DEFAULT_TELEMETRY_PORT):
+    return rpt.render_service_unit(port)
+
+
+def _unit_sha_response(port=rpt.DEFAULT_TELEMETRY_PORT):
+    """Answer the unit file's read-back verification with a matching digest."""
+    import hashlib
+
+    digest = hashlib.sha256(_unit_text(port).encode("utf-8")).hexdigest()
+    return FakeResult(stdout=f"{digest}  {rpt.SERVICE_UNIT_PATH}\n")
+
+
+def _install_ok(binary, **extra):
+    """The responses a healthy board gives during a successful install."""
+    responses = {
+        f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(binary),
+        f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
+        "is-active": FakeResult(stdout="active\n"),
+    }
+    responses.update(extra)
+    return responses
+
+
 def test_install_requires_a_bundled_binary(monkeypatch, tmp_path):
     monkeypatch.setattr(rpt, "BUNDLED_BINARY_PATH", tmp_path / "missing")
     manager, *_ = make_manager([make_device()])
@@ -752,7 +775,8 @@ def test_install_runs_the_full_flow_and_verifies(bundled_binary, monkeypatch):
     device = make_device()
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="active\n"),
         }
     )
@@ -797,13 +821,26 @@ def test_the_unit_is_written_without_carriage_returns(bundled_binary, monkeypatc
     systemd reports that only as "bad unit file setting", naming neither the
     setting nor the reason, so it must be impossible to send one.
     """
+    import hashlib
+
     device = make_device()
+    crlf_unit = "[Unit]\r\nDescription=x\r\n\r\n[Service]\r\nType=simple\r\n"
+    normalized = rpt._normalize_unit(crlf_unit)
+    assert "\r" not in normalized
+    unit_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
     connection = FakeConnection(
-        {
-            "sha256sum": _sha_response(bundled_binary),
-            "is-active": FakeResult(stdout="active\n"),
-            "LoadState": FakeResult(stdout="loaded\n\n"),
-        }
+        _install_ok(
+            bundled_binary,
+            **{
+                # The board reports the digest of the NORMALISED text, which is
+                # what actually gets written -- so the read-back must compare
+                # against the same bytes, not the CRLF source.
+                f"sha256sum {rpt.SERVICE_UNIT_PATH}": FakeResult(
+                    stdout=f"{unit_digest}  {rpt.SERVICE_UNIT_PATH}\n"
+                ),
+            },
+        )
     )
     manager, *_ = _install_manager(device, connection)
     monkeypatch.setattr(
@@ -811,11 +848,7 @@ def test_the_unit_is_written_without_carriage_returns(bundled_binary, monkeypatc
         "read_telemetry_sync",
         lambda *a, **k: rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=48.0),
     )
-    monkeypatch.setattr(
-        rpt,
-        "render_service_unit",
-        lambda port=0: "[Unit]\r\nDescription=x\r\n\r\n[Service]\r\nType=simple\r\n",
-    )
+    monkeypatch.setattr(rpt, "render_service_unit", lambda port=0: crlf_unit)
 
     manager.install(device)
 
@@ -825,14 +858,21 @@ def test_the_unit_is_written_without_carriage_returns(bundled_binary, monkeypatc
 
 
 def test_install_reports_a_unit_systemd_refuses_to_load(bundled_binary):
-    """Turn "bad unit file setting" into something that names the problem."""
+    """Turn "bad unit file setting" into something that names the problem.
+
+    Here the file on disk matches what was written byte-for-byte, so this is
+    systemd refusing a directive rather than corruption -- the read-back check
+    cannot catch it, and the LoadState query is what surfaces it.
+    """
     device = make_device()
     connection = FakeConnection(
-        {
-            "sha256sum": _sha_response(bundled_binary),
-            "LoadState": FakeResult(stdout="bad-setting\nInvalid argument\n"),
-            "cat -A": FakeResult(stdout="[Unit]^M$\nType=simple^M$\n"),
-        }
+        _install_ok(
+            bundled_binary,
+            **{
+                "LoadState": FakeResult(stdout="bad-setting\nInvalid argument\n"),
+                "cat -A": FakeResult(stdout="[Unit]$\nType=simple$\n"),
+            },
+        )
     )
     manager, _saved, _published, logs = _install_manager(device, connection)
 
@@ -841,11 +881,74 @@ def test_install_reports_a_unit_systemd_refuses_to_load(bundled_binary):
 
     message = str(excinfo.value)
     assert "systemd rejected the unit file" in message
-    # The file as systemd actually sees it, control characters made visible.
-    assert "^M" in message
+    assert "bad-setting" in message
     assert any(e["code"] == "rp_telemetry_install_failed" for e in logs)
     # A rejected unit must not be recorded as installed.
     assert rpt.DEVICE_PARAM_KEY not in device.parameters
+
+
+def test_install_detects_a_unit_corrupted_after_writing(bundled_binary):
+    """A NUL-filled unit -- what a reboot mid-install actually leaves behind.
+
+    The board resets before writeback, so the file comes back at the right size
+    full of zero bytes, and systemd reports only "bad unit file setting".
+    """
+    device = make_device()
+    connection = FakeConnection(
+        _install_ok(
+            bundled_binary,
+            **{
+                f"sha256sum {rpt.SERVICE_UNIT_PATH}": FakeResult(
+                    stdout=f"{'0' * 64}  {rpt.SERVICE_UNIT_PATH}\n"
+                ),
+                "cat -A": FakeResult(stdout="^@^@^@^@^@^@"),
+            },
+        )
+    )
+    manager, saved, _published, _logs = _install_manager(device, connection)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        manager.install(device)
+
+    message = str(excinfo.value)
+    assert "does not match what was written" in message
+    # Contents as stored, so NULs are visible rather than invisible.
+    assert "^@" in message
+    assert saved == []
+
+
+def test_the_unit_is_flushed_before_it_is_renamed(bundled_binary, monkeypatch):
+    """Without sync, an unflushed unit becomes NULs if the board resets."""
+    device = make_device()
+    connection = FakeConnection(_install_ok(bundled_binary))
+    manager, *_ = _install_manager(device, connection)
+    monkeypatch.setattr(
+        rpt,
+        "read_telemetry_sync",
+        lambda *a, **k: rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=48.0),
+    )
+
+    manager.install(device)
+
+    commands = connection.commands
+    write_at = next(
+        i
+        for i, c in enumerate(commands)
+        if rpt.SERVICE_UNIT_STAGE_PATH in c and "tee" in c
+    )
+    rename_at = next(
+        i
+        for i, c in enumerate(commands)
+        if c.startswith(f"mv -f {rpt.SERVICE_UNIT_STAGE_PATH}")
+    )
+    sync_at = commands.index("sync", write_at)
+    # write -> sync -> rename, so the rename can never publish unflushed data.
+    assert write_at < sync_at < rename_at
+    # The binary is flushed after its own rename, too.
+    binary_rename_at = next(
+        i for i, c in enumerate(commands) if c.startswith(f"mv -f {rpt.REMOTE_STAGE_PATH}")
+    )
+    assert "sync" in commands[binary_rename_at:write_at]
 
 
 def test_a_shell_hostile_unit_cannot_break_out_of_the_command():
@@ -859,7 +962,8 @@ def test_install_is_idempotent(bundled_binary, monkeypatch):
     device = make_device()
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="active\n"),
         }
     )
@@ -882,7 +986,11 @@ def test_install_is_idempotent(bundled_binary, monkeypatch):
 def test_install_rejects_a_corrupted_upload(bundled_binary):
     device = make_device()
     connection = FakeConnection(
-        {"sha256sum": FakeResult(stdout="deadbeef  /tmp/rp-telemetry.upload\n")}
+        {
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": FakeResult(
+                stdout="deadbeef  /tmp/rp-telemetry.upload\n"
+            )
+        }
     )
     manager, saved, _published, logs = _install_manager(device, connection)
 
@@ -901,10 +1009,12 @@ def test_install_falls_back_to_a_size_check_without_sha256sum(
 ):
     device = make_device()
     size = len(bundled_binary.read_bytes())
+    unit_size = len(_unit_text().encode("utf-8"))
     connection = FakeConnection(
         {
             "sha256sum": FakeResult(exited=127, stderr="sha256sum: not found"),
-            "wc -c": FakeResult(stdout=f"{size}\n"),
+            f"wc -c < {rpt.REMOTE_UPLOAD_PATH}": FakeResult(stdout=f"{size}\n"),
+            f"wc -c < {rpt.SERVICE_UNIT_PATH}": FakeResult(stdout=f"{unit_size}\n"),
             "is-active": FakeResult(stdout="active\n"),
         }
     )
@@ -922,7 +1032,7 @@ def test_install_detects_a_truncated_upload(bundled_binary):
     connection = FakeConnection(
         {
             "sha256sum": FakeResult(exited=127),
-            "wc -c": FakeResult(stdout="3\n"),
+            f"wc -c < {rpt.REMOTE_UPLOAD_PATH}": FakeResult(stdout="3\n"),
         }
     )
     manager, *_ = _install_manager(device, connection)
@@ -934,7 +1044,8 @@ def test_install_fails_when_the_service_does_not_come_up(bundled_binary):
     device = make_device()
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="failed\n", exited=3),
         }
     )
@@ -962,7 +1073,8 @@ def test_a_wrong_architecture_binary_explains_itself(bundled_binary):
     device = make_device()
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="failed\n", exited=3),
             "journalctl": FakeResult(stdout=EXEC_FORMAT_JOURNAL),
         }
@@ -997,7 +1109,8 @@ def test_a_board_without_journalctl_still_reports_the_failure(bundled_binary):
     device = make_device()
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="failed\n", exited=3),
             "journalctl": FakeResult(exited=127, stderr="journalctl: not found"),
         }
@@ -1016,7 +1129,8 @@ def test_the_journal_is_bounded_in_the_error_message(bundled_binary):
     device = make_device()
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="failed\n", exited=3),
             "journalctl": FakeResult(stdout="x" * 10_000),
         }
@@ -1051,7 +1165,8 @@ def test_install_fails_when_the_daemon_does_not_answer(bundled_binary, monkeypat
     device = make_device()
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="active\n"),
         }
     )
@@ -1081,7 +1196,8 @@ def test_install_uses_sudo_for_a_non_root_user(bundled_binary, monkeypatch):
     device = make_device(username="pitaya")
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="active\n"),
         }
     )
@@ -1229,7 +1345,8 @@ def test_install_persists_onto_a_freshly_read_device(bundled_binary, monkeypatch
     device = make_device(parameters={"influx_logging_state": {"enabled": False}})
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="active\n"),
         }
     )
@@ -1364,7 +1481,8 @@ def test_install_retries_the_protocol_check_before_giving_up(
     device = make_device()
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="active\n"),
         }
     )
@@ -1390,7 +1508,8 @@ def test_install_still_fails_when_the_daemon_never_answers(
     device = make_device()
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="active\n"),
         }
     )
@@ -1467,7 +1586,8 @@ def test_an_in_flight_poll_cannot_undo_a_real_install(bundled_binary, monkeypatc
 
     connection = FakeConnection(
         {
-            "sha256sum": _sha_response(bundled_binary),
+            f"sha256sum {rpt.REMOTE_UPLOAD_PATH}": _sha_response(bundled_binary),
+            f"sha256sum {rpt.SERVICE_UNIT_PATH}": _unit_sha_response(),
             "is-active": FakeResult(stdout="active\n"),
         }
     )
