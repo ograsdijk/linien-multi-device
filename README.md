@@ -462,12 +462,10 @@ the Red Pitaya makes no extra HTTP/TLS request.
 
 - Field name: **`rp_temperature_c`**, written to the same measurement, bucket,
   org, and URL already configured for that device.
-- Tagged **`device=<device key>`**. Points for boards that share a destination
-  are batched into one request, and nothing else in the point identifies the
-  board — without the tag, two boards configured with the same
-  url/org/bucket/measurement would write into one indistinguishable series.
-  Note that this differs from the Linien parameter logging, which writes
-  untagged points.
+- Written **untagged**, exactly like the Linien parameter logging, so the
+  temperature lands in the same series as the rest of that device's data
+  instead of a neighbouring one. Each device is expected to have its own
+  destination — as it already must for the Linien parameters themselves.
 - Cadence matches the telemetry poll (30 s).
 - Only written for devices that have InfluxDB logging **enabled**.
 - Points for devices sharing a destination are batched into one request, and the

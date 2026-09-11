@@ -74,13 +74,6 @@ SUSTAINED_LOSS_POLLS = 3
 INFLUX_CREDENTIAL_RETRY_S = 300.0
 # Field name written to the device's existing InfluxDB measurement.
 INFLUX_TEMPERATURE_FIELD = "rp_temperature_c"
-# Tag identifying which board a temperature came from. Points for devices that
-# share a destination are batched into one request, and nothing else in the
-# point distinguishes them -- without this tag two boards configured with the
-# same url/org/bucket/measurement would write into one indistinguishable
-# series and same-timestamp points would overwrite each other.
-INFLUX_DEVICE_TAG = "device"
-
 # Reasons a sampled temperature is not written, surfaced to the operator.
 INFLUX_SKIP_DISABLED = "influx_logging_disabled"
 INFLUX_SKIP_NO_CREDENTIALS = "no_influx_credentials"
@@ -1080,11 +1073,16 @@ class RpTelemetryManager:
             # never the RPyC netref the session hands back.
             destination = InfluxDestination.from_credentials(credentials)
             measurement = credentials.measurement
+            # Untagged, exactly like linien-server's own parameter writes, so
+            # the temperature lands in the same series as the rest of that
+            # device's data rather than beside it. Two boards sharing one
+            # url/org/bucket/measurement would collide -- but they already do
+            # for every Linien parameter, so a device is expected to have its
+            # own destination.
             line = format_point(
                 measurement,
                 {INFLUX_TEMPERATURE_FIELD: temperature},
                 int(sampled_at * 1_000_000_000),
-                tags={INFLUX_DEVICE_TAG: str(getattr(device, "key", "") or "unknown")},
             )
             self._note_influx_skip(device, None)
             batch_key = (destination, measurement)

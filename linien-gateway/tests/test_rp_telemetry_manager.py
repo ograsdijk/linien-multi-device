@@ -571,9 +571,9 @@ def test_temperature_is_written_to_the_configured_measurement():
     destination, lines = writer.calls[0]
     assert destination.bucket == "linien"
     assert len(lines) == 1
-    # Tagged with the device key: points for devices sharing a destination are
-    # batched into one request, and nothing else in the point tells them apart.
-    assert lines[0].startswith("linien,device=dev-1 rp_temperature_c=57.25 ")
+    # Untagged, like linien-server's own writes, so the temperature lands in
+    # the same series as the rest of that device's data.
+    assert lines[0].startswith("linien rp_temperature_c=57.25 ")
 
 
 def test_no_influx_write_without_credentials():
@@ -1927,8 +1927,14 @@ def test_rejected_credentials_still_honour_the_retry_window():
     assert fetches == []
 
 
-def test_devices_sharing_a_destination_stay_distinguishable():
-    """Batched points share a request; only the tag tells the boards apart."""
+def test_points_carry_no_tags():
+    """The temperature must sit in the same series as the device's parameters.
+
+    linien-server writes its parameters untagged; a tag here would put the
+    temperature in a neighbouring series that does not line up with them in a
+    query or dashboard. Devices are expected to have their own destination --
+    as they already must for the Linien parameters themselves.
+    """
     devices = [_influx_device("laser-a", "10.0.0.1"), _influx_device("laser-b", "10.0.0.2")]
     writer = RecordingWriter()
     manager, *_ = make_manager(
@@ -1944,8 +1950,9 @@ def test_devices_sharing_a_destination_stay_distinguishable():
 
     lines = writer.calls[0][1]
     assert len(lines) == 2
-    assert any("device=laser-a" in line for line in lines)
-    assert any("device=laser-b" in line for line in lines)
+    for line in lines:
+        # measurement, then a space, then the field set -- no ",tag=" between.
+        assert line.startswith("linien rp_temperature_c=")
 
 
 def test_publishing_after_stop_does_not_leak_a_thread():
