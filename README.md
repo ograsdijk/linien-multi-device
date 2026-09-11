@@ -38,6 +38,9 @@ Linien laser-lock devices from one interface.
   and auto-relock actions.
 - Optional InfluxDB logging control from the UI (credentials, interval, loggable
   parameter multiselect), resumed on reconnect.
+- Red Pitaya die-temperature telemetry: a near-zero-CPU C helper on the board,
+  polled over a tiny TCP protocol, shown per device and logged to InfluxDB by the
+  gateway.
 - In-app logs: tail, clear, and a live structured log-event stream surfaced as toasts.
 
 ## Repo structure
@@ -45,6 +48,8 @@ Linien laser-lock devices from one interface.
 - `linien-gateway`: FastAPI backend (Python).
 - `linien-web`: React UI (Vite + TypeScript).
 - `linien-sim`: virtual Linien-compatible simulator for local testing.
+- `rp-telemetry`: tiny C daemon deployed to each Red Pitaya to report its Zynq die
+  temperature (see [Red Pitaya telemetry](#red-pitaya-telemetry-zynq-die-temperature)).
 - `docker/`: optional Docker stacks (gateway + UI; Postgres + pgAdmin).
 
 ## Architecture overview
@@ -273,6 +278,202 @@ The shipped init SQL is `docker/postgres/postgres-init/01-init.sql`.
 - Use the `InfluxDB` chip in the top header.
 - Select a device, configure credentials, interval, and logged parameters.
 - Start/stop logging from the same popover.
+
+## Red Pitaya telemetry (Zynq die temperature)
+
+Each Red Pitaya can run **`rp-telemetry`**, a tiny C daemon that reports the
+board's **Zynq die (junction) temperature** — the temperature of the SoC itself,
+*not* ambient/room temperature and *not* a laser temperature. The gateway polls
+it, shows it on each device card, and (optionally) logs it to InfluxDB.
+
+The daemon is written in C and does almost nothing on purpose: CPU time on a Gen
+1 STEMlab 125-14 is needed by `linien-server`. It spends its whole life blocked
+in `accept()` — no polling loop, no timer, no thread, no HTTP, no JSON, no
+Python, and no InfluxDB client on the board. Source and build instructions:
+[`rp-telemetry/`](rp-telemetry/README.md).
+
+### Protocol and port
+
+Line-based TCP on port **18864**, one request per (short-lived) connection:
+
+```text
+->  STATUS\n      <-  RPT1 57.34\n          temperature in °C
+                  <-  RPT1 ERR XADC\n       sysfs read failed
+->  VERSION\n     <-  RPT1 VERSION 1.0.0\n
+->  anything else <-  RPT1 ERR COMMAND\n
+```
+
+`RPT1` is the protocol/version identifier. Requests are capped at 64 bytes and
+accepted sockets have a 2 s receive timeout.
+
+Manual test:
+
+```bash
+printf 'STATUS\n' | nc <red-pitaya-host> 18864
+```
+
+```text
+RPT1 57.34
+```
+
+The temperature comes from the Zynq XADC through Linux IIO. The daemon
+discovers the IIO device exposing `in_temp0_raw` at startup (the device index is
+not hard-coded), reads the constant `in_temp0_offset` / `in_temp0_scale` once,
+and per request re-reads only `in_temp0_raw`:
+
+```text
+temperature_c = (raw + offset) * scale / 1000.0
+```
+
+### Deployment
+
+Installation is always an **explicit operator action** — the gateway never
+installs the daemon just because a device exists or connects.
+
+Build the ARM binary once (Docker, no local toolchain needed):
+
+```bash
+cd rp-telemetry
+./build-arm.sh
+```
+
+That drops a statically linked armv7 binary at
+`linien-gateway/app/assets/rp-telemetry-armv7`, which is what the gateway
+deploys. Until it exists, the install action fails with a message saying so
+rather than deploying anything.
+
+Then, per device: open the thermometer menu on the device card and choose
+**Install**. Or use **Telemetry: install all** in the devices panel header to do
+every board at once (each board is handled independently; one unreachable board
+does not fail the batch).
+
+Install is idempotent and does the whole job over SSH:
+
+1. upload the binary to `/tmp/rp-telemetry.upload`,
+2. verify it (sha256, falling back to a byte-size check on images without
+   `sha256sum`),
+3. stage it at `/usr/local/bin/.rp-telemetry.new` with mode `0755` and **rename
+   it atomically** onto `/usr/local/bin/rp-telemetry`, so a failed upload can
+   never leave a truncated executable,
+4. write `/etc/systemd/system/rp-telemetry.service`,
+5. `systemctl daemon-reload`, `enable` (so it comes back after a reboot),
+   `restart`,
+6. confirm `systemctl is-active`,
+7. confirm the TCP protocol returns a plausible temperature.
+
+The unit is:
+
+```ini
+[Unit]
+Description=Red Pitaya telemetry (Zynq die temperature)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rp-telemetry --port 18864
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Uninstall / reinstall** — the same menu offers `Start`, `Stop`, `Restart`, and
+`Uninstall`. Uninstall stops and disables the service, removes the unit and the
+binary, and clears the gateway's install record. Reinstalling is just
+**Install** again; it replaces the binary and restarts the service. When the
+board runs an older build than the one bundled with the gateway, the card shows
+an **Update** action.
+
+### Polling, caching, and staleness
+
+- The gateway polls every device every **30 s**, all devices concurrently, over
+  TCP only. Connect and read timeouts are 1 s each, so one unreachable board
+  never delays the others.
+- **SSH is never used for monitoring** — only for the explicit management
+  actions above. Installation state is remembered in the device record so the
+  gateway can tell "installed but stopped" from "never installed" without an SSH
+  round trip.
+- Readings are cached. `GET /api/devices/statuses`, `GET /api/devices/{key}/status`
+  and `DeviceSession.status()` read that cache and make no remote calls, so
+  telemetry cannot slow the status endpoints, the RPyC poll loop, plot
+  processing, WebSocket streaming, auto-relock, or connection diagnosis.
+- A changed reading is pushed over the existing per-device WebSocket `status`
+  message, so the UI updates without waiting for the REST backstop poll.
+  Temperature is compared at 0.1 °C resolution, so a settled board does not
+  generate a message every cycle.
+- **Staleness**: a successful reading older than **90 s** (three missed polls) is
+  reported as `stale` and the UI stops presenting it as current. The last value
+  is kept internally for context but is never shown as a live number.
+
+Per-device telemetry state is one of `unknown` (not polled yet),
+`not_installed`, `running`, `stopped`, `offline`, `stale`, `error`, or
+`version_mismatch` (the endpoint answered something that is not this protocol).
+
+### UI
+
+Each device card shows, under the host/IP:
+
+```text
+Laser A
+192.168.1.42:18862
+RP temperature: 57.3 °C
+```
+
+and when it is unavailable, the reason plus a one-click remedy:
+
+```text
+RP temperature: unavailable
+Telemetry not installed   [Install]
+```
+
+The multi-device overview cards show the same compact reading. Temperatures are
+shown neutrally up to 75 °C, amber to 85 °C, and red above that — see
+`linien-web/src/features/devices/telemetryDisplay.ts` for the thresholds and the
+rationale (the XC7Z010 is rated to a maximum junction temperature of 85 °C).
+Nothing is ever shut down automatically.
+
+### InfluxDB logging
+
+The **gateway** writes the temperature — the daemon never talks to InfluxDB, and
+the Red Pitaya makes no extra HTTP/TLS request.
+
+- Field name: **`rp_temperature_c`**, written to the same measurement, bucket,
+  org, and URL already configured for that device.
+- Tagged **`device=<device key>`**. Points for boards that share a destination
+  are batched into one request, and nothing else in the point identifies the
+  board — without the tag, two boards configured with the same
+  url/org/bucket/measurement would write into one indistinguishable series.
+  Note that this differs from the Linien parameter logging, which writes
+  untagged points.
+- Cadence matches the telemetry poll (30 s).
+- Only written for devices that have InfluxDB logging **enabled**.
+- Points for devices sharing a destination are batched into one request, and the
+  HTTP connection is kept alive between cycles.
+- Best effort: a failed write never affects telemetry polling, the Linien
+  connection, locking, plotting, or auto-relock, and a sustained outage is logged
+  once (with one recovery message) rather than every 30 s.
+
+The existing Linien parameter logging is unchanged: it still runs on the Red
+Pitaya, driven by `linien-server`, and remains authoritative for those
+parameters.
+
+### Testing without hardware
+
+`linien-sim` ships a host-side stand-in that speaks the same protocol:
+
+```bash
+linien-rp-telemetry-sim --port 18864 --base 57
+linien-rp-telemetry-sim --port 18864 --fail          # exercise the error state
+linien-rp-telemetry-sim --port 18864 --version 0.9.0 # exercise "update available"
+```
+
+### Security note
+
+`rp-telemetry` answers only the fixed protocol above — there is no path to
+arbitrary command execution — but it is unauthenticated and binds all interfaces
+so the gateway can reach it over the LAN. Like the rest of this deployment it
+assumes a trusted, isolated lab network. See [Security model](#security-model).
 
 ## Logs and observability
 

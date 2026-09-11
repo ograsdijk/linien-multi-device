@@ -50,6 +50,30 @@ export type DeviceRecovery = {
   error?: string | null;
 };
 
+// Red Pitaya (Zynq die) telemetry, served from the gateway's cache.
+// 'unknown' means the gateway has not completed a poll yet; 'stale' means the
+// last good sample is older than the staleness window and must not be shown
+// as a live reading. See linien-gateway/app/rp_telemetry.py.
+export type RpTelemetryState =
+  | 'unknown'
+  | 'not_installed'
+  | 'running'
+  | 'stopped'
+  | 'offline'
+  | 'stale'
+  | 'error'
+  | 'version_mismatch';
+
+export type RpTelemetry = {
+  state: RpTelemetryState;
+  version?: string | null;
+  bundled_version?: string | null;
+  update_available?: boolean;
+  installed?: boolean;
+  port?: number | null;
+  error?: string | null;
+};
+
 export type DeviceStatus = {
   connected: boolean;
   connecting: boolean;
@@ -65,6 +89,12 @@ export type DeviceStatus = {
   stalled?: boolean;
   diagnosis?: DeviceDiagnosis | null;
   recovery?: DeviceRecovery | null;
+  // Red Pitaya die temperature in degrees Celsius and the epoch seconds it was
+  // sampled at. Only present as a live value while rp_telemetry.state is
+  // 'running' -- other states keep the last reading for context.
+  rp_temperature_c?: number | null;
+  rp_temperature_sampled_at?: number | null;
+  rp_telemetry?: RpTelemetry | null;
 };
 
 export type LockIndicatorConfig = {

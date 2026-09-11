@@ -347,4 +347,3 @@ class LogEntry(BaseModel):
 class LogTailResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     entries: list[LogEntry]
-

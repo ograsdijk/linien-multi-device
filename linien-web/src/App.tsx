@@ -58,6 +58,7 @@ import {
   toGroupTabDragId,
 } from './features/devices/dragIds';
 import { useDeviceStatusPolling } from './features/devices/useDeviceStatusPolling';
+import { useTelemetryActions } from './features/devices/useTelemetryActions';
 import { useDeviceStateUpdater } from './features/devices/useDeviceStateUpdater';
 
 const DEVICE_BAR_COLLAPSED_KEY = 'linien.deviceBarCollapsed';
@@ -256,6 +257,8 @@ export function App() {
     logScrollRef,
     appendUiErrorLog,
   } = useLogsController(devices);
+  const { telemetryBusyKeys, runTelemetryCommand, installTelemetryAll } =
+    useTelemetryActions({ appendUiErrorLog, pushToast });
   const {
     lockBusyKeys,
     autoLockBusyKeys,
@@ -703,6 +706,9 @@ export function App() {
             onRebootDevice={async (key) => {
               await api.rebootDevice(key);
             }}
+            onTelemetryCommand={runTelemetryCommand}
+            onInstallTelemetryAll={installTelemetryAll}
+            telemetryBusyKeys={telemetryBusyKeys}
           />
         </AppShell.Navbar>
       ) : null}

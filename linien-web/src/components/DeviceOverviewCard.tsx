@@ -5,6 +5,7 @@ import type {
   DeviceDiagnosis,
   LockIndicatorSnapshot,
   PlotFrame,
+  RpTelemetryState,
   StreamMessage,
 } from '../types';
 import { api } from '../api';
@@ -15,6 +16,7 @@ import { ThrottledStatusRow } from './ThrottledStatusRow';
 import { resolveConnectionDisplay } from '../features/connection/connectionState';
 import { markStreamFrame } from '../features/devices/streamFreshness';
 import { resolveLockDisplay } from '../features/locks/lockState';
+import { RpTemperatureLine } from './RpTemperatureLine';
 import { type DeviceStateEntry, useDeviceStateSlice } from '../state/deviceStatesStore';
 
 // Narrow slice this card actually consumes: the lock primitive and a
@@ -29,6 +31,10 @@ type CardSlice = {
   connecting: boolean;
   lockFromStatus: boolean | undefined;
   diagnosis: DeviceDiagnosis | null;
+  // Only the two fields the temperature line reads, so the card still ignores
+  // param traffic and only re-renders when the reading actually moves.
+  temperatureC: number | null;
+  telemetryState: RpTelemetryState | null;
 };
 
 const selectCardSlice = (entry: DeviceStateEntry): CardSlice => {
@@ -41,6 +47,8 @@ const selectCardSlice = (entry: DeviceStateEntry): CardSlice => {
     connecting: Boolean(s?.connecting),
     lockFromStatus: typeof s?.lock === 'boolean' ? s.lock : undefined,
     diagnosis: s?.diagnosis ?? null,
+    temperatureC: typeof s?.rp_temperature_c === 'number' ? s.rp_temperature_c : null,
+    telemetryState: s?.rp_telemetry?.state ?? null,
   };
 };
 
@@ -52,7 +60,9 @@ const cardSliceEqual = (a: CardSlice, b: CardSlice): boolean => {
     a.lockFromStatus === b.lockFromStatus &&
     a.diagnosis?.category === b.diagnosis?.category &&
     a.diagnosis?.lock_state === b.diagnosis?.lock_state &&
-    a.diagnosis?.probed_at === b.diagnosis?.probed_at
+    a.diagnosis?.probed_at === b.diagnosis?.probed_at &&
+    a.temperatureC === b.temperatureC &&
+    a.telemetryState === b.telemetryState
   );
 };
 
@@ -190,6 +200,14 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
           <Text size="xs" c="dimmed">
             {device.host}:{device.port}
           </Text>
+          <RpTemperatureLine
+            status={{
+              connected: slice.connected,
+              connecting: slice.connecting,
+              rp_temperature_c: slice.temperatureC,
+              rp_telemetry: slice.telemetryState ? { state: slice.telemetryState } : null,
+            }}
+          />
         </div>
         <Group gap="xs" align="center">
           <Text size="xs" c="dimmed">

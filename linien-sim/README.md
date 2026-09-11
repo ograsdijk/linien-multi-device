@@ -97,3 +97,26 @@ At runtime, use commands:
 - `L` starts lock mode.
 - `S` starts sweep mode.
 - `Q` quits the simulator UI.
+
+## Red Pitaya telemetry simulator
+
+`linien-rp-telemetry-sim` stands in for the `rp-telemetry` daemon that normally
+runs on a Red Pitaya, so the gateway's die-temperature polling, caching,
+staleness handling, and UI can be developed without hardware. It speaks the same
+line protocol (see [`rp-telemetry/`](../rp-telemetry/README.md)).
+
+```powershell
+linien-rp-telemetry-sim --port 18864
+linien-rp-telemetry-sim --port 18864 --base 62 --swing 3 --period 120
+linien-rp-telemetry-sim --port 18864 --fail            # always answer ERR XADC
+linien-rp-telemetry-sim --port 18864 --version 0.9.0   # look like an old build
+```
+
+Point a device's host at the machine running this and the gateway polls it like
+any other board. Note that the gateway reports `not_installed` until an install
+record exists for that device — over TCP alone it cannot distinguish a stopped
+daemon from an absent one — which is expected in simulation.
+
+This is a development tool only: it is deliberately *not* what gets deployed,
+since the whole point of the C daemon is that no Python process has to run on
+the Red Pitaya.

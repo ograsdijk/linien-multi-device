@@ -17,7 +17,23 @@ import type {
   PostgresManualLockState,
   PostgresManualLockTestResult,
   PsdTailResponse,
+  RpTelemetry,
 } from './types';
+
+export type TelemetryServiceStatus = {
+  installed: boolean;
+  active: boolean;
+  active_state: string;
+  enabled_state: string;
+  version: string | null;
+  bundled_version: string;
+};
+
+export type TelemetryStatus = {
+  rp_temperature_c: number | null;
+  rp_temperature_sampled_at: number | null;
+  rp_telemetry: RpTelemetry;
+};
 
 export type PsdStartOptions = {
   algorithm?: number;
@@ -195,6 +211,41 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(payload),
     }),
+  // --- Red Pitaya telemetry (Zynq die temperature) ---
+  // Management actions are SSH-backed and can take a few seconds; the read
+  // paths are served from the gateway's cache.
+  getTelemetry: (key: string) => request<TelemetryStatus>(`/devices/${key}/telemetry`),
+  installTelemetry: (key: string) =>
+    request<{ ok: boolean; version: string; temperature_c: number | null }>(
+      `/devices/${key}/telemetry/install`,
+      { method: 'POST' }
+    ),
+  uninstallTelemetry: (key: string) =>
+    request<{ ok: boolean }>(`/devices/${key}/telemetry/uninstall`, { method: 'POST' }),
+  startTelemetry: (key: string) =>
+    request<{ ok: boolean; active: boolean; state: string }>(
+      `/devices/${key}/telemetry/start`,
+      { method: 'POST' }
+    ),
+  stopTelemetry: (key: string) =>
+    request<{ ok: boolean; active: boolean; state: string }>(
+      `/devices/${key}/telemetry/stop`,
+      { method: 'POST' }
+    ),
+  restartTelemetry: (key: string) =>
+    request<{ ok: boolean; active: boolean; state: string }>(
+      `/devices/${key}/telemetry/restart`,
+      { method: 'POST' }
+    ),
+  getTelemetryServiceStatus: (key: string) =>
+    request<TelemetryServiceStatus>(`/devices/${key}/telemetry/service`),
+  readTelemetryNow: (key: string) =>
+    request<TelemetryStatus>(`/devices/${key}/telemetry/read`, { method: 'POST' }),
+  installTelemetryMany: (deviceKeys: string[]) =>
+    request<{ installed: string[]; failed: Record<string, string> }>(
+      '/telemetry/install',
+      { method: 'POST', body: JSON.stringify({ device_keys: deviceKeys }) }
+    ),
   postgresManualLockState: () =>
     request<PostgresManualLockState>('/postgres/manual-lock'),
   updatePostgresManualLockState: (payload: PostgresManualLockConfig) =>
