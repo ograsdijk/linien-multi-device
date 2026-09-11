@@ -81,6 +81,23 @@ INFLUX_TEMPERATURE_FIELD = "rp_temperature_c"
 # series and same-timestamp points would overwrite each other.
 INFLUX_DEVICE_TAG = "device"
 
+# Reasons a sampled temperature is not written, surfaced to the operator.
+INFLUX_SKIP_DISABLED = "influx_logging_disabled"
+INFLUX_SKIP_NO_CREDENTIALS = "no_influx_credentials"
+INFLUX_SKIP_REASON_TEXT = {
+    INFLUX_SKIP_DISABLED: (
+        "Red Pitaya temperature is not being written to InfluxDB: InfluxDB "
+        "logging is not enabled for this device. Start it from the InfluxDB "
+        "panel and the temperature follows the same destination."
+    ),
+    INFLUX_SKIP_NO_CREDENTIALS: (
+        "Red Pitaya temperature is not being written to InfluxDB: no usable "
+        "credentials for this device yet. Open the InfluxDB panel for it once "
+        "(the gateway caches them from there), or connect the device so they "
+        "can be read from the board."
+    ),
+}
+
 REMOTE_BINARY_PATH = "/usr/local/bin/rp-telemetry"
 REMOTE_STAGE_PATH = "/usr/local/bin/.rp-telemetry.new"
 REMOTE_UPLOAD_PATH = "/tmp/rp-telemetry.upload"
@@ -434,6 +451,9 @@ class TelemetryEntry:
     influx_credentials: InfluxCredentialSnapshot | None = None
     influx_credentials_checked_at: float | None = None
     influx_error_reported: bool = False
+    # Why this device's temperature is not reaching InfluxDB, or None while it
+    # is. Reported once per change rather than once per cycle.
+    influx_skip_reason: str | None = None
 
 
 def _material_signature(entry: TelemetryEntry, state: str) -> tuple:
@@ -572,6 +592,7 @@ class RpTelemetryManager:
             temperature = entry.temperature_c
             sampled_at = entry.sampled_at
             installed = entry.installed
+            influx_skip_reason = entry.influx_skip_reason
         return {
             "rp_temperature_c": temperature,
             "rp_temperature_sampled_at": sampled_at,
@@ -585,6 +606,9 @@ class RpTelemetryManager:
                 "installed": installed,
                 "port": self._port,
                 "error": error,
+                # None while the temperature is reaching InfluxDB; otherwise
+                # why it is not (see INFLUX_SKIP_* above).
+                "influx_skip_reason": influx_skip_reason,
             },
         }
 
@@ -1043,12 +1067,14 @@ class RpTelemetryManager:
         keys_by_batch: dict[tuple[InfluxDestination, str], list[str]] = {}
         for device, temperature, sampled_at in samples:
             if not self._influx_logging_enabled(device):
+                self._note_influx_skip(device, INFLUX_SKIP_DISABLED)
                 continue
             # Off-loop: _resolve_credentials can fall back to a blocking RPyC
             # call, and a wedged device would otherwise freeze every websocket
             # and HTTP handler for the duration of the poll cycle.
             credentials = await asyncio.to_thread(self._resolve_credentials, device)
             if credentials is None or not credentials.is_usable():
+                self._note_influx_skip(device, INFLUX_SKIP_NO_CREDENTIALS)
                 continue
             # Plain local reads: `credentials` is an InfluxCredentialSnapshot,
             # never the RPyC netref the session hands back.
@@ -1060,6 +1086,7 @@ class RpTelemetryManager:
                 int(sampled_at * 1_000_000_000),
                 tags={INFLUX_DEVICE_TAG: str(getattr(device, "key", "") or "unknown")},
             )
+            self._note_influx_skip(device, None)
             batch_key = (destination, measurement)
             batches.setdefault(batch_key, []).append(line)
             keys_by_batch.setdefault(batch_key, []).append(getattr(device, "key", ""))
@@ -1075,6 +1102,46 @@ class RpTelemetryManager:
                 self._report_influx_failure(device_keys, str(exc))
             else:
                 self._report_influx_success(device_keys)
+
+    def _note_influx_skip(self, device: Any, reason: str | None) -> None:
+        """Record (and report once) why a temperature is not being written.
+
+        Both skips are silent `continue`s on the hot path, which left an
+        operator watching a working temperature reading and an empty InfluxDB
+        with nothing to go on. Emitted on change only -- never once per cycle.
+        """
+        key = getattr(device, "key", "")
+        with self._lock:
+            entry = self._entry(key)
+            if entry.influx_skip_reason == reason:
+                return
+            previous = entry.influx_skip_reason
+            entry.influx_skip_reason = reason
+        if reason is None:
+            if previous is not None:
+                self._emit_log(
+                    logging.INFO,
+                    "rp_telemetry_influx_writing",
+                    "Red Pitaya temperature is now being written to InfluxDB.",
+                    key,
+                    {"previous_reason": previous},
+                )
+            return
+        self._emit_log(
+            logging.WARNING,
+            "rp_telemetry_influx_skipped",
+            INFLUX_SKIP_REASON_TEXT.get(
+                reason, "Red Pitaya temperature is not being written to InfluxDB."
+            ),
+            key,
+            {"reason": reason},
+        )
+
+    def influx_skip_reason(self, key: str) -> str | None:
+        """Why this device's temperature is not reaching InfluxDB, if it isn't."""
+        with self._lock:
+            entry = self._entries.get(key)
+            return entry.influx_skip_reason if entry is not None else None
 
     def _report_influx_failure(self, device_keys: Sequence[str], error: str) -> None:
         # An auth rejection means the cached token/org is stale (rotated on the
@@ -1179,38 +1246,53 @@ class RpTelemetryManager:
 
         try:
             with self._open_ssh(device) as conn:
-                conn.put(str(binary), remote=REMOTE_UPLOAD_PATH)
-
-                verified = self._verify_upload(conn, device, digest, len(payload))
-                if verified is not None:
-                    raise RuntimeError(verified)
-
-                # Each privileged step is its own command: `sudo -n a && b`
-                # would only elevate `a`, leaving `b` to run unprivileged.
-                self._ssh_run(conn, device, "mkdir -p /usr/local/bin")
-                staged = self._ssh_run(
-                    conn,
-                    device,
-                    f"install -m 0755 {REMOTE_UPLOAD_PATH} {REMOTE_STAGE_PATH}",
-                )
-                if self._failed(staged):
-                    raise RuntimeError(
-                        f"Could not stage the binary: {self._detail(staged)}"
+                # Skip the transfer when the board already has this exact
+                # binary. An update on an up-to-date board is then a few
+                # systemctl calls instead of a 400 KB SFTP transfer followed by
+                # a copy and an fsync -- by far the heaviest I/O the gateway
+                # ever asks of a Red Pitaya, and worth not repeating for
+                # nothing.
+                if self._remote_binary_matches(conn, device, digest):
+                    logger.info(
+                        "rp-telemetry binary already current on device=%s; "
+                        "skipping upload",
+                        key,
                     )
-                # Rename within the same filesystem: atomic, and safe while the
-                # old binary is executing (the running process keeps its inode).
-                moved = self._ssh_run(
-                    conn, device, f"mv -f {REMOTE_STAGE_PATH} {REMOTE_BINARY_PATH}"
-                )
-                if self._failed(moved):
-                    raise RuntimeError(
-                        f"Could not install the binary: {self._detail(moved)}"
+                else:
+                    conn.put(str(binary), remote=REMOTE_UPLOAD_PATH)
+
+                    verified = self._verify_upload(conn, device, digest, len(payload))
+                    if verified is not None:
+                        raise RuntimeError(verified)
+
+                    # Each privileged step is its own command: `sudo -n a && b`
+                    # would only elevate `a`, leaving `b` unprivileged.
+                    self._ssh_run(conn, device, "mkdir -p /usr/local/bin")
+                    staged = self._ssh_run(
+                        conn,
+                        device,
+                        f"install -m 0755 {REMOTE_UPLOAD_PATH} {REMOTE_STAGE_PATH}",
                     )
-                # Same reasoning as the unit file below: an unflushed executable
-                # that survives a power loss as NULs would fail to exec, and the
-                # checksum we verified was of the upload, before the rename.
-                self._ssh_run(conn, device, "sync")
-                self._ssh_run(conn, device, f"rm -f {REMOTE_UPLOAD_PATH}")
+                    if self._failed(staged):
+                        raise RuntimeError(
+                            f"Could not stage the binary: {self._detail(staged)}"
+                        )
+                    # Rename within the same filesystem: atomic, and safe while
+                    # the old binary is executing (the running process keeps its
+                    # inode).
+                    moved = self._ssh_run(
+                        conn, device, f"mv -f {REMOTE_STAGE_PATH} {REMOTE_BINARY_PATH}"
+                    )
+                    if self._failed(moved):
+                        raise RuntimeError(
+                            f"Could not install the binary: {self._detail(moved)}"
+                        )
+                    # Same reasoning as the unit file: an unflushed executable
+                    # that survives a reset as NULs would fail to exec, and the
+                    # checksum verified above was of the upload, before the
+                    # rename.
+                    self._ssh_run(conn, device, "sync")
+                    self._ssh_run(conn, device, f"rm -f {REMOTE_UPLOAD_PATH}")
 
                 # Piped into `tee` rather than `cat > path`: a shell redirect
                 # is performed by the *calling* shell, so `sudo -n cat > path`
@@ -1395,6 +1477,21 @@ class RpTelemetryManager:
             "version": BUNDLED_VERSION,
             "temperature_c": reading.temperature_c,
         }
+
+    def _remote_binary_matches(self, conn: Any, device: Any, digest: str) -> bool:
+        """True when the board already carries exactly this binary.
+
+        Cheap (one sha256sum) compared with what it saves (an SFTP transfer, a
+        copy, and an fsync). Returns False whenever it cannot tell, so an
+        unverifiable board still gets a full install.
+        """
+        checked = self._ssh_run(
+            conn, device, f"sha256sum {REMOTE_BINARY_PATH}", privileged=False
+        )
+        if self._failed(checked):
+            return False
+        remote = (getattr(checked, "stdout", "") or "").split()
+        return bool(remote) and remote[0] == digest
 
     def _verify_remote_file(
         self, conn: Any, device: Any, path: str, expected: str

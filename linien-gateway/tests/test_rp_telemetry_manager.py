@@ -958,6 +958,98 @@ def test_a_shell_hostile_unit_cannot_break_out_of_the_command():
     assert "'\"'\"'" in quoted
 
 
+def test_an_up_to_date_board_is_not_re_uploaded(bundled_binary, monkeypatch):
+    """Update on a current board should not repeat the heaviest I/O it does.
+
+    An SFTP transfer plus a copy and an fsync is by far the largest demand the
+    gateway makes of a Red Pitaya; repeating it to write bytes that are already
+    there is pure risk for no gain.
+    """
+    import hashlib
+
+    device = make_device()
+    digest = hashlib.sha256(bundled_binary.read_bytes()).hexdigest()
+    connection = FakeConnection(
+        _install_ok(
+            bundled_binary,
+            **{
+                f"sha256sum {rpt.REMOTE_BINARY_PATH}": FakeResult(
+                    stdout=f"{digest}  {rpt.REMOTE_BINARY_PATH}\n"
+                ),
+            },
+        )
+    )
+    manager, *_ = _install_manager(device, connection)
+    monkeypatch.setattr(
+        rpt,
+        "read_telemetry_sync",
+        lambda *a, **k: rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=48.0),
+    )
+
+    assert manager.install(device)["ok"] is True
+
+    # Nothing was transferred or copied...
+    assert connection.puts == []
+    joined = "\n".join(connection.commands)
+    assert f"install -m 0755 {rpt.REMOTE_UPLOAD_PATH}" not in joined
+    assert f"mv -f {rpt.REMOTE_STAGE_PATH}" not in joined
+    # ...but the unit and the service are still brought up to date.
+    assert rpt.SERVICE_UNIT_PATH in joined
+    assert f"systemctl restart {rpt.SERVICE_NAME}" in joined
+    assert device.parameters[rpt.DEVICE_PARAM_KEY]["installed"] is True
+
+
+def test_a_board_with_a_different_binary_is_re_uploaded(bundled_binary, monkeypatch):
+    device = make_device()
+    connection = FakeConnection(
+        _install_ok(
+            bundled_binary,
+            **{
+                f"sha256sum {rpt.REMOTE_BINARY_PATH}": FakeResult(
+                    stdout=f"{'a' * 64}  {rpt.REMOTE_BINARY_PATH}\n"
+                ),
+            },
+        )
+    )
+    manager, *_ = _install_manager(device, connection)
+    monkeypatch.setattr(
+        rpt,
+        "read_telemetry_sync",
+        lambda *a, **k: rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=48.0),
+    )
+
+    manager.install(device)
+
+    assert connection.puts == [(str(bundled_binary), rpt.REMOTE_UPLOAD_PATH)]
+
+
+def test_a_board_that_cannot_be_checked_still_gets_a_full_install(
+    bundled_binary, monkeypatch
+):
+    """No binary yet, or no sha256sum: fall back to installing it."""
+    device = make_device()
+    connection = FakeConnection(
+        _install_ok(
+            bundled_binary,
+            **{
+                f"sha256sum {rpt.REMOTE_BINARY_PATH}": FakeResult(
+                    exited=1, stderr="No such file or directory"
+                ),
+            },
+        )
+    )
+    manager, *_ = _install_manager(device, connection)
+    monkeypatch.setattr(
+        rpt,
+        "read_telemetry_sync",
+        lambda *a, **k: rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=48.0),
+    )
+
+    manager.install(device)
+
+    assert connection.puts == [(str(bundled_binary), rpt.REMOTE_UPLOAD_PATH)]
+
+
 def test_install_is_idempotent(bundled_binary, monkeypatch):
     device = make_device()
     connection = FakeConnection(
