@@ -404,7 +404,29 @@ an **Update** action.
   generate a message every cycle.
 - **Staleness**: a successful reading older than **90 s** (three missed polls) is
   reported as `stale` and the UI stops presenting it as current. The last value
-  is kept internally for context but is never shown as a live number.
+  is kept internally for context but is never shown as a live number. Note that
+  a *failed* poll reports `offline`/`stopped`/`error` instead, so `stale` means
+  the gateway stopped polling, not that the board is unwell.
+
+### When something goes wrong
+
+Failures of an action you triggered (Install, Start, Stop, Restart, Uninstall)
+surface as an error toast **and** an entry in the Logs modal, carrying the
+reason — a missing bundled binary, a checksum mismatch, a truncated upload, a
+service that would not start, or one that started but never answered.
+
+Because the daemon's own output goes to the board's systemd journal, the
+gateway pulls the last 20 journal lines back when a start or verification step
+fails and appends them to the message. That is what turns the most likely
+first-install failure — a binary built for the wrong architecture — from
+"service did not become active" into `Exec format error`, without an SSH
+session. `GET /api/devices/{key}/telemetry/service` returns the same journal
+tail in its `journal` field.
+
+Background problems the operator never triggered — sustained telemetry loss, a
+version mismatch, a failed InfluxDB write, and the recoveries from each — are
+toasted once per state transition, not once per poll, and are always in the
+Logs modal.
 
 Per-device telemetry state is one of `unknown` (not polled yet),
 `not_installed`, `running`, `stopped`, `offline`, `stale`, `error`, or

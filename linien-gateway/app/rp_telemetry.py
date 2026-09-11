@@ -93,6 +93,13 @@ SSH_COMMAND_TIMEOUT_S = 20.0
 # refused connection.
 INSTALL_VERIFY_ATTEMPTS = 6
 INSTALL_VERIFY_INTERVAL_S = 0.5
+# Journal lines pulled from the board when a start/verify step fails. The
+# daemon's own stderr goes to the board's journal, so without this the gateway
+# can only say "the service did not become active" and the operator has to SSH
+# in to find out why (a wrong-architecture binary, a missing loader, a port
+# already in use). Bounded so one failure cannot dump a log into the UI.
+SERVICE_JOURNAL_LINES = 20
+SERVICE_JOURNAL_MESSAGE_CHARS = 400
 
 # Plausible Zynq die temperatures. A reading outside this is a broken sysfs
 # value, not a hot board, and is reported as an error rather than displayed.
@@ -1201,16 +1208,25 @@ class RpTelemetryManager:
                 ):
                     result = self._ssh_run(conn, device, command)
                     if self._failed(result):
-                        raise RuntimeError(f"{failure}: {self._detail(result)}")
+                        journal = self._service_journal(device, conn)
+                        raise RuntimeError(
+                            self._with_journal(
+                                f"{failure}: {self._detail(result)}", journal
+                            )
+                        )
 
                 active = self._ssh_run(
                     conn, device, f"systemctl is-active {SERVICE_NAME}"
                 )
                 active_state = (getattr(active, "stdout", "") or "").strip()
                 if active_state != "active":
+                    journal = self._service_journal(device, conn)
                     raise RuntimeError(
-                        f"Service did not become active (systemctl reports "
-                        f"{active_state or 'nothing'})."
+                        self._with_journal(
+                            f"Service did not become active (systemctl reports "
+                            f"{active_state or 'nothing'}).",
+                            journal,
+                        )
                     )
         except RuntimeError as exc:
             self._emit_log(
@@ -1269,16 +1285,20 @@ class RpTelemetryManager:
                 entry.error = reading.error
                 entry.mutation_seq += 1
             self._publish(key)
+            journal = self._service_journal(device)
             self._emit_log(
                 logging.ERROR,
                 "rp_telemetry_install_failed",
                 "Red Pitaya telemetry installed but did not answer.",
                 key,
-                {"state": reading.state, "error": reading.error},
+                {"state": reading.state, "error": reading.error, "journal": journal},
             )
             raise RuntimeError(
-                "The service started but the telemetry port did not return a "
-                f"temperature ({reading.state}: {reading.error})."
+                self._with_journal(
+                    "The service started but the telemetry port did not return "
+                    f"a temperature ({reading.state}: {reading.error}).",
+                    journal,
+                )
             )
 
         with self._lock:
@@ -1302,6 +1322,36 @@ class RpTelemetryManager:
             "version": BUNDLED_VERSION,
             "temperature_c": reading.temperature_c,
         }
+
+    def _service_journal(self, device: Any, conn: Any = None) -> str:
+        """Last few journal lines for the unit. Never raises; "" when unknown.
+
+        Used only on failure paths, to turn "did not become active" into
+        something self-diagnosing.
+        """
+        command = (
+            f"journalctl -u {SERVICE_NAME} -n {SERVICE_JOURNAL_LINES} "
+            "--no-pager --output=cat"
+        )
+        try:
+            if conn is not None:
+                result = self._ssh_run(conn, device, command)
+            else:
+                with self._open_ssh(device) as fresh:
+                    result = self._ssh_run(fresh, device, command)
+        except Exception:  # noqa: BLE001 - diagnostics must not mask the error
+            logger.debug("rp-telemetry journal read failed", exc_info=True)
+            return ""
+        if self._failed(result):
+            return ""
+        return (getattr(result, "stdout", "") or "").strip()
+
+    @staticmethod
+    def _with_journal(message: str, journal: str) -> str:
+        if not journal:
+            return message
+        tail = journal[-SERVICE_JOURNAL_MESSAGE_CHARS:].strip()
+        return f"{message} Board log: {tail}"
 
     def _verify_installed_daemon(self, host: str) -> TelemetryReading:
         """Poll the freshly started daemon until it answers, briefly.
@@ -1404,7 +1454,10 @@ class RpTelemetryManager:
                 )
                 if self._failed(result):
                     raise RuntimeError(
-                        f"systemctl {action} failed: {self._detail(result)}"
+                        self._with_journal(
+                            f"systemctl {action} failed: {self._detail(result)}",
+                            self._service_journal(device, conn),
+                        )
                     )
                 active = self._ssh_run(
                     conn, device, f"systemctl is-active {SERVICE_NAME}"
@@ -1474,6 +1527,7 @@ class RpTelemetryManager:
                 version = self._ssh_run(
                     conn, device, f"{REMOTE_BINARY_PATH} --version", privileged=False
                 )
+                journal = self._service_journal(device, conn)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Could not read the telemetry service state: {exc}")
         installed_version = (getattr(version, "stdout", "") or "").strip() or None
@@ -1507,6 +1561,9 @@ class RpTelemetryManager:
             "enabled_state": (getattr(enabled, "stdout", "") or "").strip(),
             "version": installed_version,
             "bundled_version": BUNDLED_VERSION,
+            # The daemon's own output lives on the board; surface it here so a
+            # misbehaving service can be diagnosed without an SSH session.
+            "journal": journal,
         }
 
     async def read_temperature(self, device: Any) -> dict[str, Any]:

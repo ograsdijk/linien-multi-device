@@ -42,7 +42,9 @@ const levelBucket = (entry: UiLogEntry): 'info' | 'warning' | 'error' => {
   return 'info';
 };
 
-const toastFromLogEntry = (
+// Exported for tests: this is the allowlist deciding which structured log
+// events interrupt the operator with a toast.
+export const toastFromLogEntry = (
   entry: UiLogEntry,
   deviceLabel?: string | null
 ): Omit<UiToast, 'id'> | null => {
@@ -68,6 +70,25 @@ const toastFromLogEntry = (
     code === 'auto_lock_scan_failed'
   ) {
     return { level: 'error', title: `Error${deviceSuffix}`, message };
+  }
+  // Background telemetry events. The operator-triggered failures
+  // (rp_telemetry_install_failed, rp_telemetry_service_action_failed) are
+  // deliberately NOT here: useTelemetryActions already toasts those from the
+  // HTTP error, and listing them would double-toast one failure.
+  if (code === 'rp_telemetry_unavailable') {
+    return { level: 'warning', title: `Telemetry${deviceSuffix}`, message };
+  }
+  if (code === 'rp_telemetry_version_mismatch') {
+    return { level: 'warning', title: `Telemetry${deviceSuffix}`, message };
+  }
+  if (code === 'rp_telemetry_influx_write_failed') {
+    return { level: 'warning', title: `Telemetry${deviceSuffix}`, message };
+  }
+  if (
+    code === 'rp_telemetry_recovered' ||
+    code === 'rp_telemetry_influx_write_recovered'
+  ) {
+    return { level: 'info', title: `Telemetry${deviceSuffix}`, message };
   }
   if (code === 'connection_diagnosis') {
     const category = String(entry.details?.category || '').trim();

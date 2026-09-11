@@ -881,6 +881,108 @@ def test_install_fails_when_the_service_does_not_come_up(bundled_binary):
     assert any(e["code"] == "rp_telemetry_install_failed" for e in logs)
 
 
+EXEC_FORMAT_JOURNAL = (
+    "rp-telemetry.service: Failed to execute /usr/local/bin/rp-telemetry: "
+    "Exec format error\n"
+    "rp-telemetry.service: Main process exited, code=exited, status=203/EXEC"
+)
+
+
+def test_a_wrong_architecture_binary_explains_itself(bundled_binary):
+    """The exec error only exists in the board's journal.
+
+    Without pulling it back the gateway can only say "did not become active",
+    and the operator has to SSH in to discover the binary is for the wrong
+    architecture -- the single most likely first-install failure.
+    """
+    device = make_device()
+    connection = FakeConnection(
+        {
+            "sha256sum": _sha_response(bundled_binary),
+            "is-active": FakeResult(stdout="failed\n", exited=3),
+            "journalctl": FakeResult(stdout=EXEC_FORMAT_JOURNAL),
+        }
+    )
+    manager, _saved, _published, logs = _install_manager(device, connection)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        manager.install(device)
+
+    message = str(excinfo.value)
+    assert "did not become active" in message
+    assert "Exec format error" in message
+    assert any(e["code"] == "rp_telemetry_install_failed" for e in logs)
+
+
+def test_a_failed_restart_carries_the_board_log():
+    device = make_device()
+    connection = FakeConnection(
+        {
+            f"systemctl restart {rpt.SERVICE_NAME}": FakeResult(exited=5, stderr="nope"),
+            "journalctl": FakeResult(stdout=EXEC_FORMAT_JOURNAL),
+        }
+    )
+    manager, *_ = _install_manager(device, connection)
+
+    with pytest.raises(RuntimeError, match="Exec format error"):
+        manager.restart_service(device)
+
+
+def test_a_board_without_journalctl_still_reports_the_failure(bundled_binary):
+    """Diagnostics are best effort; they must never mask the real error."""
+    device = make_device()
+    connection = FakeConnection(
+        {
+            "sha256sum": _sha_response(bundled_binary),
+            "is-active": FakeResult(stdout="failed\n", exited=3),
+            "journalctl": FakeResult(exited=127, stderr="journalctl: not found"),
+        }
+    )
+    manager, *_ = _install_manager(device, connection)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        manager.install(device)
+
+    message = str(excinfo.value)
+    assert "did not become active" in message
+    assert "Board log:" not in message
+
+
+def test_the_journal_is_bounded_in_the_error_message(bundled_binary):
+    device = make_device()
+    connection = FakeConnection(
+        {
+            "sha256sum": _sha_response(bundled_binary),
+            "is-active": FakeResult(stdout="failed\n", exited=3),
+            "journalctl": FakeResult(stdout="x" * 10_000),
+        }
+    )
+    manager, *_ = _install_manager(device, connection)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        manager.install(device)
+
+    # One bad service must not dump its whole log into a toast.
+    assert len(str(excinfo.value)) < rpt.SERVICE_JOURNAL_MESSAGE_CHARS + 300
+
+
+def test_service_status_returns_the_board_log():
+    device = make_device()
+    connection = FakeConnection(
+        {
+            "is-active": FakeResult(stdout="active\n"),
+            "is-enabled": FakeResult(stdout="enabled\n"),
+            "--version": FakeResult(stdout="1.0.0\n"),
+            "journalctl": FakeResult(stdout="rp-telemetry 1.0.0 listening on port 18864"),
+        }
+    )
+    manager, *_ = _install_manager(device, connection)
+
+    status = manager.service_status(device)
+
+    assert "listening on port 18864" in status["journal"]
+
+
 def test_install_fails_when_the_daemon_does_not_answer(bundled_binary, monkeypatch):
     device = make_device()
     connection = FakeConnection(
