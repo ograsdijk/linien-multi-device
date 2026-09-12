@@ -33,6 +33,7 @@ import {
 } from '@tabler/icons-react';
 import { useMantineColorScheme } from '@mantine/core';
 import { api } from './api';
+import type { Device } from './types';
 import { DeviceList, type DeviceSortMode } from './components/DeviceList';
 import { DeviceWorkspace } from './components/DeviceWorkspace';
 import { DeviceOverviewCard } from './components/DeviceOverviewCard';
@@ -160,7 +161,16 @@ const LogsModal = lazy(async () => {
   return { default: module.LogsModal };
 });
 
+// Lazy for the same reason as LogsModal: it is opened rarely, when something
+// has already gone wrong, and its Accordion/Code tree need not be in the
+// initial bundle.
+const DiagnosticsModal = lazy(async () => {
+  const module = await import('./components/DiagnosticsModal');
+  return { default: module.DiagnosticsModal };
+});
+
 export function App() {
+  const [diagnosticsDevice, setDiagnosticsDevice] = useState<Device | null>(null);
   const [overviewFps, setOverviewFps] = useState<number>(10);
   const [groupFps, setGroupFps] = useState<number>(() => {
     try {
@@ -713,6 +723,7 @@ export function App() {
             onTelemetryCommand={runTelemetryCommand}
             onInstallTelemetryAll={installTelemetryAll}
             onStartTelemetryAll={startTelemetryAll}
+            onRequestDiagnostics={setDiagnosticsDevice}
             telemetryBusyKeys={telemetryBusyKeys}
           />
         </AppShell.Navbar>
@@ -972,6 +983,14 @@ export function App() {
           onCopyMessage={copyLogMessage}
           onCopyJson={copyLogJson}
           viewportRef={logScrollRef}
+        />
+        <DiagnosticsModal
+          device={diagnosticsDevice}
+          status={
+            diagnosticsDevice ? deviceStatusMap[diagnosticsDevice.key] : undefined
+          }
+          onClose={() => setDiagnosticsDevice(null)}
+          appendUiErrorLog={appendUiErrorLog}
         />
       </Suspense>
       <ToastStack toasts={toasts} onDismiss={dismissToast} />

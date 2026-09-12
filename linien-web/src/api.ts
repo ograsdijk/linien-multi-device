@@ -5,9 +5,11 @@ import type {
   AutoLockCalibrationResult,
   AutoLockScanResult,
   AutoLockScanSettings,
+  BoardEvent,
   Device,
   DeviceStatus,
   DeviceGroup,
+  DiagnosticsBundle,
   InfluxCredentials,
   InfluxUpdateResult,
   LockIndicatorConfig,
@@ -252,6 +254,20 @@ export const api = {
     request<{ started: string[]; failed: Record<string, string> }>(
       '/telemetry/start',
       { method: 'POST', body: JSON.stringify({ device_keys: deviceKeys }) }
+    ),
+  // --- Board diagnostics ---
+  // `getBoardEvents` is a cache read; the other two are SSH-backed and take a
+  // few seconds.
+  getBoardEvents: (key: string, limit = 200) =>
+    request<{ events: BoardEvent[] }>(`/devices/${key}/events?limit=${limit}`),
+  collectDiagnostics: (key: string) =>
+    request<DiagnosticsBundle>(`/devices/${key}/diagnostics/collect`, {
+      method: 'POST',
+    }),
+  enablePersistentLog: (key: string) =>
+    request<{ ok: boolean; persistent_journal: boolean }>(
+      `/devices/${key}/diagnostics/enable-persistent-log`,
+      { method: 'POST' }
     ),
   postgresManualLockState: () =>
     request<PostgresManualLockState>('/postgres/manual-lock'),

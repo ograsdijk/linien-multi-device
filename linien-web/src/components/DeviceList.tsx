@@ -77,6 +77,7 @@ type DeviceListProps = {
   onTelemetryCommand: (key: string, command: TelemetryCommand) => Promise<void>;
   onInstallTelemetryAll: (keys: string[]) => Promise<void>;
   onStartTelemetryAll: (keys: string[]) => Promise<void>;
+  onRequestDiagnostics: (device: Device) => void;
   telemetryBusyKeys?: Record<string, boolean>;
 };
 
@@ -98,6 +99,7 @@ type SortableDeviceCardProps = {
   onDisconnect: (key: string) => Promise<void>;
   onRequestShutdown: (device: Device) => void;
   onRequestReboot: (device: Device) => void;
+  onRequestDiagnostics: (device: Device) => void;
   onTelemetryCommand: (key: string, command: TelemetryCommand) => Promise<void>;
   telemetryBusy: boolean;
 };
@@ -120,6 +122,7 @@ function SortableDeviceCard({
   onDisconnect,
   onRequestShutdown,
   onRequestReboot,
+  onRequestDiagnostics,
   onTelemetryCommand,
   telemetryBusy,
 }: SortableDeviceCardProps) {
@@ -369,6 +372,15 @@ function SortableDeviceCard({
           >
             {recoveryActive ? 'Rebooting' : 'Reboot board'}
           </Button>
+          <Button
+            size="xs"
+            variant="light"
+            color="gray"
+            onClick={() => onRequestDiagnostics(device)}
+            title="Why did this board reset, or why did linien-server stop?"
+          >
+            Diagnostics
+          </Button>
         </Group>
         <ActionIcon
           size="sm"
@@ -412,6 +424,7 @@ export function DeviceList({
   onTelemetryCommand,
   onInstallTelemetryAll,
   onStartTelemetryAll,
+  onRequestDiagnostics,
   telemetryBusyKeys,
 }: DeviceListProps) {
   const [opened, setOpened] = useState(false);
@@ -612,6 +625,7 @@ export function DeviceList({
               onDisconnect={onDisconnect}
               onRequestShutdown={setShutdownDevice}
               onRequestReboot={setRebootDevice}
+              onRequestDiagnostics={onRequestDiagnostics}
               onTelemetryCommand={onTelemetryCommand}
               telemetryBusy={Boolean(telemetryBusyKeys?.[device.key])}
             />

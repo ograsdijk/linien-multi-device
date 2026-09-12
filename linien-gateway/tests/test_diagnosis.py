@@ -30,6 +30,38 @@ def _classify(result: ProbeResult, since=None):
     )
 
 
+def test_low_uptime_is_not_a_reboot_when_we_were_connected_even_more_recently():
+    """A server that died on a board which had just finished booting.
+
+    The bare threshold called this a reboot and therefore reported the FPGA
+    lock as lost -- the expensive direction to be wrong in, since the operator
+    would stop trying to preserve a lock that is in fact still held.
+    """
+    d = _classify(ProbeResult(False, True, 30.0, True, 1), since=10.0)
+    assert d["category"] == CATEGORY_SERVER_CRASHED
+    assert d["lock_state"] == "locked"
+
+
+def test_the_threshold_is_only_used_when_we_have_never_been_connected():
+    """With no absence to compare against, the heuristic is all there is."""
+    d = _classify(ProbeResult(False, True, 30.0, True, None))
+    assert d["category"] == CATEGORY_REBOOTED
+
+    d = _classify(ProbeResult(False, True, 3600.0, True, None))
+    assert d["category"] == CATEGORY_SERVER_CRASHED
+
+
+def test_a_long_uptime_still_counts_as_a_reboot_if_we_were_away_longer():
+    d = _classify(ProbeResult(False, True, 86_400.0, True, 1), since=172_800.0)
+    assert d["category"] == CATEGORY_REBOOTED
+    assert d["lock_state"] == "lost"
+
+
+def test_the_boot_id_is_reported_so_the_timeline_can_use_it():
+    d = _classify(ProbeResult(False, True, 3600.0, True, 1, boot_id="boot-a"), since=60.0)
+    assert d["boot_id"] == "boot-a"
+
+
 def test_classify_recovering_when_server_listening():
     d = _classify(ProbeResult(True, True, None, None, None))
     assert d["category"] == CATEGORY_RECOVERING

@@ -32,6 +32,55 @@ export type DeviceDiagnosis = {
   server_running?: boolean | null;
   fpga_operating?: boolean | null;
   seconds_since_last_connected?: number | null;
+  /** The board's kernel boot ID. A change between probes proves a reboot. */
+  boot_id?: string | null;
+};
+
+// --- Board diagnostics ---------------------------------------------------
+
+/**
+ * One retained board/server transition. Kinds mirror the gateway's
+ * once-per-transition log codes, so the timeline never fills with repeats of a
+ * steady state. See linien-gateway/app/board_event_store.py.
+ */
+export type BoardEventKind =
+  | 'disconnected'
+  | 'diagnosis'
+  | 'reboot_detected'
+  | 'reboot_requested'
+  | 'telemetry_offline'
+  | 'telemetry_recovered'
+  | 'persistent_log_enabled';
+
+export type BoardEvent = {
+  ts: number;
+  device_key: string;
+  kind: BoardEventKind;
+  detail: string;
+  data?: Record<string, unknown>;
+  boot_id?: string | null;
+};
+
+/** One command's worth of the diagnostics bundle. */
+export type DiagnosticsSection = {
+  name: string;
+  title: string;
+  command: string;
+  output: string;
+  /** Set when the command failed. `output` may still hold partial output. */
+  error: string | null;
+};
+
+export type DiagnosticsBundle = {
+  ok: boolean;
+  error: string | null;
+  collected_at: number;
+  sections: DiagnosticsSection[];
+  /**
+   * Whether the board keeps logs across a reboot. `false` means the next crash
+   * will again leave nothing behind; `null` means it could not be determined.
+   */
+  persistent_journal: boolean | null;
 };
 
 export type DeviceRecovery = {

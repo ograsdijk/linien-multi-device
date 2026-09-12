@@ -57,6 +57,9 @@ device_settings.json
 # {}), otherwise Docker creates a directory at the mount path and persistence
 # breaks.
 !docker/linien-multi-device/data/device_settings.json
+# Per-device board/server event timeline, written at runtime.
+board_events.json
+board_events.json.tmp
 
 # OS / Editor
 .DS_Store
