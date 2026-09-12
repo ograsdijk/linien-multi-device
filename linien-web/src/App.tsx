@@ -257,8 +257,12 @@ export function App() {
     logScrollRef,
     appendUiErrorLog,
   } = useLogsController(devices);
-  const { telemetryBusyKeys, runTelemetryCommand, installTelemetryAll } =
-    useTelemetryActions({ appendUiErrorLog, pushToast });
+  const {
+    telemetryBusyKeys,
+    runTelemetryCommand,
+    installTelemetryAll,
+    startTelemetryAll,
+  } = useTelemetryActions({ appendUiErrorLog, pushToast });
   const {
     lockBusyKeys,
     autoLockBusyKeys,
@@ -708,6 +712,7 @@ export function App() {
             }}
             onTelemetryCommand={runTelemetryCommand}
             onInstallTelemetryAll={installTelemetryAll}
+            onStartTelemetryAll={startTelemetryAll}
             telemetryBusyKeys={telemetryBusyKeys}
           />
         </AppShell.Navbar>

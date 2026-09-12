@@ -246,6 +246,13 @@ export const api = {
       '/telemetry/install',
       { method: 'POST', body: JSON.stringify({ device_keys: deviceKeys }) }
     ),
+  // A board whose unit starts and then dies immediately is reported in
+  // `failed`, not `started` -- see the gateway endpoint.
+  startTelemetryMany: (deviceKeys: string[]) =>
+    request<{ started: string[]; failed: Record<string, string> }>(
+      '/telemetry/start',
+      { method: 'POST', body: JSON.stringify({ device_keys: deviceKeys }) }
+    ),
   postgresManualLockState: () =>
     request<PostgresManualLockState>('/postgres/manual-lock'),
   updatePostgresManualLockState: (payload: PostgresManualLockConfig) =>

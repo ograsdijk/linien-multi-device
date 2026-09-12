@@ -76,6 +76,7 @@ type DeviceListProps = {
   onRebootDevice: (key: string) => Promise<void>;
   onTelemetryCommand: (key: string, command: TelemetryCommand) => Promise<void>;
   onInstallTelemetryAll: (keys: string[]) => Promise<void>;
+  onStartTelemetryAll: (keys: string[]) => Promise<void>;
   telemetryBusyKeys?: Record<string, boolean>;
 };
 
@@ -410,6 +411,7 @@ export function DeviceList({
   onRebootDevice,
   onTelemetryCommand,
   onInstallTelemetryAll,
+  onStartTelemetryAll,
   telemetryBusyKeys,
 }: DeviceListProps) {
   const [opened, setOpened] = useState(false);
@@ -420,6 +422,7 @@ export function DeviceList({
   const [rebootSubmitting, setRebootSubmitting] = useState(false);
   const [rebootError, setRebootError] = useState<string | null>(null);
   const [telemetryAllBusy, setTelemetryAllBusy] = useState(false);
+  const [telemetryStartAllBusy, setTelemetryStartAllBusy] = useState(false);
   const [telemetryAllOpen, setTelemetryAllOpen] = useState(false);
   const activeSet = useMemo(() => new Set(activeKeys), [activeKeys]);
   const sortable = sortMode === 'manual';
@@ -532,6 +535,25 @@ export function DeviceList({
             onClick={() => setTelemetryAllOpen(true)}
           >
             Telemetry: install all
+          </Button>
+          {/* No confirmation, unlike install-all: starting an already-running
+              service is a no-op and cannot damage a board, whereas install
+              rewrites the binary on every device. */}
+          <Button
+            size="xs"
+            color="gray"
+            variant="light"
+            loading={telemetryStartAllBusy}
+            disabled={devices.length === 0}
+            title="Start the Red Pitaya telemetry service on every device"
+            onClick={() => {
+              setTelemetryStartAllBusy(true);
+              onStartTelemetryAll(devices.map((device) => device.key))
+                .catch(() => null)
+                .finally(() => setTelemetryStartAllBusy(false));
+            }}
+          >
+            Telemetry: start all
           </Button>
         </Group>
         <Group gap="xs" align="center">

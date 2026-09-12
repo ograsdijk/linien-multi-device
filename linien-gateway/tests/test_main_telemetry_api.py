@@ -161,6 +161,52 @@ def test_bulk_install_reports_per_device_outcomes(monkeypatch):
     assert payload["failed"]["missing"] == "Device not found"
 
 
+def test_bulk_start_reports_per_device_outcomes(monkeypatch):
+    devices = {key: make_device(key) for key in ("a", "b")}
+    monkeypatch.setattr(main.device_store, "get_device", lambda key: devices.get(key))
+
+    def start_service(device):
+        if device.key == "b":
+            raise RuntimeError("ssh timed out")
+        return {"ok": True, "active": True, "state": "active"}
+
+    monkeypatch.setattr(main.telemetry_manager, "start_service", start_service)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/telemetry/start", json={"device_keys": ["a", "b", "missing"]}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    # One failing board must not fail the batch.
+    assert payload["started"] == ["a"]
+    assert payload["failed"]["b"] == "ssh timed out"
+    assert payload["failed"]["missing"] == "Device not found"
+
+
+def test_bulk_start_does_not_count_a_unit_that_died_immediately(monkeypatch):
+    """`systemctl start` succeeds for a unit that exits straight afterwards.
+
+    Reporting that board as started would be a green summary line for a service
+    that is not running -- exactly the failure the single-device UI already
+    refuses to paper over.
+    """
+    devices = {key: make_device(key) for key in ("a",)}
+    monkeypatch.setattr(main.device_store, "get_device", lambda key: devices.get(key))
+    monkeypatch.setattr(
+        main.telemetry_manager,
+        "start_service",
+        lambda device: {"ok": True, "active": False, "state": "failed"},
+    )
+    client = TestClient(main.app)
+
+    payload = client.post("/api/telemetry/start", json={"device_keys": ["a"]}).json()
+
+    assert payload["started"] == []
+    assert "failed" in payload["failed"]["a"]
+
+
 def test_status_payload_carries_the_telemetry_fields(monkeypatch):
     """DeviceSession.status() merges the cached telemetry, without any I/O."""
 

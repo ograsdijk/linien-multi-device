@@ -284,4 +284,50 @@ describe('useTelemetryActions', () => {
 
     expect(spy).not.toHaveBeenCalled();
   });
+
+  it('summarises a bulk start and logs each failed board', async () => {
+    vi.spyOn(api, 'startTelemetryMany').mockResolvedValue({
+      started: ['a'],
+      failed: { b: 'ssh timed out' },
+    });
+    const { hook, appendUiErrorLog, pushToast } = setup();
+
+    await act(async () => {
+      await hook.result.current.startTelemetryAll(['a', 'b']);
+    });
+
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ level: 'warning', message: 'Started on 1; 1 failed.' })
+    );
+    expect(appendUiErrorLog).toHaveBeenCalledWith(
+      'rp_telemetry',
+      'telemetry_start_failed',
+      'ssh timed out',
+      'b'
+    );
+  });
+
+  it('marks every board busy for the duration of a bulk start', async () => {
+    let release!: () => void;
+    vi.spyOn(api, 'startTelemetryMany').mockReturnValue(
+      new Promise((resolve) => {
+        release = () => resolve({ started: ['a', 'b'], failed: {} });
+      })
+    );
+    const { hook } = setup();
+
+    let pending!: Promise<void>;
+    act(() => {
+      pending = hook.result.current.startTelemetryAll(['a', 'b']);
+    });
+    await waitFor(() => expect(hook.result.current.telemetryBusyKeys['a']).toBe(true));
+    expect(hook.result.current.telemetryBusyKeys['b']).toBe(true);
+
+    await act(async () => {
+      release();
+      await pending;
+    });
+    expect(hook.result.current.telemetryBusyKeys['a']).toBe(false);
+    expect(hook.result.current.telemetryBusyKeys['b']).toBe(false);
+  });
 });

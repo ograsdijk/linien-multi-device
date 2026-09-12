@@ -102,39 +102,61 @@ export const useTelemetryActions = ({
     [appendUiErrorLog, pushToast, refreshStatus]
   );
 
-  const installTelemetryAll = useCallback(
-    async (deviceKeys: string[]) => {
+  /**
+   * Shared mechanics for the whole-fleet actions.
+   *
+   * `run` returns the keys that succeeded plus a per-device failure map; the
+   * gateway reports each board independently, so a batch is normally a partial
+   * success rather than a pass or a fail.
+   */
+  const runTelemetryBatch = useCallback(
+    async (
+      deviceKeys: string[],
+      {
+        run,
+        code,
+        summarize,
+        failureFallback,
+        batchFallback,
+      }: {
+        run: (keys: string[]) => Promise<{
+          ok: string[];
+          failed: Record<string, string>;
+        }>;
+        code: string;
+        summarize: (okCount: number, failedCount: number) => string;
+        failureFallback: string;
+        batchFallback: string;
+      }
+    ) => {
       if (deviceKeys.length === 0) return;
       // Mark every target busy for the duration: otherwise the cards stay
-      // clickable and a second install against the same board races the first
-      // over the shared remote upload path, failing a board that is fine.
+      // clickable and a second action against the same board races the first
+      // over the shared remote path, failing a board that is fine.
       setTelemetryBusyKeys((prev) => {
         const next = { ...prev };
         for (const key of deviceKeys) next[key] = true;
         return next;
       });
       try {
-        const result = await api.installTelemetryMany(deviceKeys);
+        const result = await run(deviceKeys);
         const failedKeys = Object.keys(result.failed ?? {});
         pushToast({
           level: failedKeys.length > 0 ? 'warning' : 'info',
           title: 'Red Pitaya telemetry',
-          message:
-            failedKeys.length > 0
-              ? `Installed on ${result.installed.length}; ${failedKeys.length} failed.`
-              : `Installed on ${result.installed.length} device(s).`,
+          message: summarize(result.ok.length, failedKeys.length),
         });
         for (const key of failedKeys) {
           appendUiErrorLog(
             'rp_telemetry',
-            'telemetry_install_failed',
-            result.failed[key] || 'Telemetry install failed.',
+            code,
+            result.failed[key] || failureFallback,
             key
           );
         }
       } catch (error) {
-        const message = toErrorMessage(error, 'Failed to install telemetry.');
-        appendUiErrorLog('rp_telemetry', 'telemetry_install_failed', message);
+        const message = toErrorMessage(error, batchFallback);
+        appendUiErrorLog('rp_telemetry', code, message);
         // Same reasoning as the single-device path: the modal has already
         // closed and the spinner just stops, so without a toast the operator
         // has no sign the batch never ran.
@@ -151,5 +173,46 @@ export const useTelemetryActions = ({
     [appendUiErrorLog, pushToast, refreshStatus]
   );
 
-  return { telemetryBusyKeys, runTelemetryCommand, installTelemetryAll };
+  const installTelemetryAll = useCallback(
+    (deviceKeys: string[]) =>
+      runTelemetryBatch(deviceKeys, {
+        run: async (keys) => {
+          const { installed, failed } = await api.installTelemetryMany(keys);
+          return { ok: installed, failed };
+        },
+        code: 'telemetry_install_failed',
+        summarize: (okCount, failedCount) =>
+          failedCount > 0
+            ? `Installed on ${okCount}; ${failedCount} failed.`
+            : `Installed on ${okCount} device(s).`,
+        failureFallback: 'Telemetry install failed.',
+        batchFallback: 'Failed to install telemetry.',
+      }),
+    [runTelemetryBatch]
+  );
+
+  const startTelemetryAll = useCallback(
+    (deviceKeys: string[]) =>
+      runTelemetryBatch(deviceKeys, {
+        run: async (keys) => {
+          const { started, failed } = await api.startTelemetryMany(keys);
+          return { ok: started, failed };
+        },
+        code: 'telemetry_start_failed',
+        summarize: (okCount, failedCount) =>
+          failedCount > 0
+            ? `Started on ${okCount}; ${failedCount} failed.`
+            : `Started on ${okCount} device(s).`,
+        failureFallback: 'Telemetry start failed.',
+        batchFallback: 'Failed to start telemetry.',
+      }),
+    [runTelemetryBatch]
+  );
+
+  return {
+    telemetryBusyKeys,
+    runTelemetryCommand,
+    installTelemetryAll,
+    startTelemetryAll,
+  };
 };

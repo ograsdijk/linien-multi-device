@@ -347,6 +347,13 @@ Then, per device: open the thermometer menu on the device card and choose
 every board at once (each board is handled independently; one unreachable board
 does not fail the batch).
 
+Beside it, **Telemetry: start all** starts the service on every board — the
+action you want after a power cut or a batch of reboots, when every daemon is
+down and the per-device menu is twelve visits away. It asks for no confirmation
+because starting an already-running service is a no-op, and a board whose unit
+starts and then dies immediately is reported as a failure rather than counted
+as started.
+
 Install is idempotent and does the whole job over SSH:
 
 1. upload the binary to `/tmp/rp-telemetry.upload`,
@@ -379,7 +386,8 @@ WantedBy=multi-user.target
 ```
 
 **Uninstall / reinstall** — the same menu offers `Start`, `Stop`, `Restart`, and
-`Uninstall`. Uninstall stops and disables the service, removes the unit and the
+`Uninstall` per device (`Stop`, `Restart` and `Uninstall` are deliberately not
+offered fleet-wide: a mistake there should cost one board, not twelve). Uninstall stops and disables the service, removes the unit and the
 binary, and clears the gateway's install record. Reinstalling is just
 **Install** again; it replaces the binary and restarts the service. When the
 board runs an older build than the one bundled with the gateway, the card shows

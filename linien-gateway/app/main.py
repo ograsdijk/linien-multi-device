@@ -1519,16 +1519,22 @@ async def read_telemetry_now(key: str) -> dict:
     return await telemetry_manager.read_temperature(device)
 
 
-@app.post("/api/telemetry/install")
-async def install_telemetry_many(payload: DeviceKeysIn) -> dict:
-    """Install/update telemetry on several boards, one SSH session each.
+async def _telemetry_bulk(
+    device_keys: list[str], action
+) -> tuple[list[tuple[str, dict]], list[str]]:
+    """Run one telemetry SSH action across several boards, independently.
 
-    Boards are handled concurrently but each failure is reported per device;
-    one unreachable board never fails the batch.
+    Returns the per-device results and the keys that named no device. Boards are
+    handled concurrently but each failure is reported per device; one
+    unreachable board never fails the batch.
+
+    Devices are resolved through `device_store` rather than `session_registry`:
+    telemetry actions touch the stored device record and must work on a board
+    that is not connected -- which, after a power cut, is all of them.
     """
     devices = []
     missing: list[str] = []
-    for key in payload.device_keys:
+    for key in device_keys:
         device = device_store.get_device(key)
         if device is None:
             missing.append(key)
@@ -1537,19 +1543,61 @@ async def install_telemetry_many(payload: DeviceKeysIn) -> dict:
 
     # Concurrency is bounded by the shared telemetry SSH pool (see
     # _get_telemetry_ssh_executor); the gather below simply queues onto it.
-    async def _install(device) -> tuple[str, dict]:
+    async def _run(device) -> tuple[str, dict]:
         try:
-            result = await _run_telemetry_ssh(telemetry_manager.install, device)
+            result = await _run_telemetry_ssh(action, device)
         except Exception as exc:  # noqa: BLE001 - per-device error, not a batch failure
             return device.key, {"ok": False, "error": str(exc)}
         return device.key, result
 
-    results = await asyncio.gather(*(_install(device) for device in devices))
+    results = await asyncio.gather(*(_run(device) for device in devices))
+    return list(results), missing
+
+
+@app.post("/api/telemetry/install")
+async def install_telemetry_many(payload: DeviceKeysIn) -> dict:
+    """Install/update telemetry on several boards, one SSH session each."""
+    results, missing = await _telemetry_bulk(
+        payload.device_keys, telemetry_manager.install
+    )
     installed = [key for key, result in results if result.get("ok")]
     failed = {key: result.get("error", "") for key, result in results if not result.get("ok")}
     for key in missing:
         failed[key] = "Device not found"
     return {"installed": installed, "failed": failed}
+
+
+@app.post("/api/telemetry/start")
+async def start_telemetry_many(payload: DeviceKeysIn) -> dict:
+    """Start the telemetry service on several boards, one SSH session each.
+
+    The companion to install-all: after a batch of board reboots every daemon is
+    down, and the per-device menu is twelve visits away.
+
+    Boards whose install record says "not installed" are still attempted. The
+    record can be stale, `systemctl start` on a board with no unit fails fast,
+    and skipping would quietly do nothing to a board that is in fact fine.
+    """
+    results, missing = await _telemetry_bulk(
+        payload.device_keys, telemetry_manager.start_service
+    )
+    started: list[str] = []
+    failed: dict[str, str] = {}
+    for key, result in results:
+        if not result.get("ok"):
+            failed[key] = result.get("error", "")
+        elif result.get("active"):
+            started.append(key)
+        else:
+            # `systemctl start` reports success for a unit that dies straight
+            # afterwards. Counting that as started would be a green result for
+            # a service that is not running -- the single-device UI already
+            # refuses to do so, and the batch summary must not either.
+            state = result.get("state") or "inactive"
+            failed[key] = f"start was accepted but the service is {state}"
+    for key in missing:
+        failed[key] = "Device not found"
+    return {"started": started, "failed": failed}
 
 
 @app.get("/api/postgres/manual-lock", response_model=PostgresManualLockState)
