@@ -20,14 +20,58 @@ from app.diagnosis import (
 THRESHOLD = 600.0
 
 
-def _classify(result: ProbeResult, since=None):
+def _classify(result: ProbeResult, since=None, previous_boot_id=None):
     return classify_diagnosis(
         result,
         host="rp-test.local",
         seconds_since_last_connected=since,
         probed_at=123.0,
         uptime_threshold_s=THRESHOLD,
+        previous_boot_id=previous_boot_id,
     )
+
+
+def test_a_changed_boot_id_proves_a_reboot_however_long_the_board_has_been_up():
+    """Uptime alone would call this a crash and claim the lock was held."""
+    d = _classify(
+        ProbeResult(False, True, 99_999.0, True, 1, boot_id="boot-b"),
+        since=60.0,
+        previous_boot_id="boot-a",
+    )
+    assert d["category"] == CATEGORY_REBOOTED
+    assert d["lock_state"] == "lost"
+    assert "boot id" in d["message"].lower()
+
+
+def test_an_unchanged_boot_id_rules_out_a_reboot_despite_low_uptime():
+    """The case the threshold gets wrong: a server that died on a board that
+    had only just finished booting. The lock register still means something."""
+    d = _classify(
+        ProbeResult(False, True, 30.0, True, 1, boot_id="boot-a"),
+        since=10.0,
+        previous_boot_id="boot-a",
+    )
+    assert d["category"] == CATEGORY_SERVER_CRASHED
+    assert d["lock_state"] == "locked"
+
+
+def test_a_changed_boot_id_wins_even_when_uptime_is_unreadable():
+    d = _classify(
+        ProbeResult(False, True, None, None, None, boot_id="boot-b"),
+        previous_boot_id="boot-a",
+    )
+    assert d["category"] == CATEGORY_REBOOTED
+
+
+def test_the_uptime_heuristic_still_applies_to_a_board_never_seen_before():
+    """No stored boot id means no comparison, not a licence to guess."""
+    d = _classify(ProbeResult(False, True, 30.0, True, None, boot_id="boot-a"))
+    assert d["category"] == CATEGORY_REBOOTED
+
+
+def test_the_boot_id_is_reported_so_the_timeline_can_use_it():
+    d = _classify(ProbeResult(False, True, 3600.0, True, 1, boot_id="boot-a"), since=60.0)
+    assert d["boot_id"] == "boot-a"
 
 
 def test_classify_recovering_when_server_listening():
