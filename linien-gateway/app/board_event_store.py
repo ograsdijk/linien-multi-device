@@ -128,6 +128,7 @@ class BoardEventStore:
                 "data": _jsonable(data or {}),
                 "boot_id": boot_id,
             }
+            due = False
             with self._lock:
                 items = self._events.setdefault(device_key, [])
                 items.append(event)
@@ -135,7 +136,12 @@ class BoardEventStore:
                     self._boot_ids[device_key] = boot_id
                 self._prune_locked(device_key, now=now)
                 self._dirty = True
-                self._maybe_flush_locked(now)
+                due = now - self._last_flush >= self._flush_interval_s
+            # Deliberately outside the lock: the caller is a poll thread, and a
+            # disk write held under the store lock would stall every other
+            # device's recording for its duration.
+            if due:
+                self.flush()
             return event
         except Exception:  # noqa: BLE001 - history must never break a caller
             logger.debug("Failed recording board event key=%s", device_key, exc_info=True)
@@ -153,9 +159,18 @@ class BoardEventStore:
         with self._lock:
             previous = self._boot_ids.get(device_key)
             self._boot_ids[device_key] = boot_id
-            if previous is None or previous == boot_id:
-                self._dirty = self._dirty or previous is None
+            if previous == boot_id:
                 return False
+            if previous is None:
+                # First sighting: remember it so the *next* probe can compare,
+                # but do not claim a reboot we have no evidence of.
+                self._dirty = True
+                first_sighting = True
+            else:
+                first_sighting = False
+        if first_sighting:
+            self.flush()
+            return False
         self.record(
             device_key,
             KIND_REBOOT_DETECTED,
@@ -194,12 +209,6 @@ class BoardEventStore:
             # Never fatal: the timeline is a diagnostic aid, and losing a write
             # must not take down whatever was being diagnosed.
             logger.warning("Failed writing board events to %s", self._path, exc_info=True)
-
-    def _maybe_flush_locked(self, now: float) -> None:
-        if now - self._last_flush < self._flush_interval_s:
-            return
-        # Released and re-taken inside flush(); the lock is reentrant.
-        self.flush()
 
     def _load(self) -> None:
         try:
