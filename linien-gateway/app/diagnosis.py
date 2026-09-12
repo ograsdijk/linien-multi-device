@@ -291,29 +291,21 @@ def classify_diagnosis(
     seconds_since_last_connected: float | None,
     probed_at: float,
     uptime_threshold_s: float = DEFAULT_UPTIME_THRESHOLD_S,
-    previous_boot_id: str | None = None,
 ) -> dict[str, Any]:
     """Turn raw probe signals into a category, lock state, and a message.
 
-    When a boot id from a previous probe is available it settles the
-    reboot/crash question outright, and the uptime heuristic below is used only
-    as the fallback for a board we have not seen before. That matters in both
-    directions: a changed id proves a reboot however long the board has since
-    been up, and an unchanged id rules one out even when uptime is low --
-    which is exactly the case the threshold gets wrong, a server that died on a
-    board that had only just finished booting.
+    The reboot test is `uptime < seconds_since_last_connected`: a board whose
+    uptime is shorter than our absence must have restarted during it, and one
+    whose uptime is longer cannot have. That is exact whenever both numbers are
+    known, and it needs no threshold.
+
+    `uptime_threshold_s` is only the fallback for a device we have never been
+    connected to, where there is no absence to compare against. It must not be
+    applied when we do know: a linien-server that died on a board which had
+    just finished booting has low uptime and has not rebooted, and calling that
+    a reboot would wrongly report the FPGA lock as lost.
     """
     uptime_s = result.uptime_s
-    rebooted_by_boot_id = (
-        previous_boot_id is not None
-        and result.boot_id is not None
-        and result.boot_id != previous_boot_id
-    )
-    same_boot = (
-        previous_boot_id is not None
-        and result.boot_id is not None
-        and result.boot_id == previous_boot_id
-    )
 
     if result.server_listening:
         category = CATEGORY_RECOVERING
@@ -323,25 +315,16 @@ def classify_diagnosis(
         category = CATEGORY_HOST_UNREACHABLE
         lock_state = "unknown"
         message = f"Cannot reach {host or 'the device'}. The lock is lost if the board is powered off."
-    elif rebooted_by_boot_id:
-        category = CATEGORY_REBOOTED
-        lock_state = "lost"
-        message = (
-            "Red Pitaya rebooted (confirmed: the kernel boot ID changed) — the lock "
-            "was lost. linien-server is not running (auto-start is disabled)."
-        )
     elif uptime_s is None:
         category = CATEGORY_SERVER_DOWN_UNKNOWN
         lock_state = "unknown"
         message = (
             "Board is reachable but linien-server is down; board state could not be read."
         )
-    elif not same_boot and (
-        uptime_s < uptime_threshold_s
-        or (
-            seconds_since_last_connected is not None
-            and uptime_s < seconds_since_last_connected
-        )
+    elif (
+        uptime_s < seconds_since_last_connected
+        if seconds_since_last_connected is not None
+        else uptime_s < uptime_threshold_s
     ):
         category = CATEGORY_REBOOTED
         lock_state = "lost"
@@ -428,8 +411,8 @@ class DiagnosisProbe:
         self._probe_fn = probe_fn
         self._reprobe_interval_s = reprobe_interval_s
         self._uptime_threshold_s = uptime_threshold_s
-        # Optional: the probe works without it, it just cannot then tell a
-        # reboot from a crash by boot id, nor leave a trace in the timeline.
+        # Optional: without it the probe simply leaves no trace in the
+        # board timeline.
         self._event_store = event_store
         self._max_workers = max_workers
         self._heap: list[tuple[float, int, str]] = []
@@ -555,22 +538,19 @@ class DiagnosisProbe:
         except Exception:  # noqa: BLE001 - defense in depth; probe_fn shouldn't raise
             logger.debug("diagnosis probe raised key=%s", key, exc_info=True)
             result = ProbeResult(False, False, None, None, None, error="probe error")
-        # Read the remembered boot id *before* recording the new one, or the
-        # comparison would always be against itself.
-        previous_boot_id = None
-        if self._event_store is not None:
-            try:
-                previous_boot_id = self._event_store.last_boot_id(key)
-            except Exception:  # noqa: BLE001 - history must not break the probe
-                logger.debug("last_boot_id failed key=%s", key, exc_info=True)
         diagnosis = classify_diagnosis(
             result,
             host=getattr(device, "host", "") or "",
             seconds_since_last_connected=since,
             probed_at=probed_at,
             uptime_threshold_s=self._uptime_threshold_s,
-            previous_boot_id=previous_boot_id,
         )
+        # Timeline only. The boot id deliberately does not feed the
+        # classification above: the store holds the id from the last *probe*,
+        # not from when we were last connected, so it cannot answer "did it
+        # reboot during this outage" -- and re-probing a still-down board every
+        # 20 s would compare the id against itself and retract a reboot it had
+        # just correctly reported.
         if self._event_store is not None and result.boot_id:
             try:
                 self._event_store.note_boot_id(key, result.boot_id)

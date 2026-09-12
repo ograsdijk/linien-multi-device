@@ -60,14 +60,23 @@ JOURNAL_DIR = "/var/log/journal"
 # journald's default of 10% of the filesystem. 32 MB is days of a quiet board.
 JOURNALD_DROPIN = "[Journal]\nStorage=persistent\nSystemMaxUse=32M\nSystemMaxFileSize=8M\n"
 
-# (name, title, command). Ordered as an operator reads them: what board is
-# this, does it even keep logs, what did the server do, what did the kernel
-# say. `|| true` where a non-match is a normal outcome rather than a fault.
-_SECTIONS: tuple[tuple[str, str, str], ...] = (
+# (name, title, command, needs_root). Ordered as an operator reads them: what
+# board is this, does it even keep logs, what did the server do, what did the
+# kernel say. `|| true` where a non-match is a normal outcome rather than a
+# fault.
+#
+# `needs_root` is per section on purpose. Running everything through `sudo -n`
+# means that on a board whose SSH user has no passwordless sudo, all twelve
+# sections come back "a password is required" -- an empty bundle, and no signal
+# at all about persistence, so the Enable button never appears either. The
+# sections that read world-readable files work unprivileged and should stay
+# that way, so such a board still yields the half of the bundle it can.
+_SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
     (
         "identity",
         "Board identity and uptime",
         "cat /proc/uptime; cat /proc/sys/kernel/random/boot_id; uname -a; date -Is",
+        False,
     ),
     (
         "journald",
@@ -75,50 +84,58 @@ _SECTIONS: tuple[tuple[str, str, str], ...] = (
         "ls -d " + JOURNAL_DIR + " 2>/dev/null || echo MISSING; "
         "grep -hE \"^[[:space:]]*Storage=\" /etc/systemd/journald.conf "
         "/etc/systemd/journald.conf.d/*.conf 2>/dev/null || true",
+        False,
     ),
-    ("boots", "Recorded boots", "journalctl --list-boots --no-pager || true"),
+    ("boots", "Recorded boots", "journalctl --list-boots --no-pager || true", True),
     (
         "linien_unit",
         "linien-server unit state",
         "systemctl show " + LINIEN_UNIT + " -p ActiveState -p SubState -p Result "
         "-p ExecMainStatus -p ExecMainCode -p ExecMainStartTimestamp "
         "-p ExecMainExitTimestamp -p NRestarts",
+        False,
     ),
     (
         "linien_journal",
         "linien-server log (this boot)",
         "journalctl -u " + LINIEN_UNIT + " -b 0 -n " + str(JOURNAL_LINES)
         + " --no-pager --output=short-iso",
+        True,
     ),
     (
         "linien_journal_prev",
         "linien-server log (previous boot)",
         "journalctl -u " + LINIEN_UNIT + " -b -1 -n " + str(JOURNAL_LINES)
         + " --no-pager --output=short-iso",
+        True,
     ),
-    ("kernel", "Kernel ring buffer", "dmesg | tail -n " + str(DMESG_LINES)),
+    ("kernel", "Kernel ring buffer", "dmesg | tail -n " + str(DMESG_LINES), True),
     (
         "reset_cause",
         "Reset, OOM and panic lines",
         "dmesg | grep -iE "
         "\"watchdog|reset|reboot|panic|oom-kill|out of memory|bus error|hung task\" "
         "|| true",
+        True,
     ),
     (
         "pstore",
         "Crash dump remnants",
         "cat /sys/fs/pstore/* 2>/dev/null || echo \"no pstore records\"",
+        True,
     ),
     (
         "resources",
         "Memory, disk and load",
         "free -m; df -h /; cat /proc/loadavg",
+        False,
     ),
-    ("fpga", "FPGA manager state", "cat /sys/class/fpga_manager/fpga0/state"),
+    ("fpga", "FPGA manager state", "cat /sys/class/fpga_manager/fpga0/state", False),
     (
         "telemetry",
         "rp-telemetry log",
         "journalctl -u " + TELEMETRY_UNIT + " -n 40 --no-pager --output=cat",
+        True,
     ),
 )
 
@@ -158,8 +175,10 @@ def collect_diagnostics(
 
     try:
         with _open(device, connection_factory) as conn:
-            for name, title, command in _SECTIONS:
-                sections.append(_run_section(conn, device, name, title, command))
+            for name, title, command, needs_root in _SECTIONS:
+                sections.append(
+                    _run_section(conn, device, name, title, command, needs_root)
+                )
     except AuthenticationException as exc:
         error = f"SSH authentication failed: {exc}"
     except Exception as exc:  # noqa: BLE001 - collection must never raise
@@ -176,11 +195,15 @@ def collect_diagnostics(
 
 
 def _run_section(
-    conn: Any, device: Any, name: str, title: str, command: str
+    conn: Any, device: Any, name: str, title: str, command: str, needs_root: bool
 ) -> dict[str, Any]:
     try:
         exited, stdout, stderr = run_remote(
-            conn, device, _bounded(command), timeout=SECTION_TIMEOUT_S + 5.0
+            conn,
+            device,
+            _bounded(command),
+            timeout=SECTION_TIMEOUT_S + 5.0,
+            privileged_command=needs_root,
         )
     except Exception as exc:  # noqa: BLE001 - one section, not the bundle
         logger.debug("diagnostics section failed name=%s", name, exc_info=True)

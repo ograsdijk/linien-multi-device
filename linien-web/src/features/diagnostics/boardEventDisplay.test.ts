@@ -11,6 +11,7 @@ describe('resolveBoardEventDisplay', () => {
     ['disconnected', 'Connection lost', 'red'],
     ['telemetry_recovered', 'Telemetry back', 'green'],
     ['persistent_log_enabled', 'Persistent logs on', 'green'],
+    ['reboot_requested', 'Rebooted (requested)', 'dimmed'],
   ])('%s reads as "%s"', (kind, label, tone) => {
     const display = resolveBoardEventDisplay(event(kind));
     expect(display.label).toBe(label);
@@ -39,5 +40,18 @@ describe('countReboots', () => {
   it('is zero for a quiet board', () => {
     expect(countReboots([event('telemetry_recovered')])).toBe(0);
     expect(countReboots([])).toBe(0);
+  });
+
+  it('excludes reboots the operator asked for', () => {
+    // The badge means "this board is unstable". Counting deliberate reboots
+    // would make it mean "you used the Reboot button", which is the opposite
+    // of a signal -- and the Reboot button is how you recover a wedged board,
+    // so the two would correlate exactly.
+    const events = [
+      event('reboot_requested'),
+      event('reboot_requested'),
+      event('reboot_detected'),
+    ];
+    expect(countReboots(events)).toBe(1);
   });
 });

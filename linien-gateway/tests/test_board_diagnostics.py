@@ -59,7 +59,7 @@ def test_every_section_is_collected_over_one_connection():
     assert len(bundle["sections"]) == len(bd._SECTIONS)
     assert len(conn.commands) == len(bd._SECTIONS)
     assert {section["name"] for section in bundle["sections"]} == {
-        name for name, _title, _command in bd._SECTIONS
+        name for name, _title, _command, _root in bd._SECTIONS
     }
 
 
@@ -137,7 +137,13 @@ def test_a_huge_section_is_truncated_from_the_front():
     assert len(section["output"]) <= bd.SECTION_MAX_CHARS + 32
 
 
-def test_a_non_root_user_gets_sudo():
+def test_only_the_sections_that_need_root_get_sudo():
+    """A board whose SSH user has no passwordless sudo must still yield the
+    half of the bundle that reads world-readable files. Putting `sudo -n` in
+    front of everything turned that board into an empty bundle -- and with no
+    `journald` section, the Enable persistent logs button never appeared
+    either, so the operator got no explanation at all.
+    """
     class Pi(Device):
         username = "pi"
 
@@ -145,7 +151,20 @@ def test_a_non_root_user_gets_sudo():
 
     bd.collect_diagnostics(Pi(), connection_factory=factory_for(conn))
 
-    assert all(command.startswith("sudo -n timeout") for command in conn.commands)
+    sudoed = [c for c in conn.commands if c.startswith("sudo -n ")]
+    plain = [c for c in conn.commands if not c.startswith("sudo -n ")]
+    assert any("dmesg" in c for c in sudoed)
+    assert any("journalctl -u linien-server" in c for c in sudoed)
+    assert any("/proc/uptime" in c for c in plain)
+    assert any("/var/log/journal" in c for c in plain)
+
+
+def test_root_needs_no_sudo_at_all():
+    conn = FakeConnection()
+
+    bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert all(command.startswith("timeout ") for command in conn.commands)
 
 
 # --- persistence detection ----------------------------------------------
