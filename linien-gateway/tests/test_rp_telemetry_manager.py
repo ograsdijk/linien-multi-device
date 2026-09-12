@@ -555,13 +555,49 @@ def test_a_wedged_device_cannot_stall_the_whole_fleet_poll(monkeypatch):
         stuck.set()
 
     # The poll completed instead of hanging, and the healthy board still got
-    # its temperature written.
+    # its temperature written. One timeout's worth, not one per wedged board:
+    # serially, a handful of them would add up and push the 30 s cycle past its
+    # own interval, delaying the next sample for every board in the lab.
     assert elapsed < 5.0
     healthy_writes = [line for _destination, lines in writer.calls for line in lines]
     assert healthy_writes, "the healthy board's temperature was not written"
     assert manager.status_fields("fine")["rp_temperature_c"] == 50.0
     # The wedged board is reported as skipped, not silently dropped.
     assert manager.influx_skip_reason("wedged") == rpt.INFLUX_SKIP_NO_CREDENTIALS
+
+
+def test_wedged_boards_do_not_add_their_timeouts_together(monkeypatch):
+    """The lookups are gathered, so N stuck boards cost one timeout, not N."""
+    monkeypatch.setattr(rpt, "INFLUX_CREDENTIAL_TIMEOUT_S", 0.2)
+    stuck = threading.Event()
+
+    def fetcher(key):
+        stuck.wait(timeout=10.0)
+        return NetrefCredentials()
+
+    devices = [_influx_device(f"wedged-{i}", f"10.0.0.{i}") for i in range(4)]
+    manager, *_ = make_manager(
+        devices,
+        read_fn=reading_fn(rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=50.0)),
+        version_fn=_no_version,
+        influx_writer=RecordingWriter(),
+        credentials_fetcher=fetcher,
+    )
+
+    async def run():
+        started = time.monotonic()
+        await manager.poll_once()
+        elapsed = time.monotonic() - started
+        stuck.set()
+        return elapsed
+
+    try:
+        elapsed = asyncio.run(run())
+    finally:
+        stuck.set()
+
+    # Four boards, one timeout's worth -- not four.
+    assert elapsed < 0.2 * 3
 
 
 def test_credentials_are_snapshotted_off_the_event_loop():

@@ -1092,34 +1092,51 @@ class RpTelemetryManager:
             self._entry(key).influx_credentials = snapshot
         return snapshot
 
+    async def _resolve_credentials_bounded(self, device: Any) -> Any | None:
+        """`_resolve_credentials` off the loop and under a deadline.
+
+        Off-loop alone only protects the websocket and HTTP handlers; the poll
+        coroutine still awaits the result, so an unbounded wait here stalls the
+        whole fleet's telemetry. On timeout the worker thread stays blocked on
+        the wedged RPyC lock, but `influx_credentials_checked_at` is stamped
+        before the fetch, so that board is not retried for
+        INFLUX_CREDENTIAL_RETRY_S and the threads cannot pile up.
+        """
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._resolve_credentials, device),
+                timeout=INFLUX_CREDENTIAL_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.debug(
+                "rp-telemetry credential fetch timed out key=%s",
+                getattr(device, "key", ""),
+            )
+            return None
+
     async def _write_influx(self, samples: Iterable[tuple[Any, float, float]]) -> None:
         writer = self._influx_writer
         if writer is None:
             return
         batches: dict[tuple[InfluxDestination, str], list[str]] = {}
         keys_by_batch: dict[tuple[InfluxDestination, str], list[str]] = {}
+
+        eligible = []
         for device, temperature, sampled_at in samples:
             if not self._influx_logging_enabled(device):
                 self._note_influx_skip(device, INFLUX_SKIP_DISABLED)
                 continue
-            # Off-loop AND time-bounded. Off-loop alone only protects the
-            # websocket and HTTP handlers; the poll coroutine still awaits the
-            # result, so an unbounded wait here stalls the whole fleet's
-            # telemetry. On timeout the worker thread stays blocked on the
-            # wedged RPyC lock, but `influx_credentials_checked_at` was already
-            # stamped before the fetch, so that board is not retried for
-            # INFLUX_CREDENTIAL_RETRY_S and the threads cannot pile up.
-            try:
-                credentials = await asyncio.wait_for(
-                    asyncio.to_thread(self._resolve_credentials, device),
-                    timeout=INFLUX_CREDENTIAL_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                logger.debug(
-                    "rp-telemetry credential fetch timed out key=%s",
-                    getattr(device, "key", ""),
-                )
-                credentials = None
+            eligible.append((device, temperature, sampled_at))
+
+        # Resolved for every board at once, not one at a time down the loop.
+        # Each lookup is bounded, but serially a handful of wedged boards would
+        # still add their timeouts together and push the 30 s cycle past its
+        # own interval, delaying the next temperature sample for every board.
+        resolved = await asyncio.gather(
+            *(self._resolve_credentials_bounded(device) for device, _t, _s in eligible)
+        )
+
+        for (device, temperature, sampled_at), credentials in zip(eligible, resolved):
             if credentials is None or not credentials.is_usable():
                 self._note_influx_skip(device, INFLUX_SKIP_NO_CREDENTIALS)
                 continue
