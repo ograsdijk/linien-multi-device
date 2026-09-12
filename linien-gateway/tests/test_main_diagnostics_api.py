@@ -196,3 +196,38 @@ def test_an_operator_reboot_is_recorded_as_requested_and_resets_the_baseline(cli
     assert main.board_event_store.last_boot_id("dev-1") is None
     assert main.board_event_store.note_boot_id("dev-1", "boot-b") is False
 
+
+def test_requesting_a_reboot_clears_the_boot_id_baseline(client, monkeypatch):
+    """Cleared on dispatch, not on completion.
+
+    A reboot that times out or is cancelled after the command already landed
+    never emits `device_reboot_completed`, so a later probe would see the
+    changed boot id and file a spontaneous `reboot_detected` -- putting the
+    operator's own reboot back into the instability count.
+    """
+
+    class Session:
+        def start_reboot(self):
+            return {"operation_id": "op-1"}
+
+    monkeypatch.setattr(main, "_get_session", lambda _key: Session())
+    main.board_event_store.note_boot_id("dev-1", "boot-a")
+
+    response = client.post("/api/devices/dev-1/control/reboot")
+
+    assert response.status_code == 202
+    assert main.board_event_store.last_boot_id("dev-1") is None
+    # The next probe therefore files nothing.
+    assert main.board_event_store.note_boot_id("dev-1", "boot-b") is False
+    assert client.get("/api/devices/dev-1/events").json()["events"] == []
+
+
+def test_the_events_limit_is_clamped_to_what_is_actually_retained(client):
+    """Asking for 500 used to return 200 with nothing to say it was cut."""
+    for index in range(5):
+        main.board_event_store.record("dev-1", KIND_DISCONNECTED, detail=str(index))
+
+    payload = client.get("/api/devices/dev-1/events?limit=100000").json()
+
+    assert len(payload["events"]) == 5
+

@@ -60,6 +60,10 @@ device_settings.json
 # Per-device board/server event timeline, written at runtime.
 board_events.json
 board_events.json.tmp
+# ...but, as for device_settings.json above, the Docker stack needs a committed
+# seed file to bind-mount, or Docker creates a directory at the mount path and
+# the timeline never persists at all.
+!docker/linien-multi-device/data/board_events.json
 
 # OS / Editor
 .DS_Store

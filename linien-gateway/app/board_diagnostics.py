@@ -344,7 +344,14 @@ def enable_persistent_journal(
             # JOURNAL_DIR exists would only confirm the mkdir above, and would
             # report success for a board whose Storage= is still being
             # overridden by another drop-in.
-            exited, out, _err = run(_STORAGE_PROBE)
+            #
+            # Through `_bounded`, which wraps it in `sh -c`. The probe is a
+            # compound `if ...; then ...; fi`, and `sudo -n if ...` is a syntax
+            # error -- so on a non-root board the verification failed every
+            # time and reported a board it had just configured correctly as a
+            # failure. The section path was always safe because it is bounded;
+            # this call was the one that was not.
+            exited, out, _err = run(_bounded(_STORAGE_PROBE))
             if "STORAGE=PERSISTENT" not in out:
                 state = (
                     "could not be determined"

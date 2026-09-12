@@ -320,6 +320,28 @@ def test_journald_still_volatile_afterwards_is_not_reported_as_success():
         bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
 
 
+def test_the_verification_survives_a_non_root_board():
+    """`sudo -n if ...; then ...; fi` is a shell syntax error.
+
+    The probe is a compound command, so it has to reach the board inside
+    `sh -c`. Without that, a non-root board wrote the drop-in, created the
+    directory, restarted journald -- and then reported the whole thing as a
+    failure it had in fact completed, leaving the Enable button on screen
+    forever.
+    """
+    class Pi(Device):
+        username = "pi"
+
+    conn = _enable_conn()
+
+    result = bd.enable_persistent_journal(Pi(), connection_factory=factory_for(conn))
+
+    assert result["ok"] is True
+    probe = next(c for c in conn.commands if "STORAGE=PERSISTENT" in c)
+    assert probe.startswith("sudo -n timeout ")
+    assert " sh -c " in probe
+
+
 def test_a_journald_that_cannot_be_asked_is_not_reported_as_success():
     conn = _enable_conn(**{"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=UNKNOWN")})
 

@@ -36,10 +36,10 @@ from .device_config_store import (
 )
 from . import board_diagnostics
 from .board_event_store import (
+    DEFAULT_MAX_PER_DEVICE as BOARD_EVENT_LIMIT,
     KIND_DIAGNOSIS,
     KIND_DISCONNECTED,
     KIND_PERSISTENT_LOG_ENABLED,
-    KIND_REBOOT_DETECTED,
     KIND_REBOOT_REQUESTED,
     KIND_TELEMETRY_OFFLINE,
     KIND_TELEMETRY_RECOVERED,
@@ -818,6 +818,14 @@ def reboot_device(key: str, response: Response) -> dict:
             recovery = session.start_reboot()
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+    # From here on the board may restart, so the remembered boot id is no
+    # longer a baseline for "did this board restart on its own". Cleared on
+    # *dispatch* rather than on completion: the reboot can time out or be
+    # cancelled after the command has already landed, and in those paths no
+    # `device_reboot_completed` is ever emitted -- so a later probe would see
+    # the changed id and file a spontaneous `reboot_detected`, putting the
+    # operator's own reboot into the instability count.
+    board_event_store.forget_boot_id(key)
     response.headers["Cache-Control"] = "no-store"
     return {"ok": True, "operation_id": recovery["operation_id"]}
 
@@ -1694,10 +1702,14 @@ async def start_telemetry_many(payload: DeviceKeysIn) -> dict:
 
 
 @app.get("/api/devices/{key}/events")
-def get_board_events(key: str, limit: int = 200) -> dict:
-    """The device's retained timeline. Cache read; no I/O, no SSH."""
+def get_board_events(key: str, limit: int = BOARD_EVENT_LIMIT) -> dict:
+    """The device's retained timeline. Cache read; no I/O, no SSH.
+
+    Clamped to what the store actually retains, rather than to a larger number
+    it would silently cut down anyway.
+    """
     _get_device_or_404(key)
-    safe_limit = max(1, min(int(limit), 500))
+    safe_limit = max(1, min(int(limit), BOARD_EVENT_LIMIT))
     return {"events": board_event_store.events(key, limit=safe_limit)}
 
 
