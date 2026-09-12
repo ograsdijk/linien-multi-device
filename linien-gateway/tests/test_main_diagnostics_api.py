@@ -7,7 +7,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main
-from app.board_event_store import KIND_DISCONNECTED, KIND_PERSISTENT_LOG_ENABLED
+from app.board_event_store import (
+    KIND_DISCONNECTED,
+    KIND_PERSISTENT_LOG_ENABLED,
+    KIND_REBOOT_REQUESTED,
+)
 
 
 def make_device(key="dev-1"):
@@ -172,3 +176,23 @@ def test_bulk_enable_reports_per_device_outcomes(monkeypatch):
     assert payload["enabled"] == ["a"]
     assert payload["failed"]["b"] == "ssh timed out"
     assert payload["failed"]["missing"] == "Device not found"
+
+
+def test_an_operator_reboot_is_recorded_as_requested_and_resets_the_baseline(client):
+    """It must not land in the instability count, directly or via the probe."""
+    main.board_event_store.note_boot_id("dev-1", "boot-a")
+
+    main._emit_log(
+        logging.INFO,
+        "session",
+        "device_reboot_completed",
+        "Red Pitaya reboot completed.",
+        "dev-1",
+    )
+
+    events = client.get("/api/devices/dev-1/events").json()["events"]
+    assert events[0]["kind"] == KIND_REBOOT_REQUESTED
+    # Baseline cleared, so the next probe files no spontaneous reboot.
+    assert main.board_event_store.last_boot_id("dev-1") is None
+    assert main.board_event_store.note_boot_id("dev-1", "boot-b") is False
+

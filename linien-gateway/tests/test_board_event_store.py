@@ -3,6 +3,7 @@ import time
 from app.board_event_store import (
     KIND_DISCONNECTED,
     KIND_REBOOT_DETECTED,
+    KIND_REBOOT_REQUESTED,
     BoardEventStore,
 )
 
@@ -213,4 +214,38 @@ def test_concurrent_recording_never_publishes_a_torn_file(tmp_path):
     reloaded = make_store(tmp_path)
     # A corrupt file would come back empty for every device.
     assert sum(len(reloaded.events(f"dev-{i}")) for i in range(4)) == 80
+
+
+def test_forgetting_the_boot_id_keeps_the_timeline(tmp_path):
+    """Used after an operator reboot, which is already on the timeline."""
+    store = make_store(tmp_path)
+    store.note_boot_id("dev-1", "boot-a")
+    store.record("dev-1", KIND_DISCONNECTED, detail="keep me")
+
+    store.forget_boot_id("dev-1")
+
+    assert store.last_boot_id("dev-1") is None
+    assert [event["detail"] for event in store.events("dev-1")] == ["keep me"]
+
+
+def test_an_operator_reboot_does_not_produce_a_second_spontaneous_one(tmp_path):
+    """The whole point of separating requested from detected reboots.
+
+    Without resetting the baseline, the next probe after a requested reboot
+    compares against the id from before it, sees a change, and files a
+    spontaneous `reboot_detected` -- putting the operator's own reboot straight
+    back into the instability count.
+    """
+    store = make_store(tmp_path)
+    store.note_boot_id("dev-1", "boot-a")
+
+    # Operator reboots; the requested event is recorded and the baseline reset.
+    store.record("dev-1", KIND_REBOOT_REQUESTED, detail="Reboot completed.")
+    store.forget_boot_id("dev-1")
+
+    # The next probe sees the new boot id.
+    assert store.note_boot_id("dev-1", "boot-b") is False
+
+    kinds = [event["kind"] for event in store.events("dev-1")]
+    assert kinds == [KIND_REBOOT_REQUESTED]
 

@@ -95,6 +95,7 @@ class BoardEventStore:
             max_workers=1, thread_name_prefix="board-events-write"
         )
         self._pending: Future | None = None
+        self._write_lock = threading.Lock()
         self._load()
 
     # --- reading ---------------------------------------------------------
@@ -188,6 +189,21 @@ class BoardEventStore:
         )
         return True
 
+    def forget_boot_id(self, device_key: str) -> None:
+        """Drop the remembered boot id, keeping the timeline.
+
+        Called when a restart is already accounted for -- an operator-requested
+        reboot. Without it the next probe compares against the id from before
+        that reboot, sees a change, and records a second, spontaneous-looking
+        `reboot_detected`, which is exactly what the instability badge is
+        supposed to exclude.
+        """
+        with self._lock:
+            if self._boot_ids.pop(device_key, None) is None:
+                return
+            self._dirty = True
+        self.flush()
+
     def forget(self, device_key: str) -> None:
         with self._lock:
             self._events.pop(device_key, None)
@@ -206,10 +222,12 @@ class BoardEventStore:
         fan-out for its duration. `block=True` is for shutdown, where the
         process is about to go away and the write must actually land.
 
-        One writer thread also means writes are serialised: two overlapping
-        `replace()` calls through the same temp path could otherwise publish a
-        half-written file, and a torn file is read back as corrupt and drops
-        the whole retained history -- the one thing this store exists to keep.
+        Writes go through that one thread even when blocking, so they are
+        serialised: two overlapping `replace()` calls through the same temp
+        path would otherwise publish a half-written file, and a torn file is
+        read back as corrupt and drops the whole retained history -- the one
+        thing this store exists to keep. `_write_lock` covers the fallback
+        paths, where there is no executor left to serialise through.
         """
         payload = None
         with self._lock:
@@ -223,19 +241,20 @@ class BoardEventStore:
                 self._last_flush = time.time()
 
         if payload is not None:
-            if block or self._writer is None:
+            writer = self._writer
+            if writer is None:
                 self._write(payload)
             else:
                 try:
-                    self._pending = self._writer.submit(self._write, payload)
+                    self._pending = writer.submit(self._write, payload)
                 except RuntimeError:
                     # Executor already shut down: write inline, never lose it.
                     self._write(payload)
 
         if block:
-            # A debounced write submitted earlier may still be in flight, and
-            # "blocking" has to mean the file on disk is current -- otherwise
-            # shutdown races the writer it is trying to wait for.
+            # Wait for whatever is queued -- this call's write and any earlier
+            # debounced one. "Blocking" has to mean the file on disk is
+            # current, or shutdown races the writer it is trying to wait for.
             pending = self._pending
             self._pending = None
             if pending is not None:
@@ -246,10 +265,13 @@ class BoardEventStore:
 
     def _write(self, payload: dict[str, Any]) -> None:
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = self._path.with_suffix(self._path.suffix + ".tmp")
-            temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            temp_path.replace(self._path)
+            # Serialises the fallback paths too (executor gone at shutdown),
+            # which share the one temp path with anything still in flight.
+            with self._write_lock:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = self._path.with_suffix(self._path.suffix + ".tmp")
+                temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                temp_path.replace(self._path)
         except (OSError, TypeError, ValueError):
             # Never fatal: the timeline is a diagnostic aid, and losing a write
             # must not take down whatever was being diagnosed. But mark the

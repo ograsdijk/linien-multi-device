@@ -269,7 +269,13 @@ amount of collecting recovers it retroactively.
 `Storage=persistent` journald drop-in (32 MB, 8 MB per file — these are SD
 cards), creates `/var/log/journal`, and restarts journald. The write is
 checksum-verified and `sync`ed, with the same care the telemetry unit write
-earned on real hardware. `POST /api/diagnostics/enable-persistent-log` does a
+earned on real hardware.
+
+It then asks journald which file it is *actually* writing to, rather than
+checking that `/var/log/journal` exists — that directory is created by this
+very action, so its presence proves nothing. A board whose `Storage=` is still
+overridden by another drop-in reports failure and says where to look, instead
+of showing a green badge over logs that would not survive. `POST /api/diagnostics/enable-persistent-log` does a
 set of boards at once, which is how you would want to do it the first time.
 
 The modal offers the action only when a collected bundle shows the board has no

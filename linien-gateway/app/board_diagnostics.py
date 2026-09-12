@@ -53,12 +53,28 @@ DMESG_LINES = 200
 SECTION_MAX_CHARS = 20_000
 
 JOURNALD_DROPIN_DIR = "/etc/systemd/journald.conf.d"
-JOURNALD_DROPIN_PATH = JOURNALD_DROPIN_DIR + "/00-linien-persistent.conf"
+# `99-` so it wins: systemd applies drop-ins in lexical order, and a `00-`
+# prefix loses to the conventional `99-*.conf` a vendor image may already
+# ship -- silently, with Storage= reverting and nothing to show for it.
+JOURNALD_DROPIN_PATH = JOURNALD_DROPIN_DIR + "/99-linien-persistent.conf"
 JOURNAL_DIR = "/var/log/journal"
 
 # SD cards wear out and fill up, so the journal is capped rather than left to
 # journald's default of 10% of the filesystem. 32 MB is days of a quiet board.
 JOURNALD_DROPIN = "[Journal]\nStorage=persistent\nSystemMaxUse=32M\nSystemMaxFileSize=8M\n"
+
+# journald reports the file it is really writing to: a path under
+# /var/log/journal means persistent storage is live, one under /run/log/journal
+# means it is still in tmpfs. Everything keys on this rather than on the
+# existence of /var/log/journal, because `enable_persistent_journal` creates
+# that directory itself -- so checking for it afterwards would confirm nothing
+# but our own mkdir, and would report success for a board still logging to RAM.
+_STORAGE_PROBE = (
+    "if journalctl --header >/dev/null 2>&1; then "
+    'if journalctl --header 2>/dev/null | grep -qi "' + JOURNAL_DIR + '"; '
+    "then echo STORAGE=PERSISTENT; else echo STORAGE=VOLATILE; fi; "
+    "else echo STORAGE=UNKNOWN; fi"
+)
 
 # (name, title, command, needs_root). Ordered as an operator reads them: what
 # board is this, does it even keep logs, what did the server do, what did the
@@ -81,10 +97,12 @@ _SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
     (
         "journald",
         "Journal persistence",
-        "ls -d " + JOURNAL_DIR + " 2>/dev/null || echo MISSING; "
+        _STORAGE_PROBE + "; "
+        'journalctl --header 2>/dev/null | grep -i "file path" | head -n 3 || true; '
+        "ls -d " + JOURNAL_DIR + " 2>/dev/null || echo NO-JOURNAL-DIR; "
         "grep -hE \"^[[:space:]]*Storage=\" /etc/systemd/journald.conf "
         "/etc/systemd/journald.conf.d/*.conf 2>/dev/null || true",
-        False,
+        True,
     ),
     ("boots", "Recorded boots", "journalctl --list-boots --no-pager || true", True),
     (
@@ -242,9 +260,14 @@ def _persistent_journal(sections: list[dict[str, Any]]) -> bool | None:
         if section.get("name") != "journald":
             continue
         output = section.get("output") or ""
-        if not output.strip():
-            return None
-        return JOURNAL_DIR in output and "MISSING" not in output
+        if "STORAGE=PERSISTENT" in output:
+            return True
+        if "STORAGE=VOLATILE" in output:
+            return False
+        # UNKNOWN, or the section did not run at all. Stay honest: reporting
+        # False here would nag about a board we could not read, and True would
+        # promise logs that may not survive.
+        return None
     return None
 
 
@@ -317,14 +340,22 @@ def enable_persistent_journal(
                 )
             run("sync")
 
-            exited, out, _err = run(
-                "ls -d " + JOURNAL_DIR + " 2>/dev/null || echo MISSING",
-                privileged_command=False,
-            )
-            if JOURNAL_DIR not in out or "MISSING" in out:
+            # Ask journald which file it is now writing to. Checking that
+            # JOURNAL_DIR exists would only confirm the mkdir above, and would
+            # report success for a board whose Storage= is still being
+            # overridden by another drop-in.
+            exited, out, _err = run(_STORAGE_PROBE)
+            if "STORAGE=PERSISTENT" not in out:
+                state = (
+                    "could not be determined"
+                    if "STORAGE=UNKNOWN" in out or exited != 0
+                    else "is still volatile"
+                )
                 raise RuntimeError(
-                    "journald restarted but the persistent journal directory is "
-                    f"still missing ({JOURNAL_DIR})"
+                    "journald restarted but its storage "
+                    f"{state} -- logs would still not survive a reboot. "
+                    f"Check for another drop-in in {JOURNALD_DROPIN_DIR} "
+                    "overriding Storage=."
                 )
     except AuthenticationException as exc:
         raise RuntimeError(f"SSH authentication failed: {exc}") from exc
