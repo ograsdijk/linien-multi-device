@@ -226,6 +226,56 @@ def test_a_board_with_only_the_fpga_xadc_reports_an_error(daemon, tmp_path):
     assert "iio_device1" in text and "FPGA-backed" in text
 
 
+def test_a_refused_device_is_reported_once_not_once_per_request(daemon, tmp_path):
+    """Discovery re-runs per request while it fails; the warning must not.
+
+    A line per request is the steady background work this daemon exists to
+    avoid -- and it would land on exactly the boards already in trouble.
+    """
+    root = make_board_like_iio_root(tmp_path, ps=False)
+    server = daemon(root)
+
+    for _ in range(5):
+        assert server.request(b"STATUS\n") == b"RPT1 ERR XADC\n"
+
+    server.process.terminate()
+    _stdout, stderr = server.process.communicate(timeout=5)
+    warnings = [
+        line for line in stderr.decode().splitlines() if "FPGA-backed" in line
+    ]
+    assert len(warnings) == 1
+
+
+def test_the_default_root_accepts_nothing_but_the_ps_xadc(daemon_binary):
+    """Matching on "adc_wiz" only catches the wizard by the name it happens to
+    have. On a real board anything unrecognised is refused as well, because the
+    cost of being wrong is a reset -- while a caller that overrode --iio-root
+    still gets the permissive behaviour the fixtures rely on.
+    """
+    process = subprocess.Popen(
+        [str(daemon_binary), "--port", str(_free_port())],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(0.5)
+    finally:
+        process.terminate()
+    _stdout, stderr = process.communicate(timeout=5)
+    assert "restricting discovery to the PS XADC" in stderr.decode()
+
+
+def test_an_overridden_root_is_not_restricted(daemon, tmp_path):
+    root, _device = make_iio_root(tmp_path)
+    server = daemon(root)
+
+    assert server.request(b"STATUS\n").startswith(b"RPT1 ")
+
+    server.process.terminate()
+    _stdout, stderr = server.process.communicate(timeout=5)
+    assert "restricting discovery" not in stderr.decode()
+
+
 def test_an_unclassifiable_device_is_still_usable(daemon, tmp_path):
     """Other hardware (and the plain test tree) has no f8007100 in its path."""
     root, _device = make_iio_root(tmp_path)

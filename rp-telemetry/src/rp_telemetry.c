@@ -19,7 +19,8 @@
  * IIO. The device directory is discovered once at startup by scanning
  * /sys/bus/iio/devices; the FPGA-backed XADC wizard, which carries the same
  * IIO name and whose registers vanish when the bitstream is reprogrammed, is
- * refused (see xadc_rank()). `in_temp0_offset` and `in_temp0_scale` are read
+ * refused -- as is anything else that is not demonstrably the PS XADC (see
+ * xadc_rank()). `in_temp0_offset` and `in_temp0_scale` are read
  * once at the same time (they are constants of the XADC transfer function).
  * Only `in_temp0_raw` is re-read per request.
  *
@@ -143,6 +144,14 @@ struct xadc {
     char raw_path[PATH_MAX_LEN];
     long offset;
     double scale;
+    /* Refuse anything but the PS XADC. Set when scanning the real
+     * /sys/bus/iio/devices; see main(). */
+    int strict;
+    /* Refusals are latched: discovery re-runs per request while it is
+     * failing, and a warning per request is exactly the kind of steady
+     * background work this daemon exists to avoid. */
+    int warned_pl;
+    int warned_unknown;
 };
 
 static int path_exists(const char *path)
@@ -165,10 +174,14 @@ static int path_exists(const char *path)
  * answers: the bus hangs and the watchdog reboots the board. Since the name is
  * identical, the only way to tell them apart is the resolved device path.
  *
- * Returns 0 for the PS XADC, 1 for a device that cannot be classified (used
- * only when no PS XADC is found, so the daemon still works on other hardware
- * and under test), and -1 for anything PL-backed or unresolvable, which must
- * never be read.
+ * Returns 0 for the PS XADC, 1 for a device that cannot be classified, and
+ * -1 for anything PL-backed or unresolvable, which must never be read.
+ *
+ * Note that rank 1 is not by itself a licence to read: matching on the name
+ * `adc_wiz` only catches the wizard as Xilinx's tooling happens to name it,
+ * and a PL peripheral under any other name would rank 1 and reboot the board.
+ * So on a real Red Pitaya (see `strict`) rank 1 is refused too, and the
+ * fallback exists only for a caller that pointed us somewhere else on purpose.
  */
 static int xadc_rank(const char *iio_root, const char *name)
 {
@@ -224,10 +237,24 @@ static int xadc_discover(struct xadc *x, const char *iio_root)
         }
         int rank = xadc_rank(iio_root, entry->d_name);
         if (rank < 0) {
-            fprintf(stderr,
-                    "rp-telemetry: ignoring FPGA-backed XADC %s/%s "
-                    "(reading it can hang the AXI bus)\n",
-                    iio_root, entry->d_name);
+            if (!x->warned_pl) {
+                x->warned_pl = 1;
+                fprintf(stderr,
+                        "rp-telemetry: ignoring FPGA-backed XADC %s/%s "
+                        "(reading it can hang the AXI bus)\n",
+                        iio_root, entry->d_name);
+            }
+            continue;
+        }
+        if (rank > 0 && x->strict) {
+            if (!x->warned_unknown) {
+                x->warned_unknown = 1;
+                fprintf(stderr,
+                        "rp-telemetry: ignoring unrecognised XADC %s/%s "
+                        "(only the PS XADC at " PS_XADC_MARKER
+                        " is safe to read)\n",
+                        iio_root, entry->d_name);
+            }
             continue;
         }
         if (rank >= best_rank) {
@@ -483,6 +510,16 @@ int main(int argc, char **argv)
 
     struct xadc x;
     memset(&x, 0, sizeof(x));
+    /* A caller that overrides the IIO root is a test harness or unusual
+     * hardware, and takes responsibility for what it points us at. The default
+     * root means a Red Pitaya, where reading the wrong peripheral resets the
+     * board -- so there, nothing but the PS XADC is touched. */
+    x.strict = (strcmp(iio_root, DEFAULT_IIO_ROOT) == 0);
+    if (x.strict) {
+        fprintf(stderr,
+                "rp-telemetry: restricting discovery to the PS XADC ("
+                PS_XADC_MARKER ")\n");
+    }
     if (xadc_discover(&x, iio_root) != 0) {
         /* Not fatal: report once and keep serving, answering ERR XADC until
          * the sysfs entries appear. Discovery is retried per request only

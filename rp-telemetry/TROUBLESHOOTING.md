@@ -40,21 +40,31 @@ harmless. Only `in_temp0_raw` touches the hardware, and only per request.
 **Fix (daemon 1.1.0).** Discovery now resolves each IIO device's real path and
 classifies it:
 
-- path contains `f8007100` → the PS XADC, preferred;
+- path contains `f8007100` → the PS XADC, used;
 - path contains `adc_wiz` → FPGA-backed, **refused outright** and logged;
-- anything else → used only if no PS XADC exists (other hardware, and the test
-  fixtures);
-- unresolvable → refused, on the principle that a device we cannot prove is safe
-  does not get read.
+- anything else → also refused on a real board, because matching on `adc_wiz`
+  only catches the wizard by the name Xilinx's tooling happens to give it, and
+  a PL peripheral under any other name would reset the board just as
+  thoroughly. `ERR XADC` is the right answer for a board we do not recognise;
+- unresolvable → refused, on the same principle.
 
-At startup the daemon now prints which device it settled on:
+That restriction applies when scanning the real `/sys/bus/iio/devices`. A
+caller that passes `--iio-root` somewhere else (the test fixtures, unusual
+hardware) takes responsibility for what it points the daemon at and gets the
+permissive behaviour.
+
+At startup the daemon prints what it restricted itself to and what it settled
+on:
 
 ```
+rp-telemetry: restricting discovery to the PS XADC (f8007100)
 rp-telemetry: ignoring FPGA-backed XADC /sys/bus/iio/devices/iio:device1 (reading it can hang the AXI bus)
 rp-telemetry: reading temperature from /sys/bus/iio/devices/iio:device0/in_temp0_raw
 ```
 
-Two lines at startup, nothing per request.
+A fixed handful of lines at startup, nothing per request -- refusals are
+latched, so a board that never finds a usable XADC does not accumulate a
+warning per poll.
 
 ### Checking a board
 

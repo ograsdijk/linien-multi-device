@@ -114,3 +114,22 @@ def test_xadc_temperature_formula_matches_the_c_daemon():
     reading = rpt.parse_status_line(f"RPT1 {expected:.2f}")
     assert reading.state == rpt.STATE_RUNNING
     assert abs((reading.temperature_c or 0) - expected) < 0.005
+
+
+def test_the_bundled_binary_is_the_one_the_gateway_claims_to_ship():
+    """Guard against editing the daemon and forgetting build-arm.sh.
+
+    Nothing else ties the committed armv7 asset to BUNDLED_VERSION: the
+    compile-and-run tests build the C source fresh, so they stay green while
+    the bundled binary goes stale. The board would then keep whatever it had,
+    and the UI would show an update that installing never clears.
+    """
+    binary = rpt.BUNDLED_BINARY_PATH.read_bytes()
+
+    assert rpt.BUNDLED_VERSION.encode() in binary
+
+    # ...and it is still an ARM binary, so the board does not answer a fresh
+    # install with "Exec format error".
+    assert binary[:4] == b"\x7fELF"
+    assert int.from_bytes(binary[18:20], "little") == 40  # EM_ARM
+

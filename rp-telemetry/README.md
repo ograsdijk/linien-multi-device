@@ -112,7 +112,9 @@ XADC at `f8007100.adc`, and an XADC wizard core at `83c00000.xadc_wiz` that
 lives inside the FPGA bitstream. Reading the second one after `linien-server`
 has reprogrammed the FPGA is an AXI access nothing answers — the bus hangs and
 the watchdog reboots the board. The daemon therefore identifies the device by
-its resolved sysfs path, prefers the PS XADC, and refuses FPGA-backed ones. See
+its resolved sysfs path and, on a real board, reads nothing but the PS XADC;
+anything else answers `ERR XADC` rather than risk a reset. A `--iio-root`
+override lifts that restriction, for the tests and for other hardware. See
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## Security
