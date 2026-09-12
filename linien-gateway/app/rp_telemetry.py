@@ -72,6 +72,19 @@ SUSTAINED_LOSS_POLLS = 3
 # How long to wait before re-asking a connected device for its InfluxDB
 # credentials after a failed/absent attempt.
 INFLUX_CREDENTIAL_RETRY_S = 300.0
+# Ceiling on one device's credential lookup. The fetch ends in an RPyC
+# round trip under the session's `_rpyc_lock`, which a wedged board can
+# hold indefinitely -- and the poll loop awaits it, so without a bound one
+# stuck device stops temperature polling for every board in the lab.
+INFLUX_CREDENTIAL_TIMEOUT_S = 5.0
+# Unanswered VERSION requests before the probe gives up on a daemon.
+VERSION_PROBE_ATTEMPTS = 3
+# Workers building status frames. More than one because `_publish_blocking`
+# can block on a device's `_rpyc_lock` (see `_publish`), and with a single
+# worker one wedged board holds up the status push for every other board.
+# Small enough to stay a fan-out helper rather than a thread pool of
+# consequence; publishes are per material change, not per poll.
+PUBLISH_WORKERS = 4
 # Field name written to the device's existing InfluxDB measurement.
 INFLUX_TEMPERATURE_FIELD = "rp_temperature_c"
 # Reasons a sampled temperature is not written, surfaced to the operator.
@@ -423,6 +436,10 @@ class TelemetryEntry:
     # boards where a mismatch matters. Reset whenever the daemon goes away, so a
     # restart or an out-of-band reflash is picked up.
     version_probed: bool = False
+    # Consecutive VERSION requests that went unanswered. A daemon too old
+    # to implement VERSION must not be asked every poll, but one dropped
+    # connection must not silence the probe for the daemon's lifetime.
+    version_probe_failures: int = 0
     # Version the mismatch warning was last emitted for. In-memory, so the
     # warning repeats at most once per gateway run rather than being persisted
     # into the device record from the poll loop.
@@ -764,12 +781,26 @@ class RpTelemetryManager:
                     connect_timeout=CONNECT_TIMEOUT_S,
                     read_timeout=READ_TIMEOUT_S,
                 )
-                # Recorded (either way -- a daemon too old to answer VERSION
-                # must not be re-asked every cycle) by _apply_reading, so that
-                # it lands under the same staleness guard as everything else.
-                # Setting it here would let a poll that overlapped a Restart
-                # undo that restart's request for a fresh probe.
-                probed = True
+                # Recorded by _apply_reading, so it lands under the same
+                # staleness guard as everything else. Setting it here would let
+                # a poll that overlapped a Restart undo that restart's request
+                # for a fresh probe.
+                #
+                # An answer settles it. A non-answer only counts towards giving
+                # up: `read_version` returns None both for "this daemon is too
+                # old to implement VERSION" and for "the connection dropped",
+                # and latching on the first of those would mean one momentary
+                # blip stops us ever noticing a board reflashed out-of-band
+                # with an older build -- the case the probe exists for.
+                if version is not None:
+                    probed = True
+                else:
+                    with self._lock:
+                        entry = self._entry(key)
+                        entry.version_probe_failures += 1
+                        probed = (
+                            entry.version_probe_failures >= VERSION_PROBE_ATTEMPTS
+                        )
 
         return self._apply_reading(
             device,
@@ -820,6 +851,7 @@ class RpTelemetryManager:
                         entry.version = recorded
             if version_probed:
                 entry.version_probed = True
+                entry.version_probe_failures = 0
             previous_state = entry.state
             if version is not None:
                 entry.version = version
@@ -838,6 +870,7 @@ class RpTelemetryManager:
                 # The daemon we probed is gone; whatever comes back may be a
                 # different build (a restart, a reinstall, a reflash).
                 entry.version_probed = False
+                entry.version_probe_failures = 0
             entry.state = reading.state
             current = _material_signature(entry, self._effective_state(entry, now))
             failures = entry.consecutive_failures
@@ -936,6 +969,13 @@ class RpTelemetryManager:
         the poll thread holds it. Since `_publish` is reached from the poll
         coroutine, do that work on a worker thread; management actions already
         run on one and publish inline.
+
+        The pool has several workers so that one device stuck on its
+        `_rpyc_lock` cannot hold up status pushes for the rest of the fleet.
+        Two frames for the *same* device can then be built concurrently and
+        delivered out of order, which at worst shows a reading one cycle old
+        until the next frame -- a far better failure than every board's card
+        freezing behind one sick one.
         """
         publisher = self._status_publisher
         if publisher is None:
@@ -959,7 +999,7 @@ class RpTelemetryManager:
                 logger.debug("rp-telemetry publish skipped during shutdown key=%s", key)
                 return
             executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="rp-telemetry-publish"
+                max_workers=PUBLISH_WORKERS, thread_name_prefix="rp-telemetry-publish"
             )
             self._publish_executor = executor
         try:
@@ -1062,10 +1102,24 @@ class RpTelemetryManager:
             if not self._influx_logging_enabled(device):
                 self._note_influx_skip(device, INFLUX_SKIP_DISABLED)
                 continue
-            # Off-loop: _resolve_credentials can fall back to a blocking RPyC
-            # call, and a wedged device would otherwise freeze every websocket
-            # and HTTP handler for the duration of the poll cycle.
-            credentials = await asyncio.to_thread(self._resolve_credentials, device)
+            # Off-loop AND time-bounded. Off-loop alone only protects the
+            # websocket and HTTP handlers; the poll coroutine still awaits the
+            # result, so an unbounded wait here stalls the whole fleet's
+            # telemetry. On timeout the worker thread stays blocked on the
+            # wedged RPyC lock, but `influx_credentials_checked_at` was already
+            # stamped before the fetch, so that board is not retried for
+            # INFLUX_CREDENTIAL_RETRY_S and the threads cannot pile up.
+            try:
+                credentials = await asyncio.wait_for(
+                    asyncio.to_thread(self._resolve_credentials, device),
+                    timeout=INFLUX_CREDENTIAL_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "rp-telemetry credential fetch timed out key=%s",
+                    getattr(device, "key", ""),
+                )
+                credentials = None
             if credentials is None or not credentials.is_usable():
                 self._note_influx_skip(device, INFLUX_SKIP_NO_CREDENTIALS)
                 continue
@@ -1420,6 +1474,7 @@ class RpTelemetryManager:
             entry.installed = True
             entry.version = BUNDLED_VERSION
             entry.version_probed = False
+            entry.version_probe_failures = 0
             entry.logged_version_mismatch = None
             entry.consecutive_failures = 0
             entry.loss_reported = False
@@ -1634,6 +1689,7 @@ class RpTelemetryManager:
             entry.state = STATE_NOT_INSTALLED
             entry.version = None
             entry.version_probed = False
+            entry.version_probe_failures = 0
             entry.logged_version_mismatch = None
             entry.mutation_seq += 1
             entry.temperature_c = None
@@ -1708,6 +1764,7 @@ class RpTelemetryManager:
                     entry.sampled_at = None
                     # A restart may be running a different build.
                     entry.version_probed = False
+                    entry.version_probe_failures = 0
         self._publish(key)
         return {"ok": True, "active": active, "state": active_state}
 

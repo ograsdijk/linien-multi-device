@@ -236,6 +236,11 @@ def test_version_is_re_probed_after_the_daemon_goes_away():
 
 
 def test_a_daemon_that_cannot_answer_version_is_not_re_asked_every_cycle():
+    """A daemon too old to implement VERSION must not be asked forever.
+
+    It gets VERSION_PROBE_ATTEMPTS chances, then the probe gives up for that
+    daemon's lifetime -- not once per 30 s poll for the life of the gateway.
+    """
     device = make_device()
     calls: list[str] = []
 
@@ -248,9 +253,37 @@ def test_a_daemon_that_cannot_answer_version_is_not_re_asked_every_cycle():
         read_fn=reading_fn(rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=50.0)),
         version_fn=version_fn,
     )
+    for _ in range(8):
+        asyncio.run(manager.poll_once())
+    assert len(calls) == rpt.VERSION_PROBE_ATTEMPTS
+
+
+def test_one_dropped_version_request_does_not_silence_the_probe():
+    """`read_version` returns None for a dropped connection as well as for a
+    daemon too old to answer, and latching on the first of those would mean a
+    momentary blip stops us ever noticing a board reflashed out-of-band with an
+    older build -- the one case this probe exists for.
+    """
+    device = make_device()
+    answers = [None, "0.9.0"]
+    calls: list[str] = []
+
+    async def version_fn(host, port, **_kwargs):
+        calls.append(host)
+        return answers[len(calls) - 1] if len(calls) <= len(answers) else "0.9.0"
+
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=50.0)),
+        version_fn=version_fn,
+    )
     for _ in range(4):
         asyncio.run(manager.poll_once())
-    assert len(calls) == 1
+
+    # Asked again after the blip, got the real version, then stopped asking.
+    # That version is what drives `update_available` on an installed board.
+    assert len(calls) == 2
+    assert manager.status_fields("dev-1")["rp_telemetry"]["version"] == "0.9.0"
 
 
 def test_poll_loop_never_writes_to_the_device_store():
@@ -480,6 +513,55 @@ class NetrefCredentials:
             "bucket": "linien",
             "measurement": "linien",
         }[name]
+
+
+def test_a_wedged_device_cannot_stall_the_whole_fleet_poll(monkeypatch):
+    """The credential fetch ends in an RPyC call under the session's
+    `_rpyc_lock`, which a wedged board can hold indefinitely. The poll
+    coroutine awaits it, so running it off-loop is not enough on its own --
+    without a timeout, one stuck device stops temperature polling for every
+    board in the lab, and every card degrades to `stale`.
+    """
+    monkeypatch.setattr(rpt, "INFLUX_CREDENTIAL_TIMEOUT_S", 0.05)
+    stuck = threading.Event()
+    def fetcher(key):
+        if key == "wedged":
+            stuck.wait(timeout=10.0)  # released in the finally below
+        return NetrefCredentials()
+
+    writer = RecordingWriter()
+    devices = [_influx_device("wedged", "10.0.0.1"), _influx_device("fine", "10.0.0.2")]
+    manager, *_ = make_manager(
+        devices,
+        read_fn=reading_fn(rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=50.0)),
+        version_fn=_no_version,
+        influx_writer=writer,
+        credentials_fetcher=fetcher,
+    )
+
+    async def run():
+        started = time.monotonic()
+        await manager.poll_once()
+        elapsed = time.monotonic() - started
+        # Release the orphaned worker before the loop tears down: asyncio.run
+        # joins the default executor on exit, which would otherwise wait out
+        # the stuck fetch and say nothing about how long the poll took.
+        stuck.set()
+        return elapsed
+
+    try:
+        elapsed = asyncio.run(run())
+    finally:
+        stuck.set()
+
+    # The poll completed instead of hanging, and the healthy board still got
+    # its temperature written.
+    assert elapsed < 5.0
+    healthy_writes = [line for _destination, lines in writer.calls for line in lines]
+    assert healthy_writes, "the healthy board's temperature was not written"
+    assert manager.status_fields("fine")["rp_temperature_c"] == 50.0
+    # The wedged board is reported as skipped, not silently dropped.
+    assert manager.influx_skip_reason("wedged") == rpt.INFLUX_SKIP_NO_CREDENTIALS
 
 
 def test_credentials_are_snapshotted_off_the_event_loop():
