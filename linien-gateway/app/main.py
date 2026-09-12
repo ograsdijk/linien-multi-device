@@ -34,11 +34,21 @@ from .device_config_store import (
     CONFIG_LOCK_INDICATOR,
     DeviceConfigStore,
 )
+from . import board_diagnostics
+from .board_event_store import (
+    KIND_DIAGNOSIS,
+    KIND_DISCONNECTED,
+    KIND_PERSISTENT_LOG_ENABLED,
+    KIND_REBOOT_DETECTED,
+    KIND_TELEMETRY_OFFLINE,
+    KIND_TELEMETRY_RECOVERED,
+    BoardEventStore,
+)
 from .diagnosis import DiagnosisProbe
 from .influx_writer import InfluxLineWriter
 from .log_store import LogStore
 from .manual_lock_postgres import LockResultPostgresService
-from .path_utils import find_repo_root
+from .path_utils import find_repo_root, resolve_repo_path
 from .psd_store import PsdStore
 from .rp_telemetry import RpTelemetryManager
 from .schemas import (
@@ -88,7 +98,13 @@ log_store = LogStore(max_entries=10_000, max_age_s=24.0 * 60.0 * 60.0)
 psd_store = PsdStore(max_entries=500, max_age_s=24.0 * 60.0 * 60.0)
 device_config_store = DeviceConfigStore()
 session_registry = SessionRegistry()
-diagnosis_probe = DiagnosisProbe(session_registry)
+# Durable per-device timeline. Lives beside devices.json so a gateway
+# restart -- which is itself often part of the incident -- does not erase
+# the history of what the boards were doing.
+board_event_store = BoardEventStore(
+    resolve_repo_path("board_events.json", Path.cwd().resolve())
+)
+diagnosis_probe = DiagnosisProbe(session_registry, event_store=board_event_store)
 logger = logging.getLogger(__name__)
 
 
@@ -158,6 +174,40 @@ async def _run_telemetry_ssh(action, *args):
     """Run one blocking telemetry SSH action off the loop's default executor."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_get_telemetry_ssh_executor(), action, *args)
+
+
+# Diagnostics get their own pool rather than sharing the telemetry one: a
+# fleet-wide collect is a dozen SSH sessions of up to a dozen commands each,
+# and it must not leave an operator's Install or Start queued behind it.
+DIAGNOSTICS_SSH_CONCURRENCY = 3
+_diagnostics_ssh_executor: ThreadPoolExecutor | None = None
+_diagnostics_ssh_executor_lock = threading.Lock()
+
+
+def _get_diagnostics_ssh_executor() -> ThreadPoolExecutor:
+    global _diagnostics_ssh_executor
+    with _diagnostics_ssh_executor_lock:
+        if _diagnostics_ssh_executor is None:
+            _diagnostics_ssh_executor = ThreadPoolExecutor(
+                max_workers=DIAGNOSTICS_SSH_CONCURRENCY,
+                thread_name_prefix="board-diagnostics-ssh",
+            )
+        return _diagnostics_ssh_executor
+
+
+async def _run_diagnostics_ssh(action, *args):
+    """Run one blocking diagnostics SSH action off the loop's default executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_get_diagnostics_ssh_executor(), action, *args)
+
+
+def _shutdown_diagnostics_ssh_executor() -> None:
+    global _diagnostics_ssh_executor
+    with _diagnostics_ssh_executor_lock:
+        executor = _diagnostics_ssh_executor
+        _diagnostics_ssh_executor = None
+    if executor is not None:
+        executor.shutdown(wait=False)
 
 
 def _shutdown_telemetry_ssh_executor() -> None:
@@ -238,6 +288,9 @@ async def _shutdown() -> None:
     diagnosis_probe.stop()
     await telemetry_manager.stop()
     _shutdown_telemetry_ssh_executor()
+    _shutdown_diagnostics_ssh_executor()
+    # Persist whatever the debounce was still holding.
+    board_event_store.flush()
 
 
 @asynccontextmanager
@@ -365,6 +418,30 @@ def _emit_log(
         device_key=device_key,
         details=details,
     )
+    _record_board_event(code, message, device_key, details)
+
+
+# Log codes that are also board history. Every one of these already fires
+# exactly once per transition -- `_log_transitions` in rp_telemetry, the
+# category-change guard in DeviceSession.apply_diagnosis -- so mirroring them
+# costs nothing on the poll paths and cannot flood the timeline with repeats of
+# a steady state.
+_BOARD_EVENT_CODES: dict[str, str] = {
+    "poll_failure": KIND_DISCONNECTED,
+    "connection_diagnosis": KIND_DIAGNOSIS,
+    "device_reboot_completed": KIND_REBOOT_DETECTED,
+    "rp_telemetry_unavailable": KIND_TELEMETRY_OFFLINE,
+    "rp_telemetry_recovered": KIND_TELEMETRY_RECOVERED,
+}
+
+
+def _record_board_event(
+    code: str, message: str, device_key: str | None, details: dict[str, Any] | None
+) -> None:
+    kind = _BOARD_EVENT_CODES.get(code)
+    if kind is None or not device_key:
+        return
+    board_event_store.record(device_key, kind, detail=message, data=details or {})
 
 
 def _emit_psd(device_key: str, entry: dict[str, Any]) -> None:
@@ -579,6 +656,7 @@ def delete_device(key: str) -> dict:
     device_config_store.remove_device(key)
     group_store.remove_device_from_groups(key)
     telemetry_manager.forget(key)
+    board_event_store.forget(key)
     return {"ok": True}
 
 
@@ -1598,6 +1676,100 @@ async def start_telemetry_many(payload: DeviceKeysIn) -> dict:
     for key in missing:
         failed[key] = "Device not found"
     return {"started": started, "failed": failed}
+
+
+# --- Board diagnostics ---------------------------------------------------
+#
+# Answers "why did this board reset / why did linien-server die?" with evidence
+# rather than inference. All of it is operator-triggered: nothing below runs on
+# a timer, because SSH is deliberately absent from every monitoring path.
+
+
+@app.get("/api/devices/{key}/events")
+def get_board_events(key: str, limit: int = 200) -> dict:
+    """The device's retained timeline. Cache read; no I/O, no SSH."""
+    _get_device_or_404(key)
+    safe_limit = max(1, min(int(limit), 500))
+    return {"events": board_event_store.events(key, limit=safe_limit)}
+
+
+@app.post("/api/devices/{key}/diagnostics/collect")
+async def collect_board_diagnostics(key: str) -> dict:
+    device = _get_device_or_404(key)
+    return await _run_diagnostics_ssh(board_diagnostics.collect_diagnostics, device)
+
+
+@app.post("/api/devices/{key}/diagnostics/enable-persistent-log")
+async def enable_persistent_log(key: str) -> dict:
+    """Make this board's journal survive a reboot.
+
+    The one write in the diagnostics feature, and the one that makes the rest
+    worth having: until it runs, a board that resets takes the explanation with
+    it.
+    """
+    device = _get_device_or_404(key)
+    try:
+        result = await _run_diagnostics_ssh(
+            board_diagnostics.enable_persistent_journal, device
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    _emit_log(
+        logging.INFO,
+        "board_diagnostics",
+        "persistent_log_enabled",
+        "Persistent logging enabled on the Red Pitaya.",
+        key,
+    )
+    board_event_store.record(
+        key,
+        KIND_PERSISTENT_LOG_ENABLED,
+        detail="Persistent journald storage enabled; logs now survive a reboot.",
+    )
+    return result
+
+
+@app.post("/api/diagnostics/enable-persistent-log")
+async def enable_persistent_log_many(payload: DeviceKeysIn) -> dict:
+    """One-time fleet-wide setup, per device but concurrent.
+
+    Twelve boards each needing this once is the same friction the bulk
+    telemetry actions exist to remove.
+    """
+    devices = []
+    missing: list[str] = []
+    for device_key in payload.device_keys:
+        device = device_store.get_device(device_key)
+        if device is None:
+            missing.append(device_key)
+        else:
+            devices.append(device)
+
+    async def _enable(device) -> tuple[str, dict]:
+        try:
+            result = await _run_diagnostics_ssh(
+                board_diagnostics.enable_persistent_journal, device
+            )
+        except Exception as exc:  # noqa: BLE001 - per-device, not a batch failure
+            return device.key, {"ok": False, "error": str(exc)}
+        return device.key, result
+
+    results = await asyncio.gather(*(_enable(device) for device in devices))
+    enabled: list[str] = []
+    failed: dict[str, str] = {}
+    for device_key, result in results:
+        if result.get("ok"):
+            enabled.append(device_key)
+            board_event_store.record(
+                device_key,
+                KIND_PERSISTENT_LOG_ENABLED,
+                detail="Persistent journald storage enabled; logs now survive a reboot.",
+            )
+        else:
+            failed[device_key] = result.get("error", "")
+    for device_key in missing:
+        failed[device_key] = "Device not found"
+    return {"enabled": enabled, "failed": failed}
 
 
 @app.get("/api/postgres/manual-lock", response_model=PostgresManualLockState)

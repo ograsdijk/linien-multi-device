@@ -54,6 +54,10 @@ logger = logging.getLogger(__name__)
 # Bit 0 of the 32-bit word at this address is 1 while the FPGA lock loop runs.
 LOCK_RUNNING_REGISTER_ADDR = 0x4030443C
 FPGA_STATE_PATH = "/sys/class/fpga_manager/fpga0/state"
+# The kernel regenerates this on every boot, so comparing it against the
+# value we saw last turns "did this board reboot?" from a threshold into a
+# fact. Free to collect: it rides along in the compound read below.
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
 # Ordered methods for reading the lock-status register over SSH. Both are pure
 # 32-bit register reads (mmap of /dev/mem): reading a status register has no
@@ -106,6 +110,8 @@ class ProbeResult:
     fpga_operating: bool | None
     lock_bit: int | None
     error: str | None = None
+    # The board's current kernel boot id, when it could be read.
+    boot_id: str | None = None
     # True when conditions warranted reading the lock register. Combined with
     # lock_bit is None, this distinguishes "read attempted but unreadable"
     # (e.g. devmem missing / wrong fpga path) from "deliberately not read".
@@ -128,9 +134,10 @@ def _tcp_open(host: str, port: int, timeout: float) -> bool:
         return False
 
 
-def _parse_uptime_fpga(text: str) -> tuple[float | None, bool | None]:
+def _parse_uptime_fpga(text: str) -> tuple[float | None, bool | None, str | None]:
     uptime_s: float | None = None
     fpga_operating: bool | None = None
+    boot_id: str | None = None
     parts = text.split("---")
     head = parts[0].strip().split() if parts else []
     if head:
@@ -142,12 +149,23 @@ def _parse_uptime_fpga(text: str) -> tuple[float | None, bool | None]:
         state = parts[1].strip()
         if state:
             fpga_operating = state == "operating"
-    return uptime_s, fpga_operating
+    if len(parts) > 2:
+        candidate = parts[2].strip()
+        if candidate:
+            boot_id = candidate
+    return uptime_s, fpga_operating, boot_id
 
 
-def _read_uptime_and_fpga(conn: Connection) -> tuple[float | None, bool | None]:
-    # One compound command to avoid extra SSH round-trips.
-    cmd = f"cat /proc/uptime; echo '---'; cat {FPGA_STATE_PATH} 2>/dev/null"
+def _read_uptime_and_fpga(
+    conn: Connection,
+) -> tuple[float | None, bool | None, str | None]:
+    # One compound command to avoid extra SSH round-trips. The boot id rides
+    # along for free -- it is the difference between inferring a reboot from an
+    # uptime threshold and knowing one happened.
+    cmd = (
+        f"cat /proc/uptime; echo '---'; cat {FPGA_STATE_PATH} 2>/dev/null; "
+        f"echo '---'; cat {BOOT_ID_PATH} 2>/dev/null"
+    )
     result = conn.run(cmd, hide=True, warn=True, timeout=SSH_COMMAND_TIMEOUT_S)
     return _parse_uptime_fpga(result.stdout or "")
 
@@ -215,7 +233,7 @@ def probe_device(
     # 2. SSH probe for uptime / FPGA state / (gated) lock register.
     try:
         with open_ssh_connection(device, Connection) as conn:
-            uptime_s, fpga_operating = _read_uptime_and_fpga(conn)
+            uptime_s, fpga_operating, boot_id = _read_uptime_and_fpga(conn)
             lock_bit: int | None = None
             # Only trust the lock register when a reboot is ruled out: the
             # gateware must be loaded (fpga_operating), uptime must be high, and
@@ -252,6 +270,7 @@ def probe_device(
                 uptime_s=uptime_s,
                 fpga_operating=fpga_operating,
                 lock_bit=lock_bit,
+                boot_id=boot_id,
                 lock_read_attempted=should_read,
             )
     except AuthenticationException as exc:
@@ -272,9 +291,29 @@ def classify_diagnosis(
     seconds_since_last_connected: float | None,
     probed_at: float,
     uptime_threshold_s: float = DEFAULT_UPTIME_THRESHOLD_S,
+    previous_boot_id: str | None = None,
 ) -> dict[str, Any]:
-    """Turn raw probe signals into a category, lock state, and a message."""
+    """Turn raw probe signals into a category, lock state, and a message.
+
+    When a boot id from a previous probe is available it settles the
+    reboot/crash question outright, and the uptime heuristic below is used only
+    as the fallback for a board we have not seen before. That matters in both
+    directions: a changed id proves a reboot however long the board has since
+    been up, and an unchanged id rules one out even when uptime is low --
+    which is exactly the case the threshold gets wrong, a server that died on a
+    board that had only just finished booting.
+    """
     uptime_s = result.uptime_s
+    rebooted_by_boot_id = (
+        previous_boot_id is not None
+        and result.boot_id is not None
+        and result.boot_id != previous_boot_id
+    )
+    same_boot = (
+        previous_boot_id is not None
+        and result.boot_id is not None
+        and result.boot_id == previous_boot_id
+    )
 
     if result.server_listening:
         category = CATEGORY_RECOVERING
@@ -284,15 +323,25 @@ def classify_diagnosis(
         category = CATEGORY_HOST_UNREACHABLE
         lock_state = "unknown"
         message = f"Cannot reach {host or 'the device'}. The lock is lost if the board is powered off."
+    elif rebooted_by_boot_id:
+        category = CATEGORY_REBOOTED
+        lock_state = "lost"
+        message = (
+            "Red Pitaya rebooted (confirmed: the kernel boot ID changed) — the lock "
+            "was lost. linien-server is not running (auto-start is disabled)."
+        )
     elif uptime_s is None:
         category = CATEGORY_SERVER_DOWN_UNKNOWN
         lock_state = "unknown"
         message = (
             "Board is reachable but linien-server is down; board state could not be read."
         )
-    elif uptime_s < uptime_threshold_s or (
-        seconds_since_last_connected is not None
-        and uptime_s < seconds_since_last_connected
+    elif not same_boot and (
+        uptime_s < uptime_threshold_s
+        or (
+            seconds_since_last_connected is not None
+            and uptime_s < seconds_since_last_connected
+        )
     ):
         category = CATEGORY_REBOOTED
         lock_state = "lost"
@@ -349,6 +398,7 @@ def classify_diagnosis(
         "server_running": result.server_listening,
         "fpga_operating": result.fpga_operating,
         "seconds_since_last_connected": seconds_since_last_connected,
+        "boot_id": result.boot_id,
     }
 
 
@@ -372,11 +422,15 @@ class DiagnosisProbe:
         reprobe_interval_s: float = MIN_REPROBE_INTERVAL_S,
         uptime_threshold_s: float = DEFAULT_UPTIME_THRESHOLD_S,
         max_workers: int = DIAGNOSIS_PROBE_WORKERS,
+        event_store: Any = None,
     ) -> None:
         self._registry = registry
         self._probe_fn = probe_fn
         self._reprobe_interval_s = reprobe_interval_s
         self._uptime_threshold_s = uptime_threshold_s
+        # Optional: the probe works without it, it just cannot then tell a
+        # reboot from a crash by boot id, nor leave a trace in the timeline.
+        self._event_store = event_store
         self._max_workers = max_workers
         self._heap: list[tuple[float, int, str]] = []
         self._pending: set[str] = set()  # scheduled in the heap, not yet running
@@ -501,11 +555,25 @@ class DiagnosisProbe:
         except Exception:  # noqa: BLE001 - defense in depth; probe_fn shouldn't raise
             logger.debug("diagnosis probe raised key=%s", key, exc_info=True)
             result = ProbeResult(False, False, None, None, None, error="probe error")
+        # Read the remembered boot id *before* recording the new one, or the
+        # comparison would always be against itself.
+        previous_boot_id = None
+        if self._event_store is not None:
+            try:
+                previous_boot_id = self._event_store.last_boot_id(key)
+            except Exception:  # noqa: BLE001 - history must not break the probe
+                logger.debug("last_boot_id failed key=%s", key, exc_info=True)
         diagnosis = classify_diagnosis(
             result,
             host=getattr(device, "host", "") or "",
             seconds_since_last_connected=since,
             probed_at=probed_at,
             uptime_threshold_s=self._uptime_threshold_s,
+            previous_boot_id=previous_boot_id,
         )
+        if self._event_store is not None and result.boot_id:
+            try:
+                self._event_store.note_boot_id(key, result.boot_id)
+            except Exception:  # noqa: BLE001 - history must not break the probe
+                logger.debug("note_boot_id failed key=%s", key, exc_info=True)
         session.apply_diagnosis(diagnosis)
