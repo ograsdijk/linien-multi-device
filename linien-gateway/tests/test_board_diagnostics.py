@@ -192,10 +192,14 @@ def test_a_board_whose_journald_is_still_in_tmpfs_is_not():
     assert bundle["persistent_journal"] is False
 
 
-def test_an_existing_journal_directory_alone_does_not_mean_persistent():
-    """The directory can exist while journald still logs to RAM -- another
-    drop-in overriding Storage=, or a restart that has not happened. Keying on
-    the directory reported success for a board that would still lose its logs.
+def test_leftover_journal_files_do_not_pass_for_persistent():
+    """A board that was persistent once and is volatile now still has files
+    under /var/log/journal. Grepping `journalctl --header` matched those
+    leftovers and reported the board as safe, so the Enable button was never
+    offered and the next crash again left nothing behind.
+
+    The probe decides on journald's *active* per-machine directory, and checks
+    the runtime one first precisely because both can exist at once.
     """
     conn = FakeConnection(
         rules={
@@ -212,6 +216,15 @@ def test_an_existing_journal_directory_alone_does_not_mean_persistent():
     bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
 
     assert bundle["persistent_journal"] is False
+
+
+def test_the_probe_checks_the_runtime_directory_before_the_persistent_one():
+    probe = bd._STORAGE_PROBE
+    assert probe.index(bd.RUNTIME_JOURNAL_DIR) < probe.index(bd.JOURNAL_DIR + '/$MID')
+    # And it is decided by journald's own per-machine directory, not by a grep
+    # of every journal header it can read.
+    assert "machine-id" in probe
+    assert "journalctl" not in probe
 
 
 def test_persistence_is_unknown_when_journald_could_not_be_asked():
@@ -252,6 +265,10 @@ def test_enabling_persistence_writes_verifies_and_restarts():
     assert f"tee {bd.JOURNALD_DROPIN_PATH}" in joined
     assert "sha256sum" in joined
     assert "systemctl restart systemd-journald" in joined
+    # Flushed, so the logs already in RAM -- possibly the ones being chased --
+    # move to disk instead of being lost at the next reset, and journald's
+    # runtime directory goes away so the verification reads a settled state.
+    assert "journalctl --flush" in joined
     assert "sync" in joined
 
 

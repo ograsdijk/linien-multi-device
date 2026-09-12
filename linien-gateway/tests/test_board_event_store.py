@@ -249,3 +249,30 @@ def test_an_operator_reboot_does_not_produce_a_second_spontaneous_one(tmp_path):
     kinds = [event["kind"] for event in store.events("dev-1")]
     assert kinds == [KIND_REBOOT_REQUESTED]
 
+
+def test_persistence_survives_a_filesystem_that_cannot_rename(tmp_path, monkeypatch):
+    """The shipped Docker deployment bind-mounts this file singly.
+
+    The temp file is then on the container overlay and the target on the host
+    filesystem, so the atomic rename is cross-device and fails with EXDEV. The
+    warning is swallowed, so without a fallback the timeline is simply never
+    written in the one deployment the compose file describes.
+    """
+    from pathlib import Path
+
+    real_replace = Path.replace
+
+    def no_cross_device_rename(self, target):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(Path, "replace", no_cross_device_rename)
+    store = make_store(tmp_path)
+    store.record("dev-1", KIND_DISCONNECTED, detail="written the hard way")
+    store.flush(block=True)
+    monkeypatch.setattr(Path, "replace", real_replace)
+
+    reloaded = make_store(tmp_path)
+    assert [event["detail"] for event in reloaded.events("dev-1")] == [
+        "written the hard way"
+    ]
+

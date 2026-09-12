@@ -303,17 +303,23 @@ def test_probe_never_raises_on_unexpected_error(monkeypatch):
 
 
 class _FakeSession:
-    def __init__(self, key, *, connected=False, connecting=False, wants=True):
+    def __init__(
+        self, key, *, connected=False, connecting=False, wants=True, recovering=False
+    ):
         self.device = SimpleNamespace(
             host=f"{key}.local", port=18862, username="root", password="root"
         )
         self.connected = connected
         self.connecting = connecting
         self._wants = wants
+        self._recovering = recovering
         self.applied: list[dict] = []
 
     def wants_diagnosis(self):
         return self._wants
+
+    def recovery_active(self):
+        return self._recovering
 
     def seconds_since_last_connected(self):
         return 60.0
@@ -397,3 +403,49 @@ def test_start_stop_is_clean():
     probe.stop()
     assert probe._thread is None
     assert probe._executor is None
+
+
+class _RecordingStore:
+    def __init__(self):
+        self.noted: list[tuple[str, str]] = []
+
+    def last_boot_id(self, _key):
+        return None
+
+    def note_boot_id(self, key, boot_id):
+        self.noted.append((key, boot_id))
+        return False
+
+
+def _boot_id_probe(device, *, seconds_since_last_connected, uptime_threshold_s):
+    return ProbeResult(False, True, 3600.0, True, 1, boot_id="boot-b")
+
+
+def test_a_probe_records_the_boot_id_for_the_timeline():
+    session = _FakeSession("dev-1")
+    store = _RecordingStore()
+    probe = diagnosis.DiagnosisProbe(
+        _FakeRegistry({"dev-1": session}), probe_fn=_boot_id_probe, event_store=store
+    )
+
+    probe._probe_once("dev-1")
+
+    assert store.noted == [("dev-1", "boot-b")]
+
+
+def test_a_probe_in_flight_across_a_reboot_does_not_relatch_the_boot_id():
+    """An SSH probe takes ~6-11 s, so one already running when the operator
+    clicks Reboot finishes afterwards. Recording then would restore the
+    pre-reboot id that dispatch had just cleared, and the operator's own reboot
+    would be filed as a spontaneous one and counted as instability.
+    """
+    session = _FakeSession("dev-1", recovering=True)
+    store = _RecordingStore()
+    probe = diagnosis.DiagnosisProbe(
+        _FakeRegistry({"dev-1": session}), probe_fn=_boot_id_probe, event_store=store
+    )
+
+    probe._probe_once("dev-1")
+
+    assert store.noted == []
+

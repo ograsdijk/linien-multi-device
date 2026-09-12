@@ -267,11 +267,30 @@ class BoardEventStore:
         try:
             # Serialises the fallback paths too (executor gone at shutdown),
             # which share the one temp path with anything still in flight.
+            body = json.dumps(payload, indent=2)
             with self._write_lock:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path = self._path.with_suffix(self._path.suffix + ".tmp")
-                temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-                temp_path.replace(self._path)
+                temp_path.write_text(body, encoding="utf-8")
+                try:
+                    temp_path.replace(self._path)
+                except OSError:
+                    # Atomic rename fails across filesystems -- notably when the
+                    # target is a single-file Docker bind mount, which is
+                    # exactly how this file is deployed: the temp file is on the
+                    # container overlay and the target on the host fs, so the
+                    # rename is EXDEV and the timeline would never persist at
+                    # all. Same fallback, and same reason, as
+                    # DeviceConfigStore._write_to_disk_locked.
+                    logger.warning(
+                        "Atomic write of %s failed; falling back to direct write",
+                        self._path,
+                        exc_info=True,
+                    )
+                    try:
+                        self._path.write_text(body, encoding="utf-8")
+                    finally:
+                        temp_path.unlink(missing_ok=True)
         except (OSError, TypeError, ValueError):
             # Never fatal: the timeline is a diagnostic aid, and losing a write
             # must not take down whatever was being diagnosed. But mark the

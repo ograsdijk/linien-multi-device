@@ -551,7 +551,18 @@ class DiagnosisProbe:
         # reboot during this outage" -- and re-probing a still-down board every
         # 20 s would compare the id against itself and retract a reboot it had
         # just correctly reported.
-        if self._event_store is not None and result.boot_id:
+        #
+        # Skipped once a recovery is under way, the same way apply_diagnosis
+        # drops its result: an SSH probe takes ~6-11 s, so one already running
+        # when the operator clicks Reboot would finish afterwards and re-latch
+        # the pre-reboot id that `forget_boot_id` had just cleared -- and the
+        # operator's own reboot would end up in the instability count.
+        recovery_active = False
+        try:
+            recovery_active = bool(session.recovery_active())
+        except Exception:  # noqa: BLE001 - absence of the hook is not fatal
+            logger.debug("recovery_active check failed key=%s", key, exc_info=True)
+        if self._event_store is not None and result.boot_id and not recovery_active:
             try:
                 self._event_store.note_boot_id(key, result.boot_id)
             except Exception:  # noqa: BLE001 - history must not break the probe

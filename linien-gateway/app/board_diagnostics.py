@@ -63,16 +63,27 @@ JOURNAL_DIR = "/var/log/journal"
 # journald's default of 10% of the filesystem. 32 MB is days of a quiet board.
 JOURNALD_DROPIN = "[Journal]\nStorage=persistent\nSystemMaxUse=32M\nSystemMaxFileSize=8M\n"
 
-# journald reports the file it is really writing to: a path under
-# /var/log/journal means persistent storage is live, one under /run/log/journal
-# means it is still in tmpfs. Everything keys on this rather than on the
-# existence of /var/log/journal, because `enable_persistent_journal` creates
-# that directory itself -- so checking for it afterwards would confirm nothing
-# but our own mkdir, and would report success for a board still logging to RAM.
+RUNTIME_JOURNAL_DIR = "/run/log/journal"
+
+# Which storage journald is *currently* using, decided by where its per-machine
+# directory lives. journald creates `<dir>/<machine-id>` under whichever of the
+# two it is writing to, and a flush removes the runtime copy once the logs have
+# moved to disk.
+#
+# Not the existence of /var/log/journal: `enable_persistent_journal` creates
+# that directory itself, so checking for it afterwards would confirm nothing
+# but our own mkdir. And not a grep of `journalctl --header` either -- that
+# lists every journal file it can read, archived ones included, so a board that
+# was persistent once and is volatile now would match on its own leftovers and
+# be reported as safe when the next crash would again leave nothing.
+#
+# The runtime directory is checked first for exactly that reason: when both
+# exist, the one journald is writing to now is the runtime one.
 _STORAGE_PROBE = (
-    "if journalctl --header >/dev/null 2>&1; then "
-    'if journalctl --header 2>/dev/null | grep -qi "' + JOURNAL_DIR + '"; '
-    "then echo STORAGE=PERSISTENT; else echo STORAGE=VOLATILE; fi; "
+    'MID=$(cat /etc/machine-id 2>/dev/null || true); '
+    'if [ -z "$MID" ]; then echo STORAGE=UNKNOWN; '
+    'elif [ -d "' + RUNTIME_JOURNAL_DIR + '/$MID" ]; then echo STORAGE=VOLATILE; '
+    'elif [ -d "' + JOURNAL_DIR + '/$MID" ]; then echo STORAGE=PERSISTENT; '
     "else echo STORAGE=UNKNOWN; fi"
 )
 
@@ -99,7 +110,7 @@ _SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
         "Journal persistence",
         _STORAGE_PROBE + "; "
         'journalctl --header 2>/dev/null | grep -i "file path" | head -n 3 || true; '
-        "ls -d " + JOURNAL_DIR + " 2>/dev/null || echo NO-JOURNAL-DIR; "
+        "ls -d " + JOURNAL_DIR + " " + RUNTIME_JOURNAL_DIR + " 2>/dev/null; "
         "grep -hE \"^[[:space:]]*Storage=\" /etc/systemd/journald.conf "
         "/etc/systemd/journald.conf.d/*.conf 2>/dev/null || true",
         True,
@@ -338,6 +349,12 @@ def enable_persistent_journal(
                 raise RuntimeError(
                     f"Could not restart systemd-journald: {err.strip()[:300]}"
                 )
+            # Move what is already in RAM onto the disk and drop the runtime
+            # copy. Two reasons: the logs from this boot -- possibly including
+            # whatever is being investigated right now -- are preserved instead
+            # of discarded at the next reset, and journald's runtime directory
+            # goes away, which is what the verification below reads.
+            run("journalctl --flush")
             run("sync")
 
             # Ask journald which file it is now writing to. Checking that
