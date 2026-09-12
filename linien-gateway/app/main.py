@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -33,10 +35,12 @@ from .device_config_store import (
     DeviceConfigStore,
 )
 from .diagnosis import DiagnosisProbe
+from .influx_writer import InfluxLineWriter
 from .log_store import LogStore
 from .manual_lock_postgres import LockResultPostgresService
 from .path_utils import find_repo_root
 from .psd_store import PsdStore
+from .rp_telemetry import RpTelemetryManager
 from .schemas import (
     AutoLockCalibrateRequest,
     AutoLockCalibrationResult,
@@ -88,6 +92,94 @@ diagnosis_probe = DiagnosisProbe(session_registry)
 logger = logging.getLogger(__name__)
 
 
+def _publish_telemetry_status(device_key: str) -> None:
+    """Push a fresh status frame after a telemetry state change.
+
+    Only called when the telemetry cache actually moved (see
+    RpTelemetryManager._material_signature), so a settled board does not
+    generate a websocket message every poll.
+    """
+    session = session_registry.get(device_key)
+    if session is None:
+        return
+    _publish_status_update(device_key, session)
+
+
+def _fetch_influx_credentials(device_key: str):
+    """Best-effort one-off credential lookup for the telemetry Influx write.
+
+    Normally the credentials are cached when the operator opens or saves them
+    in the UI. This covers the case where the gateway restarted since: it is
+    rate-limited by the manager (INFLUX_CREDENTIAL_RETRY_S) and only runs for
+    a connected device, so it is never part of the 30 s telemetry path.
+    """
+    session = session_registry.get(device_key)
+    if session is None or not getattr(session, "connected", False):
+        return None
+    try:
+        return session.logging_get_credentials()
+    except Exception:  # noqa: BLE001 - credentials are optional here
+        logger.debug(
+            "Influx credential lookup failed for device=%s", device_key, exc_info=True
+        )
+        return None
+
+
+# Every telemetry management action is long, blocking SSH work: an install is
+# ~8 commands at up to SSH_COMMAND_TIMEOUT_S each plus the verify retries. They
+# all share one bounded pool of their own, so no amount of telemetry work --
+# a bulk install, or an operator clicking Install on a dozen boards in turn --
+# can occupy the loop's default executor, which serves /api/devices/statuses,
+# the PSD start/stop fan-outs, and every other asyncio.to_thread() caller.
+TELEMETRY_SSH_CONCURRENCY = 4
+_telemetry_ssh_executor: ThreadPoolExecutor | None = None
+_telemetry_ssh_executor_lock = threading.Lock()
+
+
+def _get_telemetry_ssh_executor() -> ThreadPoolExecutor:
+    """The telemetry SSH pool, created on first use.
+
+    Created lazily rather than at import so that a shutdown (which disposes of
+    it) can be followed by another startup in the same process -- several
+    TestClient instances in one test session do exactly that, and so does a
+    uvicorn reload.
+    """
+    global _telemetry_ssh_executor
+    with _telemetry_ssh_executor_lock:
+        if _telemetry_ssh_executor is None:
+            _telemetry_ssh_executor = ThreadPoolExecutor(
+                max_workers=TELEMETRY_SSH_CONCURRENCY,
+                thread_name_prefix="rp-telemetry-ssh",
+            )
+        return _telemetry_ssh_executor
+
+
+async def _run_telemetry_ssh(action, *args):
+    """Run one blocking telemetry SSH action off the loop's default executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_get_telemetry_ssh_executor(), action, *args)
+
+
+def _shutdown_telemetry_ssh_executor() -> None:
+    global _telemetry_ssh_executor
+    with _telemetry_ssh_executor_lock:
+        executor = _telemetry_ssh_executor
+        _telemetry_ssh_executor = None
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+influx_line_writer = InfluxLineWriter()
+telemetry_manager = RpTelemetryManager(
+    device_provider=device_store.list_devices,
+    save_device=device_store.save_device,
+    status_publisher=_publish_telemetry_status,
+    log_callback=lambda **kwargs: _emit_log(**kwargs),
+    credentials_fetcher=_fetch_influx_credentials,
+    reload_device=device_store.get_device,
+    influx_writer=influx_line_writer,
+)
+
+
 def _remove_rotating_file_handlers(logger_name: str) -> None:
     logger = logging.getLogger(logger_name)
     for handler in list(logger.handlers):
@@ -137,12 +229,15 @@ async def _startup() -> None:
     if hasattr(lock_result_postgres, "start"):
         lock_result_postgres.start()
     diagnosis_probe.start()
+    telemetry_manager.start()
 
 
 async def _shutdown() -> None:
     if hasattr(lock_result_postgres, "stop"):
         lock_result_postgres.stop()
     diagnosis_probe.stop()
+    await telemetry_manager.stop()
+    _shutdown_telemetry_ssh_executor()
 
 
 @asynccontextmanager
@@ -428,6 +523,7 @@ def _session_for_device(device: Device) -> DeviceSession:
         session.set_log_event_callback(_emit_log)
         session.set_psd_event_callback(_emit_psd)
         session.set_diagnosis_request_callback(diagnosis_probe.request)
+        session.set_telemetry_provider(telemetry_manager.status_fields)
         session.sync_configs_from_device()
         return session
 
@@ -482,6 +578,7 @@ def delete_device(key: str) -> dict:
     device_store.remove_device(device)
     device_config_store.remove_device(key)
     group_store.remove_device_from_groups(key)
+    telemetry_manager.forget(key)
     return {"ok": True}
 
 
@@ -1340,6 +1437,9 @@ def get_logging_credentials(key: str) -> dict:
         credentials = session.logging_get_credentials()
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    # Cache them for the gateway-side temperature write so the telemetry poll
+    # never needs an RPyC round trip of its own.
+    telemetry_manager.set_influx_credentials(key, credentials)
     return {
         "url": credentials.url,
         "org": credentials.org,
@@ -1352,13 +1452,152 @@ def get_logging_credentials(key: str) -> dict:
 @app.put("/api/devices/{key}/logging/credentials")
 def update_logging_credentials(key: str, payload: InfluxCredentials) -> dict:
     session = _get_session(key)
+    credentials = InfluxDBCredentials(**payload.model_dump())
     try:
-        success, message = session.logging_update_credentials(
-            InfluxDBCredentials(**payload.model_dump())
-        )
+        success, message = session.logging_update_credentials(credentials)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    if success:
+        telemetry_manager.set_influx_credentials(key, credentials)
     return {"success": success, "message": message}
+
+
+# --- Red Pitaya telemetry (Zynq die temperature) ------------------------
+#
+# Management actions (install/uninstall/start/stop/restart/service status) are
+# blocking SSH calls and run on a worker thread so they never occupy the event
+# loop. The read paths below are cache-only.
+
+
+async def _telemetry_action(key: str, action, *args) -> dict:
+    device = _get_device_or_404(key)
+    try:
+        return await _run_telemetry_ssh(action, device, *args)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/api/devices/{key}/telemetry")
+def get_telemetry(key: str) -> dict:
+    _get_device_or_404(key)
+    return telemetry_manager.status_fields(key)
+
+
+@app.post("/api/devices/{key}/telemetry/install")
+async def install_telemetry(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.install)
+
+
+@app.post("/api/devices/{key}/telemetry/uninstall")
+async def uninstall_telemetry(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.uninstall)
+
+
+@app.post("/api/devices/{key}/telemetry/start")
+async def start_telemetry(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.start_service)
+
+
+@app.post("/api/devices/{key}/telemetry/stop")
+async def stop_telemetry(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.stop_service)
+
+
+@app.post("/api/devices/{key}/telemetry/restart")
+async def restart_telemetry(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.restart_service)
+
+
+@app.get("/api/devices/{key}/telemetry/service")
+async def telemetry_service_status(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.service_status)
+
+
+@app.post("/api/devices/{key}/telemetry/read")
+async def read_telemetry_now(key: str) -> dict:
+    device = _get_device_or_404(key)
+    return await telemetry_manager.read_temperature(device)
+
+
+async def _telemetry_bulk(
+    device_keys: list[str], action
+) -> tuple[list[tuple[str, dict]], list[str]]:
+    """Run one telemetry SSH action across several boards, independently.
+
+    Returns the per-device results and the keys that named no device. Boards are
+    handled concurrently but each failure is reported per device; one
+    unreachable board never fails the batch.
+
+    Devices are resolved through `device_store` rather than `session_registry`:
+    telemetry actions touch the stored device record and must work on a board
+    that is not connected -- which, after a power cut, is all of them.
+    """
+    devices = []
+    missing: list[str] = []
+    for key in device_keys:
+        device = device_store.get_device(key)
+        if device is None:
+            missing.append(key)
+        else:
+            devices.append(device)
+
+    # Concurrency is bounded by the shared telemetry SSH pool (see
+    # _get_telemetry_ssh_executor); the gather below simply queues onto it.
+    async def _run(device) -> tuple[str, dict]:
+        try:
+            result = await _run_telemetry_ssh(action, device)
+        except Exception as exc:  # noqa: BLE001 - per-device error, not a batch failure
+            return device.key, {"ok": False, "error": str(exc)}
+        return device.key, result
+
+    results = await asyncio.gather(*(_run(device) for device in devices))
+    return list(results), missing
+
+
+@app.post("/api/telemetry/install")
+async def install_telemetry_many(payload: DeviceKeysIn) -> dict:
+    """Install/update telemetry on several boards, one SSH session each."""
+    results, missing = await _telemetry_bulk(
+        payload.device_keys, telemetry_manager.install
+    )
+    installed = [key for key, result in results if result.get("ok")]
+    failed = {key: result.get("error", "") for key, result in results if not result.get("ok")}
+    for key in missing:
+        failed[key] = "Device not found"
+    return {"installed": installed, "failed": failed}
+
+
+@app.post("/api/telemetry/start")
+async def start_telemetry_many(payload: DeviceKeysIn) -> dict:
+    """Start the telemetry service on several boards, one SSH session each.
+
+    The companion to install-all: after a batch of board reboots every daemon is
+    down, and the per-device menu is twelve visits away.
+
+    Boards whose install record says "not installed" are still attempted. The
+    record can be stale, `systemctl start` on a board with no unit fails fast,
+    and skipping would quietly do nothing to a board that is in fact fine.
+    """
+    results, missing = await _telemetry_bulk(
+        payload.device_keys, telemetry_manager.start_service
+    )
+    started: list[str] = []
+    failed: dict[str, str] = {}
+    for key, result in results:
+        if not result.get("ok"):
+            failed[key] = result.get("error", "")
+        elif result.get("active"):
+            started.append(key)
+        else:
+            # `systemctl start` reports success for a unit that dies straight
+            # afterwards. Counting that as started would be a green result for
+            # a service that is not running -- the single-device UI already
+            # refuses to do so, and the batch summary must not either.
+            state = result.get("state") or "inactive"
+            failed[key] = f"start was accepted but the service is {state}"
+    for key in missing:
+        failed[key] = "Device not found"
+    return {"started": started, "failed": failed}
 
 
 @app.get("/api/postgres/manual-lock", response_model=PostgresManualLockState)

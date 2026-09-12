@@ -30,6 +30,22 @@ const isSeriesRecord = (value: unknown): boolean => {
   return true;
 };
 
+// Shape check for the nested telemetry object.
+//
+// Deliberately shallow: an object with a string `state`, and nothing more.
+// A failed guard discards the ENTIRE status object -- connection, lock,
+// recovery, diagnosis and all -- so every additional assertion here is a way
+// for one unexpected telemetry field to blank a whole device card. That is a
+// far worse outcome than rendering a stray value, and it is exactly what a
+// gateway upgrade (a new state, a new field type) or a browser on a cached
+// bundle would trigger.
+//
+// This also matches how the sibling nested objects are treated: `diagnosis`,
+// `recovery` and `auto_relock` are `isObject`-checked only. The display layer
+// tolerates unknown states and missing fields (see telemetryDisplay.ts).
+const isRpTelemetry = (value: unknown): boolean =>
+  isObject(value) && isString(value.state);
+
 export const isDeviceStatus = (value: unknown): value is DeviceStatus => {
   if (!isObject(value)) return false;
   if (!isBoolean(value.connected) || !isBoolean(value.connecting)) return false;
@@ -42,6 +58,9 @@ export const isDeviceStatus = (value: unknown): value is DeviceStatus => {
   if (value.diagnosis != null && !isObject(value.diagnosis)) return false;
   if (value.recovery != null && !isObject(value.recovery)) return false;
   if (value.auto_relock != null && !isObject(value.auto_relock)) return false;
+  if (!isOptionalFiniteNumber(value.rp_temperature_c)) return false;
+  if (!isOptionalFiniteNumber(value.rp_temperature_sampled_at)) return false;
+  if (value.rp_telemetry != null && !isRpTelemetry(value.rp_telemetry)) return false;
   return true;
 };
 

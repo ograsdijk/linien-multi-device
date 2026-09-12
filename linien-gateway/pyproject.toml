@@ -24,6 +24,12 @@ linien-gateway = "app.main:main"
 [tool.setuptools.packages.find]
 namespaces = false
 
+# The cross-compiled rp-telemetry binary is deployed to Red Pitayas by
+# app/rp_telemetry.py, so it has to travel with an installed gateway.
+# See app/assets/README.md for how to build it.
+[tool.setuptools.package-data]
+app = ["assets/*"]
+
 # linien-common/linien-client 2.1.0 pin numpy<2, which conflicts with the
 # numpy>=2.0 dependency above. This override reconciles it, but it is uv-only:
 # a plain `pip install .` does NOT honor it and fails to resolve. Install the

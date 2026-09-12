@@ -264,6 +264,10 @@ class DeviceSession:
         self._recovery_cancel = threading.Event()
         self._recovery_thread: threading.Thread | None = None
         self._removed = False
+        # Supplies the cached Red Pitaya telemetry fields (die temperature +
+        # service state) to status(). A pure in-memory dict read owned by
+        # RpTelemetryManager -- status() must stay free of remote calls.
+        self._telemetry_provider: Callable[[str], dict[str, Any]] | None = None
 
     @staticmethod
     def _utc_now_iso() -> str:
@@ -464,6 +468,11 @@ class DeviceSession:
         self, callback: Callable[[str], None] | None
     ) -> None:
         self._diagnosis_request_callback = callback
+
+    def set_telemetry_provider(
+        self, provider: Callable[[str], dict[str, Any]] | None
+    ) -> None:
+        self._telemetry_provider = provider
 
     def seconds_since_last_connected(self) -> float | None:
         with self._state_lock:
@@ -2150,6 +2159,18 @@ class DeviceSession:
             and stream_age_s is not None
             and stream_age_s > AUTO_RELOCK_STREAM_STALL_S
         )
+        telemetry_fields: Dict[str, Any] = {}
+        provider = self._telemetry_provider
+        if provider is not None:
+            try:
+                telemetry_fields = provider(self.device.key) or {}
+            except Exception:  # noqa: BLE001 - telemetry must not break status
+                logger.debug(
+                    "Telemetry status lookup failed for device=%s",
+                    self.device.key,
+                    exc_info=True,
+                )
+                telemetry_fields = {}
         return {
             "connected": self.connected,
             "connecting": self.connecting,
@@ -2182,6 +2203,9 @@ class DeviceSession:
             "stalled": stalled,
             "diagnosis": diagnosis,
             "recovery": recovery,
+            # Red Pitaya (Zynq die) temperature and telemetry-service state.
+            # Cache-only; see app/rp_telemetry.py.
+            **telemetry_fields,
         }
 
     def set_param(self, name: str, value: Any, write_registers: bool) -> None:
