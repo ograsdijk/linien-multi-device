@@ -299,7 +299,7 @@ Line-based TCP on port **18864**, one request per (short-lived) connection:
 ```text
 ->  STATUS\n      <-  RPT1 57.34\n          temperature in °C
                   <-  RPT1 ERR XADC\n       sysfs read failed
-->  VERSION\n     <-  RPT1 VERSION 1.0.0\n
+->  VERSION\n     <-  RPT1 VERSION 1.1.0\n
 ->  anything else <-  RPT1 ERR COMMAND\n
 ```
 
@@ -414,6 +414,11 @@ Failures of an action you triggered (Install, Start, Stop, Restart, Uninstall)
 surface as an error toast **and** an entry in the Logs modal, carrying the
 reason — a missing bundled binary, a checksum mismatch, a truncated upload, a
 service that would not start, or one that started but never answered.
+
+If a board *reboots* the moment a temperature is requested, it is running
+daemon 1.0.0 and has picked the FPGA-backed XADC; update it from the telemetry
+panel and see
+[rp-telemetry/TROUBLESHOOTING.md](rp-telemetry/TROUBLESHOOTING.md).
 
 Because the daemon's own output goes to the board's systemd journal, the
 gateway pulls the last 20 journal lines back when a start or verification step

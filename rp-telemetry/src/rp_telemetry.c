@@ -12,14 +12,16 @@
  *
  *     ->  "STATUS\n"     <-  "RPT1 57.34\n"       (degrees Celsius)
  *                        <-  "RPT1 ERR XADC\n"    (sysfs read failed)
- *     ->  "VERSION\n"    <-  "RPT1 VERSION 1.0.0\n"
+ *     ->  "VERSION\n"    <-  "RPT1 VERSION 1.1.0\n"
  *     ->  anything else  <-  "RPT1 ERR COMMAND\n"
  *
- * Temperature source: the Zynq XADC exposed through Linux IIO. The device
- * directory is discovered once at startup by scanning /sys/bus/iio/devices for
- * the entry that provides `in_temp0_raw`; `in_temp0_offset` and
- * `in_temp0_scale` are read once at the same time (they are constants of the
- * XADC transfer function). Only `in_temp0_raw` is re-read per request.
+ * Temperature source: the Zynq *processing-system* XADC exposed through Linux
+ * IIO. The device directory is discovered once at startup by scanning
+ * /sys/bus/iio/devices; the FPGA-backed XADC wizard, which carries the same
+ * IIO name and whose registers vanish when the bitstream is reprogrammed, is
+ * refused (see xadc_rank()). `in_temp0_offset` and `in_temp0_scale` are read
+ * once at the same time (they are constants of the XADC transfer function).
+ * Only `in_temp0_raw` is re-read per request.
  *
  *     temperature_c = (raw + offset) * scale / 1000.0
  *
@@ -50,7 +52,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define RPT_VERSION "1.0.0"
+#define RPT_VERSION "1.1.0"
 #define RPT_PROTOCOL "RPT1"
 
 #define DEFAULT_PORT 18864
@@ -65,6 +67,15 @@
 #define CLIENT_TIMEOUT_S 2
 
 #define PATH_MAX_LEN 512
+
+/*
+ * The Zynq-7000 processing-system XADC, at a fixed address on every board.
+ * See xadc_rank() for why the device has to be identified by address rather
+ * than by its IIO name.
+ */
+#define PS_XADC_MARKER "f8007100"
+/* Substring of the PL XADC wizard's device path ("83c00000.xadc_wiz"). */
+#define PL_XADC_MARKER "adc_wiz"
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -140,9 +151,53 @@ static int path_exists(const char *path)
 }
 
 /*
+ * Classify one IIO device by where it actually lives on the SoC.
+ *
+ * A Red Pitaya exposes *two* IIO devices, and both are named "xadc":
+ *
+ *     iio:device0 -> /sys/devices/soc0/axi/f8007100.adc/       (PS XADC)
+ *     iio:device1 -> /sys/devices/soc0/axi/83c00000.xadc_wiz/  (PL XADC wizard)
+ *
+ * The first is in the processing system and is always present and always
+ * safe. The second is a core inside the FPGA bitstream. linien-server
+ * reprograms the FPGA, and its bitstream has nothing at 0x83c00000 -- so
+ * reading in_temp0_raw from that device issues an AXI access that nothing
+ * answers: the bus hangs and the watchdog reboots the board. Since the name is
+ * identical, the only way to tell them apart is the resolved device path.
+ *
+ * Returns 0 for the PS XADC, 1 for a device that cannot be classified (used
+ * only when no PS XADC is found, so the daemon still works on other hardware
+ * and under test), and -1 for anything PL-backed or unresolvable, which must
+ * never be read.
+ */
+static int xadc_rank(const char *iio_root, const char *name)
+{
+    char dir[PATH_MAX_LEN];
+    if (snprintf(dir, sizeof(dir), "%s/%s", iio_root, name) >=
+        (int)sizeof(dir)) {
+        return -1;
+    }
+    /* The entries under /sys/bus/iio/devices are symlinks into
+     * /sys/devices/...; the target is what names the hardware. */
+    char *resolved = realpath(dir, NULL);
+    if (resolved == NULL) {
+        return -1; /* cannot prove it is safe, so do not touch it */
+    }
+    int rank = 1;
+    if (strstr(resolved, PL_XADC_MARKER) != NULL) {
+        rank = -1;
+    } else if (strstr(resolved, PS_XADC_MARKER) != NULL) {
+        rank = 0;
+    }
+    free(resolved);
+    return rank;
+}
+
+/*
  * Locate the IIO device exposing in_temp0_raw and cache the raw path plus the
- * (constant) offset and scale. Called once at startup; retried lazily only
- * after a failed read, never on the happy path.
+ * (constant) offset and scale. Prefers the PS XADC and refuses FPGA-backed
+ * devices outright; see xadc_rank(). Called once at startup; retried lazily
+ * only after a failed read, never on the happy path.
  */
 static int xadc_discover(struct xadc *x, const char *iio_root)
 {
@@ -151,6 +206,7 @@ static int xadc_discover(struct xadc *x, const char *iio_root)
         return -1;
     }
     int found = -1;
+    int best_rank = 2; /* worse than any acceptable rank */
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') {
@@ -165,6 +221,17 @@ static int xadc_discover(struct xadc *x, const char *iio_root)
         }
         if (!path_exists(raw)) {
             continue;
+        }
+        int rank = xadc_rank(iio_root, entry->d_name);
+        if (rank < 0) {
+            fprintf(stderr,
+                    "rp-telemetry: ignoring FPGA-backed XADC %s/%s "
+                    "(reading it can hang the AXI bus)\n",
+                    iio_root, entry->d_name);
+            continue;
+        }
+        if (rank >= best_rank) {
+            continue; /* already holding something at least as good */
         }
         if (snprintf(offset_path, sizeof(offset_path), "%s/%s/in_temp0_offset",
                      iio_root, entry->d_name) >= (int)sizeof(offset_path)) {
@@ -190,9 +257,16 @@ static int xadc_discover(struct xadc *x, const char *iio_root)
         x->scale = scale;
         x->ready = 1;
         found = 0;
-        break;
+        best_rank = rank;
+        if (rank == 0) {
+            break; /* the PS XADC; nothing can be better */
+        }
     }
     closedir(dir);
+    if (found == 0) {
+        fprintf(stderr, "rp-telemetry: reading temperature from %s\n",
+                x->raw_path);
+    }
     return found;
 }
 

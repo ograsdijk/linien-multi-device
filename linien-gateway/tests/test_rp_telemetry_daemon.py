@@ -77,6 +77,37 @@ def make_iio_root(tmp_path, *, raw="2504", offset="-2219", scale="123.040771484"
     return root, device
 
 
+def make_board_like_iio_root(tmp_path, *, ps=True, pl=True):
+    """Reproduce a Red Pitaya's IIO tree: two devices, both named "xadc".
+
+        iio:device0 -> /sys/devices/soc0/axi/f8007100.adc/...      (PS, safe)
+        iio:device1 -> /sys/devices/soc0/axi/83c00000.xadc_wiz/... (in the FPGA)
+
+    Reading the second one's in_temp0_raw while the Linien bitstream is loaded
+    issues an AXI access nothing answers, which hangs the bus and reboots the
+    board -- so the daemon must identify the device by its resolved path, not
+    by its name.
+    """
+    soc = tmp_path / "sys" / "devices" / "soc0" / "axi"
+    root = tmp_path / "iio"
+    root.mkdir(parents=True)
+
+    def add(link_name, device_dir, raw):
+        device_dir.mkdir(parents=True)
+        (device_dir / "name").write_text("xadc\n")
+        (device_dir / "in_temp0_raw").write_text(raw)
+        (device_dir / "in_temp0_offset").write_text("-2219")
+        (device_dir / "in_temp0_scale").write_text("123.040771484")
+        (root / link_name).symlink_to(device_dir, target_is_directory=True)
+
+    if ps:
+        add("iio_device0", soc / "f8007100.adc" / "iio_device0", "2504")
+    if pl:
+        # A distinct value, so a test can tell which device was read.
+        add("iio_device1", soc / "83c00000.xadc_wiz" / "iio_device1", "3000")
+    return root
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -160,6 +191,47 @@ def test_status_returns_the_computed_temperature(daemon, tmp_path):
     reading = rpt.parse_status_line(response.decode())
     assert reading.state == rpt.STATE_RUNNING
     assert abs((reading.temperature_c or 0) - expected) < 0.01
+
+
+def test_the_fpga_backed_xadc_is_never_read(daemon, tmp_path):
+    """Both devices are named "xadc"; only the PS one is safe to touch.
+
+    Picking whichever one readdir() returned first was a coin flip that, with
+    the Linien bitstream loaded, reset the board on the first STATUS request.
+    """
+    root = make_board_like_iio_root(tmp_path)
+    server = daemon(root)
+
+    response = server.request(b"STATUS\n")
+
+    ps_temperature = (2504 + -2219) * 123.040771484 / 1000.0
+    assert response == f"RPT1 {ps_temperature:.2f}\n".encode()
+
+    # ...and it says so, so the choice is visible in the journal.
+    server.process.terminate()
+    _stdout, stderr = server.process.communicate(timeout=5)
+    assert "iio_device0/in_temp0_raw" in stderr.decode()
+
+
+def test_a_board_with_only_the_fpga_xadc_reports_an_error(daemon, tmp_path):
+    """Refusing to answer is correct here; reading it would reboot the board."""
+    root = make_board_like_iio_root(tmp_path, ps=False)
+    server = daemon(root)
+
+    assert server.request(b"STATUS\n") == b"RPT1 ERR XADC\n"
+
+    server.process.terminate()
+    _stdout, stderr = server.process.communicate(timeout=5)
+    text = stderr.decode()
+    assert "iio_device1" in text and "FPGA-backed" in text
+
+
+def test_an_unclassifiable_device_is_still_usable(daemon, tmp_path):
+    """Other hardware (and the plain test tree) has no f8007100 in its path."""
+    root, _device = make_iio_root(tmp_path)
+    server = daemon(root)
+
+    assert server.request(b"STATUS\n").startswith(b"RPT1 ")
 
 
 def test_version_request(daemon, tmp_path):
@@ -302,5 +374,6 @@ def test_daemon_is_quiet_during_normal_requests(daemon, tmp_path):
         server.request(b"STATUS\n")
     server.process.terminate()
     _stdout, stderr = server.process.communicate(timeout=5)
-    # Exactly the one startup line, nothing per request.
-    assert len(stderr.decode().strip().splitlines()) == 1
+    # Exactly the two startup lines (the device it settled on, and the
+    # listening port) -- nothing per request.
+    assert len(stderr.decode().strip().splitlines()) == 2

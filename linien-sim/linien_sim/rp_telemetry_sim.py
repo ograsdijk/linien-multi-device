@@ -5,7 +5,7 @@ exercised without a physical board. It speaks the same line protocol as
 `rp-telemetry/src/rp_telemetry.c`:
 
     STATUS\\n   ->  RPT1 57.34\\n     (or RPT1 ERR XADC\\n with --fail)
-    VERSION\\n  ->  RPT1 VERSION 1.0.0\\n
+    VERSION\\n  ->  RPT1 VERSION 1.1.0\\n
     other      ->  RPT1 ERR COMMAND\\n
 
 This is a *development* tool that runs on your workstation. It is deliberately
@@ -30,7 +30,7 @@ import socketserver
 import time
 
 PROTOCOL_ID = "RPT1"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MAX_REQUEST = 64
 CLIENT_TIMEOUT_S = 2.0
 

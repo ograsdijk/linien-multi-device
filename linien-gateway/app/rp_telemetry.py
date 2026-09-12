@@ -52,12 +52,12 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_ID = "RPT1"
 # Must match RPT_VERSION in rp-telemetry/src/rp_telemetry.c.
-BUNDLED_VERSION = "1.0.0"
+BUNDLED_VERSION = "1.1.0"
 
 DEFAULT_TELEMETRY_PORT = 18864
 CONNECT_TIMEOUT_S = 1.0
 READ_TIMEOUT_S = 1.0
-# A response is "RPT1 VERSION 1.0.0\n" at the longest. Anything past this is a
+# A response is "RPT1 VERSION 1.1.0\n" at the longest. Anything past this is a
 # broken or hostile peer; cap the read so a chatty endpoint cannot make the
 # gateway buffer without bound.
 MAX_RESPONSE_BYTES = 128

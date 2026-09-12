@@ -17,7 +17,7 @@ See the repo README section **Red Pitaya telemetry** for the gateway/UI side.
 ```text
 ->  STATUS\n      <-  RPT1 57.34\n          temperature in °C
                   <-  RPT1 ERR XADC\n       sysfs read failed
-->  VERSION\n     <-  RPT1 VERSION 1.0.0\n
+->  VERSION\n     <-  RPT1 VERSION 1.1.0\n
 ->  anything else <-  RPT1 ERR COMMAND\n
 ```
 
@@ -104,6 +104,16 @@ Deploy through the gateway UI rather than by hand — see the repo README. The
 gateway uploads the binary over SSH, installs it atomically at
 `/usr/local/bin/rp-telemetry`, writes `rp-telemetry.service`, enables it at
 boot, starts it, and verifies the protocol answers.
+
+## Which XADC it reads
+
+A Red Pitaya exposes two IIO devices, both named `xadc`: the processing-system
+XADC at `f8007100.adc`, and an XADC wizard core at `83c00000.xadc_wiz` that
+lives inside the FPGA bitstream. Reading the second one after `linien-server`
+has reprogrammed the FPGA is an AXI access nothing answers — the bus hangs and
+the watchdog reboots the board. The daemon therefore identifies the device by
+its resolved sysfs path, prefers the PS XADC, and refuses FPGA-backed ones. See
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## Security
 
