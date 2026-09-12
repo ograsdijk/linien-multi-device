@@ -444,6 +444,12 @@ def _record_board_event(
     if kind is None or not device_key:
         return
     board_event_store.record(device_key, kind, detail=message, data=details or {})
+    if kind == KIND_REBOOT_REQUESTED:
+        # This restart is already on the timeline. Drop the remembered boot id
+        # so the next diagnosis probe does not notice the change and log it a
+        # second time as a spontaneous reboot -- which would put the operator's
+        # own reboot back into the instability count.
+        board_event_store.forget_boot_id(device_key)
 
 
 def _emit_psd(device_key: str, entry: dict[str, Any]) -> None:

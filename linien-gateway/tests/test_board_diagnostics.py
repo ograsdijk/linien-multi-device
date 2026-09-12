@@ -156,7 +156,7 @@ def test_only_the_sections_that_need_root_get_sudo():
     assert any("dmesg" in c for c in sudoed)
     assert any("journalctl -u linien-server" in c for c in sudoed)
     assert any("/proc/uptime" in c for c in plain)
-    assert any("/var/log/journal" in c for c in plain)
+    assert any("free -m" in c for c in plain)
 
 
 def test_root_needs_no_sudo_at_all():
@@ -170,9 +170,9 @@ def test_root_needs_no_sudo_at_all():
 # --- persistence detection ----------------------------------------------
 
 
-def test_a_board_with_a_journal_directory_is_persistent():
+def test_a_board_whose_journald_writes_to_disk_is_persistent():
     conn = FakeConnection(
-        rules={"/var/log/journal 2>/dev/null": FakeResult(stdout="/var/log/journal")}
+        rules={"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=PERSISTENT")}
     )
 
     bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
@@ -180,10 +180,11 @@ def test_a_board_with_a_journal_directory_is_persistent():
     assert bundle["persistent_journal"] is True
 
 
-def test_a_board_without_one_is_not():
-    """The state every stock Red Pitaya image is in, and the reason B3 exists."""
+def test_a_board_whose_journald_is_still_in_tmpfs_is_not():
+    """The state every stock Red Pitaya image is in, and the reason the
+    enable action exists."""
     conn = FakeConnection(
-        rules={"/var/log/journal 2>/dev/null": FakeResult(stdout="MISSING")}
+        rules={"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=VOLATILE")}
     )
 
     bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
@@ -191,9 +192,31 @@ def test_a_board_without_one_is_not():
     assert bundle["persistent_journal"] is False
 
 
-def test_persistence_is_unknown_when_the_probe_said_nothing():
+def test_an_existing_journal_directory_alone_does_not_mean_persistent():
+    """The directory can exist while journald still logs to RAM -- another
+    drop-in overriding Storage=, or a restart that has not happened. Keying on
+    the directory reported success for a board that would still lose its logs.
+    """
     conn = FakeConnection(
-        rules={"/var/log/journal 2>/dev/null": FakeResult(stdout="   ")}
+        rules={
+            "STORAGE=PERSISTENT": FakeResult(
+                stdout=(
+                    "STORAGE=VOLATILE\n"
+                    "File path: /run/log/journal/x/system.journal\n"
+                    "/var/log/journal\n"
+                )
+            )
+        }
+    )
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert bundle["persistent_journal"] is False
+
+
+def test_persistence_is_unknown_when_journald_could_not_be_asked():
+    conn = FakeConnection(
+        rules={"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=UNKNOWN")}
     )
 
     bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
@@ -210,7 +233,7 @@ def _enable_conn(**overrides):
     digest = hashlib.sha256(bd.JOURNALD_DROPIN.encode("utf-8")).hexdigest()
     rules = {
         "sha256sum": FakeResult(stdout=f"{digest}  {bd.JOURNALD_DROPIN_PATH}"),
-        "ls -d /var/log/journal": FakeResult(stdout="/var/log/journal"),
+        "STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=PERSISTENT"),
     }
     rules.update(overrides)
     return FakeConnection(rules=rules)
@@ -284,9 +307,27 @@ def test_a_journald_that_would_not_restart_is_reported():
         bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
 
 
-def test_a_directory_still_missing_afterwards_is_not_reported_as_success():
-    """Claiming success here would leave the next crash unexplained again."""
-    conn = _enable_conn(**{"ls -d /var/log/journal": FakeResult(stdout="MISSING")})
+def test_journald_still_volatile_afterwards_is_not_reported_as_success():
+    """The verification must not just confirm our own mkdir.
 
-    with pytest.raises(RuntimeError, match="still missing"):
+    Claiming success here would leave the next crash unexplained again, and
+    would paint the green "logs survive a reboot" badge over a board that will
+    lose them.
+    """
+    conn = _enable_conn(**{"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=VOLATILE")})
+
+    with pytest.raises(RuntimeError, match="still volatile"):
         bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_a_journald_that_cannot_be_asked_is_not_reported_as_success():
+    conn = _enable_conn(**{"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=UNKNOWN")})
+
+    with pytest.raises(RuntimeError, match="could not be determined"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_the_drop_in_is_ordered_to_win():
+    """A `00-` prefix loses to the conventional `99-*.conf` a vendor image may
+    already ship, silently reverting Storage=."""
+    assert bd.JOURNALD_DROPIN_PATH.rsplit("/", 1)[-1].startswith("99-")
