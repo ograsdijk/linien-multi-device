@@ -40,6 +40,7 @@ from .board_event_store import (
     KIND_DISCONNECTED,
     KIND_PERSISTENT_LOG_ENABLED,
     KIND_REBOOT_DETECTED,
+    KIND_REBOOT_REQUESTED,
     KIND_TELEMETRY_OFFLINE,
     KIND_TELEMETRY_RECOVERED,
     BoardEventStore,
@@ -289,8 +290,9 @@ async def _shutdown() -> None:
     await telemetry_manager.stop()
     _shutdown_telemetry_ssh_executor()
     _shutdown_diagnostics_ssh_executor()
-    # Persist whatever the debounce was still holding.
-    board_event_store.flush()
+    # Persist whatever the debounce was still holding, synchronously: the
+    # process is about to go away, so a backgrounded write would not land.
+    board_event_store.close()
 
 
 @asynccontextmanager
@@ -429,7 +431,7 @@ def _emit_log(
 _BOARD_EVENT_CODES: dict[str, str] = {
     "poll_failure": KIND_DISCONNECTED,
     "connection_diagnosis": KIND_DIAGNOSIS,
-    "device_reboot_completed": KIND_REBOOT_DETECTED,
+    "device_reboot_completed": KIND_REBOOT_REQUESTED,
     "rp_telemetry_unavailable": KIND_TELEMETRY_OFFLINE,
     "rp_telemetry_recovered": KIND_TELEMETRY_RECOVERED,
 }

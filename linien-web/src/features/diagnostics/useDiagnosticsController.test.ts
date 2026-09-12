@@ -153,3 +153,38 @@ it('clears a previous board’s bundle when reopened for another', async () => {
 
   expect(hook.result.current.bundle).toBeNull();
 });
+
+it('never renders one board’s bundle under another board’s title', async () => {
+  // A collect is a dozen SSH commands. Closing the modal and opening a second
+  // board before it resolves must not paint board A's dmesg and journal under
+  // board B -- clearing state on open is not enough, the promise still lands.
+  let release!: (value: DiagnosticsBundle) => void;
+  vi.spyOn(api, 'collectDiagnostics').mockReturnValue(
+    new Promise((resolve) => {
+      release = resolve;
+    })
+  );
+  const appendUiErrorLog = vi.fn();
+  const hook = renderHook(
+    ({ deviceKey }) => useDiagnosticsController({ deviceKey, appendUiErrorLog }),
+    { initialProps: { deviceKey: 'dev-1' as string | null } }
+  );
+
+  let pending!: Promise<void>;
+  act(() => {
+    pending = hook.result.current.collect();
+  });
+
+  act(() => {
+    hook.rerender({ deviceKey: 'dev-2' });
+  });
+
+  await act(async () => {
+    release(bundle());
+    await pending;
+  });
+
+  expect(hook.result.current.bundle).toBeNull();
+  expect(hook.result.current.collecting).toBe(false);
+});
+

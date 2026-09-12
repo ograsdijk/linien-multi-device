@@ -58,7 +58,7 @@ def test_the_timeline_survives_a_gateway_restart(tmp_path):
     """The restart is often part of the incident; the history must outlive it."""
     store = make_store(tmp_path)
     store.record("dev-1", KIND_DISCONNECTED, detail="the night before")
-    store.flush()
+    store.flush(block=True)
 
     reloaded = make_store(tmp_path)
 
@@ -111,7 +111,7 @@ def test_the_remembered_boot_id_survives_a_restart(tmp_path):
     store = make_store(tmp_path)
     store.note_boot_id("dev-1", "boot-a")
     store.record("dev-1", KIND_DISCONNECTED, detail="x")
-    store.flush()
+    store.flush(block=True)
 
     reloaded = make_store(tmp_path)
 
@@ -141,7 +141,7 @@ def test_an_unserialisable_detail_does_not_poison_the_file(tmp_path):
 
     assert store.record("dev-1", KIND_DISCONNECTED, data={"obj": object()}) is not None
     store.record("dev-1", KIND_DISCONNECTED, detail="after the bad one")
-    store.flush()
+    store.flush(block=True)
 
     reloaded = make_store(tmp_path)
     details = [event["detail"] for event in reloaded.events("dev-1")]
@@ -151,6 +151,66 @@ def test_an_unserialisable_detail_does_not_poison_the_file(tmp_path):
 def test_an_unwritable_path_does_not_break_recording(tmp_path):
     store = BoardEventStore(tmp_path / "nope" / "x" / "board_events.json")
     store.record("dev-1", KIND_DISCONNECTED, detail="x")
-    store.flush()
+    store.flush(block=True)
 
     assert [event["detail"] for event in store.events("dev-1")] == ["x"]
+
+
+def test_a_backgrounded_flush_still_lands(tmp_path):
+    """The default path is async so it never blocks the event loop."""
+    store = make_store(tmp_path)
+    store.record("dev-1", KIND_DISCONNECTED, detail="async")
+    store.close()
+
+    reloaded = make_store(tmp_path)
+    assert [event["detail"] for event in reloaded.events("dev-1")] == ["async"]
+
+
+def test_a_failed_write_leaves_the_events_pending_not_lost(tmp_path):
+    """A full disk must not silently discard the history.
+
+    Clearing the dirty flag before the write meant one transient failure made
+    every later flush -- including the one at shutdown -- believe there was
+    nothing to write.
+    """
+    path = tmp_path / "board_events.json"
+    store = BoardEventStore(path, flush_interval_s=0.0)
+    store.record("dev-1", KIND_DISCONNECTED, detail="precious")
+
+    # Make the write fail (the parent is a file, so mkdir cannot succeed),
+    # then let it succeed.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    store._path = blocker / "board_events.json"
+    store.flush(block=True)
+    assert store._dirty is True
+
+    store._path = path
+    store.flush(block=True)
+
+    reloaded = make_store(tmp_path)
+    assert [event["detail"] for event in reloaded.events("dev-1")] == ["precious"]
+
+
+def test_concurrent_recording_never_publishes_a_torn_file(tmp_path):
+    """Two writers sharing one temp path could publish half a file, and a torn
+    file is read back as corrupt -- losing the whole retained history."""
+    import threading
+
+    store = make_store(tmp_path)
+
+    def worker(index):
+        for n in range(20):
+            store.record(f"dev-{index}", KIND_DISCONNECTED, detail=f"{index}-{n}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    store.close()
+
+    reloaded = make_store(tmp_path)
+    # A corrupt file would come back empty for every device.
+    assert sum(len(reloaded.events(f"dev-{i}")) for i in range(4)) == 80
+

@@ -6,6 +6,7 @@ type EventDisplay = { label: string; tone: EventTone };
 
 const BY_KIND: Record<BoardEventKind, EventDisplay> = {
   reboot_detected: { label: 'Rebooted', tone: 'red' },
+  reboot_requested: { label: 'Rebooted (requested)', tone: 'dimmed' },
   disconnected: { label: 'Connection lost', tone: 'red' },
   diagnosis: { label: 'Diagnosis', tone: 'amber' },
   telemetry_offline: { label: 'Telemetry lost', tone: 'amber' },
@@ -17,10 +18,15 @@ export const resolveBoardEventDisplay = (event: BoardEvent): EventDisplay =>
   BY_KIND[event.kind] ?? { label: event.kind, tone: 'dimmed' };
 
 /**
- * How many times the board restarted within the retained window.
+ * How many times the board restarted *on its own* within the retained window.
  *
  * The headline number: a board that rebooted once overnight is a different
  * problem from one that rebooted eleven times, and the raw list buries that.
+ *
+ * Operator-requested reboots are excluded deliberately. They are still shown
+ * on the timeline, but counting them would turn a badge that means "this board
+ * is unstable" into one that means "you used the Reboot button", which is the
+ * opposite of a signal.
  */
 export const countReboots = (events: BoardEvent[]): number =>
   events.filter((event) => event.kind === 'reboot_detected').length;

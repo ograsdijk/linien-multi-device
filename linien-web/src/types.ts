@@ -47,6 +47,7 @@ export type BoardEventKind =
   | 'disconnected'
   | 'diagnosis'
   | 'reboot_detected'
+  | 'reboot_requested'
   | 'telemetry_offline'
   | 'telemetry_recovered'
   | 'persistent_log_enabled';

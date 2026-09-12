@@ -27,6 +27,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,9 @@ logger = logging.getLogger(__name__)
 KIND_DISCONNECTED = "disconnected"
 KIND_DIAGNOSIS = "diagnosis"
 KIND_REBOOT_DETECTED = "reboot_detected"
+# Kept apart from KIND_REBOOT_DETECTED: a restart the operator asked for is
+# not evidence of an unstable board, and must not be counted as one.
+KIND_REBOOT_REQUESTED = "reboot_requested"
 KIND_TELEMETRY_OFFLINE = "telemetry_offline"
 KIND_TELEMETRY_RECOVERED = "telemetry_recovered"
 KIND_PERSISTENT_LOG_ENABLED = "persistent_log_enabled"
@@ -86,6 +90,11 @@ class BoardEventStore:
         self._boot_ids: dict[str, str] = {}
         self._dirty = False
         self._last_flush = 0.0
+        # One thread, so writes are serialised and never land on a caller's.
+        self._writer: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="board-events-write"
+        )
+        self._pending: Future | None = None
         self._load()
 
     # --- reading ---------------------------------------------------------
@@ -188,18 +197,54 @@ class BoardEventStore:
 
     # --- persistence -----------------------------------------------------
 
-    def flush(self) -> None:
-        """Write the file if anything changed. Best effort; never raises."""
+    def flush(self, *, block: bool = False) -> None:
+        """Persist the file if anything changed. Best effort; never raises.
+
+        By default the write is handed to a single background thread. Callers
+        include FastAPI request handlers running on the event loop, and a
+        synchronous SD-card write there would stall every websocket status
+        fan-out for its duration. `block=True` is for shutdown, where the
+        process is about to go away and the write must actually land.
+
+        One writer thread also means writes are serialised: two overlapping
+        `replace()` calls through the same temp path could otherwise publish a
+        half-written file, and a torn file is read back as corrupt and drops
+        the whole retained history -- the one thing this store exists to keep.
+        """
+        payload = None
         with self._lock:
-            if not self._dirty:
-                return
-            payload = {
-                "version": 1,
-                "boot_ids": dict(self._boot_ids),
-                "events": {key: list(items) for key, items in self._events.items()},
-            }
-            self._dirty = False
-            self._last_flush = time.time()
+            if self._dirty:
+                payload = {
+                    "version": 1,
+                    "boot_ids": dict(self._boot_ids),
+                    "events": {key: list(items) for key, items in self._events.items()},
+                }
+                self._dirty = False
+                self._last_flush = time.time()
+
+        if payload is not None:
+            if block or self._writer is None:
+                self._write(payload)
+            else:
+                try:
+                    self._pending = self._writer.submit(self._write, payload)
+                except RuntimeError:
+                    # Executor already shut down: write inline, never lose it.
+                    self._write(payload)
+
+        if block:
+            # A debounced write submitted earlier may still be in flight, and
+            # "blocking" has to mean the file on disk is current -- otherwise
+            # shutdown races the writer it is trying to wait for.
+            pending = self._pending
+            self._pending = None
+            if pending is not None:
+                try:
+                    pending.result(timeout=5.0)
+                except Exception:  # noqa: BLE001 - already logged in _write
+                    pass
+
+    def _write(self, payload: dict[str, Any]) -> None:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = self._path.with_suffix(self._path.suffix + ".tmp")
@@ -207,8 +252,21 @@ class BoardEventStore:
             temp_path.replace(self._path)
         except (OSError, TypeError, ValueError):
             # Never fatal: the timeline is a diagnostic aid, and losing a write
-            # must not take down whatever was being diagnosed.
+            # must not take down whatever was being diagnosed. But mark the
+            # state dirty again, or a transient failure (a full disk, a
+            # read-only mount) would leave every later flush believing there
+            # was nothing to write and silently discard the events for good.
+            with self._lock:
+                self._dirty = True
             logger.warning("Failed writing board events to %s", self._path, exc_info=True)
+
+    def close(self) -> None:
+        """Flush synchronously and stop the writer thread."""
+        self.flush(block=True)
+        writer = self._writer
+        self._writer = None
+        if writer is not None:
+            writer.shutdown(wait=True)
 
     def _load(self) -> None:
         try:
