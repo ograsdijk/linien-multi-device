@@ -42,6 +42,9 @@ Linien laser-lock devices from one interface.
   polled over a tiny TCP protocol, shown per device and logged to InfluxDB by the
   gateway.
 - In-app logs: tail, clear, and a live structured log-event stream surfaced as toasts.
+- Board diagnostics: a retained per-device timeline of reboots and outages, an
+  on-demand post-mortem bundle pulled from the board, and one-click persistent
+  journald so the next crash leaves evidence behind.
 
 ## Repo structure
 
@@ -116,6 +119,9 @@ Network and plot-stream settings, read by the gateway at startup:
   This file is **gitignored and created at runtime** — do not expect it in a fresh
   checkout. These settings are broadcast to all connected clients for the same device
   via WebSocket `config_update` events.
+- `board_events.json` (repo root): the per-device board/server timeline (see
+  [Board diagnostics](#board-diagnostics)). Also gitignored and created at
+  runtime; capped at 200 events and 30 days per device.
 - The Linien client also persists a device list (`devices.json`) and
   `manual_lock_postgres.json` under `linien_common.config.USER_DATA_PATH`.
 - In addition to the three config blocks above, the gateway snapshots a set of
@@ -209,6 +215,65 @@ the cause out-of-band and surfaces it in the device status as a `diagnosis` obje
 (category + lock-state inference + message), rendered as a badge in the UI. The probe
 needs SSH access to the Red Pitaya. Note that the gateway does **not** auto-reconnect — the
 "recovering" wording is informational only, and reconnect is operator-driven.
+
+## Board diagnostics
+
+Connection diagnosis says *what* happened. This says *why*, and keeps a record.
+Open it from **Diagnostics** on a device card.
+
+### Timeline
+
+The gateway retains each board's transitions in `board_events.json`: connection
+losses, diagnosis changes, reboots, and telemetry outages and recoveries. It
+survives a gateway restart, which is often itself part of the incident, so
+"this board rebooted three times last night" is answerable the next morning.
+
+Nothing new is polled to produce it. Every entry mirrors a log event the
+gateway already emits exactly once per transition, so the poll paths are
+untouched and the timeline cannot fill with repeats of a steady state.
+
+Reboots are detected by comparing `/proc/sys/kernel/random/boot_id` between
+probes. That is free — it rides along in a compound read `diagnosis.py` already
+sends — and it is a fact rather than the previous 600 s uptime heuristic, which
+was wrong in both directions: it missed a reboot on a board that had since been
+up for a day, and it called a crash-on-a-freshly-booted-board a reboot and
+wrongly declared the lock lost.
+
+### Collect diagnostics
+
+`POST /api/devices/{key}/diagnostics/collect` gathers, over one SSH connection:
+
+- board identity, uptime and boot ID;
+- whether the board keeps logs at all;
+- `linien-server.service` state and exit status, including `NRestarts` and
+  whether it died on a signal;
+- its journal for this boot **and the previous one**;
+- the kernel ring buffer, with watchdog/reset/OOM/panic lines pre-extracted;
+- `pstore` crash remnants, memory, disk, load, and FPGA manager state;
+- the `rp-telemetry` journal.
+
+Every command is `timeout`-bounded and every section fails independently —
+these images vary, and a missing tool is a finding, not a reason to lose the
+other eleven sections. Collection is operator-triggered only, on its own small
+SSH pool, so it can never queue ahead of a telemetry action or slow a status
+endpoint. It is read-only.
+
+### Enable persistent logs
+
+**This is the one that matters, and it has to be done before the crash you want
+to read about.** Stock Red Pitaya images keep the journal in RAM: after a reset
+`journalctl -b -1` has nothing, and the pre-crash evidence is simply gone. No
+amount of collecting recovers it retroactively.
+
+`POST /api/devices/{key}/diagnostics/enable-persistent-log` writes a capped
+`Storage=persistent` journald drop-in (32 MB, 8 MB per file — these are SD
+cards), creates `/var/log/journal`, and restarts journald. The write is
+checksum-verified and `sync`ed, with the same care the telemetry unit write
+earned on real hardware. `POST /api/diagnostics/enable-persistent-log` does a
+set of boards at once, which is how you would want to do it the first time.
+
+The modal offers the action only when a collected bundle shows the board has no
+persistent journal, and stops offering it once it does.
 
 ## Multi-device operations
 
