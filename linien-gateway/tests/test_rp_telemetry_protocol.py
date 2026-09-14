@@ -201,6 +201,14 @@ def test_implausible_metrics_are_dropped_individually():
     assert reading.metrics.mem_total_kb == 509216
 
 
+def test_free_disk_beyond_the_memory_bound_is_kept():
+    """Regression: rootfree was checked against the 64 GiB memory bound, so a
+    host with a terabyte free (the daemon tests in a container) lost it."""
+    reading = rpt.parse_status_line("RPT1 57.34 rootfree=993232668\n")
+
+    assert reading.metrics.root_free_kb == 993232668
+
+
 def test_available_memory_above_the_total_is_refused():
     reading = rpt.parse_status_line("RPT1 57.34 memtotal=1000 memavail=9999\n")
 

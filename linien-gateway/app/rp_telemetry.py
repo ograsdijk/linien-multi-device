@@ -149,6 +149,10 @@ MAX_PLAUSIBLE_LOAD = 1024.0
 # 64 GiB expressed in kB. No Zynq board is anywhere near this; the bound exists
 # to reject a garbled line, not to model the hardware.
 MAX_PLAUSIBLE_MEMORY_KB = 64 * 1024 * 1024
+# 16 TiB expressed in kB. Disk gets its own bound: free space on an ordinary
+# host (CI, a board booted off a big card) easily passes the memory bound, and
+# a real reading must not be dropped as garbled.
+MAX_PLAUSIBLE_DISK_KB = 16 * 1024 * 1024 * 1024
 # Ten years. An uptime past this is a broken clock or a garbled field.
 MAX_PLAUSIBLE_UPTIME_S = 10 * 365 * 24 * 3600.0
 
@@ -356,7 +360,7 @@ _METRIC_PARSERS: dict[str, tuple[str, Any]] = {
     ),
     "rootfree": (
         "root_free_kb",
-        lambda raw: _bounded_int(raw, 0, MAX_PLAUSIBLE_MEMORY_KB),
+        lambda raw: _bounded_int(raw, 0, MAX_PLAUSIBLE_DISK_KB),
     ),
 }
 
