@@ -227,6 +227,22 @@ def test_the_probe_checks_the_runtime_directory_before_the_persistent_one():
     assert "journalctl" not in probe
 
 
+def test_a_journal_directory_on_a_ram_disk_is_not_persistence():
+    """Some images mount /var/log on a tmpfs.
+
+    journald then obeys Storage=persistent, creates its per-machine directory
+    there, and still loses every line at the next reset -- so a directory check
+    alone would paint the green badge over a board that keeps nothing.
+    """
+    conn = FakeConnection(
+        rules={"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=TMPFS")}
+    )
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert bundle["persistent_journal"] is False
+
+
 def test_persistence_is_unknown_when_journald_could_not_be_asked():
     conn = FakeConnection(
         rules={"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=UNKNOWN")}
@@ -332,6 +348,56 @@ def test_journald_still_volatile_afterwards_is_not_reported_as_success():
     lose them.
     """
     conn = _enable_conn(**{"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=VOLATILE")})
+
+    with pytest.raises(RuntimeError, match="still volatile"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_the_verification_waits_for_the_flush_to_finish():
+    """`journalctl --flush` returns before the flush is done on older systemd.
+
+    Deciding on the first look reported boards that had just been configured
+    correctly as failures: the runtime directory was simply still there a
+    moment later. The retry happens on the board, in one command, rather than
+    as a second SSH round trip.
+    """
+    conn = _enable_conn()
+
+    bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    probe = next(c for c in conn.commands if "STORAGE=PERSISTENT" in c)
+    assert "sleep 1" in probe
+    assert "while" in probe
+    # And it stops at the first non-volatile answer rather than always sleeping
+    # the full budget.
+    assert "break" in probe
+
+
+def test_a_journal_directory_on_a_ram_disk_is_not_reported_as_success():
+    conn = _enable_conn(**{"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=TMPFS")})
+
+    with pytest.raises(RuntimeError, match="RAM disk"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_a_failed_verification_reports_what_the_board_said():
+    """"Still volatile" on its own leaves the operator nothing to act on."""
+    conn = _enable_conn(
+        **{
+            "STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=VOLATILE"),
+            "ActiveState": FakeResult(stdout="Storage=volatile\nActiveState=active"),
+        }
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert "Storage=volatile" in str(excinfo.value)
+
+
+def test_a_detail_command_that_fails_does_not_replace_the_real_error():
+    conn = _enable_conn(**{"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=VOLATILE")})
+    conn.raises["ActiveState"] = RuntimeError("channel closed")
 
     with pytest.raises(RuntimeError, match="still volatile"):
         bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))

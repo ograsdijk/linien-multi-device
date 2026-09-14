@@ -80,7 +80,12 @@ export function DiagnosticsModal({
 
         {error ? (
           <Alert color="red" variant="light" title="Diagnostics">
-            {error}
+            {/* A failed "enable persistent logging" carries the board's own
+                account of why, over several lines. Without pre-wrap the
+                browser folds it into one unreadable paragraph. */}
+            <Text size="sm" style={{ whiteSpace: 'pre-wrap' }}>
+              {error}
+            </Text>
           </Alert>
         ) : null}
 

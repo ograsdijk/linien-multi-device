@@ -79,12 +79,50 @@ RUNTIME_JOURNAL_DIR = "/run/log/journal"
 #
 # The runtime directory is checked first for exactly that reason: when both
 # exist, the one journald is writing to now is the runtime one.
+# TMPFS is the case a directory check alone gets wrong: some images mount
+# /var/log (or all of /var) on a tmpfs, so journald obeys Storage=persistent,
+# creates its per-machine directory there, and still loses every line at the
+# next reset. `df` rather than `stat -f`, which busybox does not implement.
 _STORAGE_PROBE = (
     'MID=$(cat /etc/machine-id 2>/dev/null || true); '
     'if [ -z "$MID" ]; then echo STORAGE=UNKNOWN; '
     'elif [ -d "' + RUNTIME_JOURNAL_DIR + '/$MID" ]; then echo STORAGE=VOLATILE; '
-    'elif [ -d "' + JOURNAL_DIR + '/$MID" ]; then echo STORAGE=PERSISTENT; '
+    'elif [ -d "' + JOURNAL_DIR + '/$MID" ]; then '
+    # Not `case "$(df ...)"`: a `case` inside a command substitution is a parse
+    # error in more than one shell, and this string is built to run under
+    # whatever /bin/sh the image ships.
+    "if df -P " + JOURNAL_DIR + " 2>/dev/null | tail -n 1 | "
+    'grep -qE "^(tmpfs|ramfs)[[:space:]]"; '
+    "then echo STORAGE=TMPFS; else echo STORAGE=PERSISTENT; fi; "
     "else echo STORAGE=UNKNOWN; fi"
+)
+
+# journald flushes the runtime journal to disk asynchronously, and on older
+# systemd `journalctl --flush` only signals the daemon and returns. Deciding on
+# the first look therefore reported boards that had just been configured
+# correctly as failures -- the runtime directory was simply still there a
+# moment later. Poll instead, and stop at the first non-volatile answer.
+_STORAGE_SETTLE_ATTEMPTS = 5
+
+_STORAGE_PROBE_SETTLED = (
+    "STATE=; i=0; while [ $i -lt " + str(_STORAGE_SETTLE_ATTEMPTS) + " ]; do "
+    "STATE=$(" + _STORAGE_PROBE + "); "
+    'case "$STATE" in *VOLATILE*) ;; *) break;; esac; '
+    "i=$((i+1)); sleep 1; done; "
+    'echo "$STATE"'
+)
+
+# Shown to the operator when the verification fails, because "it is still
+# volatile" on its own leaves them with nothing to act on. These four answers
+# cover every cause seen so far: a runtime directory that never went away, a
+# /var/log on tmpfs, another drop-in overriding Storage=, and a journald that
+# did not come back up.
+_STORAGE_DETAIL = (
+    "ls -d " + RUNTIME_JOURNAL_DIR + " " + JOURNAL_DIR + " 2>/dev/null; "
+    "df -P " + JOURNAL_DIR + " 2>/dev/null | tail -n 1; "
+    'grep -sHE "^[[:space:]]*Storage=" /etc/systemd/journald.conf '
+    "/etc/systemd/journald.conf.d/*.conf || true; "
+    "systemctl show systemd-journald -p ActiveState -p SubState || true"
 )
 
 # (name, title, command, needs_root). Ordered as an operator reads them: what
@@ -273,7 +311,9 @@ def _persistent_journal(sections: list[dict[str, Any]]) -> bool | None:
         output = section.get("output") or ""
         if "STORAGE=PERSISTENT" in output:
             return True
-        if "STORAGE=VOLATILE" in output:
+        # TMPFS is a no as firmly as VOLATILE is: journald is writing to
+        # /var/log/journal and that directory is a RAM disk.
+        if "STORAGE=VOLATILE" in output or "STORAGE=TMPFS" in output:
             return False
         # UNKNOWN, or the section did not run at all. Stay honest: reporting
         # False here would nag about a board we could not read, and True would
@@ -368,18 +408,30 @@ def enable_persistent_journal(
             # time and reported a board it had just configured correctly as a
             # failure. The section path was always safe because it is bounded;
             # this call was the one that was not.
-            exited, out, _err = run(_bounded(_STORAGE_PROBE))
+            exited, out, _err = run(_bounded(_STORAGE_PROBE_SETTLED))
             if "STORAGE=PERSISTENT" not in out:
-                state = (
-                    "could not be determined"
-                    if "STORAGE=UNKNOWN" in out or exited != 0
-                    else "is still volatile"
-                )
+                if "STORAGE=TMPFS" in out:
+                    state = "is a RAM disk"
+                    hint = (
+                        f"{JOURNAL_DIR} is on a tmpfs on this image, so journald "
+                        "obeys the setting and still loses everything at reset. "
+                        "The image has to give /var/log real storage first."
+                    )
+                elif "STORAGE=UNKNOWN" in out or exited != 0:
+                    state = "could not be determined"
+                    hint = (
+                        "Check that /etc/machine-id is readable and that "
+                        "systemd-journald came back up."
+                    )
+                else:
+                    state = "is still volatile"
+                    hint = (
+                        "Check for another drop-in in {} overriding Storage=."
+                    ).format(JOURNALD_DROPIN_DIR)
                 raise RuntimeError(
                     "journald restarted but its storage "
                     f"{state} -- logs would still not survive a reboot. "
-                    f"Check for another drop-in in {JOURNALD_DROPIN_DIR} "
-                    "overriding Storage=."
+                    f"{hint}{_storage_detail(run)}"
                 )
     except AuthenticationException as exc:
         raise RuntimeError(f"SSH authentication failed: {exc}") from exc
@@ -389,6 +441,23 @@ def enable_persistent_journal(
         raise RuntimeError(f"Could not enable persistent logging: {exc}") from exc
 
     return {"ok": True, "persistent_journal": True}
+
+
+def _storage_detail(run: Callable[..., Any]) -> str:
+    """What journald and the filesystem say, appended to a failure message.
+
+    Best effort by construction: this runs only on a path that is already
+    failing, so a detail command that itself fails must not replace the real
+    error with its own.
+    """
+    try:
+        _exited, out, _err = run(_bounded(_STORAGE_DETAIL))
+    except Exception:  # noqa: BLE001 - diagnostics for an error we are reporting
+        return ""
+    out = (out or "").strip()
+    if not out:
+        return ""
+    return "\n\nWhat the board reports:\n" + out[:800]
 
 
 def _verify_remote_file(run: Callable[..., Any], path: str, expected: str) -> str | None:
