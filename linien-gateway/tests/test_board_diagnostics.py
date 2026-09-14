@@ -403,6 +403,61 @@ def test_a_detail_command_that_fails_does_not_replace_the_real_error():
         bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
 
 
+def test_a_ram_disk_on_var_log_is_refused_before_journald_is_touched():
+    """The stock Red Pitaya image mounts /var/log as a 5 MB tmpfs.
+
+    journald fails this silently -- it falls back to runtime storage -- so
+    without the pre-flight the board got reconfigured, restarted, and then
+    reported as mysteriously "still volatile". Nothing this action does can
+    repair it, so it must not pretend to try.
+    """
+    conn = _enable_conn(
+        **{"FSTYPE=": FakeResult(stdout="FSTYPE=tmpfs MOUNT=/var/log AVAILKB=5120")}
+    )
+
+    with pytest.raises(RuntimeError, match="RAM disk"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert not any("systemctl restart" in c for c in conn.commands)
+
+
+def test_a_filesystem_too_small_for_a_journal_file_is_refused():
+    conn = _enable_conn(
+        **{"FSTYPE=": FakeResult(stdout="FSTYPE=ext4 MOUNT=/var/log AVAILKB=4096")}
+    )
+
+    with pytest.raises(RuntimeError, match="MB free"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_real_storage_with_room_passes_the_preflight():
+    conn = _enable_conn(
+        **{"FSTYPE=": FakeResult(stdout="FSTYPE=ext4 MOUNT=/ AVAILKB=2000000")}
+    )
+
+    result = bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert result["ok"] is True
+
+
+def test_a_filesystem_that_could_not_be_read_does_not_block_the_attempt():
+    """Undetermined is not a refusal -- the verification afterwards is the backstop."""
+    conn = _enable_conn(**{"FSTYPE=": FakeResult(exited=1, stderr="df: not found")})
+
+    result = bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert result["ok"] is True
+
+
+def test_the_filesystem_type_comes_from_proc_mounts_not_the_device_name():
+    """A tmpfs is routinely mounted with the source `none`.
+
+    Matching df's first column missed exactly the board this check exists for.
+    """
+    assert "/proc/mounts" in bd._FS_PROBE
+    assert "FSTYPE=" in bd._JOURNAL_FS_REPORT
+
+
 def test_the_verification_survives_a_non_root_board():
     """`sudo -n if ...; then ...; fi` is a shell syntax error.
 

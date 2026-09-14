@@ -79,23 +79,44 @@ RUNTIME_JOURNAL_DIR = "/run/log/journal"
 #
 # The runtime directory is checked first for exactly that reason: when both
 # exist, the one journald is writing to now is the runtime one.
+# What filesystem is under the journal directory, and how much room it has.
+# Sets FS and AVAILKB; echoes nothing, so it can be pasted in front of a test.
+#
+# The type comes from /proc/mounts, not from df's first column: a tmpfs is
+# routinely mounted with the source `none`, which is how a Red Pitaya image
+# with a 5 MB RAM disk on /var/log got past an earlier check that matched on
+# the device name. `stat -f` would be shorter and busybox does not have it.
+_FS_PROBE = (
+    "L=$(df -Pk " + JOURNAL_DIR + " 2>/dev/null | tail -n 1 | tr -s \" \"); "
+    'MP=$(echo "$L" | cut -d" " -f6); '
+    'AVAILKB=$(echo "$L" | cut -d" " -f4); '
+    'FS=$(grep " $MP " /proc/mounts 2>/dev/null | cut -d" " -f3 | tail -n 1); '
+)
+
+# A journal file is created at SystemMaxFileSize and journald keeps a margin
+# free, so a filesystem that cannot hold one is refused outright rather than
+# filled. journald's own failure mode here is silent: it falls back to runtime
+# storage and the board looks exactly like one that was never configured.
+JOURNAL_MIN_FREE_KB = 16 * 1024
+
 # TMPFS is the case a directory check alone gets wrong: some images mount
 # /var/log (or all of /var) on a tmpfs, so journald obeys Storage=persistent,
 # creates its per-machine directory there, and still loses every line at the
-# next reset. `df` rather than `stat -f`, which busybox does not implement.
+# next reset.
 _STORAGE_PROBE = (
     'MID=$(cat /etc/machine-id 2>/dev/null || true); '
     'if [ -z "$MID" ]; then echo STORAGE=UNKNOWN; '
     'elif [ -d "' + RUNTIME_JOURNAL_DIR + '/$MID" ]; then echo STORAGE=VOLATILE; '
     'elif [ -d "' + JOURNAL_DIR + '/$MID" ]; then '
-    # Not `case "$(df ...)"`: a `case` inside a command substitution is a parse
-    # error in more than one shell, and this string is built to run under
-    # whatever /bin/sh the image ships.
-    "if df -P " + JOURNAL_DIR + " 2>/dev/null | tail -n 1 | "
-    'grep -qE "^(tmpfs|ramfs)[[:space:]]"; '
-    "then echo STORAGE=TMPFS; else echo STORAGE=PERSISTENT; fi; "
+    + _FS_PROBE
+    + 'if [ "$FS" = tmpfs ] || [ "$FS" = ramfs ]; then echo STORAGE=TMPFS; '
+    "else echo STORAGE=PERSISTENT; fi; "
     "else echo STORAGE=UNKNOWN; fi"
 )
+
+# Run before journald is restarted, so an image that cannot hold a journal is
+# told so instead of being reconfigured, restarted and then found wanting.
+_JOURNAL_FS_REPORT = _FS_PROBE + 'echo "FSTYPE=$FS MOUNT=$MP AVAILKB=$AVAILKB"'
 
 # journald flushes the runtime journal to disk asynchronously, and on older
 # systemd `journalctl --flush` only signals the daemon and returns. Deciding on
@@ -119,7 +140,9 @@ _STORAGE_PROBE_SETTLED = (
 # did not come back up.
 _STORAGE_DETAIL = (
     "ls -d " + RUNTIME_JOURNAL_DIR + " " + JOURNAL_DIR + " 2>/dev/null; "
-    "df -P " + JOURNAL_DIR + " 2>/dev/null | tail -n 1; "
+    "df -Pk " + JOURNAL_DIR + " 2>/dev/null | tail -n 1; "
+    + _JOURNAL_FS_REPORT
+    + "; "
     'grep -sHE "^[[:space:]]*Storage=" /etc/systemd/journald.conf '
     "/etc/systemd/journald.conf.d/*.conf || true; "
     "systemctl show systemd-journald -p ActiveState -p SubState || true"
@@ -147,6 +170,9 @@ _SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
         "journald",
         "Journal persistence",
         _STORAGE_PROBE + "; "
+        # What is under /var/log, so an image that cannot hold a journal at all
+        # is visible in the bundle rather than only on a failed Enable.
+        + _JOURNAL_FS_REPORT + "; "
         'journalctl --header 2>/dev/null | grep -i "file path" | head -n 3 || true; '
         "ls -d " + JOURNAL_DIR + " " + RUNTIME_JOURNAL_DIR + " 2>/dev/null; "
         "grep -hE \"^[[:space:]]*Storage=\" /etc/systemd/journald.conf "
@@ -381,6 +407,12 @@ def enable_persistent_journal(
                     f"Could not create {JOURNAL_DIR}: {err.strip()[:300]}"
                 )
 
+            # Before the restart, not after. journald fails this silently --
+            # it falls back to runtime storage -- so a board that cannot hold a
+            # journal would otherwise be reconfigured, restarted, and then
+            # reported as mysteriously "still volatile".
+            _require_usable_journal_filesystem(run)
+
             # systemd-journald re-reads its configuration only on restart.
             # Restarting it is safe: it is socket-activated, so messages
             # produced meanwhile are queued rather than lost.
@@ -441,6 +473,47 @@ def enable_persistent_journal(
         raise RuntimeError(f"Could not enable persistent logging: {exc}") from exc
 
     return {"ok": True, "persistent_journal": True}
+
+
+def _require_usable_journal_filesystem(run: Callable[..., Any]) -> None:
+    """Raise unless /var/log/journal can actually hold a journal.
+
+    Two ways it cannot, both seen on stock Red Pitaya images: /var/log is a RAM
+    disk, so "persistent" logs die with the board anyway; or it is real but
+    smaller than one journal file, in which case journald quietly keeps using
+    runtime storage. Neither is something this action can repair -- the image
+    has to give /var/log real storage first -- so say which one it is.
+    """
+    exited, out, _err = run(_bounded(_JOURNAL_FS_REPORT))
+    if exited != 0 or "FSTYPE=" not in out:
+        # Undetermined is not a reason to refuse: the restart below is still
+        # worth attempting, and the verification afterwards is the backstop.
+        return
+    fields = dict(
+        token.split("=", 1) for token in out.split() if token.count("=") >= 1
+    )
+    fstype = fields.get("FSTYPE", "")
+    mount = fields.get("MOUNT", JOURNAL_DIR)
+    try:
+        avail_kb = int(fields.get("AVAILKB", ""))
+    except ValueError:
+        avail_kb = None
+
+    if fstype in ("tmpfs", "ramfs"):
+        raise RuntimeError(
+            f"{mount} is a RAM disk on this image ({fstype}"
+            + (f", {avail_kb // 1024} MB" if avail_kb is not None else "")
+            + "), so a journal written there would be lost at the next reset "
+            "just the same. Persistent logging needs /var/log backed by real "
+            "storage -- change the image's mount for it, then try again."
+        )
+    if avail_kb is not None and avail_kb < JOURNAL_MIN_FREE_KB:
+        raise RuntimeError(
+            f"{mount} has only {avail_kb // 1024} MB free, less than the "
+            f"{JOURNAL_MIN_FREE_KB // 1024} MB a journal file needs. journald "
+            "would silently keep logging to RAM. Free space there, or give "
+            "/var/log a larger filesystem, then try again."
+        )
 
 
 def _storage_detail(run: Callable[..., Any]) -> str:
