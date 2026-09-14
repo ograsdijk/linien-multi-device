@@ -129,7 +129,8 @@ def test_a_server_started_outside_systemd_is_still_visible():
     assert "[l]inien" in commands["linien_process"]
     # The log lives on the root filesystem, not in the journal -- which is why
     # it survives on an image that cannot keep a journal at all.
-    assert ".local/share/linien/linien.log" in commands["linien_logfile"]
+    assert bd.LINIEN_LOG_SUBDIR in commands["linien_logfile"]
+    assert "linien.log" in commands["linien_logfile"]
 
 
 def test_the_log_file_section_shows_its_timestamp():
@@ -137,6 +138,17 @@ def test_the_log_file_section_shows_its_timestamp():
     command = next(c for n, _t, c, _r in bd._SECTIONS if n == "linien_logfile")
     assert "ls -la" in command
     assert "tail -n" in command
+
+
+def test_the_rotated_log_is_collected_too():
+    """linien logs through a RotatingFileHandler.
+
+    The run that died is routinely one rotation back, with the live file
+    holding nothing but the restart that followed it -- which is exactly what
+    a board looked like when this was written.
+    """
+    command = next(c for n, _t, c, _r in bd._SECTIONS if n == "linien_logfile")
+    assert "linien.log.1" in command
 
 
 def test_a_dead_connection_is_reported_not_raised():

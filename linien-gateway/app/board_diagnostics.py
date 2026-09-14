@@ -39,6 +39,9 @@ from .ssh import open_ssh_connection, privileged, run_remote, shell_single_quote
 logger = logging.getLogger(__name__)
 
 LINIEN_UNIT = "linien-server.service"
+# Where linien puts its log, per `linien_common.config.LOG_FILE_PATH`:
+# `AppDirs("linien").user_data_dir / "linien.log"`.
+LINIEN_LOG_SUBDIR = ".local/share/linien"
 TELEMETRY_UNIT = "rp-telemetry"
 
 # Per-command ceiling. Bounds a hung command the way `diagnosis.py` bounds a
@@ -206,11 +209,18 @@ _SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
         # (`linien_common.config.LOG_FILE_PATH`), on the root filesystem rather
         # than in the journal. On these images that is the only account of a
         # server death that survives anything at all.
-        "for f in \"$HOME/.local/share/linien/linien.log\" "
-        "/root/.local/share/linien/linien.log; do "
-        'if [ -f "$f" ]; then ls -la "$f"; echo; tail -n '
+        #
+        # `linien.log.1` as well as `linien.log`: the handler is a
+        # RotatingFileHandler, so the run that died is often one rotation back
+        # and the live file holds nothing but the restart that followed it.
+        # The directory listing comes first because the mtimes are the timeline.
+        'D="$HOME/' + LINIEN_LOG_SUBDIR + '"; '
+        '[ -d "$D" ] || D="/root/' + LINIEN_LOG_SUBDIR + '"; '
+        'ls -la "$D" 2>/dev/null; '
+        'for f in "$D/linien.log.1" "$D/linien.log"; do '
+        'if [ -f "$f" ]; then echo; echo "== $f"; tail -n '
         + str(JOURNAL_LINES)
-        + ' "$f"; break; fi; done',
+        + ' "$f"; fi; done',
         False,
     ),
     (
