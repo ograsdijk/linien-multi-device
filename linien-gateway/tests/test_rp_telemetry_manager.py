@@ -123,8 +123,12 @@ def test_stale_detection_hides_an_old_reading():
     entry.sampled_at = time.time() - 120.0
     fields = manager.status_fields("dev-1")
     assert fields["rp_telemetry"]["state"] == rpt.STATE_STALE
-    # The last value is still carried for context; the UI keys off the state.
-    assert fields["rp_temperature_c"] == 57.3
+    # The reading leaves with the state that vouched for it. Carrying it "for
+    # context" meant every consumer had to remember to check the state, and a
+    # consumer that forgot showed an old number as a current one.
+    assert fields["rp_temperature_c"] is None
+    # The age still ships, so a client can say how long ago the last one was.
+    assert fields["rp_temperature_age_s"] == pytest.approx(120.0, abs=5.0)
 
 
 def test_refused_connection_on_an_uninstalled_board_reads_not_installed():
@@ -2205,3 +2209,41 @@ def test_poll_loop_starts_and_stops_cleanly():
 
     asyncio.run(run())
     assert cycles >= 2
+
+
+def test_status_fields_ship_an_age_not_just_a_sample_time():
+    """The client ages readings locally, so it needs an age, not a timestamp.
+
+    A browser comparing `rp_temperature_sampled_at` against its own clock
+    inherits the skew between the two machines; an age carries none.
+    """
+    device = make_device()
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=57.3)),
+        version_fn=_no_version,
+        stale_after_s=90.0,
+    )
+    asyncio.run(manager.poll_once())
+
+    fields = manager.status_fields("dev-1")
+
+    assert fields["rp_temperature_c"] == 57.3
+    assert fields["rp_temperature_age_s"] == pytest.approx(0.0, abs=5.0)
+    # The window is published too, so the UI ages by the gateway's rule rather
+    # than keeping a second copy of the number that could drift from this one.
+    assert fields["rp_telemetry"]["stale_after_s"] == 90.0
+
+
+def test_an_unpolled_device_has_no_age():
+    device = make_device()
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=57.3)),
+        version_fn=_no_version,
+    )
+
+    fields = manager.status_fields("dev-1")
+
+    assert fields["rp_temperature_c"] is None
+    assert fields["rp_temperature_age_s"] is None

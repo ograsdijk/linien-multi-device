@@ -72,6 +72,8 @@ export type RpTelemetry = {
   installed?: boolean;
   port?: number | null;
   error?: string | null;
+  /** The window the gateway uses to call a reading stale, in seconds. */
+  stale_after_s?: number | null;
 };
 
 export type DeviceStatus = {
@@ -90,10 +92,13 @@ export type DeviceStatus = {
   diagnosis?: DeviceDiagnosis | null;
   recovery?: DeviceRecovery | null;
   // Red Pitaya die temperature in degrees Celsius and the epoch seconds it was
-  // sampled at. Only present as a live value while rp_telemetry.state is
-  // 'running' -- other states keep the last reading for context.
+  // sampled at. The gateway sends a reading ONLY while rp_telemetry.state is
+  // 'running'; every other state sends null rather than an old number.
   rp_temperature_c?: number | null;
   rp_temperature_sampled_at?: number | null;
+  /** Age of the reading when the gateway sent it. Skew-proof, unlike the
+   *  absolute sample time: the UI ages it locally from here. */
+  rp_temperature_age_s?: number | null;
   rp_telemetry?: RpTelemetry | null;
 };
 

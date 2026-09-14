@@ -1,6 +1,10 @@
 import { MantineProvider } from '@mantine/core';
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { act, render, screen } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  clearStatusFreshness,
+  markStatusReceived,
+} from '../features/devices/statusFreshness';
 import type { DeviceStatus } from '../types';
 import { RpTemperatureLine } from './RpTemperatureLine';
 
@@ -101,5 +105,48 @@ describe('RpTemperatureLine', () => {
   it('handles a missing status', () => {
     renderLine(null);
     expect(readingLine().textContent).toBe('RP temperature: unavailable');
+  });
+});
+
+describe('RpTemperatureLine ageing', () => {
+  const running = status({
+    rp_temperature_c: 57.3,
+    rp_telemetry: { state: 'running', stale_after_s: 90 },
+  });
+
+  beforeEach(() => {
+    clearStatusFreshness('dev-age');
+  });
+
+  it('shows a reading that has just arrived', () => {
+    markStatusReceived('dev-age', 5);
+    renderLine(running, { deviceKey: 'dev-age' });
+    expect(readingLine().textContent).toBe('RP temperature: 57.3 °C');
+  });
+
+  it('withdraws the reading once it ages out, with no new status', () => {
+    vi.useFakeTimers();
+    try {
+      markStatusReceived('dev-age', 5);
+      renderLine(running, { deviceKey: 'dev-age' });
+      expect(readingLine().textContent).toBe('RP temperature: 57.3 °C');
+
+      // No new payload ever arrives -- the line must notice on its own.
+      act(() => {
+        vi.advanceTimersByTime(120_000);
+      });
+
+      expect(readingLine().textContent).toBe('RP temperature: unavailable');
+      expect(screen.getByText('No recent reading')).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps showing a reading when no device key is given', () => {
+    // Callers that opt out of ageing (tests, any card without a key) must be
+    // unaffected rather than silently blanked.
+    renderLine(running);
+    expect(readingLine().textContent).toBe('RP temperature: 57.3 °C');
   });
 });

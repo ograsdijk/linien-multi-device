@@ -225,6 +225,7 @@ function SortableDeviceCard({
             </Text>
             <RpTemperatureLine
               status={status}
+              deviceKey={device.key}
               busy={telemetryBusy}
               onAction={(action) => {
                 // 'update' is an install of the newer bundled binary.

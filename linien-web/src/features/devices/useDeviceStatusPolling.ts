@@ -3,6 +3,7 @@ import { api } from '../../api';
 import type { Device, DeviceStatus } from '../../types';
 import { isDeviceStatus } from '../runtime/messageGuards';
 import { deviceStatesStore } from '../../state/deviceStatesStore';
+import { markStatusReceived } from './statusFreshness';
 import { isStreamFresh } from './streamFreshness';
 
 // How long a streaming device may go without a plot frame before the backstop
@@ -168,6 +169,10 @@ export const useDeviceStatusPolling = ({
             if (!isDeviceStatus(status)) {
               continue;
             }
+            // Outside the updater below, which runs only when something
+            // changed: an unchanged status is still a fresh one, and the
+            // temperature's local ageing keys off when it arrived.
+            markStatusReceived(device.key, status.rp_temperature_age_s);
             entries.push({
               deviceKey: device.key,
               updater: (prev) => {

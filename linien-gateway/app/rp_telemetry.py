@@ -603,9 +603,22 @@ class RpTelemetryManager:
             sampled_at = entry.sampled_at
             installed = entry.installed
             influx_skip_reason = entry.influx_skip_reason
+        # Never ship a reading the state does not vouch for. The state alone
+        # used to carry that meaning, leaving a stale number in the payload for
+        # every consumer to remember to ignore; one that forgets shows an old
+        # temperature as if it were current.
+        if state != STATE_RUNNING:
+            temperature = None
+        # Age at the moment of sending, NOT the absolute sample time: a client
+        # comparing `sampled_at` against its own clock inherits whatever skew
+        # exists between the two machines. An age is skew-proof, and a client
+        # that stops receiving updates can go on ageing it locally instead of
+        # showing a frozen reading forever.
+        age_s = None if sampled_at is None else max(0.0, now - sampled_at)
         return {
             "rp_temperature_c": temperature,
             "rp_temperature_sampled_at": sampled_at,
+            "rp_temperature_age_s": age_s,
             "rp_telemetry": {
                 "state": state,
                 "version": version,
@@ -616,6 +629,10 @@ class RpTelemetryManager:
                 "installed": installed,
                 "port": self._port,
                 "error": error,
+                # The window the gateway itself uses to call a reading stale,
+                # so the UI ages readings by the same rule instead of keeping
+                # its own copy of the number that could drift from this one.
+                "stale_after_s": self._stale_after_s,
                 # None while the temperature is reaching InfluxDB; otherwise
                 # why it is not (see INFLUX_SKIP_* above).
                 "influx_skip_reason": influx_skip_reason,
