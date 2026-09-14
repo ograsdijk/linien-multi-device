@@ -1449,6 +1449,77 @@ def get_logging_credentials(key: str) -> dict:
     }
 
 
+# One RPyC round trip per board. Bounded per device AND capped in width: a few
+# boards with a wedged RPyC lock must not turn "open the InfluxDB panel" into a
+# request that hangs for as long as the slowest board, nor fill the loop's
+# default executor (which also serves /api/devices/statuses) with blocked
+# threads. A timed-out lookup leaves its worker thread blocked until RPyC gives
+# up -- the same trade RpTelemetryManager._resolve_credentials_bounded makes --
+# so the width cap is what keeps that bounded.
+BULK_CREDENTIALS_TIMEOUT_S = 5.0
+BULK_CREDENTIALS_CONCURRENCY = 8
+
+
+@app.get("/api/devices/logging/credentials")
+async def get_all_logging_credentials() -> dict[str, dict]:
+    """Every device's InfluxDB credentials in one call.
+
+    Fetching them one key at a time meant the operator had to select each board
+    in the UI dropdown before its settings were readable -- and since this is
+    also what primes the telemetry credential cache, boards nobody clicked
+    stayed unprimed. Disconnected devices are reported, not skipped: "this
+    board has no settings because it is offline" is what the UI needs to show,
+    and it costs no round trip.
+    """
+    devices = device_store.list_devices()
+    semaphore = asyncio.Semaphore(BULK_CREDENTIALS_CONCURRENCY)
+
+    def _credentials_for(device: Device) -> dict:
+        session = _session_for_device(device)
+        if not getattr(session, "connected", False):
+            return {"connected": False, "credentials": None, "error": None}
+        credentials = session.logging_get_credentials()
+        # Same cache priming as the per-device endpoint, so one panel open
+        # primes the whole fleet for the gateway-side temperature write.
+        telemetry_manager.set_influx_credentials(device.key, credentials)
+        return {
+            "connected": True,
+            "credentials": {
+                "url": credentials.url,
+                "org": credentials.org,
+                "token": credentials.token,
+                "bucket": credentials.bucket,
+                "measurement": credentials.measurement,
+            },
+            "error": None,
+        }
+
+    async def _bounded(device: Device) -> tuple[str, dict]:
+        async with semaphore:
+            try:
+                entry = await asyncio.wait_for(
+                    asyncio.to_thread(_credentials_for, device),
+                    timeout=BULK_CREDENTIALS_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                entry = {
+                    "connected": True,
+                    "credentials": None,
+                    "error": "Timed out reading InfluxDB credentials",
+                }
+            except Exception as exc:  # noqa: BLE001 - one board must not fail the batch
+                logger.warning(
+                    "bulk influx credential lookup failed for device=%s",
+                    device.key,
+                    exc_info=True,
+                )
+                entry = {"connected": True, "credentials": None, "error": str(exc)}
+            return device.key, entry
+
+    results = await asyncio.gather(*(_bounded(device) for device in devices))
+    return {key: entry for key, entry in results}
+
+
 @app.put("/api/devices/{key}/logging/credentials")
 def update_logging_credentials(key: str, payload: InfluxCredentials) -> dict:
     session = _get_session(key)

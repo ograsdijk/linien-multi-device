@@ -529,6 +529,7 @@ export function App() {
     influxMessage,
     influxMessageError,
     influxDeviceOptions,
+    influxFleet,
     influxSelectedDevice,
     influxDeviceConnected,
     influxLoggingActive,
@@ -603,6 +604,7 @@ export function App() {
             influxChipColor={influxChipColor}
             influxLabel={influxLabel}
             influxDeviceOptions={influxDeviceOptions}
+            influxFleet={influxFleet}
             influxDeviceKey={influxDeviceKey}
             onInfluxDeviceChange={(value) => {
               setInfluxDeviceKey(value);

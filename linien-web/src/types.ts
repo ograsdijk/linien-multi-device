@@ -376,6 +376,13 @@ export type InfluxCredentials = {
   measurement: string;
 };
 
+/** One device's entry in the fleet-wide credentials response. */
+export type InfluxCredentialsEntry = {
+  connected: boolean;
+  credentials: InfluxCredentials | null;
+  error: string | null;
+};
+
 export type InfluxUpdateResult = {
   success: boolean;
   message: string;
