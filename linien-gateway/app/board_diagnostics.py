@@ -189,6 +189,31 @@ _SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
         False,
     ),
     (
+        "linien_process",
+        "linien-server process",
+        # The unit sections go blank on a board where the server was started by
+        # `linien-server start` over SSH rather than by systemd -- which is
+        # what the gateway's own autostart does. Without this, such a board
+        # looks identical to one where nothing was ever running.
+        'ps -eo pid,etime,rss,args 2>/dev/null | grep -i "[l]inien" '
+        '|| echo "no linien process running"',
+        False,
+    ),
+    (
+        "linien_logfile",
+        "linien-server log file",
+        # linien logs to a file under the user data directory
+        # (`linien_common.config.LOG_FILE_PATH`), on the root filesystem rather
+        # than in the journal. On these images that is the only account of a
+        # server death that survives anything at all.
+        "for f in \"$HOME/.local/share/linien/linien.log\" "
+        "/root/.local/share/linien/linien.log; do "
+        'if [ -f "$f" ]; then ls -la "$f"; echo; tail -n '
+        + str(JOURNAL_LINES)
+        + ' "$f"; break; fi; done',
+        False,
+    ),
+    (
         "linien_journal",
         "linien-server log (this boot)",
         "journalctl -u " + LINIEN_UNIT + " -b 0 -n " + str(JOURNAL_LINES)

@@ -113,6 +113,32 @@ def test_output_is_kept_alongside_a_non_zero_exit():
     assert section["error"] == "boom"
 
 
+def test_a_server_started_outside_systemd_is_still_visible():
+    """The gateway's own autostart runs `linien-server start` over SSH.
+
+    systemd then knows nothing about the process, so every journal and unit
+    section comes back empty and a board where the server died looks exactly
+    like one where it was never running. The process list and the log file are
+    what distinguish them.
+    """
+    names = {name for name, _title, _command, _root in bd._SECTIONS}
+    assert {"linien_process", "linien_logfile"} <= names
+
+    commands = {name: command for name, _t, command, _r in bd._SECTIONS}
+    # `[l]inien` so the grep does not report itself.
+    assert "[l]inien" in commands["linien_process"]
+    # The log lives on the root filesystem, not in the journal -- which is why
+    # it survives on an image that cannot keep a journal at all.
+    assert ".local/share/linien/linien.log" in commands["linien_logfile"]
+
+
+def test_the_log_file_section_shows_its_timestamp():
+    """The file's mtime is the time of death when nothing else recorded one."""
+    command = next(c for n, _t, c, _r in bd._SECTIONS if n == "linien_logfile")
+    assert "ls -la" in command
+    assert "tail -n" in command
+
+
 def test_a_dead_connection_is_reported_not_raised():
     def factory(*_args, **_kwargs):
         raise OSError("no route to host")
