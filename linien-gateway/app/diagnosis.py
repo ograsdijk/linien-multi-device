@@ -122,7 +122,12 @@ _EXIT_CODE_HINTS = {
 _LOCK_DETAIL_MAX_CHARS = 120
 
 TCP_PROBE_TIMEOUT_S = 2.0
-SSH_COMMAND_TIMEOUT_S = 5.0
+# Deliberately much shorter than `ssh.SSH_COMMAND_TIMEOUT_S` (20 s), which
+# bounds the diagnostics *bundle* -- a dozen commands an operator waited for.
+# This bounds an automatic probe that runs on every disconnect, for every
+# device, so it must give up quickly rather than be generous. Do not
+# consolidate the two: a probe at 20 s stalls reconnection for the whole fleet.
+PROBE_COMMAND_TIMEOUT_S = 5.0
 # A board up longer than this is assumed not to have rebooted since we lost the
 # connection. Used as the reboot/crash discriminator.
 DEFAULT_UPTIME_THRESHOLD_S = 600.0
@@ -210,7 +215,7 @@ def _read_uptime_and_fpga(
         f"cat /proc/uptime; echo '---'; cat {FPGA_STATE_PATH} 2>/dev/null; "
         f"echo '---'; cat {BOOT_ID_PATH} 2>/dev/null"
     )
-    result = conn.run(cmd, hide=True, warn=True, timeout=SSH_COMMAND_TIMEOUT_S)
+    result = conn.run(cmd, hide=True, warn=True, timeout=PROBE_COMMAND_TIMEOUT_S)
     return _parse_uptime_fpga(result.stdout or "")
 
 
@@ -225,7 +230,7 @@ def _run_lock_bit_cmd(conn: Connection, cmd: str) -> tuple[int | None, str | Non
     unavailable, and the user is left with nothing to act on.
     """
     try:
-        result = conn.run(cmd, hide=True, warn=True, timeout=SSH_COMMAND_TIMEOUT_S)
+        result = conn.run(cmd, hide=True, warn=True, timeout=PROBE_COMMAND_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001 - any transport/command error -> next method
         logger.debug("lock-bit command errored cmd=%r", cmd, exc_info=True)
         return None, f"{type(exc).__name__}: {exc}"
