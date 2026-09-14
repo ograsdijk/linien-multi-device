@@ -186,7 +186,12 @@ _SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
     (
         "linien_unit",
         "linien-server unit state",
-        "systemctl show " + LINIEN_UNIT + " -p ActiveState -p SubState -p Result "
+        # LoadState and UnitFileState first: `systemctl show` prints a full set
+        # of defaults for a unit that does not exist at all, so without them
+        # "never installed" and "installed but never started" render as the
+        # same all-zeroes, all-n/a output.
+        "systemctl show " + LINIEN_UNIT + " -p LoadState -p UnitFileState "
+        "-p ActiveState -p SubState -p Result "
         "-p ExecMainStatus -p ExecMainCode -p ExecMainStartTimestamp "
         "-p ExecMainExitTimestamp -p NRestarts",
         False,
