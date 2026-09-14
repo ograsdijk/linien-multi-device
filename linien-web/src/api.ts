@@ -270,7 +270,14 @@ export const api = {
       method: 'POST',
     }),
   enablePersistentLog: (key: string) =>
-    request<{ ok: boolean; persistent_journal: boolean }>(
+    request<{
+      ok: boolean;
+      persistent_journal: boolean;
+      // True when /var/log was a RAM disk and the journal is now bind-mounted
+      // from real storage -- a change to how the board boots, not just a
+      // journald setting.
+      backing_mount?: boolean;
+    }>(
       `/devices/${key}/diagnostics/enable-persistent-log`,
       { method: 'POST' }
     ),

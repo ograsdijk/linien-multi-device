@@ -32,6 +32,11 @@ class FakeConnection:
                 raise exc
         for needle, result in self.rules.items():
             if needle in command:
+                # A list answers successive matches in turn, holding the last
+                # value once exhausted -- for probes whose answer is supposed to
+                # change because of something that happened in between.
+                if isinstance(result, list):
+                    return result.pop(0) if len(result) > 1 else result[0]
                 return result
         return self.default
 
@@ -294,15 +299,38 @@ def test_persistence_is_unknown_when_journald_could_not_be_asked():
 # --- enabling persistence ------------------------------------------------
 
 
-def _enable_conn(**overrides):
+def _digest_rule(path, text):
     import hashlib
 
-    digest = hashlib.sha256(bd.JOURNALD_DROPIN.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return f"sha256sum {path}", FakeResult(stdout=f"{digest}  {path}")
+
+
+def _enable_conn(**overrides):
+    # Keyed per file: the drop-in and the mount unit are both written and both
+    # read back, and one digest cannot stand for both.
+    dropin_key, dropin_result = _digest_rule(
+        bd.JOURNALD_DROPIN_PATH, bd.JOURNALD_DROPIN
+    )
+    mount_key, mount_result = _digest_rule(
+        bd.JOURNAL_MOUNT_UNIT_PATH, bd.JOURNAL_MOUNT_UNIT_TEXT
+    )
+    # Order matters, because rules are matched by substring in insertion order.
+    #
+    # The storage probe goes first: it embeds the same `df -Pk /var/log/journal`
+    # that the filesystem report uses, so a test that stubs the filesystem would
+    # otherwise answer the storage probe too. Only the storage probe contains
+    # the literal STORAGE=PERSISTENT, so keying on that separates them.
+    #
+    # Then the remaining overrides, so a broad one like "sha256sum" is seen
+    # before the per-file keys it stands in for. Then the defaults.
+    storage_key = "STORAGE=PERSISTENT"
     rules = {
-        "sha256sum": FakeResult(stdout=f"{digest}  {bd.JOURNALD_DROPIN_PATH}"),
-        "STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=PERSISTENT"),
+        storage_key: overrides.pop(storage_key, FakeResult(stdout=storage_key))
     }
     rules.update(overrides)
+    for key, result in ((dropin_key, dropin_result), (mount_key, mount_result)):
+        rules.setdefault(key, result)
     return FakeConnection(rules=rules)
 
 
@@ -311,7 +339,11 @@ def test_enabling_persistence_writes_verifies_and_restarts():
 
     result = bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
 
-    assert result == {"ok": True, "persistent_journal": True}
+    assert result == {
+        "ok": True,
+        "persistent_journal": True,
+        "backing_mount": False,
+    }
     joined = "\n".join(conn.commands)
     assert f"mkdir -p {bd.JOURNALD_DROPIN_DIR}" in joined
     # `tee`, not a redirect: the redirect would be performed by the calling,
@@ -341,7 +373,7 @@ def test_the_written_config_is_the_capped_one():
 
 def test_a_config_that_did_not_land_intact_is_an_error():
     """The failure the rp-telemetry install learned to catch on real hardware."""
-    conn = _enable_conn(sha256sum=FakeResult(stdout="0000  path"))
+    conn = _enable_conn(**{"sha256sum": FakeResult(stdout="0000  path")})
 
     with pytest.raises(RuntimeError, match="does not match"):
         bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
@@ -350,8 +382,10 @@ def test_a_config_that_did_not_land_intact_is_an_error():
 def test_a_board_without_sha256sum_falls_back_to_a_size_check():
     size = len(bd.JOURNALD_DROPIN.encode("utf-8"))
     conn = _enable_conn(
-        sha256sum=FakeResult(exited=127, stderr="not found"),
-        **{"wc -c": FakeResult(stdout=str(size))},
+        **{
+            "sha256sum": FakeResult(exited=127, stderr="not found"),
+            "wc -c": FakeResult(stdout=str(size)),
+        }
     )
 
     result = bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
@@ -361,8 +395,10 @@ def test_a_board_without_sha256sum_falls_back_to_a_size_check():
 
 def test_a_truncated_config_is_caught_by_the_size_check():
     conn = _enable_conn(
-        sha256sum=FakeResult(exited=127, stderr="not found"),
-        **{"wc -c": FakeResult(stdout="3")},
+        **{
+            "sha256sum": FakeResult(exited=127, stderr="not found"),
+            "wc -c": FakeResult(stdout="3"),
+        }
     )
 
     with pytest.raises(RuntimeError, match="truncated"):
@@ -441,22 +477,107 @@ def test_a_detail_command_that_fails_does_not_replace_the_real_error():
         bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
 
 
-def test_a_ram_disk_on_var_log_is_refused_before_journald_is_touched():
+def _tmpfs(mount="/var/log", kb=5120):
+    return FakeResult(stdout=f"FSTYPE=tmpfs MOUNT={mount} AVAILKB={kb}")
+
+
+def _real_fs(mount="/", kb=2_000_000):
+    return FakeResult(stdout=f"FSTYPE=ext4 MOUNT={mount} AVAILKB={kb}")
+
+
+def _journal_probe():
+    return "df -Pk " + bd.JOURNAL_DIR
+
+
+def _backing_probe():
+    return "df -Pk " + bd.JOURNAL_BACKING_DIR
+
+
+def test_a_ram_disk_on_var_log_is_repaired_with_a_bind_mount():
     """The stock Red Pitaya image mounts /var/log as a 5 MB tmpfs.
 
-    journald fails this silently -- it falls back to runtime storage -- so
-    without the pre-flight the board got reconfigured, restarted, and then
-    reported as mysteriously "still volatile". Nothing this action does can
-    repair it, so it must not pretend to try.
+    journald's path is hardcoded, but what is mounted at that path is ours to
+    choose -- so rather than refusing, put real storage under it.
     """
     conn = _enable_conn(
-        **{"FSTYPE=": FakeResult(stdout="FSTYPE=tmpfs MOUNT=/var/log AVAILKB=5120")}
+        **{
+            _backing_probe(): _real_fs(),
+            # tmpfs before the mount, real storage after it.
+            _journal_probe(): [_tmpfs(), _real_fs(mount=bd.JOURNAL_DIR)],
+        }
     )
 
-    with pytest.raises(RuntimeError, match="RAM disk"):
+    result = bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert result["backing_mount"] is True
+    joined = "\n".join(conn.commands)
+    assert f"mkdir -p {bd.JOURNAL_BACKING_DIR}" in joined
+    assert f"tee {bd.JOURNAL_MOUNT_UNIT_PATH}" in joined
+    assert "systemctl daemon-reload" in joined
+    assert f"systemctl start {bd.JOURNAL_MOUNT_UNIT}" in joined
+    # And the mount is established before journald is restarted, so the flush
+    # has real storage to land on.
+    assert joined.index("systemctl start " + bd.JOURNAL_MOUNT_UNIT) < joined.index(
+        "systemctl restart systemd-journald"
+    )
+
+
+def test_a_board_with_nowhere_to_put_a_journal_is_refused():
+    """Both the path and its backing store on RAM disks.
+
+    Nothing this action does can repair that, so it must not pretend to try --
+    and it must not restart journald to find out.
+    """
+    conn = _enable_conn(
+        **{
+            _journal_probe(): _tmpfs(),
+            _backing_probe(): _tmpfs(mount="/var"),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="nowhere"):
         bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
 
-    assert not any("systemctl restart" in c for c in conn.commands)
+    assert not any("systemctl restart systemd-journald" in c for c in conn.commands)
+
+
+def test_a_bind_mount_that_did_not_take_is_not_reported_as_success():
+    """`mount` can exit zero and leave the old filesystem visible."""
+    conn = _enable_conn(
+        **{
+            _backing_probe(): _real_fs(),
+            _journal_probe(): _tmpfs(),  # still a RAM disk afterwards
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="still a RAM disk"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_the_mount_unit_is_named_for_its_mount_point():
+    """systemd derives the name from the path; any other name is never used."""
+    assert bd.JOURNAL_MOUNT_UNIT == "var-log-journal.mount"
+    assert bd.JOURNAL_DIR == "/var/log/journal"
+
+
+def test_the_mount_unit_is_not_wired_into_local_fs_target():
+    """A failed mount must not drop a headless board into emergency mode.
+
+    systemd-journal-flush.service carries RequiresMountsFor=/var/log/journal,
+    which pulls the unit in and orders it ahead of the flush on its own. Adding
+    WantedBy=local-fs.target would look tidier and would make a broken mount a
+    boot failure on a board reachable only over the network.
+    """
+    assert "[Install]" not in bd.JOURNAL_MOUNT_UNIT_TEXT
+    assert "WantedBy" not in bd.JOURNAL_MOUNT_UNIT_TEXT
+    assert "Options=bind" in bd.JOURNAL_MOUNT_UNIT_TEXT
+    assert f"What={bd.JOURNAL_BACKING_DIR}" in bd.JOURNAL_MOUNT_UNIT_TEXT
+    assert f"Where={bd.JOURNAL_DIR}" in bd.JOURNAL_MOUNT_UNIT_TEXT
+
+
+def test_the_backing_store_is_outside_the_directory_it_backs():
+    """Inside /var/log it would be swallowed by the same tmpfs at every boot."""
+    assert not bd.JOURNAL_BACKING_DIR.startswith("/var/log/")
 
 
 def test_a_filesystem_too_small_for_a_journal_file_is_refused():

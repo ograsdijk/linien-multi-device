@@ -68,6 +68,67 @@ JOURNALD_DROPIN = "[Journal]\nStorage=persistent\nSystemMaxUse=32M\nSystemMaxFil
 
 RUNTIME_JOURNAL_DIR = "/run/log/journal"
 
+# Where the journal actually lives on an image whose /var/log is a RAM disk.
+# On the root filesystem, beside /var/log rather than inside it, so it is not
+# swallowed by the tmpfs that covers /var/log at every boot.
+JOURNAL_BACKING_DIR = "/var/log-persistent/journal"
+
+# The unit name is not a choice: systemd derives it from the mount point, and
+# `/var/log/journal` escapes to exactly this. A different name would never be
+# matched to the path and would never be pulled in.
+JOURNAL_MOUNT_UNIT = "var-log-journal.mount"
+JOURNAL_MOUNT_UNIT_PATH = "/etc/systemd/system/" + JOURNAL_MOUNT_UNIT
+
+# No [Install] section, deliberately. systemd-journal-flush.service carries
+# `RequiresMountsFor=/var/log/journal`, which pulls this unit in *and* orders it
+# before the flush at every boot -- so the mount is established before journald
+# moves anything to disk, with no enablement to remember.
+#
+# `WantedBy=local-fs.target` would look tidier and is the trap: it would make a
+# failed mount a local-fs.target failure, and a headless board that drops to
+# emergency mode needs a lab visit with an SD reader. Pulled in only by the
+# flush, the worst case of a broken mount is the journal staying in RAM --
+# which is the status quo this action is trying to improve on.
+#
+# systemd creates the mount point itself (src/core/mount.c), which matters:
+# /var/log is emptied by its tmpfs at every boot, so /var/log/journal cannot be
+# created once at install time and expected to still be there.
+JOURNAL_MOUNT_UNIT_TEXT = (
+    "[Unit]\n"
+    "Description=Persistent backing store for the systemd journal\n"
+    "DefaultDependencies=no\n"
+    "\n"
+    "[Mount]\n"
+    "What=" + JOURNAL_BACKING_DIR + "\n"
+    "Where=" + JOURNAL_DIR + "\n"
+    "Type=none\n"
+    "Options=bind\n"
+)
+
+# What filesystem is under the journal directory, and how much room it has.
+# Sets FS and AVAILKB; echoes nothing, so it can be pasted in front of a test.
+#
+# The type comes from /proc/mounts, not from df's first column: a tmpfs is
+# routinely mounted with the source `none`, which is how a Red Pitaya image
+# with a 5 MB RAM disk on /var/log got past an earlier check that matched on
+# the device name. `stat -f` would be shorter and busybox does not have it.
+def _fs_probe(path: str) -> str:
+    return (
+        "L=$(df -Pk " + path + " 2>/dev/null | tail -n 1 | tr -s \" \"); "
+        'MP=$(echo "$L" | cut -d" " -f6); '
+        'AVAILKB=$(echo "$L" | cut -d" " -f4); '
+        'FS=$(grep " $MP " /proc/mounts 2>/dev/null | cut -d" " -f3 | tail -n 1); '
+    )
+
+
+_FS_PROBE = _fs_probe(JOURNAL_DIR)
+
+# A journal file is created at SystemMaxFileSize and journald keeps a margin
+# free, so a filesystem that cannot hold one is refused outright rather than
+# filled. journald's own failure mode here is silent: it falls back to runtime
+# storage and the board looks exactly like one that was never configured.
+JOURNAL_MIN_FREE_KB = 16 * 1024
+
 # Which storage journald is *currently* using, decided by where its per-machine
 # directory lives. journald creates `<dir>/<machine-id>` under whichever of the
 # two it is writing to, and a flush removes the runtime copy once the logs have
@@ -82,26 +143,7 @@ RUNTIME_JOURNAL_DIR = "/run/log/journal"
 #
 # The runtime directory is checked first for exactly that reason: when both
 # exist, the one journald is writing to now is the runtime one.
-# What filesystem is under the journal directory, and how much room it has.
-# Sets FS and AVAILKB; echoes nothing, so it can be pasted in front of a test.
 #
-# The type comes from /proc/mounts, not from df's first column: a tmpfs is
-# routinely mounted with the source `none`, which is how a Red Pitaya image
-# with a 5 MB RAM disk on /var/log got past an earlier check that matched on
-# the device name. `stat -f` would be shorter and busybox does not have it.
-_FS_PROBE = (
-    "L=$(df -Pk " + JOURNAL_DIR + " 2>/dev/null | tail -n 1 | tr -s \" \"); "
-    'MP=$(echo "$L" | cut -d" " -f6); '
-    'AVAILKB=$(echo "$L" | cut -d" " -f4); '
-    'FS=$(grep " $MP " /proc/mounts 2>/dev/null | cut -d" " -f3 | tail -n 1); '
-)
-
-# A journal file is created at SystemMaxFileSize and journald keeps a margin
-# free, so a filesystem that cannot hold one is refused outright rather than
-# filled. journald's own failure mode here is silent: it falls back to runtime
-# storage and the board looks exactly like one that was never configured.
-JOURNAL_MIN_FREE_KB = 16 * 1024
-
 # TMPFS is the case a directory check alone gets wrong: some images mount
 # /var/log (or all of /var) on a tmpfs, so journald obeys Storage=persistent,
 # creates its per-machine directory there, and still loses every line at the
@@ -119,7 +161,9 @@ _STORAGE_PROBE = (
 
 # Run before journald is restarted, so an image that cannot hold a journal is
 # told so instead of being reconfigured, restarted and then found wanting.
-_JOURNAL_FS_REPORT = _FS_PROBE + 'echo "FSTYPE=$FS MOUNT=$MP AVAILKB=$AVAILKB"'
+_FS_REPORT_TAIL = 'echo "FSTYPE=$FS MOUNT=$MP AVAILKB=$AVAILKB"'
+_JOURNAL_FS_REPORT = _FS_PROBE + _FS_REPORT_TAIL
+_BACKING_FS_REPORT = _fs_probe(JOURNAL_BACKING_DIR) + _FS_REPORT_TAIL
 
 # journald flushes the runtime journal to disk asynchronously, and on older
 # systemd `journalctl --flush` only signals the daemon and returns. Deciding on
@@ -148,7 +192,12 @@ _STORAGE_DETAIL = (
     + "; "
     'grep -sHE "^[[:space:]]*Storage=" /etc/systemd/journald.conf '
     "/etc/systemd/journald.conf.d/*.conf || true; "
-    "systemctl show systemd-journald -p ActiveState -p SubState || true"
+    "systemctl show systemd-journald -p ActiveState -p SubState || true; "
+    # The bind mount, when this board has one: a journal that stopped
+    # persisting because its mount unit failed looks identical from journald's
+    # side to one that was never configured.
+    "systemctl show " + JOURNAL_MOUNT_UNIT + " -p LoadState -p ActiveState "
+    "-p Result || true"
 )
 
 # (name, title, command, needs_root). Ordered as an operator reads them: what
@@ -450,8 +499,10 @@ def enable_persistent_journal(
             # Before the restart, not after. journald fails this silently --
             # it falls back to runtime storage -- so a board that cannot hold a
             # journal would otherwise be reconfigured, restarted, and then
-            # reported as mysteriously "still volatile".
-            _require_usable_journal_filesystem(run)
+            # reported as mysteriously "still volatile". On an image whose
+            # /var/log is a RAM disk this also puts real storage under the path
+            # first, so the flush below has somewhere to land.
+            bind_mounted = _require_usable_journal_filesystem(run, device)
 
             # systemd-journald re-reads its configuration only on restart.
             # Restarting it is safe: it is socket-activated, so messages
@@ -512,47 +563,140 @@ def enable_persistent_journal(
     except Exception as exc:  # noqa: BLE001 - surfaced to the operator as a message
         raise RuntimeError(f"Could not enable persistent logging: {exc}") from exc
 
-    return {"ok": True, "persistent_journal": True}
+    return {
+        "ok": True,
+        "persistent_journal": True,
+        # True when /var/log was a RAM disk and the journal is now bind-mounted
+        # from real storage. Worth surfacing: that is a change to how the board
+        # boots, not just a journald setting.
+        "backing_mount": bind_mounted,
+    }
 
 
-def _require_usable_journal_filesystem(run: Callable[..., Any]) -> None:
-    """Raise unless /var/log/journal can actually hold a journal.
-
-    Two ways it cannot, both seen on stock Red Pitaya images: /var/log is a RAM
-    disk, so "persistent" logs die with the board anyway; or it is real but
-    smaller than one journal file, in which case journald quietly keeps using
-    runtime storage. Neither is something this action can repair -- the image
-    has to give /var/log real storage first -- so say which one it is.
-    """
-    exited, out, _err = run(_bounded(_JOURNAL_FS_REPORT))
+def _filesystem_facts(run: Callable[..., Any], report: str) -> tuple[str, str, int | None] | None:
+    """(fstype, mount point, free KB) for a path, or None when unreadable."""
+    exited, out, _err = run(_bounded(report))
     if exited != 0 or "FSTYPE=" not in out:
-        # Undetermined is not a reason to refuse: the restart below is still
-        # worth attempting, and the verification afterwards is the backstop.
-        return
+        return None
     fields = dict(
         token.split("=", 1) for token in out.split() if token.count("=") >= 1
     )
-    fstype = fields.get("FSTYPE", "")
-    mount = fields.get("MOUNT", JOURNAL_DIR)
     try:
-        avail_kb = int(fields.get("AVAILKB", ""))
+        avail_kb: int | None = int(fields.get("AVAILKB", ""))
     except ValueError:
         avail_kb = None
+    return fields.get("FSTYPE", ""), fields.get("MOUNT", ""), avail_kb
+
+
+def _require_usable_journal_filesystem(
+    run: Callable[..., Any], device: Any
+) -> bool:
+    """Make /var/log/journal able to hold a journal, or explain why it cannot.
+
+    Returns True when a bind mount had to be set up to get there.
+
+    Two ways the path is unusable, both on stock Red Pitaya images: /var/log is
+    a RAM disk, so "persistent" logs die with the board anyway; or it is real
+    but smaller than one journal file, in which case journald quietly falls
+    back to runtime storage and the board looks exactly like one that was never
+    configured.
+
+    The first is repairable without touching the image: journald's path is
+    hardcoded, but what is *mounted* at that path is ours to choose. The second
+    is not -- nothing here can conjure free space.
+    """
+    facts = _filesystem_facts(run, _JOURNAL_FS_REPORT)
+    if facts is None:
+        # Undetermined is not a reason to refuse: the restart below is still
+        # worth attempting, and the verification afterwards is the backstop.
+        return False
+    fstype, mount, avail_kb = facts
 
     if fstype in ("tmpfs", "ramfs"):
-        raise RuntimeError(
-            f"{mount} is a RAM disk on this image ({fstype}"
-            + (f", {avail_kb // 1024} MB" if avail_kb is not None else "")
-            + "), so a journal written there would be lost at the next reset "
-            "just the same. Persistent logging needs /var/log backed by real "
-            "storage -- change the image's mount for it, then try again."
-        )
+        _mount_journal_backing_store(run, device)
+        return True
     if avail_kb is not None and avail_kb < JOURNAL_MIN_FREE_KB:
         raise RuntimeError(
-            f"{mount} has only {avail_kb // 1024} MB free, less than the "
-            f"{JOURNAL_MIN_FREE_KB // 1024} MB a journal file needs. journald "
-            "would silently keep logging to RAM. Free space there, or give "
-            "/var/log a larger filesystem, then try again."
+            f"{mount or JOURNAL_DIR} has only {avail_kb // 1024} MB free, less "
+            f"than the {JOURNAL_MIN_FREE_KB // 1024} MB a journal file needs. "
+            "journald would silently keep logging to RAM. Free space there, or "
+            "give /var/log a larger filesystem, then try again."
+        )
+    return False
+
+
+def _mount_journal_backing_store(run: Callable[..., Any], device: Any) -> None:
+    """Bind a directory on real storage over /var/log/journal.
+
+    journald's path is hardcoded and /var/log is a RAM disk on these images, so
+    the only way to keep a journal is to change what is mounted at that path.
+    A systemd mount unit rather than an fstab line or a boot-time symlink: the
+    flush that moves this boot's logs to disk runs *before*
+    systemd-tmpfiles-setup, so a symlink recreated by tmpfiles would not exist
+    yet and the whole boot would stay in RAM -- while a mount unit is pulled in
+    and ordered ahead of the flush by its RequiresMountsFor.
+    """
+    exited, _out, err = run("mkdir -p " + JOURNAL_BACKING_DIR)
+    if exited != 0:
+        raise RuntimeError(
+            f"Could not create {JOURNAL_BACKING_DIR}: {err.strip()[:300]}"
+        )
+
+    # The backing store has to be real storage itself, or this buys nothing.
+    facts = _filesystem_facts(run, _BACKING_FS_REPORT)
+    if facts is not None:
+        fstype, mount, avail_kb = facts
+        if fstype in ("tmpfs", "ramfs"):
+            raise RuntimeError(
+                f"{JOURNAL_DIR} is a RAM disk on this image, and so is "
+                f"{mount or JOURNAL_BACKING_DIR} ({fstype}) -- there is nowhere "
+                "on this board to put a journal that survives a reboot. The "
+                "image has to give /var real storage first."
+            )
+        if avail_kb is not None and avail_kb < JOURNAL_MIN_FREE_KB:
+            raise RuntimeError(
+                f"{mount or JOURNAL_BACKING_DIR} has only {avail_kb // 1024} MB "
+                f"free, less than the {JOURNAL_MIN_FREE_KB // 1024} MB a journal "
+                "file needs."
+            )
+
+    tee = privileged(device, "tee " + JOURNAL_MOUNT_UNIT_PATH)
+    exited, _out, err = run(
+        "printf '%s' '"
+        + shell_single_quote(JOURNAL_MOUNT_UNIT_TEXT)
+        + "' | "
+        + tee
+        + " > /dev/null",
+        privileged_command=False,
+    )
+    if exited != 0:
+        raise RuntimeError(
+            f"Could not write {JOURNAL_MOUNT_UNIT_PATH}: {err.strip()[:300]}"
+        )
+    run("sync")
+    mismatch = _verify_remote_file(run, JOURNAL_MOUNT_UNIT_PATH, JOURNAL_MOUNT_UNIT_TEXT)
+    if mismatch is not None:
+        raise RuntimeError(mismatch)
+
+    exited, _out, err = run("systemctl daemon-reload")
+    if exited != 0:
+        raise RuntimeError(f"Could not reload systemd: {err.strip()[:300]}")
+
+    exited, _out, err = run("systemctl start " + JOURNAL_MOUNT_UNIT)
+    if exited != 0:
+        raise RuntimeError(
+            f"Could not mount {JOURNAL_DIR} from {JOURNAL_BACKING_DIR}: "
+            f"{err.strip()[:300]}"
+        )
+
+    # Confirm the mount took, rather than trusting a zero exit: a bind mount
+    # onto a path journald is using can succeed and still leave the old
+    # filesystem visible to anything holding it open.
+    facts = _filesystem_facts(run, _JOURNAL_FS_REPORT)
+    if facts is not None and facts[0] in ("tmpfs", "ramfs"):
+        raise RuntimeError(
+            f"{JOURNAL_MOUNT_UNIT} started but {JOURNAL_DIR} is still a RAM "
+            f"disk ({facts[0]}). The journal would not survive a reboot."
         )
 
 

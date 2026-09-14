@@ -271,12 +271,40 @@ cards), creates `/var/log/journal`, and restarts journald. The write is
 checksum-verified and `sync`ed, with the same care the telemetry unit write
 earned on real hardware.
 
+On these images that is not enough on its own: `/var/log` is itself a 5 MB RAM
+disk, so journald obeys `Storage=persistent`, cannot fit an 8 MB journal file
+there, and falls back to logging in RAM — silently, leaving a board that looks
+exactly like one that was never configured. So before restarting journald, the
+action checks what filesystem is under `/var/log/journal` (from `/proc/mounts`,
+not from `df`'s device column — a tmpfs is usually mounted as `none`), and when
+it finds a RAM disk it puts real storage under the path: a
+`var-log-journal.mount` unit bind-mounting `/var/log-persistent/journal` from
+the root filesystem.
+
+That unit has no `[Install]` section on purpose. `systemd-journal-flush.service`
+carries `RequiresMountsFor=/var/log/journal`, which pulls the mount in *and*
+orders it ahead of the flush at every boot, so nothing needs enabling. The
+tidier-looking `WantedBy=local-fs.target` is a trap: it would make a failed
+mount a boot failure, and a headless board in emergency mode needs a lab visit
+with an SD reader. Pulled in only by the flush, a broken mount costs you the
+journal and nothing else. (A boot-time symlink is not an option either — the
+flush runs `Before=systemd-tmpfiles-setup.service`, so the link would not exist
+yet and the whole boot would stay in RAM.)
+
 It then asks journald which file it is *actually* writing to, rather than
 checking that `/var/log/journal` exists — that directory is created by this
-very action, so its presence proves nothing. A board whose `Storage=` is still
-overridden by another drop-in reports failure and says where to look, instead
-of showing a green badge over logs that would not survive. `POST /api/diagnostics/enable-persistent-log` does a
+very action, so its presence proves nothing. The check retries for a few
+seconds, because `journalctl --flush` returns before the flush has finished on
+older systemd and a board configured correctly was being reported as a failure.
+A board whose `Storage=` is still overridden by another drop-in reports failure
+and says where to look, along with what the board itself reports: both journal
+directories, the filesystem under them, every effective `Storage=` line with the
+file it came from, and journald's state. `POST /api/diagnostics/enable-persistent-log` does a
 set of boards at once, which is how you would want to do it the first time.
+
+A board where even `/var` is a RAM disk is refused outright rather than
+half-configured: there is nowhere to put a journal, and only a change to the
+image can fix that.
 
 The modal offers the action only when a collected bundle shows the board has no
 persistent journal, and stops offering it once it does.
