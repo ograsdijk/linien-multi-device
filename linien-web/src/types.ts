@@ -76,6 +76,22 @@ export type RpTelemetry = {
   stale_after_s?: number | null;
 };
 
+// Board health sampled on the same request as the temperature, so it ages by
+// `rp_temperature_age_s` too. Every field is independently optional: a daemon
+// older than 1.2.0 reports none of them, and one it could not read is omitted
+// rather than sent as zero. See linien-gateway/app/rp_telemetry.py.
+export type RpMetrics = {
+  /** Busy percent over the gateway's polling interval, not an instant. */
+  cpu_percent?: number | null;
+  load1?: number | null;
+  mem_total_kb?: number | null;
+  mem_available_kb?: number | null;
+  mem_used_percent?: number | null;
+  uptime_s?: number | null;
+  /** Free space on the board's root filesystem (the SD card). */
+  root_free_kb?: number | null;
+};
+
 export type DeviceStatus = {
   connected: boolean;
   connecting: boolean;
@@ -100,6 +116,9 @@ export type DeviceStatus = {
    *  absolute sample time: the UI ages it locally from here. */
   rp_temperature_age_s?: number | null;
   rp_telemetry?: RpTelemetry | null;
+  // Null both for a board whose daemon does not report metrics and for a state
+  // that does not vouch for them -- a consumer never has to tell those apart.
+  rp_metrics?: RpMetrics | null;
 };
 
 export type LockIndicatorConfig = {

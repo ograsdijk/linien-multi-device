@@ -10,10 +10,23 @@
  *
  * Protocol (line oriented, one request per connection):
  *
- *     ->  "STATUS\n"     <-  "RPT1 57.34\n"       (degrees Celsius)
+ *     ->  "STATUS\n"     <-  "RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216
+ *                             memavail=311044 uptime=690.2 rootfree=1204880\n"
+ *                             (one line; temperature in degrees Celsius,
+ *                              followed by zero or more key=value host metrics)
  *                        <-  "RPT1 ERR XADC\n"    (sysfs read failed)
- *     ->  "VERSION\n"    <-  "RPT1 VERSION 1.1.0\n"
+ *     ->  "VERSION\n"    <-  "RPT1 VERSION 1.2.0\n"
  *     ->  anything else  <-  "RPT1 ERR COMMAND\n"
+ *
+ * The key=value tail is an *extension*: every key is independently optional,
+ * and a reader that does not recognise one must ignore it. A client too old to
+ * know about the tail parses the temperature exactly as before, which is why
+ * this is not a new command -- see rp_telemetry.py's parse_status_line().
+ *
+ * Host metrics come from /proc and statvfs(), one small read each, on the same
+ * request that reads the temperature. Nothing here samples on a timer: `cpu` is
+ * the busy fraction *since the previous STATUS request*, computed from cached
+ * /proc/stat counters, so a 30 s poll yields a 30 s average for free.
  *
  * Temperature source: the Zynq *processing-system* XADC exposed through Linux
  * IIO. The device directory is discovered once at startup by scanning
@@ -41,28 +54,39 @@
 #define _FILE_OFFSET_BITS 64
 
 #include <dirent.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#define RPT_VERSION "1.1.0"
+#define RPT_VERSION "1.2.0"
 #define RPT_PROTOCOL "RPT1"
 
 #define DEFAULT_PORT 18864
 #define DEFAULT_IIO_ROOT "/sys/bus/iio/devices"
+#define DEFAULT_PROC_ROOT "/proc"
+/* Filesystem whose free space is reported. On every Red Pitaya image this
+ * is the SD card, and filling it is a common and otherwise silent death. */
+#define ROOT_FS_PATH "/"
 
 /* A request is at most "VERSION\r\n". Anything longer is malformed by
  * definition, so the read buffer is a hard cap on what one client can make us
  * buffer. */
 #define MAX_REQUEST 64
+/* A STATUS line carrying every metric is ~110 bytes. The margin is for future
+ * keys; it must stay at or below MAX_RESPONSE_BYTES in rp_telemetry.py, which
+ * is the gateway's read limit for one line. */
+#define MAX_RESPONSE 256
 /* Receive/send timeout on an accepted socket. A client that connects and then
  * says nothing is dropped after this long instead of pinning the daemon. */
 #define CLIENT_TIMEOUT_S 2
@@ -321,6 +345,299 @@ static int xadc_read_temperature(struct xadc *x, const char *iio_root,
     return 0;
 }
 
+/* --- host metrics ------------------------------------------------------- */
+
+/*
+ * Everything below is best-effort and independently optional: a metric that
+ * cannot be read is left out of the response rather than failing it, so a
+ * board with an unexpected /proc still reports its temperature.
+ */
+
+/* Minimum /proc/stat movement before a new CPU figure is computed, in jiffies
+ * summed over all cores (~50 ms on a 2-core board at HZ=100). Below this the
+ * sample window is too short to mean anything, and two clients polling at once
+ * would otherwise turn a 30 s average into noise. */
+#define CPU_MIN_DELTA_JIFFIES 10
+
+struct metrics {
+    const char *proc_root;
+    /* /proc/stat counters from the previous STATUS request. CPU usage is a
+     * delta, and this daemon has no timer to take one against -- so the
+     * previous request is the baseline, making `cpu` the busy fraction over
+     * the caller's own polling interval. */
+    int have_prev_cpu;
+    unsigned long long prev_total;
+    unsigned long long prev_busy;
+    /* Last computed percentage, re-served when a request arrives too soon
+     * after the previous one to measure a fresh window. */
+    int have_cpu_pct;
+    double cpu_pct;
+};
+
+static int proc_path(const struct metrics *m, const char *name, char *out,
+                     size_t len)
+{
+    if (snprintf(out, len, "%s/%s", m->proc_root, name) >= (int)len) {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Sum the aggregate "cpu" line of /proc/stat into total and busy jiffies.
+ * busy is everything except idle and iowait -- a core waiting on I/O is not
+ * doing work, and counting it as such makes an idle board look loaded.
+ */
+static int read_cpu_jiffies(const struct metrics *m, unsigned long long *total,
+                            unsigned long long *busy)
+{
+    char path[PATH_MAX_LEN];
+    char buf[512];
+    if (proc_path(m, "stat", path, sizeof(path)) != 0) {
+        return -1;
+    }
+    if (read_small_file(path, buf, sizeof(buf)) != 0) {
+        return -1;
+    }
+    if (strncmp(buf, "cpu ", 4) != 0 && strncmp(buf, "cpu\t", 4) != 0) {
+        return -1;
+    }
+    const char *cursor = buf + 3;
+    unsigned long long sum = 0;
+    unsigned long long idle = 0;
+    int field = 0;
+    while (*cursor != '\0' && *cursor != '\n') {
+        while (*cursor == ' ' || *cursor == '\t') {
+            cursor++;
+        }
+        if (!isdigit((unsigned char)*cursor)) {
+            break;
+        }
+        char *end = NULL;
+        errno = 0;
+        unsigned long long value = strtoull(cursor, &end, 10);
+        if (end == cursor || errno == ERANGE) {
+            return -1;
+        }
+        cursor = end;
+        sum += value;
+        /* Fields are user, nice, system, idle, iowait, ... */
+        if (field == 3 || field == 4) {
+            idle += value;
+        }
+        field++;
+    }
+    if (field < 4) {
+        return -1; /* not a /proc/stat we recognise */
+    }
+    *total = sum;
+    *busy = sum - idle;
+    return 0;
+}
+
+/* Busy percentage since the previous successful sample. Returns 0 on success;
+ * -1 while no window has been measured yet (the first request after start). */
+static int cpu_percent(struct metrics *m, double *out)
+{
+    unsigned long long total = 0;
+    unsigned long long busy = 0;
+    if (read_cpu_jiffies(m, &total, &busy) == 0) {
+        if (!m->have_prev_cpu || total < m->prev_total) {
+            /* First sample, or the counters restarted under us. Anything
+             * computed from the old baseline would be fiction. */
+            m->have_prev_cpu = 1;
+            m->have_cpu_pct = 0;
+            m->prev_total = total;
+            m->prev_busy = busy;
+        } else if (total - m->prev_total >= CPU_MIN_DELTA_JIFFIES) {
+            unsigned long long delta_total = total - m->prev_total;
+            unsigned long long delta_busy =
+                busy >= m->prev_busy ? busy - m->prev_busy : 0;
+            double pct = 100.0 * (double)delta_busy / (double)delta_total;
+            if (pct < 0.0) {
+                pct = 0.0;
+            }
+            if (pct > 100.0) {
+                pct = 100.0;
+            }
+            m->cpu_pct = pct;
+            m->have_cpu_pct = 1;
+            m->prev_total = total;
+            m->prev_busy = busy;
+        }
+        /* Otherwise the window was too short: keep the old baseline so the
+         * next request measures against it rather than against a sliver. */
+    }
+    if (!m->have_cpu_pct) {
+        return -1;
+    }
+    *out = m->cpu_pct;
+    return 0;
+}
+
+static int read_load1(const struct metrics *m, double *out)
+{
+    char path[PATH_MAX_LEN];
+    if (proc_path(m, "loadavg", path, sizeof(path)) != 0) {
+        return -1;
+    }
+    double value = 0.0;
+    if (read_double_file(path, &value) != 0) {
+        return -1;
+    }
+    if (value < 0.0) {
+        return -1;
+    }
+    *out = value;
+    return 0;
+}
+
+static int read_uptime(const struct metrics *m, double *out)
+{
+    char path[PATH_MAX_LEN];
+    if (proc_path(m, "uptime", path, sizeof(path)) != 0) {
+        return -1;
+    }
+    double value = 0.0;
+    if (read_double_file(path, &value) != 0) {
+        return -1;
+    }
+    if (value < 0.0) {
+        return -1;
+    }
+    *out = value;
+    return 0;
+}
+
+/* Find "Key:  12345 kB" in a /proc/meminfo body. Returns 0 on success. */
+static int meminfo_field(const char *body, const char *key, long *out)
+{
+    size_t key_len = strlen(key);
+    const char *line = body;
+    while (line != NULL && *line != '\0') {
+        if (strncmp(line, key, key_len) == 0 && line[key_len] == ':') {
+            const char *cursor = line + key_len + 1;
+            char *end = NULL;
+            errno = 0;
+            long value = strtol(cursor, &end, 10);
+            if (end == cursor || errno == ERANGE || value < 0) {
+                return -1;
+            }
+            *out = value;
+            return 0;
+        }
+        line = strchr(line, '\n');
+        if (line != NULL) {
+            line++;
+        }
+    }
+    return -1;
+}
+
+/*
+ * MemTotal and MemAvailable, in kB.
+ *
+ * MemAvailable is the kernel's own estimate of what a new allocation could
+ * get, which is what "free memory" should mean; MemFree ignores reclaimable
+ * cache and makes every healthy Linux box look nearly full. Kernels before
+ * 3.14 have no MemAvailable, so fall back to MemFree there rather than
+ * reporting nothing.
+ */
+static int read_meminfo(const struct metrics *m, long *total_kb, long *avail_kb)
+{
+    char path[PATH_MAX_LEN];
+    char buf[1024];
+    if (proc_path(m, "meminfo", path, sizeof(path)) != 0) {
+        return -1;
+    }
+    if (read_small_file(path, buf, sizeof(buf)) != 0) {
+        return -1;
+    }
+    if (meminfo_field(buf, "MemTotal", total_kb) != 0) {
+        return -1;
+    }
+    if (meminfo_field(buf, "MemAvailable", avail_kb) != 0 &&
+        meminfo_field(buf, "MemFree", avail_kb) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Free space on the root filesystem in kB, as seen by an unprivileged
+ * writer (f_bavail, not f_bfree -- the reserved blocks are not available). */
+static int read_root_free_kb(long *out)
+{
+    struct statvfs st;
+    if (statvfs(ROOT_FS_PATH, &st) != 0) {
+        return -1;
+    }
+    unsigned long unit = st.f_frsize != 0 ? st.f_frsize : st.f_bsize;
+    if (unit == 0) {
+        return -1;
+    }
+    double free_kb = ((double)st.f_bavail * (double)unit) / 1024.0;
+    if (free_kb < 0.0) {
+        return -1;
+    }
+    *out = (long)free_kb;
+    return 0;
+}
+
+/*
+ * Append " key=value" to `out` if it fits, and report whether it did.
+ *
+ * A metric is dropped whole rather than truncated: half a key=value pair on
+ * the wire is a parse error at the other end, while a missing one is an
+ * expected and handled condition.
+ */
+static void append_kv(char *out, size_t len, const char *fmt, ...)
+{
+    size_t used = strlen(out);
+    if (used >= len) {
+        return;
+    }
+    char scratch[64];
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(scratch, sizeof(scratch), fmt, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= sizeof(scratch)) {
+        return;
+    }
+    if (used + (size_t)written + 1 > len - 1) {
+        return; /* would not fit alongside the trailing newline */
+    }
+    memcpy(out + used, scratch, (size_t)written + 1);
+}
+
+/* Build the key=value tail of a STATUS response into `out` (which must
+ * already hold the "RPT1 <temp>" prefix). */
+static void append_metrics(char *out, size_t len, struct metrics *m)
+{
+    double cpu = 0.0;
+    if (cpu_percent(m, &cpu) == 0) {
+        append_kv(out, len, " cpu=%.1f", cpu);
+    }
+    double load1 = 0.0;
+    if (read_load1(m, &load1) == 0) {
+        append_kv(out, len, " load1=%.2f", load1);
+    }
+    long mem_total = 0;
+    long mem_avail = 0;
+    if (read_meminfo(m, &mem_total, &mem_avail) == 0) {
+        append_kv(out, len, " memtotal=%ld", mem_total);
+        append_kv(out, len, " memavail=%ld", mem_avail);
+    }
+    double uptime = 0.0;
+    if (read_uptime(m, &uptime) == 0) {
+        append_kv(out, len, " uptime=%.1f", uptime);
+    }
+    long root_free = 0;
+    if (read_root_free_kb(&root_free) == 0) {
+        append_kv(out, len, " rootfree=%ld", root_free);
+    }
+}
+
 /* --- networking -------------------------------------------------------- */
 
 static int send_all(int fd, const char *buf, size_t len)
@@ -392,7 +709,8 @@ static void trim_line(char *buf)
     }
 }
 
-static void handle_client(int fd, struct xadc *x, const char *iio_root)
+static void handle_client(int fd, struct xadc *x, const char *iio_root,
+                          struct metrics *m)
 {
     struct timeval tv;
     tv.tv_sec = CLIENT_TIMEOUT_S;
@@ -406,7 +724,7 @@ static void handle_client(int fd, struct xadc *x, const char *iio_root)
         /* Silent or vanished client -- nothing to answer. */
         return;
     }
-    char response[64];
+    char response[MAX_RESPONSE];
     if (len == -2) {
         snprintf(response, sizeof(response), "%s ERR COMMAND\n", RPT_PROTOCOL);
         send_all(fd, response, strlen(response));
@@ -418,8 +736,14 @@ static void handle_client(int fd, struct xadc *x, const char *iio_root)
     if (strcmp(request, "STATUS") == 0) {
         double temperature = 0.0;
         if (xadc_read_temperature(x, iio_root, &temperature) == 0) {
-            snprintf(response, sizeof(response), "%s %.2f\n", RPT_PROTOCOL,
+            snprintf(response, sizeof(response), "%s %.2f", RPT_PROTOCOL,
                      temperature);
+            append_metrics(response, sizeof(response), m);
+            /* append_metrics never fills the buffer to the brim; it reserves
+             * room for exactly this. */
+            size_t used = strlen(response);
+            response[used] = '\n';
+            response[used + 1] = '\0';
         } else {
             snprintf(response, sizeof(response), "%s ERR XADC\n", RPT_PROTOCOL);
         }
@@ -464,18 +788,20 @@ static int make_listener(int port)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s [--port N] [--iio-root DIR]\n"
+            "usage: %s [--port N] [--iio-root DIR] [--proc-root DIR]\n"
             "\n"
             "  --port N        TCP port to listen on (default %d)\n"
             "  --iio-root DIR  IIO sysfs root (default %s)\n"
+            "  --proc-root DIR procfs root for host metrics (default %s)\n"
             "  --version       print version and exit\n",
-            argv0, DEFAULT_PORT, DEFAULT_IIO_ROOT);
+            argv0, DEFAULT_PORT, DEFAULT_IIO_ROOT, DEFAULT_PROC_ROOT);
 }
 
 int main(int argc, char **argv)
 {
     int port = DEFAULT_PORT;
     const char *iio_root = DEFAULT_IIO_ROOT;
+    const char *proc_root = DEFAULT_PROC_ROOT;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -488,6 +814,8 @@ int main(int argc, char **argv)
             port = (int)value;
         } else if (strcmp(argv[i], "--iio-root") == 0 && i + 1 < argc) {
             iio_root = argv[++i];
+        } else if (strcmp(argv[i], "--proc-root") == 0 && i + 1 < argc) {
+            proc_root = argv[++i];
         } else if (strcmp(argv[i], "--version") == 0) {
             printf("%s\n", RPT_VERSION);
             return 0;
@@ -530,6 +858,10 @@ int main(int argc, char **argv)
                 iio_root);
     }
 
+    struct metrics m;
+    memset(&m, 0, sizeof(m));
+    m.proc_root = proc_root;
+
     int listener = make_listener(port);
     if (listener < 0) {
         return 1;
@@ -565,7 +897,7 @@ int main(int argc, char **argv)
             close(listener);
             return 1;
         }
-        handle_client(client, &x, iio_root);
+        handle_client(client, &x, iio_root, &m);
         close(client);
     }
 

@@ -97,7 +97,7 @@ do it from the shell just as readily as from the daemon.
 Check the deployed version:
 
 ```sh
-printf 'VERSION\n' | nc 127.0.0.1 18864     # expect: RPT1 VERSION 1.1.0
+printf 'VERSION\n' | nc 127.0.0.1 18864     # expect: RPT1 VERSION 1.2.0
 ```
 
 A board still answering `1.0.0` is running the unsafe discovery — reinstall it

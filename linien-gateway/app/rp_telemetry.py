@@ -34,7 +34,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 
@@ -52,15 +52,16 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_ID = "RPT1"
 # Must match RPT_VERSION in rp-telemetry/src/rp_telemetry.c.
-BUNDLED_VERSION = "1.1.0"
+BUNDLED_VERSION = "1.2.0"
 
 DEFAULT_TELEMETRY_PORT = 18864
 CONNECT_TIMEOUT_S = 1.0
 READ_TIMEOUT_S = 1.0
-# A response is "RPT1 VERSION 1.1.0\n" at the longest. Anything past this is a
-# broken or hostile peer; cap the read so a chatty endpoint cannot make the
-# gateway buffer without bound.
-MAX_RESPONSE_BYTES = 128
+# A STATUS response carrying every host metric is ~110 bytes; the margin is for
+# keys added later. Anything past this is a broken or hostile peer; cap the read
+# so a chatty endpoint cannot make the gateway buffer without bound. Must stay
+# at or above MAX_RESPONSE in rp-telemetry/src/rp_telemetry.c.
+MAX_RESPONSE_BYTES = 256
 
 POLL_INTERVAL_S = 30.0
 # Three missed polls. Below this a cached reading is presented as current;
@@ -85,8 +86,18 @@ VERSION_PROBE_ATTEMPTS = 3
 # Small enough to stay a fan-out helper rather than a thread pool of
 # consequence; publishes are per material change, not per poll.
 PUBLISH_WORKERS = 4
-# Field name written to the device's existing InfluxDB measurement.
+# Field names written to the device's existing InfluxDB measurement.
 INFLUX_TEMPERATURE_FIELD = "rp_temperature_c"
+# Host metrics, in the same point as the temperature. Named after the
+# HostMetrics attribute they come from; see _influx_metric_fields.
+INFLUX_METRIC_FIELDS = {
+    "cpu_percent": "rp_cpu_percent",
+    "load1": "rp_load1",
+    "mem_used_percent": "rp_mem_used_percent",
+    "mem_available_kb": "rp_mem_available_kb",
+    "root_free_kb": "rp_root_free_kb",
+    "uptime_s": "rp_uptime_s",
+}
 # Reasons a sampled temperature is not written, surfaced to the operator.
 INFLUX_SKIP_DISABLED = "influx_logging_disabled"
 INFLUX_SKIP_NO_CREDENTIALS = "no_influx_credentials"
@@ -129,6 +140,17 @@ SERVICE_JOURNAL_MESSAGE_CHARS = 400
 # value, not a hot board, and is reported as an error rather than displayed.
 MIN_PLAUSIBLE_TEMPERATURE_C = -40.0
 MAX_PLAUSIBLE_TEMPERATURE_C = 150.0
+
+# Plausibility bounds for the host metrics, applied per key. A value outside
+# its range is dropped -- the same discipline the temperature gets, and for the
+# same reason: a nonsense number displayed as a measurement is worse than a
+# blank. Unlike the temperature, one bad key never invalidates the reading.
+MAX_PLAUSIBLE_LOAD = 1024.0
+# 64 GiB expressed in kB. No Zynq board is anywhere near this; the bound exists
+# to reject a garbled line, not to model the hardware.
+MAX_PLAUSIBLE_MEMORY_KB = 64 * 1024 * 1024
+# Ten years. An uptime past this is a broken clock or a garbled field.
+MAX_PLAUSIBLE_UPTIME_S = 10 * 365 * 24 * 3600.0
 
 BUNDLED_BINARY_PATH = Path(__file__).resolve().parent / "assets" / "rp-telemetry-armv7"
 
@@ -194,6 +216,56 @@ class InfluxCredentialSnapshot:
 
 
 @dataclass(frozen=True)
+class HostMetrics:
+    """Board health from the STATUS line's key=value tail.
+
+    Every field is independently optional: the daemon omits a metric it could
+    not read, an older daemon sends none at all, and an implausible value is
+    dropped by the parser. So `None` means "not reported", never "zero".
+    """
+
+    cpu_percent: float | None = None
+    load1: float | None = None
+    mem_total_kb: int | None = None
+    mem_available_kb: int | None = None
+    uptime_s: float | None = None
+    root_free_kb: int | None = None
+
+    @property
+    def mem_used_percent(self) -> float | None:
+        """Used memory as a percentage, or None if it cannot be derived.
+
+        Derived here rather than on the board so the raw kB survive in the
+        payload: a percentage alone cannot answer "how much is left", and the
+        two numbers age better than the ratio.
+        """
+        total = self.mem_total_kb
+        available = self.mem_available_kb
+        if not total or available is None or total <= 0:
+            return None
+        used = max(0, min(total, total - available))
+        return 100.0 * used / total
+
+    def is_empty(self) -> bool:
+        return all(getattr(self, field.name) is None for field in fields(self))
+
+
+# An older daemon reports no metrics at all; one shared empty instance saves
+# allocating a new one per poll per device and makes `is EMPTY_METRICS` true.
+EMPTY_METRICS = HostMetrics()
+
+
+@dataclass(frozen=True)
+class TelemetrySample:
+    """One device's successful reading, on its way to InfluxDB."""
+
+    device: Any
+    temperature_c: float
+    sampled_at: float
+    metrics: HostMetrics = EMPTY_METRICS
+
+
+@dataclass(frozen=True)
 class TelemetryReading:
     """Outcome of one telemetry request. Never carries an exception."""
 
@@ -201,6 +273,7 @@ class TelemetryReading:
     temperature_c: float | None = None
     version: str | None = None
     error: str | None = None
+    metrics: HostMetrics | None = None
 
 
 # --- protocol parsing ----------------------------------------------------
@@ -236,7 +309,90 @@ def parse_status_line(line: str) -> TelemetryReading:
         return TelemetryReading(
             STATE_ERROR, error=f"implausible temperature {temperature:.2f} C"
         )
-    return TelemetryReading(STATE_RUNNING, temperature_c=temperature)
+    return TelemetryReading(
+        STATE_RUNNING,
+        temperature_c=temperature,
+        metrics=parse_metrics_tail(parts[2] if len(parts) > 2 else ""),
+    )
+
+
+def _bounded_float(raw: str, low: float, high: float) -> float | None:
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or not (low <= value <= high):
+        return None
+    return value
+
+
+def _bounded_int(raw: str, low: int, high: int) -> int | None:
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if not (low <= value <= high):
+        return None
+    return value
+
+
+# key -> (HostMetrics attribute, coercion). A key missing from here is ignored
+# rather than being an error: the tail is an extension point, and a gateway
+# talking to a newer daemon must not choke on a metric it has never heard of.
+_METRIC_PARSERS: dict[str, tuple[str, Any]] = {
+    "cpu": ("cpu_percent", lambda raw: _bounded_float(raw, 0.0, 100.0)),
+    "load1": ("load1", lambda raw: _bounded_float(raw, 0.0, MAX_PLAUSIBLE_LOAD)),
+    "memtotal": (
+        "mem_total_kb",
+        lambda raw: _bounded_int(raw, 0, MAX_PLAUSIBLE_MEMORY_KB),
+    ),
+    "memavail": (
+        "mem_available_kb",
+        lambda raw: _bounded_int(raw, 0, MAX_PLAUSIBLE_MEMORY_KB),
+    ),
+    "uptime": (
+        "uptime_s",
+        lambda raw: _bounded_float(raw, 0.0, MAX_PLAUSIBLE_UPTIME_S),
+    ),
+    "rootfree": (
+        "root_free_kb",
+        lambda raw: _bounded_int(raw, 0, MAX_PLAUSIBLE_MEMORY_KB),
+    ),
+}
+
+
+def parse_metrics_tail(tail: str) -> HostMetrics:
+    """Parse the `key=value ...` tail of a STATUS line. Never raises.
+
+    Malformed tokens are skipped one by one rather than failing the line: the
+    temperature has already been parsed by this point, and losing it because a
+    board garbled one metric would trade the reading that matters for one that
+    does not.
+    """
+    values: dict[str, Any] = {}
+    for token in (tail or "").split():
+        name, separator, raw = token.partition("=")
+        if not separator:
+            continue
+        parser = _METRIC_PARSERS.get(name)
+        if parser is None:
+            continue
+        attribute, coerce = parser
+        parsed = coerce(raw)
+        if parsed is not None:
+            values[attribute] = parsed
+    if not values:
+        return EMPTY_METRICS
+    metrics = HostMetrics(**values)
+    # Available memory above the total is a garbled pair, not a board with
+    # negative usage; keep the total and drop the impossible half.
+    if (
+        metrics.mem_total_kb is not None
+        and metrics.mem_available_kb is not None
+        and metrics.mem_available_kb > metrics.mem_total_kb
+    ):
+        metrics = replace(metrics, mem_available_kb=None)
+    return metrics
 
 
 def parse_version_line(line: str) -> str | None:
@@ -426,6 +582,9 @@ class TelemetryEntry:
 
     state: str = STATE_UNKNOWN
     temperature_c: float | None = None
+    # Host metrics from the same STATUS line as `temperature_c`, so they share
+    # `sampled_at` and cannot disagree about how old the reading is.
+    metrics: HostMetrics = EMPTY_METRICS
     sampled_at: float | None = None
     version: str | None = None
     error: str | None = None
@@ -466,6 +625,34 @@ class TelemetryEntry:
     influx_skip_reason: str | None = None
 
 
+def _quantize(value: float | None, step: float) -> float | None:
+    return None if value is None else round(value / step)
+
+
+def _metrics_signature(metrics: HostMetrics) -> tuple:
+    """The part of the host metrics worth a websocket push.
+
+    Deliberately coarse. CPU usage and free memory move on every single poll,
+    so comparing them as reported would mean a status push per device per 30 s
+    forever, whether or not anything happened. Quantized, an idle board stays
+    silent and a board that is actually doing something updates promptly.
+
+    `load1` and `uptime_s` are left out entirely: uptime changes by definition
+    on every poll, and load is a second view of a quantity CPU usage already
+    triggers on. Both still reach the UI -- through the 30 s status poll, which
+    carries whatever the cache holds regardless of this signature.
+    """
+    return (
+        _quantize(metrics.cpu_percent, 5.0),
+        _quantize(metrics.mem_used_percent, 1.0),
+        # ~100 MB. A disk filling up matters, but not at kB resolution.
+        _quantize(
+            None if metrics.root_free_kb is None else float(metrics.root_free_kb),
+            102400.0,
+        ),
+    )
+
+
 def _material_signature(entry: TelemetryEntry, state: str) -> tuple:
     """What counts as a change worth pushing to connected clients.
 
@@ -475,7 +662,14 @@ def _material_signature(entry: TelemetryEntry, state: str) -> tuple:
     temperature = (
         None if entry.temperature_c is None else round(entry.temperature_c, 1)
     )
-    return (state, temperature, entry.version, entry.error, entry.installed)
+    return (
+        state,
+        temperature,
+        entry.version,
+        entry.error,
+        entry.installed,
+        _metrics_signature(entry.metrics),
+    )
 
 
 class RpTelemetryManager:
@@ -600,6 +794,7 @@ class RpTelemetryManager:
             version = entry.version
             error = entry.error
             temperature = entry.temperature_c
+            metrics = entry.metrics
             sampled_at = entry.sampled_at
             installed = entry.installed
             influx_skip_reason = entry.influx_skip_reason
@@ -609,6 +804,7 @@ class RpTelemetryManager:
         # temperature as if it were current.
         if state != STATE_RUNNING:
             temperature = None
+            metrics = EMPTY_METRICS
         # Age at the moment of sending, NOT the absolute sample time: a client
         # comparing `sampled_at` against its own clock inherits whatever skew
         # exists between the two machines. An age is skew-proof, and a client
@@ -619,6 +815,20 @@ class RpTelemetryManager:
             "rp_temperature_c": temperature,
             "rp_temperature_sampled_at": sampled_at,
             "rp_temperature_age_s": age_s,
+            # Sampled on the same request as the temperature, so they age by
+            # `rp_temperature_age_s` too -- one freshness clock for the whole
+            # reading rather than one per metric. None both for a daemon too
+            # old to report metrics and for a state that does not vouch for
+            # them, so a consumer never has to tell those apart to stay honest.
+            "rp_metrics": None if metrics.is_empty() else {
+                "cpu_percent": metrics.cpu_percent,
+                "load1": metrics.load1,
+                "mem_total_kb": metrics.mem_total_kb,
+                "mem_available_kb": metrics.mem_available_kb,
+                "mem_used_percent": metrics.mem_used_percent,
+                "uptime_s": metrics.uptime_s,
+                "root_free_kb": metrics.root_free_kb,
+            },
             "rp_telemetry": {
                 "state": state,
                 "version": version,
@@ -746,7 +956,7 @@ class RpTelemetryManager:
             *(self._poll_device(device) for device in devices),
             return_exceptions=True,
         )
-        samples: list[tuple[Any, float, float]] = []
+        samples: list[TelemetrySample] = []
         for device, result in zip(devices, results):
             if isinstance(result, BaseException):
                 logger.debug(
@@ -756,11 +966,11 @@ class RpTelemetryManager:
                 )
                 continue
             if result is not None:
-                samples.append((device, result[0], result[1]))
+                samples.append(result)
         if samples:
             await self._write_influx(samples)
 
-    async def _poll_device(self, device: Any) -> tuple[float, float] | None:
+    async def _poll_device(self, device: Any) -> TelemetrySample | None:
         key = getattr(device, "key", "")
         host = getattr(device, "host", "") or ""
         if not key:
@@ -838,8 +1048,8 @@ class RpTelemetryManager:
         track_health: bool = True,
         installed: bool | None = None,
         version_probed: bool = False,
-    ) -> tuple[float, float] | None:
-        """Fold a reading into the cache. Returns (temperature, ts) to log.
+    ) -> TelemetrySample | None:
+        """Fold a reading into the cache. Returns the sample to log, if any.
 
         `expect_seq` guards against a poll that started before an operator
         action landed: if the entry was mutated in the meantime, this reading is
@@ -852,7 +1062,7 @@ class RpTelemetryManager:
         """
         key = getattr(device, "key", "")
         now = time.time()
-        sample: tuple[float, float] | None = None
+        sample: TelemetrySample | None = None
         with self._lock:
             entry = self._entry(key)
             if expect_seq is not None and entry.mutation_seq != expect_seq:
@@ -874,13 +1084,24 @@ class RpTelemetryManager:
                 entry.version = version
             if reading.state == STATE_RUNNING and reading.temperature_c is not None:
                 entry.temperature_c = reading.temperature_c
+                entry.metrics = reading.metrics or EMPTY_METRICS
                 entry.sampled_at = now
                 entry.last_success_at = now
                 entry.error = None
                 if track_health:
                     entry.consecutive_failures = 0
-                sample = (reading.temperature_c, now)
+                sample = TelemetrySample(
+                    device=device,
+                    temperature_c=reading.temperature_c,
+                    sampled_at=now,
+                    metrics=entry.metrics,
+                )
             else:
+                # Drop the cached metrics with the reading they came from. They
+                # are only ever shown for a `running` device, but leaving them
+                # behind would resurrect them if the board came back before the
+                # next successful poll.
+                entry.metrics = EMPTY_METRICS
                 entry.error = reading.error
                 if track_health:
                     entry.consecutive_failures += 1
@@ -1131,7 +1352,24 @@ class RpTelemetryManager:
             )
             return None
 
-    async def _write_influx(self, samples: Iterable[tuple[Any, float, float]]) -> None:
+    @staticmethod
+    def _influx_fields(sample: TelemetrySample) -> dict[str, float]:
+        """Line-protocol fields for one sample: temperature plus what the
+        board reported alongside it.
+
+        A metric the daemon did not report is left out of the point rather than
+        written as zero -- an absent field is a gap in the series, which is the
+        truth; a zero is a measurement that never happened.
+        """
+        point: dict[str, float] = {INFLUX_TEMPERATURE_FIELD: sample.temperature_c}
+        metrics = sample.metrics
+        for attribute, field_name in INFLUX_METRIC_FIELDS.items():
+            value = getattr(metrics, attribute, None)
+            if value is not None:
+                point[field_name] = float(value)
+        return point
+
+    async def _write_influx(self, samples: Iterable[TelemetrySample]) -> None:
         writer = self._influx_writer
         if writer is None:
             return
@@ -1139,21 +1377,22 @@ class RpTelemetryManager:
         keys_by_batch: dict[tuple[InfluxDestination, str], list[str]] = {}
 
         eligible = []
-        for device, temperature, sampled_at in samples:
-            if not self._influx_logging_enabled(device):
-                self._note_influx_skip(device, INFLUX_SKIP_DISABLED)
+        for sample in samples:
+            if not self._influx_logging_enabled(sample.device):
+                self._note_influx_skip(sample.device, INFLUX_SKIP_DISABLED)
                 continue
-            eligible.append((device, temperature, sampled_at))
+            eligible.append(sample)
 
         # Resolved for every board at once, not one at a time down the loop.
         # Each lookup is bounded, but serially a handful of wedged boards would
         # still add their timeouts together and push the 30 s cycle past its
         # own interval, delaying the next temperature sample for every board.
         resolved = await asyncio.gather(
-            *(self._resolve_credentials_bounded(device) for device, _t, _s in eligible)
+            *(self._resolve_credentials_bounded(sample.device) for sample in eligible)
         )
 
-        for (device, temperature, sampled_at), credentials in zip(eligible, resolved):
+        for sample, credentials in zip(eligible, resolved):
+            device = sample.device
             if credentials is None or not credentials.is_usable():
                 self._note_influx_skip(device, INFLUX_SKIP_NO_CREDENTIALS)
                 continue
@@ -1169,8 +1408,8 @@ class RpTelemetryManager:
             # own destination.
             line = format_point(
                 measurement,
-                {INFLUX_TEMPERATURE_FIELD: temperature},
-                int(sampled_at * 1_000_000_000),
+                self._influx_fields(sample),
+                int(sample.sampled_at * 1_000_000_000),
             )
             self._note_influx_skip(device, None)
             batch_key = (destination, measurement)

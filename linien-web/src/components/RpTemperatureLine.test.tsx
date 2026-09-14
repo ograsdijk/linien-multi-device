@@ -150,3 +150,47 @@ describe('RpTemperatureLine ageing', () => {
     expect(readingLine().textContent).toBe('RP temperature: 57.3 °C');
   });
 });
+
+describe('RpTemperatureLine host metrics', () => {
+  const withMetrics = status({
+    rp_temperature_c: 57.3,
+    rp_telemetry: { state: 'running', stale_after_s: 90 },
+    rp_metrics: { cpu_percent: 4.2, mem_used_percent: 41, uptime_s: 273_600 },
+  });
+
+  beforeEach(() => {
+    clearStatusFreshness('dev-metrics');
+  });
+
+  it('shows the board health beside the temperature', () => {
+    renderLine(withMetrics);
+    expect(screen.getByText('CPU 4%')).toBeTruthy();
+    expect(screen.getByText('RAM 41%')).toBeTruthy();
+    expect(screen.getByText('up 3d 4h')).toBeTruthy();
+  });
+
+  it('renders nothing extra for a board that reports no metrics', () => {
+    renderLine(status({ rp_temperature_c: 57.3, rp_telemetry: { state: 'running' } }));
+    expect(screen.queryByText(/^CPU /)).toBeNull();
+  });
+
+  it('withdraws the metrics on the same tick as the temperature', () => {
+    // One ageing timer drives both, so they cannot disagree about whether the
+    // reading they were sampled with is still current.
+    vi.useFakeTimers();
+    try {
+      markStatusReceived('dev-metrics', 5);
+      renderLine(withMetrics, { deviceKey: 'dev-metrics' });
+      expect(screen.getByText('CPU 4%')).toBeTruthy();
+
+      act(() => {
+        vi.advanceTimersByTime(120_000);
+      });
+
+      expect(readingLine().textContent).toBe('RP temperature: unavailable');
+      expect(screen.queryByText('CPU 4%')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

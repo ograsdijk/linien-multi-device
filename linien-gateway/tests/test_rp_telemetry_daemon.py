@@ -142,10 +142,19 @@ class Daemon:
 
 @pytest.fixture
 def daemon(daemon_binary, tmp_path):
-    def start(iio_root: Path) -> Daemon:
+    def start(iio_root: Path, proc_root: Path | None = None) -> Daemon:
         port = _free_port()
+        command = [
+            str(daemon_binary),
+            "--port",
+            str(port),
+            "--iio-root",
+            str(iio_root),
+        ]
+        if proc_root is not None:
+            command += ["--proc-root", str(proc_root)]
         process = subprocess.Popen(
-            [str(daemon_binary), "--port", str(port), "--iio-root", str(iio_root)],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -164,8 +173,8 @@ def daemon(daemon_binary, tmp_path):
 
     started: list[Daemon] = []
 
-    def factory(iio_root):
-        instance = start(iio_root)
+    def factory(iio_root, proc_root=None):
+        instance = start(iio_root, proc_root)
         started.append(instance)
         return instance
 
@@ -186,7 +195,11 @@ def test_status_returns_the_computed_temperature(daemon, tmp_path):
     response = server.request(b"STATUS\n")
 
     expected = (2504 + -2219) * 123.040771484 / 1000.0
-    assert response == f"RPT1 {expected:.2f}\n".encode()
+    # The temperature is the first field and always in the same place; what
+    # follows it is the optional host-metric tail, which this test does not
+    # constrain (the host's own /proc decides how much of it appears).
+    assert response.startswith(f"RPT1 {expected:.2f}".encode())
+    assert response.endswith(b"\n")
     # ...and the gateway parses exactly what the daemon emits.
     reading = rpt.parse_status_line(response.decode())
     assert reading.state == rpt.STATE_RUNNING
@@ -205,7 +218,7 @@ def test_the_fpga_backed_xadc_is_never_read(daemon, tmp_path):
     response = server.request(b"STATUS\n")
 
     ps_temperature = (2504 + -2219) * 123.040771484 / 1000.0
-    assert response == f"RPT1 {ps_temperature:.2f}\n".encode()
+    assert response.startswith(f"RPT1 {ps_temperature:.2f}".encode())
 
     # ...and it says so, so the choice is visible in the journal.
     server.process.terminate()
@@ -427,3 +440,171 @@ def test_daemon_is_quiet_during_normal_requests(daemon, tmp_path):
     # Exactly the two startup lines (the device it settled on, and the
     # listening port) -- nothing per request.
     assert len(stderr.decode().strip().splitlines()) == 2
+
+
+# --- host metrics --------------------------------------------------------
+#
+# The daemon reads CPU, memory, load, uptime and free disk from /proc and
+# statvfs() on the same request that reads the temperature. `--proc-root` lets
+# these run against a fixture tree, so they exercise the real parsing on a
+# machine that has no /proc at all (macOS) as well as on CI.
+
+PROC_STAT = "cpu  1000 10 200 8000 50 0 5 0 0 0\ncpu0 500 5 100 4000 25 0 2 0 0 0\n"
+# Same counters advanced by 900 jiffies total, 400 of them idle: 500/900 busy.
+PROC_STAT_LATER = "cpu  1500 10 200 8400 50 0 5 0 0 0\n"
+PROC_MEMINFO = (
+    "MemTotal:         509216 kB\n"
+    "MemFree:          100000 kB\n"
+    "MemAvailable:     311044 kB\n"
+    "Buffers:            1000 kB\n"
+)
+
+
+def make_proc_root(tmp_path, *, stat=PROC_STAT, meminfo=PROC_MEMINFO,
+                   loadavg="0.41 0.55 0.60 1/93 1234\n", uptime="690.23 1300.11\n"):
+    root = tmp_path / "proc"
+    root.mkdir(parents=True, exist_ok=True)
+    for name, content in (
+        ("stat", stat),
+        ("meminfo", meminfo),
+        ("loadavg", loadavg),
+        ("uptime", uptime),
+    ):
+        if content is not None:
+            (root / name).write_text(content)
+    return root
+
+
+def _metrics(response: bytes) -> rpt.HostMetrics:
+    """Parse a STATUS response the way the gateway does."""
+    reading = rpt.parse_status_line(response.decode())
+    assert reading.state == rpt.STATE_RUNNING, reading
+    assert reading.metrics is not None
+    return reading.metrics
+
+
+def test_status_reports_host_metrics_alongside_the_temperature(daemon, tmp_path):
+    root, _device = make_iio_root(tmp_path)
+    server = daemon(root, make_proc_root(tmp_path))
+
+    metrics = _metrics(server.request(b"STATUS\n"))
+
+    assert metrics.load1 == 0.41
+    assert metrics.mem_total_kb == 509216
+    assert metrics.mem_available_kb == 311044
+    assert metrics.uptime_s == 690.2
+    # statvfs("/") is the real root filesystem in every environment this runs
+    # in, so assert it was reported rather than pinning a number.
+    assert metrics.root_free_kb is not None and metrics.root_free_kb > 0
+
+
+def test_cpu_usage_is_measured_between_two_requests(daemon, tmp_path):
+    """There is no sampling timer: the previous request is the baseline.
+
+    That makes `cpu` the busy fraction over the caller's own polling interval,
+    which is what a 30 s poll wants -- and it costs one cached counter pair
+    rather than a thread.
+    """
+    root, _device = make_iio_root(tmp_path)
+    proc = make_proc_root(tmp_path)
+    server = daemon(root, proc)
+
+    # Nothing to measure against yet, so no figure is invented.
+    assert _metrics(server.request(b"STATUS\n")).cpu_percent is None
+
+    (proc / "stat").write_text(PROC_STAT_LATER)
+
+    assert _metrics(server.request(b"STATUS\n")).cpu_percent == pytest.approx(55.6, abs=0.1)
+
+
+def test_a_request_too_soon_after_the_last_reuses_the_previous_figure(daemon, tmp_path):
+    """A sliver of a window is noise; two clients must not produce it."""
+    root, _device = make_iio_root(tmp_path)
+    proc = make_proc_root(tmp_path)
+    server = daemon(root, proc)
+
+    server.request(b"STATUS\n")
+    (proc / "stat").write_text(PROC_STAT_LATER)
+    first = _metrics(server.request(b"STATUS\n")).cpu_percent
+
+    # Counters have not moved since, so there is no new window to measure.
+    second = _metrics(server.request(b"STATUS\n")).cpu_percent
+
+    assert first == second == pytest.approx(55.6, abs=0.1)
+
+
+def test_restarted_counters_do_not_produce_a_bogus_figure(daemon, tmp_path):
+    """After a reboot the jiffies start over; a delta against the old baseline
+    would be fiction, so the figure is withdrawn until a fresh window exists."""
+    root, _device = make_iio_root(tmp_path)
+    proc = make_proc_root(tmp_path)
+    server = daemon(root, proc)
+
+    server.request(b"STATUS\n")
+    (proc / "stat").write_text(PROC_STAT_LATER)
+    assert _metrics(server.request(b"STATUS\n")).cpu_percent is not None
+
+    (proc / "stat").write_text("cpu  1 0 0 5 0 0 0 0 0 0\n")
+
+    assert _metrics(server.request(b"STATUS\n")).cpu_percent is None
+
+
+def test_an_absent_proc_still_reports_the_temperature(daemon, tmp_path):
+    """Every metric is optional. Losing the tail must not lose the reading."""
+    root, _device = make_iio_root(tmp_path)
+    server = daemon(root, tmp_path / "no-such-proc")
+
+    response = server.request(b"STATUS\n")
+
+    expected = (2504 + -2219) * 123.040771484 / 1000.0
+    assert response.startswith(f"RPT1 {expected:.2f}".encode())
+    metrics = _metrics(response)
+    assert metrics.cpu_percent is None
+    assert metrics.load1 is None
+    assert metrics.mem_total_kb is None
+    assert metrics.uptime_s is None
+
+
+def test_memavailable_falls_back_to_memfree(daemon, tmp_path):
+    """Kernels before 3.14 have no MemAvailable, and Red Pitaya images in the
+    field are old. Reporting nothing there would be a silent gap."""
+    root, _device = make_iio_root(tmp_path)
+    proc = make_proc_root(
+        tmp_path,
+        meminfo="MemTotal:         509216 kB\nMemFree:          100000 kB\n",
+    )
+    server = daemon(root, proc)
+
+    metrics = _metrics(server.request(b"STATUS\n"))
+
+    assert metrics.mem_total_kb == 509216
+    assert metrics.mem_available_kb == 100000
+
+
+def test_a_garbled_proc_file_drops_only_its_own_metric(daemon, tmp_path):
+    root, _device = make_iio_root(tmp_path)
+    proc = make_proc_root(tmp_path, stat="not a stat file at all\n", loadavg="nonsense\n")
+    server = daemon(root, proc)
+
+    metrics = _metrics(server.request(b"STATUS\n"))
+
+    assert metrics.cpu_percent is None
+    assert metrics.load1 is None
+    # ...while the files that were fine still reported.
+    assert metrics.mem_total_kb == 509216
+    assert metrics.uptime_s == 690.2
+
+
+def test_the_response_fits_the_gateways_read_limit(daemon, tmp_path):
+    """The gateway caps one line at MAX_RESPONSE_BYTES and drops the peer past
+    it, so a full metric tail must fit with room to spare."""
+    root, _device = make_iio_root(tmp_path)
+    proc = make_proc_root(tmp_path)
+    server = daemon(root, proc)
+
+    server.request(b"STATUS\n")  # prime the CPU baseline so `cpu` is present too
+    (proc / "stat").write_text(PROC_STAT_LATER)
+    response = server.request(b"STATUS\n")
+
+    assert b"cpu=" in response
+    assert len(response) <= rpt.MAX_RESPONSE_BYTES

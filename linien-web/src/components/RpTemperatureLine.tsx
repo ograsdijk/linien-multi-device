@@ -7,6 +7,7 @@ import {
   type TelemetryDisplay,
 } from '../features/devices/telemetryDisplay';
 import { effectiveReadingAgeS } from '../features/devices/statusFreshness';
+import { RpHostMetricsLine } from './RpHostMetricsLine';
 
 // How often the reading re-checks its own age. Well below the staleness window
 // (90 s), so a reading ages out promptly, and far too slow to matter for
@@ -41,6 +42,11 @@ type RpTemperatureLineProps = {
  * The reading ages locally: statuses are pushed only on change, so without a
  * clock of its own this line would display the last number it ever received
  * for as long as the page stayed open.
+ *
+ * The board's CPU/RAM/disk line is rendered here rather than beside this one so
+ * that both share this component's ageing tick: they come from the same STATUS
+ * request, and two timers could let one withdraw a stale reading while the
+ * other still showed it.
  */
 export function RpTemperatureLine({
   status,
@@ -69,6 +75,7 @@ export function RpTemperatureLine({
       >
         RP temperature: {display.value}
       </Text>
+      <RpHostMetricsLine status={status} deviceKey={deviceKey} nowMs={nowMs} />
       {display.detail ? (
         <Group gap={6} align="center" wrap="nowrap">
           <Text size="xs" c="dimmed">

@@ -133,3 +133,92 @@ def test_the_bundled_binary_is_the_one_the_gateway_claims_to_ship():
     assert binary[:4] == b"\x7fELF"
     assert int.from_bytes(binary[18:20], "little") == 40  # EM_ARM
 
+
+
+# --- host metrics tail ----------------------------------------------------
+#
+# The daemon appends `key=value` pairs after the temperature. It is an
+# extension, not a new command: the temperature stays in the same place, every
+# key is optional, and an unrecognised one is ignored rather than fatal.
+
+
+def test_the_metric_tail_is_parsed():
+    reading = rpt.parse_status_line(
+        "RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216 memavail=311044 "
+        "uptime=690.2 rootfree=1204880\n"
+    )
+
+    assert reading.state == rpt.STATE_RUNNING
+    assert reading.temperature_c == 57.34
+    metrics = reading.metrics
+    assert metrics is not None
+    assert metrics.cpu_percent == 3.2
+    assert metrics.load1 == 0.41
+    assert metrics.mem_total_kb == 509216
+    assert metrics.mem_available_kb == 311044
+    assert metrics.uptime_s == 690.2
+    assert metrics.root_free_kb == 1204880
+
+
+def test_a_daemon_without_a_tail_still_parses():
+    """Every board in the field runs 1.1.0 until it is reinstalled."""
+    reading = rpt.parse_status_line("RPT1 57.34\n")
+
+    assert reading.temperature_c == 57.34
+    assert reading.metrics is not None
+    assert reading.metrics.is_empty()
+
+
+def test_an_unknown_key_is_ignored_not_fatal():
+    """The tail is the extension point: a newer daemon must not break a
+    gateway that has never heard of the metric it added."""
+    reading = rpt.parse_status_line("RPT1 57.34 cpu=3.2 fanrpm=1800\n")
+
+    assert reading.state == rpt.STATE_RUNNING
+    assert reading.metrics.cpu_percent == 3.2
+
+
+def test_a_garbled_metric_does_not_cost_the_temperature():
+    reading = rpt.parse_status_line("RPT1 57.34 cpu=hot load1= memtotal=509216\n")
+
+    assert reading.temperature_c == 57.34
+    assert reading.metrics.cpu_percent is None
+    assert reading.metrics.load1 is None
+    assert reading.metrics.mem_total_kb == 509216
+
+
+def test_implausible_metrics_are_dropped_individually():
+    """Same discipline the temperature gets -- a nonsense number displayed as a
+    measurement is worse than a blank -- but one bad key never invalidates the
+    rest of the reading."""
+    reading = rpt.parse_status_line(
+        "RPT1 57.34 cpu=410 load1=-1 memtotal=509216 uptime=-5\n"
+    )
+
+    assert reading.metrics.cpu_percent is None
+    assert reading.metrics.load1 is None
+    assert reading.metrics.uptime_s is None
+    assert reading.metrics.mem_total_kb == 509216
+
+
+def test_available_memory_above_the_total_is_refused():
+    reading = rpt.parse_status_line("RPT1 57.34 memtotal=1000 memavail=9999\n")
+
+    assert reading.metrics.mem_total_kb == 1000
+    assert reading.metrics.mem_available_kb is None
+    assert reading.metrics.mem_used_percent is None
+
+
+def test_memory_use_is_derived_from_the_raw_kilobytes():
+    metrics = rpt.HostMetrics(mem_total_kb=1000, mem_available_kb=250)
+
+    assert metrics.mem_used_percent == 75.0
+
+
+def test_the_gateway_read_limit_admits_a_full_metric_line():
+    """MAX_RESPONSE_BYTES caps one line; past it the peer is dropped. It must
+    stay at or above the daemon's own MAX_RESPONSE or a complete response
+    would be treated as hostile."""
+    match = re.search(r"#define MAX_RESPONSE (\d+)", _c_source())
+    assert match is not None
+    assert rpt.MAX_RESPONSE_BYTES >= int(match.group(1))

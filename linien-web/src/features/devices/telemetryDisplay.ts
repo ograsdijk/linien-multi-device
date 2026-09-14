@@ -88,6 +88,30 @@ const ACTION_LABEL: Record<Exclude<TelemetryAction, null>, string> = {
  * gateway reports `running` — every other state renders as "unavailable" so an
  * old number is never mistaken for the current one.
  */
+/**
+ * Whether a payload's reading has aged past the gateway's own staleness window.
+ *
+ * A status arrives only when something changes, so `state: running` can be
+ * minutes old -- the gateway cannot retract it if its own poll loop, the
+ * websocket, or the tab's timers have stopped. Ageing the reading locally is
+ * what stops a frozen payload being shown as live. Shared with the host-metrics
+ * line so the temperature and the metrics beside it, which were sampled on the
+ * same request, cannot disagree about whether they are current.
+ */
+export const readingIsStale = (
+  status: DeviceStatus | null | undefined,
+  readingAgeS?: number | null
+): boolean => {
+  const telemetry = status?.rp_telemetry ?? null;
+  if ((telemetry?.state ?? 'unknown') !== 'running') return false;
+  if (typeof readingAgeS !== 'number' || !Number.isFinite(readingAgeS)) return false;
+  const staleAfterS =
+    typeof telemetry?.stale_after_s === 'number' && telemetry.stale_after_s > 0
+      ? telemetry.stale_after_s
+      : DEFAULT_STALE_AFTER_S;
+  return readingAgeS > staleAfterS;
+};
+
 export const resolveTelemetryDisplay = (
   status: DeviceStatus | null | undefined,
   /** How old the reading is *now* -- the gateway's age plus the time since the
@@ -97,21 +121,8 @@ export const resolveTelemetryDisplay = (
   const telemetry = status?.rp_telemetry ?? null;
   const state: RpTelemetryState = telemetry?.state ?? 'unknown';
   const temperature = status?.rp_temperature_c;
-  const staleAfterS =
-    typeof telemetry?.stale_after_s === 'number' && telemetry.stale_after_s > 0
-      ? telemetry.stale_after_s
-      : DEFAULT_STALE_AFTER_S;
 
-  // A status arrives only when something changes, so `state: running` can be
-  // minutes old -- the gateway cannot retract it if its own poll loop, the
-  // websocket, or the tab's timers have stopped. Ageing the reading locally is
-  // what stops a frozen payload being shown as a live temperature.
-  if (
-    state === 'running' &&
-    typeof readingAgeS === 'number' &&
-    Number.isFinite(readingAgeS) &&
-    readingAgeS > staleAfterS
-  ) {
+  if (readingIsStale(status, readingAgeS)) {
     return {
       value: 'unavailable',
       available: false,

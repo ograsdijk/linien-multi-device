@@ -297,11 +297,29 @@ Python, and no InfluxDB client on the board. Source and build instructions:
 Line-based TCP on port **18864**, one request per (short-lived) connection:
 
 ```text
-->  STATUS\n      <-  RPT1 57.34\n          temperature in °C
+->  STATUS\n      <-  RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216
+                          memavail=311044 uptime=690.2 rootfree=1204880\n
+                          (one line; wrapped here to fit)
                   <-  RPT1 ERR XADC\n       sysfs read failed
-->  VERSION\n     <-  RPT1 VERSION 1.1.0\n
+->  VERSION\n     <-  RPT1 VERSION 1.2.0\n
 ->  anything else <-  RPT1 ERR COMMAND\n
 ```
+
+The temperature (°C) is the first field and always in the same place. What
+follows it is an optional tail of `key=value` host metrics, added in 1.2.0:
+
+| key | meaning |
+| --- | --- |
+| `cpu` | busy percent **since the previous STATUS request** |
+| `load1` | 1-minute load average |
+| `memtotal`, `memavail` | kB; `memavail` is the kernel's MemAvailable (MemFree on kernels too old to have it) |
+| `uptime` | seconds since boot |
+| `rootfree` | free kB on the root filesystem (the SD card) |
+
+Each key is independently optional — a metric the board could not read is left
+out rather than sent as zero — and a reader must ignore keys it does not know.
+That is why this is a tail rather than a new command: a client written against
+1.1.0 parses the temperature from these lines unchanged.
 
 `RPT1` is the protocol/version identifier. Requests are capped at 64 bytes and
 accepted sockets have a 2 s receive timeout.
@@ -313,7 +331,7 @@ printf 'STATUS\n' | nc <red-pitaya-host> 18864
 ```
 
 ```text
-RPT1 57.34
+RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216 memavail=311044 uptime=690.2 rootfree=1204880
 ```
 
 The temperature comes from the Zynq XADC through Linux IIO. The daemon
@@ -453,7 +471,15 @@ Each device card shows, under the host/IP:
 Laser A
 192.168.1.42:18862
 RP temperature: 57.3 °C
+CPU 4% · RAM 41% · disk 1.1 GB · up 3d 4h
 ```
+
+The second line is the board's own health, sampled on the same request as the
+temperature and therefore withdrawn with it the moment the reading goes stale.
+`CPU` is the busy fraction between the gateway's last two polls, not an instant.
+Memory turns amber above 90 % used and red above 97 %; free disk turns amber
+below 200 MB and red below 50 MB. Boards running a telemetry daemon older than
+1.2.0 report no metrics and show only the temperature line.
 
 and when it is unavailable, the reason plus a one-click remedy:
 
@@ -462,7 +488,9 @@ RP temperature: unavailable
 Telemetry not installed   [Install]
 ```
 
-The multi-device overview cards show the same compact reading. Temperatures are
+The multi-device overview cards show the temperature alone: CPU and memory move
+on every poll, and putting them in the card would re-render every plot card in
+the grid twice a minute to display a number nobody is watching there. Temperatures are
 shown neutrally up to 75 °C, amber to 85 °C, and red above that — see
 `linien-web/src/features/devices/telemetryDisplay.ts` for the thresholds and the
 rationale (the XC7Z010 is rated to a maximum junction temperature of 85 °C).
@@ -475,6 +503,13 @@ the Red Pitaya makes no extra HTTP/TLS request.
 
 - Field name: **`rp_temperature_c`**, written to the same measurement, bucket,
   org, and URL already configured for that device.
+- Alongside it, the board's host metrics from the same sample:
+  **`rp_cpu_percent`**, **`rp_load1`**, **`rp_mem_used_percent`**,
+  **`rp_mem_available_kb`**, **`rp_root_free_kb`** and **`rp_uptime_s`** — one
+  point per device per cycle, not one per metric. A metric the board did not
+  report is **absent** from the point rather than written as zero: a gap in the
+  series is the truth, a zero is a measurement that never happened. Boards
+  running a daemon older than 1.2.0 log the temperature alone.
 - Written **untagged**, exactly like the Linien parameter logging, so the
   temperature lands in the same series as the rest of that device's data
   instead of a neighbouring one. Each device is expected to have its own
