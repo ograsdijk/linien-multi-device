@@ -20,13 +20,14 @@ from app.diagnosis import (
 THRESHOLD = 600.0
 
 
-def _classify(result: ProbeResult, since=None):
+def _classify(result: ProbeResult, since=None, known_boot_id=None):
     return classify_diagnosis(
         result,
         host="rp-test.local",
         seconds_since_last_connected=since,
         probed_at=123.0,
         uptime_threshold_s=THRESHOLD,
+        known_boot_id=known_boot_id,
     )
 
 
@@ -361,8 +362,16 @@ def test_probe_never_raises_on_unexpected_error(monkeypatch):
 
 class _FakeSession:
     def __init__(
-        self, key, *, connected=False, connecting=False, wants=True, recovering=False
+        self,
+        key,
+        *,
+        connected=False,
+        connecting=False,
+        wants=True,
+        recovering=False,
+        healthy_boot_id=None,
     ):
+        self._healthy_boot_id = healthy_boot_id
         self.device = SimpleNamespace(
             host=f"{key}.local", port=18862, username="root", password="root"
         )
@@ -381,6 +390,9 @@ class _FakeSession:
     def seconds_since_last_connected(self):
         return 60.0
 
+    def last_healthy_boot_id(self):
+        return self._healthy_boot_id
+
     def apply_diagnosis(self, d):
         self.applied.append(d)
 
@@ -393,13 +405,89 @@ class _FakeRegistry:
         return self._sessions.get(key)
 
 
-def _crash_probe(device, *, seconds_since_last_connected, uptime_threshold_s):
+def _crash_probe(device, *, seconds_since_last_connected, uptime_threshold_s, known_boot_id=None):
     return ProbeResult(False, True, 3600.0, True, 1, lock_read_attempted=True)
 
 
 def _probe(sessions, **kwargs):
     return diagnosis.DiagnosisProbe(
         _FakeRegistry(sessions), probe_fn=_crash_probe, **kwargs
+    )
+
+
+def test_a_changed_boot_id_is_a_reboot_however_long_the_uptime():
+    """The case that shipped a wrong verdict to an operator.
+
+    A board rebooted, the gateway was restarted afterwards so it no longer knew
+    when it had last been connected, and the 600 s uptime fallback saw 2h10m of
+    uptime and concluded "not rebooted" -- reporting a crashed server and an
+    FPGA that was still running, on a board that had lost its lock hours
+    earlier. A boot id settles it without a clock or a threshold.
+    """
+    result = ProbeResult(False, True, 7800.0, True, 0, boot_id="boot-new")
+    out = _classify(result, known_boot_id="boot-old")
+
+    assert out["category"] == diagnosis.CATEGORY_REBOOTED
+    assert out["lock_state"] == "lost"
+    assert out["reboot_evidence"] == "boot_id"
+
+
+def test_the_same_boot_id_rules_out_a_reboot_however_short_the_uptime():
+    """Stronger than the absence test, and it overrules it.
+
+    A board that booted 42 s ago but is in the same boot we last saw it in did
+    not reboot -- we simply found it that way. Calling it a reboot would throw
+    away a lock that is still held.
+    """
+    result = ProbeResult(
+        False, True, 42.0, True, 1, boot_id="boot-same", lock_read_attempted=True
+    )
+    out = _classify(result, since=600.0, known_boot_id="boot-same")
+
+    assert out["category"] == diagnosis.CATEGORY_SERVER_CRASHED
+    assert out["lock_state"] == "locked"
+
+
+def test_the_absence_test_still_answers_when_no_boot_id_was_recorded():
+    result = ProbeResult(False, True, 42.0, True, None, boot_id="boot-new")
+    out = _classify(result, since=600.0)
+
+    assert out["category"] == diagnosis.CATEGORY_REBOOTED
+    assert out["reboot_evidence"] == "absence"
+
+
+def test_the_threshold_is_named_as_the_weakest_evidence():
+    """A device we have never connected to, which is the only case it is for."""
+    result = ProbeResult(False, True, 42.0, True, None)
+    out = _classify(result)
+
+    assert out["reboot_evidence"] == "uptime_threshold"
+
+
+def test_a_known_boot_id_alone_does_not_decide_it():
+    """Half a comparison is not a comparison.
+
+    A board whose boot id could not be read falls back rather than being called
+    rebooted because the strings differ from None.
+    """
+    result = ProbeResult(False, True, 7800.0, True, 0, boot_id=None)
+    out = _classify(result, known_boot_id="boot-old")
+
+    assert out["category"] == diagnosis.CATEGORY_SERVER_CRASHED
+    assert out["reboot_evidence"] != "boot_id"
+
+
+def test_the_probe_reads_the_lock_register_when_the_boot_id_proves_no_reboot():
+    """The gate and the classifier must agree, as they always must.
+
+    Without the boot id the probe would decline to read on a low uptime and the
+    classifier would then report an unreadable register nobody tried to read.
+    """
+    assert (
+        diagnosis._looks_rebooted(
+            42.0, 600.0, 600.0, known_boot_id="boot-same", boot_id="boot-same"
+        )
+        is False
     )
 
 
@@ -474,7 +562,7 @@ class _RecordingStore:
         return False
 
 
-def _boot_id_probe(device, *, seconds_since_last_connected, uptime_threshold_s):
+def _boot_id_probe(device, *, seconds_since_last_connected, uptime_threshold_s, known_boot_id=None):
     return ProbeResult(False, True, 3600.0, True, 1, boot_id="boot-b")
 
 

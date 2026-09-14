@@ -277,6 +277,9 @@ def _looks_rebooted(
     uptime_s: float,
     seconds_since_last_connected: float | None,
     uptime_threshold_s: float,
+    *,
+    known_boot_id: str | None = None,
+    boot_id: str | None = None,
 ) -> bool:
     """Has the board restarted since we were last talking to it?
 
@@ -298,10 +301,47 @@ def _looks_rebooted(
     linien-server that died on a board which had just finished booting has low
     uptime and has not rebooted, and calling that a reboot would wrongly report
     the FPGA lock as lost.
+
+    The kernel boot id beats both: it is a different string for every boot, so
+    comparing the board's current one against the one it had while we were last
+    connected answers the question outright -- no clock, no threshold, no
+    absence to measure. It is used whenever both ids are known, which requires
+    `known_boot_id` to have been recorded while the server was actually up
+    (see `DeviceSession._record_healthy_boot_id`); a boot id read by a probe of
+    an already-dead board says nothing, because the reboot would have happened
+    before the probe.
     """
+    if known_boot_id and boot_id:
+        return known_boot_id != boot_id
     if seconds_since_last_connected is not None:
         return uptime_s < seconds_since_last_connected
     return uptime_s < uptime_threshold_s
+
+
+def read_boot_id(device: Any, connection_factory: Any = None) -> str | None:
+    """Read the board's current kernel boot id over SSH. None on any failure.
+
+    Called once per successful connect, off the connect path, so the gateway
+    holds an id from a moment the board was demonstrably healthy. That is the
+    half of the comparison a probe cannot supply.
+    """
+    try:
+        with open_ssh_connection(device, connection_factory or Connection) as conn:
+            result = conn.run(
+                f"cat {BOOT_ID_PATH}",
+                hide=True,
+                warn=True,
+                timeout=PROBE_COMMAND_TIMEOUT_S,
+            )
+            boot_id = (getattr(result, "stdout", "") or "").strip()
+            return boot_id or None
+    except Exception:  # noqa: BLE001 - best effort; absence just means no id
+        logger.debug(
+            "boot id read failed host=%s",
+            getattr(device, "host", ""),
+            exc_info=True,
+        )
+        return None
 
 
 def probe_device(
@@ -310,6 +350,7 @@ def probe_device(
     seconds_since_last_connected: float | None,
     uptime_threshold_s: float = DEFAULT_UPTIME_THRESHOLD_S,
     read_lock_register: bool = True,
+    known_boot_id: str | None = None,
 ) -> ProbeResult:
     """Probe a (presumed disconnected) device out-of-band. Never raises."""
     host = getattr(device, "host", "") or ""
@@ -338,7 +379,11 @@ def probe_device(
                 and uptime_s is not None
                 and bool(fpga_operating)
                 and not _looks_rebooted(
-                    uptime_s, seconds_since_last_connected, uptime_threshold_s
+                    uptime_s,
+                    seconds_since_last_connected,
+                    uptime_threshold_s,
+                    known_boot_id=known_boot_id,
+                    boot_id=boot_id,
                 )
             )
             lock_detail: str | None = None
@@ -387,6 +432,7 @@ def classify_diagnosis(
     seconds_since_last_connected: float | None,
     probed_at: float,
     uptime_threshold_s: float = DEFAULT_UPTIME_THRESHOLD_S,
+    known_boot_id: str | None = None,
 ) -> dict[str, Any]:
     """Turn raw probe signals into a category, lock state, and a message.
 
@@ -417,7 +463,13 @@ def classify_diagnosis(
         message = (
             "Board is reachable but linien-server is down; board state could not be read."
         )
-    elif _looks_rebooted(uptime_s, seconds_since_last_connected, uptime_threshold_s):
+    elif _looks_rebooted(
+        uptime_s,
+        seconds_since_last_connected,
+        uptime_threshold_s,
+        known_boot_id=known_boot_id,
+        boot_id=result.boot_id,
+    ):
         category = CATEGORY_REBOOTED
         lock_state = "lost"
         message = (
@@ -481,6 +533,16 @@ def classify_diagnosis(
         "lock_read_detail": result.lock_read_detail,
         "seconds_since_last_connected": seconds_since_last_connected,
         "boot_id": result.boot_id,
+        "known_boot_id": known_boot_id,
+        # Which test answered "did it reboot", so a surprising verdict can be
+        # read back rather than guessed at.
+        "reboot_evidence": (
+            "boot_id"
+            if known_boot_id and result.boot_id
+            else "absence"
+            if seconds_since_last_connected is not None
+            else "uptime_threshold"
+        ),
     }
 
 
@@ -627,12 +689,18 @@ class DiagnosisProbe:
             return  # intentionally disconnected
         device = session.device
         since = session.seconds_since_last_connected()
+        known_boot_id = None
+        try:
+            known_boot_id = session.last_healthy_boot_id()
+        except Exception:  # noqa: BLE001 - absence of the hook is not fatal
+            logger.debug("last_healthy_boot_id failed key=%s", key, exc_info=True)
         probed_at = time.time()
         try:
             result = self._probe_fn(
                 device,
                 seconds_since_last_connected=since,
                 uptime_threshold_s=self._uptime_threshold_s,
+                known_boot_id=known_boot_id,
             )
         except Exception:  # noqa: BLE001 - defense in depth; probe_fn shouldn't raise
             logger.debug("diagnosis probe raised key=%s", key, exc_info=True)
@@ -643,13 +711,15 @@ class DiagnosisProbe:
             seconds_since_last_connected=since,
             probed_at=probed_at,
             uptime_threshold_s=self._uptime_threshold_s,
+            known_boot_id=known_boot_id,
         )
-        # Timeline only. The boot id deliberately does not feed the
-        # classification above: the store holds the id from the last *probe*,
-        # not from when we were last connected, so it cannot answer "did it
-        # reboot during this outage" -- and re-probing a still-down board every
-        # 20 s would compare the id against itself and retract a reboot it had
-        # just correctly reported.
+        # Timeline only, and distinct from `known_boot_id` above. The event
+        # store holds the id from the last *probe*, not from when we were last
+        # connected, so it cannot answer "did it reboot during this outage" --
+        # and re-probing a still-down board every 20 s would compare the id
+        # against itself and retract a reboot it had just correctly reported.
+        # The session's id is the one that can answer it, because it was
+        # recorded while the server was up.
         #
         # Skipped once a recovery is under way, the same way apply_diagnosis
         # drops its result: an SSH probe takes ~6-11 s, so one already running
