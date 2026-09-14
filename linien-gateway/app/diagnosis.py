@@ -250,6 +250,29 @@ def _read_lock_bit(conn: Connection) -> tuple[int | None, str | None]:
     return None, "; ".join(failures)
 
 
+def _looks_rebooted(
+    uptime_s: float,
+    seconds_since_last_connected: float | None,
+    uptime_threshold_s: float,
+) -> bool:
+    """Has the board restarted since we were last talking to it?
+
+    Shared by the probe (which uses it to decide whether the lock register is
+    worth reading) and the classifier (which uses it to decide whether the lock
+    is lost). These MUST agree: when they drifted apart, the probe skipped the
+    read for a device with no known last-connected time while the classifier
+    called the same board "not rebooted", and the result was a confident
+    "lock register unreadable" for a register nobody had tried to read.
+
+    An uptime shorter than our absence is proof of a restart. With no known
+    absence -- which is every device after a gateway restart -- the uptime
+    threshold is the only evidence available.
+    """
+    if seconds_since_last_connected is not None:
+        return uptime_s < uptime_threshold_s or uptime_s < seconds_since_last_connected
+    return uptime_s < uptime_threshold_s
+
+
 def probe_device(
     device: Any,
     *,
@@ -282,10 +305,10 @@ def probe_device(
             should_read = (
                 read_lock_register
                 and uptime_s is not None
-                and uptime_s >= uptime_threshold_s
                 and bool(fpga_operating)
-                and seconds_since_last_connected is not None
-                and uptime_s >= seconds_since_last_connected
+                and not _looks_rebooted(
+                    uptime_s, seconds_since_last_connected, uptime_threshold_s
+                )
             )
             lock_detail: str | None = None
             if should_read:
@@ -350,10 +373,7 @@ def classify_diagnosis(
         message = (
             "Board is reachable but linien-server is down; board state could not be read."
         )
-    elif uptime_s < uptime_threshold_s or (
-        seconds_since_last_connected is not None
-        and uptime_s < seconds_since_last_connected
-    ):
+    elif _looks_rebooted(uptime_s, seconds_since_last_connected, uptime_threshold_s):
         category = CATEGORY_REBOOTED
         lock_state = "lost"
         message = (
@@ -387,10 +407,16 @@ def classify_diagnosis(
                 "linien-server is down; the FPGA state could not be read, so the "
                 "lock state is unknown."
             )
+        elif not result.lock_read_attempted:
+            # The gate above declined to read. Saying "unreadable" here would
+            # blame the board for a decision this code made.
+            lock_state = "likely_held"
+            message = (
+                "linien-server is down; the FPGA gateware is still loaded, so the "
+                "lock is likely still held (the lock register was not read)."
+            )
         else:
-            # FPGA gateware is loaded but the lock register itself was
-            # unreadable — both the `devmem` and python3 /dev/mem read methods
-            # failed (e.g. /dev/mem not accessible to the SSH user).
+            # FPGA gateware is loaded but every read method failed.
             lock_state = "likely_held"
             reason = result.lock_read_detail or "no method returned a value"
             message = (

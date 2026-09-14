@@ -383,3 +383,45 @@ def test_start_stop_is_clean():
     probe.stop()
     assert probe._thread is None
     assert probe._executor is None
+
+
+def test_probe_reads_register_when_last_connected_time_is_unknown(monkeypatch):
+    # seconds_since_last_connected is None for every device after a gateway
+    # restart. The probe used to require it and skip the read, while
+    # classify_diagnosis treated the same board as "not rebooted" -- so the UI
+    # reported the register as unreadable without anyone reading it.
+    monkeypatch.setattr(diagnosis, "_tcp_open", lambda *a, **k: False)
+    monkeypatch.setattr(diagnosis, "Connection", _FakeConnection)
+
+    result = probe_device(_device(), seconds_since_last_connected=None)
+
+    assert result.lock_read_attempted is True
+    assert result.lock_bit == 1
+
+
+def test_probe_and_classify_agree_about_reboots(monkeypatch):
+    # The gate and the classifier must never disagree: whenever the classifier
+    # calls a board "crashed" (not rebooted) with the gateware loaded, the probe
+    # must have attempted the read, so the "unreadable" branch can only ever
+    # describe a real read failure.
+    monkeypatch.setattr(diagnosis, "_tcp_open", lambda *a, **k: False)
+    monkeypatch.setattr(diagnosis, "Connection", _FakeConnection)
+
+    for since in (None, 0.0, 60.0, 3600.0):
+        result = probe_device(_device(), seconds_since_last_connected=since)
+        d = _classify(result, since=since)
+        if d["category"] == CATEGORY_SERVER_CRASHED and result.fpga_operating:
+            assert result.lock_read_attempted is True, f"since={since}"
+
+
+def test_classify_does_not_claim_unreadable_when_read_was_skipped():
+    # Gateware loaded, no read attempted -> still "likely held", but the message
+    # must not blame the board for a read this code declined to perform.
+    d = _classify(
+        ProbeResult(False, True, 3600.0, True, None, lock_read_attempted=False),
+        since=60.0,
+    )
+    assert d["category"] == CATEGORY_SERVER_CRASHED
+    assert d["lock_state"] == "likely_held"
+    assert "not read" in d["message"]
+    assert "unreadable" not in d["message"]
