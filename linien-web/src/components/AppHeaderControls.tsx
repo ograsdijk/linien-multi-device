@@ -28,9 +28,11 @@ import type {
 import type {
   InfluxApplyAllOptions,
   InfluxApplyAllResult,
+  InfluxFleetRow,
 } from '../features/integrations/useInfluxController';
 import { toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
 import { DeferredNumberInput } from './DeferredNumberInput';
+import { InfluxFleetTable } from './header/InfluxFleetTable';
 import { LockChipPopover } from './header/LockChipPopover';
 
 const formatTimestamp = (value: number | null | undefined) => {
@@ -46,6 +48,7 @@ type AppHeaderControlsProps = {
   influxChipColor: string;
   influxLabel: string;
   influxDeviceOptions: Array<{ value: string; label: string }>;
+  influxFleet: InfluxFleetRow[];
   influxDeviceKey: string | null;
   onInfluxDeviceChange: (value: string | null) => void;
   influxBusy: boolean;
@@ -133,6 +136,11 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
           <Popover.Dropdown>
             <Stack gap="xs">
               <Text fw={600}>InfluxDB logging</Text>
+              <InfluxFleetTable
+                rows={props.influxFleet}
+                selectedDeviceKey={props.influxDeviceKey}
+                onSelect={props.onInfluxDeviceChange}
+              />
               <Select
                 label="Device"
                 comboboxProps={{ withinPortal: false }}

@@ -1,0 +1,652 @@
+import pytest
+
+from app import board_diagnostics as bd
+
+
+class FakeResult:
+    def __init__(self, exited=0, stdout="", stderr=""):
+        self.exited = exited
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class FakeConnection:
+    """Matches commands by substring, in the order the rules are given."""
+
+    def __init__(self, rules=None, default=None, raises=None):
+        self.rules = rules or {}
+        self.default = default if default is not None else FakeResult(stdout="ok")
+        self.raises = raises or {}
+        self.commands = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def run(self, command, **_kwargs):
+        self.commands.append(command)
+        for needle, exc in self.raises.items():
+            if needle in command:
+                raise exc
+        for needle, result in self.rules.items():
+            if needle in command:
+                # A list answers successive matches in turn, holding the last
+                # value once exhausted -- for probes whose answer is supposed to
+                # change because of something that happened in between.
+                if isinstance(result, list):
+                    return result.pop(0) if len(result) > 1 else result[0]
+                return result
+        return self.default
+
+
+class Device:
+    key = "dev-1"
+    host = "10.0.0.2"
+    username = "root"
+    password = "secret"
+
+
+def factory_for(conn):
+    return lambda *_args, **_kwargs: conn
+
+
+# --- collection ----------------------------------------------------------
+
+
+def test_every_section_is_collected_over_one_connection():
+    conn = FakeConnection()
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert bundle["ok"] is True
+    assert len(bundle["sections"]) == len(bd._SECTIONS)
+    assert len(conn.commands) == len(bd._SECTIONS)
+    assert {section["name"] for section in bundle["sections"]} == {
+        name for name, _title, _command, _root in bd._SECTIONS
+    }
+
+
+def test_every_command_is_time_bounded():
+    """A board that has stopped answering must not hold the worker twelve times.
+
+    Same defence `diagnosis.py` applies to a possible AXI stall.
+    """
+    conn = FakeConnection()
+
+    bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert all(command.startswith("timeout ") for command in conn.commands)
+
+
+def test_one_missing_tool_does_not_lose_the_other_sections():
+    """These images vary; a section that cannot run is a finding, not a failure."""
+    conn = FakeConnection(
+        rules={"pstore": FakeResult(exited=1, stderr="cat: not found")},
+        default=FakeResult(stdout="fine"),
+    )
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    sections = {section["name"]: section for section in bundle["sections"]}
+    assert bundle["ok"] is True
+    assert sections["pstore"]["error"] == "cat: not found"
+    assert sections["kernel"]["output"] == "fine"
+
+
+def test_a_section_that_raises_is_confined_to_that_section():
+    conn = FakeConnection(raises={"dmesg | tail": RuntimeError("channel closed")})
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    sections = {section["name"]: section for section in bundle["sections"]}
+    assert sections["kernel"]["error"] == "channel closed"
+    assert sections["identity"]["error"] is None
+
+
+def test_output_is_kept_alongside_a_non_zero_exit():
+    """Partial output from a failing command is usually the interesting part."""
+    conn = FakeConnection(
+        rules={"list-boots": FakeResult(exited=1, stdout="partial", stderr="boom")}
+    )
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    section = next(s for s in bundle["sections"] if s["name"] == "boots")
+    assert section["output"] == "partial"
+    assert section["error"] == "boom"
+
+
+def test_a_server_started_outside_systemd_is_still_visible():
+    """The gateway's own autostart runs `linien-server start` over SSH.
+
+    systemd then knows nothing about the process, so every journal and unit
+    section comes back empty and a board where the server died looks exactly
+    like one where it was never running. The process list and the log file are
+    what distinguish them.
+    """
+    names = {name for name, _title, _command, _root in bd._SECTIONS}
+    assert {"linien_process", "linien_logfile"} <= names
+
+    commands = {name: command for name, _t, command, _r in bd._SECTIONS}
+    # `[l]inien` so the grep does not report itself.
+    assert "[l]inien" in commands["linien_process"]
+    # The log lives on the root filesystem, not in the journal -- which is why
+    # it survives on an image that cannot keep a journal at all.
+    assert bd.LINIEN_LOG_SUBDIR in commands["linien_logfile"]
+    assert "linien.log" in commands["linien_logfile"]
+
+
+def test_the_log_file_section_shows_its_timestamp():
+    """The file's mtime is the time of death when nothing else recorded one."""
+    command = next(c for n, _t, c, _r in bd._SECTIONS if n == "linien_logfile")
+    assert "ls -la" in command
+    assert "tail -n" in command
+
+
+def test_the_rotated_log_is_collected_too():
+    """linien logs through a RotatingFileHandler.
+
+    The run that died is routinely one rotation back, with the live file
+    holding nothing but the restart that followed it -- which is exactly what
+    a board looked like when this was written.
+    """
+    command = next(c for n, _t, c, _r in bd._SECTIONS if n == "linien_logfile")
+    assert "linien.log.1" in command
+
+
+def test_a_dead_connection_is_reported_not_raised():
+    def factory(*_args, **_kwargs):
+        raise OSError("no route to host")
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory)
+
+    assert bundle["ok"] is False
+    assert "no route to host" in bundle["error"]
+    assert bundle["sections"] == []
+
+
+def test_a_huge_section_is_truncated_from_the_front():
+    """A wedged board emits megabytes of repeats; the tail is the useful end."""
+    conn = FakeConnection(
+        rules={"dmesg | tail": FakeResult(stdout="x" * (bd.SECTION_MAX_CHARS + 5_000))}
+    )
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    section = next(s for s in bundle["sections"] if s["name"] == "kernel")
+    assert section["output"].startswith("[...truncated...]")
+    assert len(section["output"]) <= bd.SECTION_MAX_CHARS + 32
+
+
+def test_only_the_sections_that_need_root_get_sudo():
+    """A board whose SSH user has no passwordless sudo must still yield the
+    half of the bundle that reads world-readable files. Putting `sudo -n` in
+    front of everything turned that board into an empty bundle -- and with no
+    `journald` section, the Enable persistent logs button never appeared
+    either, so the operator got no explanation at all.
+    """
+    class Pi(Device):
+        username = "pi"
+
+    conn = FakeConnection()
+
+    bd.collect_diagnostics(Pi(), connection_factory=factory_for(conn))
+
+    sudoed = [c for c in conn.commands if c.startswith("sudo -n ")]
+    plain = [c for c in conn.commands if not c.startswith("sudo -n ")]
+    assert any("dmesg" in c for c in sudoed)
+    assert any("journalctl -u linien-server" in c for c in sudoed)
+    assert any("/proc/uptime" in c for c in plain)
+    assert any("free -m" in c for c in plain)
+
+
+def test_root_needs_no_sudo_at_all():
+    conn = FakeConnection()
+
+    bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert all(command.startswith("timeout ") for command in conn.commands)
+
+
+# --- persistence detection ----------------------------------------------
+
+
+def test_a_board_whose_journald_writes_to_disk_is_persistent():
+    conn = FakeConnection(
+        rules={"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=PERSISTENT")}
+    )
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert bundle["persistent_journal"] is True
+
+
+def test_a_board_whose_journald_is_still_in_tmpfs_is_not():
+    """The state every stock Red Pitaya image is in, and the reason the
+    enable action exists."""
+    conn = FakeConnection(
+        rules={"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=VOLATILE")}
+    )
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert bundle["persistent_journal"] is False
+
+
+def test_leftover_journal_files_do_not_pass_for_persistent():
+    """A board that was persistent once and is volatile now still has files
+    under /var/log/journal. Grepping `journalctl --header` matched those
+    leftovers and reported the board as safe, so the Enable button was never
+    offered and the next crash again left nothing behind.
+
+    The probe decides on journald's *active* per-machine directory, and checks
+    the runtime one first precisely because both can exist at once.
+    """
+    conn = FakeConnection(
+        rules={
+            "STORAGE=PERSISTENT": FakeResult(
+                stdout=(
+                    "STORAGE=VOLATILE\n"
+                    "File path: /run/log/journal/x/system.journal\n"
+                    "/var/log/journal\n"
+                )
+            )
+        }
+    )
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert bundle["persistent_journal"] is False
+
+
+def test_the_probe_checks_the_runtime_directory_before_the_persistent_one():
+    probe = bd._STORAGE_PROBE
+    assert probe.index(bd.RUNTIME_JOURNAL_DIR) < probe.index(bd.JOURNAL_DIR + '/$MID')
+    # And it is decided by journald's own per-machine directory, not by a grep
+    # of every journal header it can read.
+    assert "machine-id" in probe
+    assert "journalctl" not in probe
+
+
+def test_a_journal_directory_on_a_ram_disk_is_not_persistence():
+    """Some images mount /var/log on a tmpfs.
+
+    journald then obeys Storage=persistent, creates its per-machine directory
+    there, and still loses every line at the next reset -- so a directory check
+    alone would paint the green badge over a board that keeps nothing.
+    """
+    conn = FakeConnection(
+        rules={"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=TMPFS")}
+    )
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert bundle["persistent_journal"] is False
+
+
+def test_persistence_is_unknown_when_journald_could_not_be_asked():
+    conn = FakeConnection(
+        rules={"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=UNKNOWN")}
+    )
+
+    bundle = bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+    assert bundle["persistent_journal"] is None
+
+
+# --- enabling persistence ------------------------------------------------
+
+
+def _digest_rule(path, text):
+    import hashlib
+
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return f"sha256sum {path}", FakeResult(stdout=f"{digest}  {path}")
+
+
+def _enable_conn(**overrides):
+    # Keyed per file: the drop-in and the mount unit are both written and both
+    # read back, and one digest cannot stand for both.
+    dropin_key, dropin_result = _digest_rule(
+        bd.JOURNALD_DROPIN_PATH, bd.JOURNALD_DROPIN
+    )
+    mount_key, mount_result = _digest_rule(
+        bd.JOURNAL_MOUNT_UNIT_PATH, bd.JOURNAL_MOUNT_UNIT_TEXT
+    )
+    # Order matters, because rules are matched by substring in insertion order.
+    #
+    # The storage probe goes first: it embeds the same `df -Pk /var/log/journal`
+    # that the filesystem report uses, so a test that stubs the filesystem would
+    # otherwise answer the storage probe too. Only the storage probe contains
+    # the literal STORAGE=PERSISTENT, so keying on that separates them.
+    #
+    # Then the remaining overrides, so a broad one like "sha256sum" is seen
+    # before the per-file keys it stands in for. Then the defaults.
+    storage_key = "STORAGE=PERSISTENT"
+    rules = {
+        storage_key: overrides.pop(storage_key, FakeResult(stdout=storage_key))
+    }
+    rules.update(overrides)
+    for key, result in ((dropin_key, dropin_result), (mount_key, mount_result)):
+        rules.setdefault(key, result)
+    return FakeConnection(rules=rules)
+
+
+def test_enabling_persistence_writes_verifies_and_restarts():
+    conn = _enable_conn()
+
+    result = bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert result == {
+        "ok": True,
+        "persistent_journal": True,
+        "backing_mount": False,
+    }
+    joined = "\n".join(conn.commands)
+    assert f"mkdir -p {bd.JOURNALD_DROPIN_DIR}" in joined
+    # `tee`, not a redirect: the redirect would be performed by the calling,
+    # unprivileged shell.
+    assert f"tee {bd.JOURNALD_DROPIN_PATH}" in joined
+    assert "sha256sum" in joined
+    assert "systemctl restart systemd-journald" in joined
+    # Flushed, so the logs already in RAM -- possibly the ones being chased --
+    # move to disk instead of being lost at the next reset, and journald's
+    # runtime directory goes away so the verification reads a settled state.
+    assert "journalctl --flush" in joined
+    assert "sync" in joined
+
+
+def test_the_written_config_is_the_capped_one():
+    """Uncapped journald on an SD card is a wear and free-space problem."""
+    conn = _enable_conn()
+
+    bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    written = next(c for c in conn.commands if "tee" in c)
+    assert "Storage=persistent" in written
+    assert "SystemMaxUse=32M" in written
+    # No stray carriage returns: a CR makes every journald value invalid.
+    assert "\\r" not in written
+
+
+def test_a_config_that_did_not_land_intact_is_an_error():
+    """The failure the rp-telemetry install learned to catch on real hardware."""
+    conn = _enable_conn(**{"sha256sum": FakeResult(stdout="0000  path")})
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_a_board_without_sha256sum_falls_back_to_a_size_check():
+    size = len(bd.JOURNALD_DROPIN.encode("utf-8"))
+    conn = _enable_conn(
+        **{
+            "sha256sum": FakeResult(exited=127, stderr="not found"),
+            "wc -c": FakeResult(stdout=str(size)),
+        }
+    )
+
+    result = bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert result["ok"] is True
+
+
+def test_a_truncated_config_is_caught_by_the_size_check():
+    conn = _enable_conn(
+        **{
+            "sha256sum": FakeResult(exited=127, stderr="not found"),
+            "wc -c": FakeResult(stdout="3"),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="truncated"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_a_journald_that_would_not_restart_is_reported():
+    conn = _enable_conn(
+        **{"systemctl restart": FakeResult(exited=1, stderr="job failed")}
+    )
+
+    with pytest.raises(RuntimeError, match="journald"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_journald_still_volatile_afterwards_is_not_reported_as_success():
+    """The verification must not just confirm our own mkdir.
+
+    Claiming success here would leave the next crash unexplained again, and
+    would paint the green "logs survive a reboot" badge over a board that will
+    lose them.
+    """
+    conn = _enable_conn(**{"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=VOLATILE")})
+
+    with pytest.raises(RuntimeError, match="still volatile"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_the_verification_waits_for_the_flush_to_finish():
+    """`journalctl --flush` returns before the flush is done on older systemd.
+
+    Deciding on the first look reported boards that had just been configured
+    correctly as failures: the runtime directory was simply still there a
+    moment later. The retry happens on the board, in one command, rather than
+    as a second SSH round trip.
+    """
+    conn = _enable_conn()
+
+    bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    probe = next(c for c in conn.commands if "STORAGE=PERSISTENT" in c)
+    assert "sleep 1" in probe
+    assert "while" in probe
+    # And it stops at the first non-volatile answer rather than always sleeping
+    # the full budget.
+    assert "break" in probe
+
+
+def test_a_journal_directory_on_a_ram_disk_is_not_reported_as_success():
+    conn = _enable_conn(**{"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=TMPFS")})
+
+    with pytest.raises(RuntimeError, match="RAM disk"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_a_failed_verification_reports_what_the_board_said():
+    """"Still volatile" on its own leaves the operator nothing to act on."""
+    conn = _enable_conn(
+        **{
+            "STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=VOLATILE"),
+            "ActiveState": FakeResult(stdout="Storage=volatile\nActiveState=active"),
+        }
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert "Storage=volatile" in str(excinfo.value)
+
+
+def test_a_detail_command_that_fails_does_not_replace_the_real_error():
+    conn = _enable_conn(**{"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=VOLATILE")})
+    conn.raises["ActiveState"] = RuntimeError("channel closed")
+
+    with pytest.raises(RuntimeError, match="still volatile"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def _tmpfs(mount="/var/log", kb=5120):
+    return FakeResult(stdout=f"FSTYPE=tmpfs MOUNT={mount} AVAILKB={kb}")
+
+
+def _real_fs(mount="/", kb=2_000_000):
+    return FakeResult(stdout=f"FSTYPE=ext4 MOUNT={mount} AVAILKB={kb}")
+
+
+def _journal_probe():
+    return "df -Pk " + bd.JOURNAL_DIR
+
+
+def _backing_probe():
+    return "df -Pk " + bd.JOURNAL_BACKING_DIR
+
+
+def test_a_ram_disk_on_var_log_is_repaired_with_a_bind_mount():
+    """The stock Red Pitaya image mounts /var/log as a 5 MB tmpfs.
+
+    journald's path is hardcoded, but what is mounted at that path is ours to
+    choose -- so rather than refusing, put real storage under it.
+    """
+    conn = _enable_conn(
+        **{
+            _backing_probe(): _real_fs(),
+            # tmpfs before the mount, real storage after it.
+            _journal_probe(): [_tmpfs(), _real_fs(mount=bd.JOURNAL_DIR)],
+        }
+    )
+
+    result = bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert result["backing_mount"] is True
+    joined = "\n".join(conn.commands)
+    assert f"mkdir -p {bd.JOURNAL_BACKING_DIR}" in joined
+    assert f"tee {bd.JOURNAL_MOUNT_UNIT_PATH}" in joined
+    assert "systemctl daemon-reload" in joined
+    assert f"systemctl start {bd.JOURNAL_MOUNT_UNIT}" in joined
+    # And the mount is established before journald is restarted, so the flush
+    # has real storage to land on.
+    assert joined.index("systemctl start " + bd.JOURNAL_MOUNT_UNIT) < joined.index(
+        "systemctl restart systemd-journald"
+    )
+
+
+def test_a_board_with_nowhere_to_put_a_journal_is_refused():
+    """Both the path and its backing store on RAM disks.
+
+    Nothing this action does can repair that, so it must not pretend to try --
+    and it must not restart journald to find out.
+    """
+    conn = _enable_conn(
+        **{
+            _journal_probe(): _tmpfs(),
+            _backing_probe(): _tmpfs(mount="/var"),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="nowhere"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert not any("systemctl restart systemd-journald" in c for c in conn.commands)
+
+
+def test_a_bind_mount_that_did_not_take_is_not_reported_as_success():
+    """`mount` can exit zero and leave the old filesystem visible."""
+    conn = _enable_conn(
+        **{
+            _backing_probe(): _real_fs(),
+            _journal_probe(): _tmpfs(),  # still a RAM disk afterwards
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="still a RAM disk"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_the_mount_unit_is_named_for_its_mount_point():
+    """systemd derives the name from the path; any other name is never used."""
+    assert bd.JOURNAL_MOUNT_UNIT == "var-log-journal.mount"
+    assert bd.JOURNAL_DIR == "/var/log/journal"
+
+
+def test_the_mount_unit_is_not_wired_into_local_fs_target():
+    """A failed mount must not drop a headless board into emergency mode.
+
+    systemd-journal-flush.service carries RequiresMountsFor=/var/log/journal,
+    which pulls the unit in and orders it ahead of the flush on its own. Adding
+    WantedBy=local-fs.target would look tidier and would make a broken mount a
+    boot failure on a board reachable only over the network.
+    """
+    assert "[Install]" not in bd.JOURNAL_MOUNT_UNIT_TEXT
+    assert "WantedBy" not in bd.JOURNAL_MOUNT_UNIT_TEXT
+    assert "Options=bind" in bd.JOURNAL_MOUNT_UNIT_TEXT
+    assert f"What={bd.JOURNAL_BACKING_DIR}" in bd.JOURNAL_MOUNT_UNIT_TEXT
+    assert f"Where={bd.JOURNAL_DIR}" in bd.JOURNAL_MOUNT_UNIT_TEXT
+
+
+def test_the_backing_store_is_outside_the_directory_it_backs():
+    """Inside /var/log it would be swallowed by the same tmpfs at every boot."""
+    assert not bd.JOURNAL_BACKING_DIR.startswith("/var/log/")
+
+
+def test_a_filesystem_too_small_for_a_journal_file_is_refused():
+    conn = _enable_conn(
+        **{"FSTYPE=": FakeResult(stdout="FSTYPE=ext4 MOUNT=/var/log AVAILKB=4096")}
+    )
+
+    with pytest.raises(RuntimeError, match="MB free"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_real_storage_with_room_passes_the_preflight():
+    conn = _enable_conn(
+        **{"FSTYPE=": FakeResult(stdout="FSTYPE=ext4 MOUNT=/ AVAILKB=2000000")}
+    )
+
+    result = bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert result["ok"] is True
+
+
+def test_a_filesystem_that_could_not_be_read_does_not_block_the_attempt():
+    """Undetermined is not a refusal -- the verification afterwards is the backstop."""
+    conn = _enable_conn(**{"FSTYPE=": FakeResult(exited=1, stderr="df: not found")})
+
+    result = bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+    assert result["ok"] is True
+
+
+def test_the_filesystem_type_comes_from_proc_mounts_not_the_device_name():
+    """A tmpfs is routinely mounted with the source `none`.
+
+    Matching df's first column missed exactly the board this check exists for.
+    """
+    assert "/proc/mounts" in bd._FS_PROBE
+    assert "FSTYPE=" in bd._JOURNAL_FS_REPORT
+
+
+def test_the_verification_survives_a_non_root_board():
+    """`sudo -n if ...; then ...; fi` is a shell syntax error.
+
+    The probe is a compound command, so it has to reach the board inside
+    `sh -c`. Without that, a non-root board wrote the drop-in, created the
+    directory, restarted journald -- and then reported the whole thing as a
+    failure it had in fact completed, leaving the Enable button on screen
+    forever.
+    """
+    class Pi(Device):
+        username = "pi"
+
+    conn = _enable_conn()
+
+    result = bd.enable_persistent_journal(Pi(), connection_factory=factory_for(conn))
+
+    assert result["ok"] is True
+    probe = next(c for c in conn.commands if "STORAGE=PERSISTENT" in c)
+    assert probe.startswith("sudo -n timeout ")
+    assert " sh -c " in probe
+
+
+def test_a_journald_that_cannot_be_asked_is_not_reported_as_success():
+    conn = _enable_conn(**{"STORAGE=PERSISTENT": FakeResult(stdout="STORAGE=UNKNOWN")})
+
+    with pytest.raises(RuntimeError, match="could not be determined"):
+        bd.enable_persistent_journal(Device(), connection_factory=factory_for(conn))
+
+
+def test_the_drop_in_is_ordered_to_win():
+    """A `00-` prefix loses to the conventional `99-*.conf` a vendor image may
+    already ship, silently reverting Storage=."""
+    assert bd.JOURNALD_DROPIN_PATH.rsplit("/", 1)[-1].startswith("99-")

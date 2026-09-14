@@ -1,11 +1,24 @@
 import { useMemo, useState, type CSSProperties } from 'react';
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { ActionIcon, Button, Card, Group, Modal, Select, Stack, Text, TextInput } from '@mantine/core';
 import {
+  ActionIcon,
+  Button,
+  Card,
+  Group,
+  Menu,
+  Modal,
+  Select,
+  Stack,
+  Text,
+  TextInput,
+} from '@mantine/core';
+import {
+  IconChevronDown,
   IconChevronLeft,
   IconDevices,
   IconPencil,
+  IconTemperature,
   IconTrash,
 } from '@tabler/icons-react';
 import type {
@@ -17,6 +30,11 @@ import type {
 import { toDeviceListDragId } from '../features/devices/dragIds';
 import { resolveConnectionDisplay } from '../features/connection/connectionState';
 import { resolveLockDisplay, resolveRelockTag } from '../features/locks/lockState';
+import { RpTemperatureLine } from './RpTemperatureLine';
+
+// Operator actions on the Red Pitaya telemetry service. `install` also enables
+// the unit at boot, starts it, and verifies the TCP protocol answers.
+export type TelemetryCommand = 'install' | 'start' | 'stop' | 'restart' | 'uninstall';
 
 const emptyForm = {
   name: '',
@@ -57,6 +75,11 @@ type DeviceListProps = {
   onDisconnect: (key: string) => Promise<void>;
   onShutdownServer: (key: string) => Promise<void>;
   onRebootDevice: (key: string) => Promise<void>;
+  onTelemetryCommand: (key: string, command: TelemetryCommand) => Promise<void>;
+  onInstallTelemetryAll: (keys: string[]) => Promise<void>;
+  onStartTelemetryAll: (keys: string[]) => Promise<void>;
+  onRequestDiagnostics: (device: Device) => void;
+  telemetryBusyKeys?: Record<string, boolean>;
 };
 
 type SortableDeviceCardProps = {
@@ -77,6 +100,9 @@ type SortableDeviceCardProps = {
   onDisconnect: (key: string) => Promise<void>;
   onRequestShutdown: (device: Device) => void;
   onRequestReboot: (device: Device) => void;
+  onRequestDiagnostics: (device: Device) => void;
+  onTelemetryCommand: (key: string, command: TelemetryCommand) => Promise<void>;
+  telemetryBusy: boolean;
 };
 
 function SortableDeviceCard({
@@ -97,6 +123,9 @@ function SortableDeviceCard({
   onDisconnect,
   onRequestShutdown,
   onRequestReboot,
+  onRequestDiagnostics,
+  onTelemetryCommand,
+  telemetryBusy,
 }: SortableDeviceCardProps) {
   const {
     attributes,
@@ -138,6 +167,7 @@ function SortableDeviceCard({
   });
   const autoRelockDisplay = resolveRelockTag(autoRelock);
   const connectionDisplay = resolveConnectionDisplay(status);
+  const telemetryInstalled = Boolean(status?.rp_telemetry?.installed);
   const recovery = status?.recovery;
   const recoveryActive = Boolean(
     recovery && !['completed', 'failed', 'cancelled'].includes(recovery.phase)
@@ -196,6 +226,15 @@ function SortableDeviceCard({
             <Text size="xs" c="dimmed">
               {device.host}:{device.port}
             </Text>
+            <RpTemperatureLine
+              status={status}
+              deviceKey={device.key}
+              busy={telemetryBusy}
+              onAction={(action) => {
+                // 'update' is an install of the newer bundled binary.
+                void onTelemetryCommand(device.key, action === 'update' ? 'install' : action);
+              }}
+            />
             {connectionDisplay.show ? (
               <Text size="xs" c="dimmed">{connectionDisplay.tooltip}</Text>
             ) : status?.last_error ? (
@@ -233,6 +272,42 @@ function SortableDeviceCard({
             >
               {autoRelockDisplay.label}
             </button>
+            <Menu shadow="md" position="bottom-end" withinPortal>
+              <Menu.Target>
+                <ActionIcon
+                  size="sm"
+                  variant="subtle"
+                  color="gray"
+                  loading={telemetryBusy}
+                  aria-label={`Telemetry actions for ${device.name || 'device'}`}
+                  title="Red Pitaya telemetry"
+                >
+                  <IconTemperature size={14} />
+                </ActionIcon>
+              </Menu.Target>
+              <Menu.Dropdown>
+                <Menu.Label>Red Pitaya telemetry</Menu.Label>
+                <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'install')}>
+                  {telemetryInstalled ? 'Update / reinstall' : 'Install'}
+                </Menu.Item>
+                <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'start')}>
+                  Start
+                </Menu.Item>
+                <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'stop')}>
+                  Stop
+                </Menu.Item>
+                <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'restart')}>
+                  Restart
+                </Menu.Item>
+                <Menu.Divider />
+                <Menu.Item
+                  color="red"
+                  onClick={() => void onTelemetryCommand(device.key, 'uninstall')}
+                >
+                  Uninstall
+                </Menu.Item>
+              </Menu.Dropdown>
+            </Menu>
           </Group>
         </Group>
         <Group mt="sm" gap="xs" style={{ paddingRight: 34 }}>
@@ -299,6 +374,15 @@ function SortableDeviceCard({
           >
             {recoveryActive ? 'Rebooting' : 'Reboot board'}
           </Button>
+          <Button
+            size="xs"
+            variant="light"
+            color="gray"
+            onClick={() => onRequestDiagnostics(device)}
+            title="Why did this board reset, or why did linien-server stop?"
+          >
+            Diagnostics
+          </Button>
         </Group>
         <ActionIcon
           size="sm"
@@ -339,6 +423,11 @@ export function DeviceList({
   onDisconnect,
   onShutdownServer,
   onRebootDevice,
+  onTelemetryCommand,
+  onInstallTelemetryAll,
+  onStartTelemetryAll,
+  onRequestDiagnostics,
+  telemetryBusyKeys,
 }: DeviceListProps) {
   const [opened, setOpened] = useState(false);
   const [editingKey, setEditingKey] = useState<string | null>(null);
@@ -347,6 +436,9 @@ export function DeviceList({
   const [rebootDevice, setRebootDevice] = useState<Device | null>(null);
   const [rebootSubmitting, setRebootSubmitting] = useState(false);
   const [rebootError, setRebootError] = useState<string | null>(null);
+  const [telemetryAllBusy, setTelemetryAllBusy] = useState(false);
+  const [telemetryStartAllBusy, setTelemetryStartAllBusy] = useState(false);
+  const [telemetryAllOpen, setTelemetryAllOpen] = useState(false);
   const activeSet = useMemo(() => new Set(activeKeys), [activeKeys]);
   const sortable = sortMode === 'manual';
   const connectableDevices = useMemo(
@@ -358,6 +450,27 @@ export function DeviceList({
       );
       return !status?.connected && !status?.connecting && !recoveryActive;
     }),
+    [devices, statuses]
+  );
+  // Drives the menu labels. `stopped` is deliberately narrow: a board that is
+  // offline or was never installed is not something "Start on all devices"
+  // can fix, so counting it would promise an action that cannot work.
+  const telemetryInstalledCount = useMemo(
+    () =>
+      devices.reduce(
+        (count, device) =>
+          count + (statuses[device.key]?.rp_telemetry?.installed ? 1 : 0),
+        0
+      ),
+    [devices, statuses]
+  );
+  const telemetryStoppedCount = useMemo(
+    () =>
+      devices.reduce(
+        (count, device) =>
+          count + (statuses[device.key]?.rp_telemetry?.state === 'stopped' ? 1 : 0),
+        0
+      ),
     [devices, statuses]
   );
   const connectedDeviceCount = useMemo(
@@ -448,6 +561,51 @@ export function DeviceList({
           >
             Connect all
           </Button>
+          {/* Both fleet-wide telemetry actions live behind one menu: they are
+              administrative (an install is a one-off or an upgrade, a start
+              follows a reboot), so they do not belong at the same weight as
+              Connect all. The counts answer "do I need this?" without opening
+              anything. Mirrors the per-device telemetry menu above. */}
+          <Menu shadow="md" position="bottom-start" withinPortal>
+            <Menu.Target>
+              <Button
+                size="xs"
+                color="gray"
+                variant="subtle"
+                leftSection={<IconTemperature size={14} />}
+                rightSection={<IconChevronDown size={12} />}
+                loading={telemetryAllBusy || telemetryStartAllBusy}
+                disabled={devices.length === 0}
+                title="Red Pitaya telemetry actions for every device"
+              >
+                Telemetry
+              </Button>
+            </Menu.Target>
+            <Menu.Dropdown>
+              <Menu.Label>Red Pitaya telemetry (all devices)</Menu.Label>
+              <Menu.Item onClick={() => setTelemetryAllOpen(true)}>
+                {telemetryInstalledCount === devices.length
+                  ? 'Update / reinstall on all devices'
+                  : 'Install / update on all devices'}
+              </Menu.Item>
+              {/* No confirmation, unlike install-all: starting an already-running
+                  service is a no-op and cannot damage a board, whereas install
+                  rewrites the binary on every device. */}
+              <Menu.Item
+                disabled={telemetryStoppedCount === 0}
+                onClick={() => {
+                  setTelemetryStartAllBusy(true);
+                  onStartTelemetryAll(devices.map((device) => device.key))
+                    .catch(() => null)
+                    .finally(() => setTelemetryStartAllBusy(false));
+                }}
+              >
+                {telemetryStoppedCount > 0
+                  ? `Start on all devices — ${telemetryStoppedCount} stopped`
+                  : 'Start on all devices — none stopped'}
+              </Menu.Item>
+            </Menu.Dropdown>
+          </Menu>
         </Group>
         <Group gap="xs" align="center">
           <Group gap={4} align="center" title="Connected (total devices)">
@@ -505,6 +663,9 @@ export function DeviceList({
               onDisconnect={onDisconnect}
               onRequestShutdown={setShutdownDevice}
               onRequestReboot={setRebootDevice}
+              onRequestDiagnostics={onRequestDiagnostics}
+              onTelemetryCommand={onTelemetryCommand}
+              telemetryBusy={Boolean(telemetryBusyKeys?.[device.key])}
             />
           ))}
         </SortableContext>
@@ -563,6 +724,38 @@ export function DeviceList({
             </Button>
             <Button color="orange" onClick={handleSubmit}>
               Save
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+      <Modal
+        opened={telemetryAllOpen}
+        onClose={() => setTelemetryAllOpen(false)}
+        title="Install telemetry on all devices?"
+        centered
+      >
+        <Stack>
+          <Text size="sm">
+            This uploads the telemetry binary over SSH and restarts the telemetry
+            service on all <strong>{devices.length}</strong> device(s), including any
+            that are already running it. It does not affect the Linien server or any
+            lock currently held.
+          </Text>
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setTelemetryAllOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              color="orange"
+              onClick={() => {
+                setTelemetryAllOpen(false);
+                setTelemetryAllBusy(true);
+                onInstallTelemetryAll(devices.map((device) => device.key))
+                  .catch(() => null)
+                  .finally(() => setTelemetryAllBusy(false));
+              }}
+            >
+              Install on all
             </Button>
           </Group>
         </Stack>

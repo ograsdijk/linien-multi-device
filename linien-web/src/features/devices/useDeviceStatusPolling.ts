@@ -3,6 +3,7 @@ import { api } from '../../api';
 import type { Device, DeviceStatus } from '../../types';
 import { isDeviceStatus } from '../runtime/messageGuards';
 import { deviceStatesStore } from '../../state/deviceStatesStore';
+import { markStatusReceived } from './statusFreshness';
 import { isStreamFresh } from './streamFreshness';
 
 // How long a streaming device may go without a plot frame before the backstop
@@ -64,7 +65,49 @@ const sameRecovery = (
   );
 };
 
-const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceStatus) => {
+const sameTelemetry = (
+  a: DeviceStatus['rp_telemetry'] | null | undefined,
+  b: DeviceStatus['rp_telemetry'] | null | undefined
+) => {
+  if (a === b) return true;
+  if (!a || !b) return !a && !b;
+  return (
+    a.state === b.state &&
+    a.version === b.version &&
+    // Compared because the card renders it ("0.9.0 installed, 1.0.0
+    // available"). Upgrading the gateway changes only this field, so leaving
+    // it out made every poll look identical and the card advertised the old
+    // bundled version until a browser reload.
+    a.bundled_version === b.bundled_version &&
+    a.update_available === b.update_available &&
+    a.installed === b.installed &&
+    a.error === b.error
+  );
+};
+
+const sameMetrics = (
+  a: DeviceStatus['rp_metrics'] | null | undefined,
+  b: DeviceStatus['rp_metrics'] | null | undefined
+) => {
+  if (a === b) return true;
+  if (!a || !b) return !a && !b;
+  // Compared as reported, not quantized. The gateway already decides what is
+  // worth a websocket push; this is the backstop poll, and its job is not to
+  // drop a change the store has not seen yet. CPU and free memory move on
+  // nearly every poll, so a device's card re-renders roughly once per poll --
+  // the same cadence a moving temperature already produced.
+  return (
+    a.cpu_percent === b.cpu_percent &&
+    a.load1 === b.load1 &&
+    a.mem_total_kb === b.mem_total_kb &&
+    a.mem_available_kb === b.mem_available_kb &&
+    a.mem_used_percent === b.mem_used_percent &&
+    a.uptime_s === b.uptime_s &&
+    a.root_free_kb === b.root_free_kb
+  );
+};
+
+export const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceStatus) => {
   if (!a) return false;
   return (
     a.connected === b.connected &&
@@ -75,7 +118,17 @@ const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceStatus) =
     a.lock === b.lock &&
     sameAutoRelock(a.auto_relock, b.auto_relock) &&
     sameDiagnosis(a.diagnosis, b.diagnosis) &&
-    sameRecovery(a.recovery, b.recovery)
+    sameRecovery(a.recovery, b.recovery) &&
+    // Temperature moves on its own poll cadence, so it has to take part in the
+    // equality check or a changed reading would be dropped as "unchanged".
+    // `rp_temperature_sampled_at` is deliberately NOT compared: the gateway
+    // refreshes it on every successful poll even when nothing else moved (it is
+    // excluded from the gateway's own change signature for the same reason),
+    // and nothing in the UI reads it -- comparing it would mark every device
+    // changed every 30 s for no visible difference.
+    a.rp_temperature_c === b.rp_temperature_c &&
+    sameMetrics(a.rp_metrics, b.rp_metrics) &&
+    sameTelemetry(a.rp_telemetry, b.rp_telemetry)
   );
 };
 
@@ -139,6 +192,10 @@ export const useDeviceStatusPolling = ({
             if (!isDeviceStatus(status)) {
               continue;
             }
+            // Outside the updater below, which runs only when something
+            // changed: an unchanged status is still a fresh one, and the
+            // temperature's local ageing keys off when it arrived.
+            markStatusReceived(device.key, status.rp_temperature_age_s);
             entries.push({
               deviceKey: device.key,
               updater: (prev) => {

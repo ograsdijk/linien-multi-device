@@ -81,6 +81,14 @@ NORMALIZED_PARAMS_ON_CONNECT = (
 PERSISTENT_SETTINGS_SNAPSHOT_KEY = "linien_settings_snapshot"
 PERSISTENT_SETTINGS_SNAPSHOT_VERSION = 1
 RECOVERY_STATE_KEY = "gateway_recovery"
+# When we last had a working connection to this board, and which kernel boot it
+# was in. Persisted because both halves are evidence about the *board*, and a
+# gateway restart is not a board event: held only in memory, every device looked
+# like one we had never connected to after a restart, the exact reboot test
+# (`uptime < our absence`) could not run, and a board that had rebooted two
+# hours ago was classified from a 600 s uptime threshold as "server crashed,
+# FPGA still running".
+LAST_HEALTHY_KEY = "gateway_last_healthy"
 EXTRA_PERSISTENT_SETTINGS = {
     # Upstream linien-server 2.1.0 does not mark this as restorable, but it is a
     # user setting that controls the sign of the PID gains written to the FPGA.
@@ -241,6 +249,8 @@ class DeviceSession:
         # disconnected). `_wants_diagnosis` gates re-probing so intentionally
         # disconnected devices are not probed forever.
         self._last_connected_at: float | None = None
+        self._last_healthy_boot_id: str | None = None
+        self._restore_last_healthy()
         self._diagnosis_cache: dict[str, Any] | None = None
         self._last_diagnosis_category: str | None = None
         self._wants_diagnosis: bool = False
@@ -264,6 +274,10 @@ class DeviceSession:
         self._recovery_cancel = threading.Event()
         self._recovery_thread: threading.Thread | None = None
         self._removed = False
+        # Supplies the cached Red Pitaya telemetry fields (die temperature +
+        # service state) to status(). A pure in-memory dict read owned by
+        # RpTelemetryManager -- status() must stay free of remote calls.
+        self._telemetry_provider: Callable[[str], dict[str, Any]] | None = None
 
     @staticmethod
     def _utc_now_iso() -> str:
@@ -465,6 +479,73 @@ class DeviceSession:
     ) -> None:
         self._diagnosis_request_callback = callback
 
+    def set_telemetry_provider(
+        self, provider: Callable[[str], dict[str, Any]] | None
+    ) -> None:
+        self._telemetry_provider = provider
+
+    def _restore_last_healthy(self) -> None:
+        stored = self._device_parameters().get(LAST_HEALTHY_KEY)
+        if not isinstance(stored, dict):
+            return
+        at = stored.get("at")
+        if isinstance(at, (int, float)) and at > 0:
+            # A stored time from the future means the clock moved, and treating
+            # it as an absence would make every board look freshly rebooted.
+            self._last_connected_at = min(float(at), time.time())
+        boot_id = stored.get("boot_id")
+        if isinstance(boot_id, str) and boot_id:
+            self._last_healthy_boot_id = boot_id
+
+    def _persist_last_healthy(self) -> None:
+        if self._removed:
+            return
+        self._device_parameters()[LAST_HEALTHY_KEY] = {
+            "at": self._last_connected_at,
+            "boot_id": self._last_healthy_boot_id,
+        }
+        device_store.save_device(self.device)
+
+    def last_healthy_boot_id(self) -> str | None:
+        """The board's boot id from the last time the server was up, if known.
+
+        Read by the diagnosis probe. It is only ever written while connected --
+        an id read from an already-dead board would be the post-reboot one and
+        would hide the very reboot it was meant to detect.
+        """
+        with self._state_lock:
+            return self._last_healthy_boot_id
+
+    def _record_healthy_boot_id(self) -> None:
+        """Read and store the boot id of the board we just connected to.
+
+        Off the connect path in its own thread: an SSH handshake is ~1 s and
+        nothing about connecting should wait for it. A device with no usable
+        SSH credentials simply never gets an id, and the uptime tests carry on
+        as before.
+        """
+        device = self.device
+
+        def worker() -> None:
+            from .diagnosis import read_boot_id
+
+            boot_id = read_boot_id(device)
+            if not boot_id:
+                return
+            with self._state_lock:
+                if not self.connected:
+                    # Dropped again while we were asking. Storing the id now
+                    # would date it to a connection that no longer exists.
+                    return
+                if boot_id == self._last_healthy_boot_id:
+                    return
+                self._last_healthy_boot_id = boot_id
+            self._persist_last_healthy()
+
+        threading.Thread(
+            target=worker, name=f"boot-id-{self.device.key}", daemon=True
+        ).start()
+
     def seconds_since_last_connected(self) -> float | None:
         with self._state_lock:
             ts = self._last_connected_at
@@ -556,6 +637,26 @@ class DeviceSession:
             self._persist_recovery_locked()
         self._publish_status()
         return True
+
+    def _clear_finished_recovery_locked(self) -> None:
+        """Drop a finished recovery record. Caller must hold ``_state_lock``.
+
+        `failed`/`completed`/`cancelled` are terminal phases, and the record is
+        persisted to devices.json, so nothing ever retracted it: a reboot that
+        timed out at REBOOT_TIMEOUT_S on a board that came back a little later
+        left "Reboot failed: Timed out waiting for the Red Pitaya to reboot" on
+        the card forever, across gateway restarts. A successful connection is
+        proof the board is back, which is the only thing that record reports.
+        The failure itself stays in the log timeline (`device_reboot_failed`).
+        """
+        recovery = self._recovery
+        if recovery is None:
+            return
+        if recovery.get("phase") not in {"completed", "failed", "cancelled"}:
+            # A run still in progress owns the record; never clear it here.
+            return
+        self._recovery = None
+        self._persist_recovery_locked()
 
     def _persist_recovery_locked(self) -> None:
         if self._removed:
@@ -1367,6 +1468,14 @@ class DeviceSession:
                     self._diagnosis_cache = None
                     self._last_diagnosis_category = None
                     self._wants_diagnosis = False
+                    # The board answered, so a finished reboot record has
+                    # nothing left to report -- including a `failed` one whose
+                    # board came back after the wait gave up.
+                    self._clear_finished_recovery_locked()
+                # Persist the moment, then go find out which boot it was. Both
+                # are facts about the board that must outlive this process.
+                self._persist_last_healthy()
+                self._record_healthy_boot_id()
                 self._register_callbacks()
                 self._stop_event.clear()
                 self._poll_thread = threading.Thread(
@@ -2150,6 +2259,18 @@ class DeviceSession:
             and stream_age_s is not None
             and stream_age_s > AUTO_RELOCK_STREAM_STALL_S
         )
+        telemetry_fields: Dict[str, Any] = {}
+        provider = self._telemetry_provider
+        if provider is not None:
+            try:
+                telemetry_fields = provider(self.device.key) or {}
+            except Exception:  # noqa: BLE001 - telemetry must not break status
+                logger.debug(
+                    "Telemetry status lookup failed for device=%s",
+                    self.device.key,
+                    exc_info=True,
+                )
+                telemetry_fields = {}
         return {
             "connected": self.connected,
             "connecting": self.connecting,
@@ -2182,6 +2303,9 @@ class DeviceSession:
             "stalled": stalled,
             "diagnosis": diagnosis,
             "recovery": recovery,
+            # Red Pitaya (Zynq die) temperature and telemetry-service state.
+            # Cache-only; see app/rp_telemetry.py.
+            **telemetry_fields,
         }
 
     def set_param(self, name: str, value: Any, write_registers: bool) -> None:

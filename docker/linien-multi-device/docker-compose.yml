@@ -10,6 +10,10 @@ services:
     volumes:
       - ./data/config.json:/opt/linien-multi-device/config.json
       - ./data/device_settings.json:/opt/linien-multi-device/device_settings.json
+      # The board timeline is the one thing meant to outlive a gateway
+      # restart -- and `docker compose up -d --build` after an update is
+      # itself often part of the incident being investigated.
+      - ./data/board_events.json:/opt/linien-multi-device/board_events.json
       - linien_user_data:/root/.local/share/linien
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/devices').read()\""]

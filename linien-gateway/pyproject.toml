@@ -14,6 +14,13 @@ dependencies = [
   "psycopg[binary]>=3.2",
   "linien-client==2.1.0",
   "linien-common==2.1.0",
+  # Imported directly by app/ssh.py, diagnosis.py, board_diagnostics.py and
+  # device_recovery.py. They arrive transitively through linien-client today,
+  # so nothing is broken -- but an undeclared import breaks the day that
+  # transitive edge moves, and a `paramiko.ssh_exception` catch that silently
+  # stops matching is the worst kind of break.
+  "fabric>=3.2",
+  "paramiko>=3.4",
   "numpy>=2.0",
   "orjson>=3.10",
 ]
@@ -23,6 +30,12 @@ linien-gateway = "app.main:main"
 
 [tool.setuptools.packages.find]
 namespaces = false
+
+# The cross-compiled rp-telemetry binary is deployed to Red Pitayas by
+# app/rp_telemetry.py, so it has to travel with an installed gateway.
+# See app/assets/README.md for how to build it.
+[tool.setuptools.package-data]
+app = ["assets/*"]
 
 # linien-common/linien-client 2.1.0 pin numpy<2, which conflicts with the
 # numpy>=2.0 dependency above. This override reconciles it, but it is uv-only:

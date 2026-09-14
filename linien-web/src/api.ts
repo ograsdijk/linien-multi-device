@@ -5,10 +5,13 @@ import type {
   AutoLockCalibrationResult,
   AutoLockScanResult,
   AutoLockScanSettings,
+  BoardEvent,
   Device,
   DeviceStatus,
   DeviceGroup,
+  DiagnosticsBundle,
   InfluxCredentials,
+  InfluxCredentialsEntry,
   InfluxUpdateResult,
   LockIndicatorConfig,
   LogsTailResponse,
@@ -17,7 +20,23 @@ import type {
   PostgresManualLockState,
   PostgresManualLockTestResult,
   PsdTailResponse,
+  RpTelemetry,
 } from './types';
+
+export type TelemetryServiceStatus = {
+  installed: boolean;
+  active: boolean;
+  active_state: string;
+  enabled_state: string;
+  version: string | null;
+  bundled_version: string;
+};
+
+export type TelemetryStatus = {
+  rp_temperature_c: number | null;
+  rp_temperature_sampled_at: number | null;
+  rp_telemetry: RpTelemetry;
+};
 
 export type PsdStartOptions = {
   algorithm?: number;
@@ -190,11 +209,78 @@ export const api = {
     }),
   loggingGetCredentials: (key: string) =>
     request<InfluxCredentials>(`/devices/${key}/logging/credentials`),
+  // Every device in one call, so opening the panel does not require selecting
+  // each board in turn to load its settings.
+  loggingGetAllCredentials: () =>
+    request<Record<string, InfluxCredentialsEntry>>(`/devices/logging/credentials`),
   loggingUpdateCredentials: (key: string, payload: InfluxCredentials) =>
     request<InfluxUpdateResult>(`/devices/${key}/logging/credentials`, {
       method: 'PUT',
       body: JSON.stringify(payload),
     }),
+  // --- Red Pitaya telemetry (Zynq die temperature) ---
+  // Management actions are SSH-backed and can take a few seconds; the read
+  // paths are served from the gateway's cache.
+  getTelemetry: (key: string) => request<TelemetryStatus>(`/devices/${key}/telemetry`),
+  installTelemetry: (key: string) =>
+    request<{ ok: boolean; version: string; temperature_c: number | null }>(
+      `/devices/${key}/telemetry/install`,
+      { method: 'POST' }
+    ),
+  uninstallTelemetry: (key: string) =>
+    request<{ ok: boolean }>(`/devices/${key}/telemetry/uninstall`, { method: 'POST' }),
+  startTelemetry: (key: string) =>
+    request<{ ok: boolean; active: boolean; state: string }>(
+      `/devices/${key}/telemetry/start`,
+      { method: 'POST' }
+    ),
+  stopTelemetry: (key: string) =>
+    request<{ ok: boolean; active: boolean; state: string }>(
+      `/devices/${key}/telemetry/stop`,
+      { method: 'POST' }
+    ),
+  restartTelemetry: (key: string) =>
+    request<{ ok: boolean; active: boolean; state: string }>(
+      `/devices/${key}/telemetry/restart`,
+      { method: 'POST' }
+    ),
+  getTelemetryServiceStatus: (key: string) =>
+    request<TelemetryServiceStatus>(`/devices/${key}/telemetry/service`),
+  readTelemetryNow: (key: string) =>
+    request<TelemetryStatus>(`/devices/${key}/telemetry/read`, { method: 'POST' }),
+  installTelemetryMany: (deviceKeys: string[]) =>
+    request<{ installed: string[]; failed: Record<string, string> }>(
+      '/telemetry/install',
+      { method: 'POST', body: JSON.stringify({ device_keys: deviceKeys }) }
+    ),
+  // A board whose unit starts and then dies immediately is reported in
+  // `failed`, not `started` -- see the gateway endpoint.
+  startTelemetryMany: (deviceKeys: string[]) =>
+    request<{ started: string[]; failed: Record<string, string> }>(
+      '/telemetry/start',
+      { method: 'POST', body: JSON.stringify({ device_keys: deviceKeys }) }
+    ),
+  // --- Board diagnostics ---
+  // `getBoardEvents` is a cache read; the other two are SSH-backed and take a
+  // few seconds.
+  getBoardEvents: (key: string, limit = 200) =>
+    request<{ events: BoardEvent[] }>(`/devices/${key}/events?limit=${limit}`),
+  collectDiagnostics: (key: string) =>
+    request<DiagnosticsBundle>(`/devices/${key}/diagnostics/collect`, {
+      method: 'POST',
+    }),
+  enablePersistentLog: (key: string) =>
+    request<{
+      ok: boolean;
+      persistent_journal: boolean;
+      // True when /var/log was a RAM disk and the journal is now bind-mounted
+      // from real storage -- a change to how the board boots, not just a
+      // journald setting.
+      backing_mount?: boolean;
+    }>(
+      `/devices/${key}/diagnostics/enable-persistent-log`,
+      { method: 'POST' }
+    ),
   postgresManualLockState: () =>
     request<PostgresManualLockState>('/postgres/manual-lock'),
   updatePostgresManualLockState: (payload: PostgresManualLockConfig) =>

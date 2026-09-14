@@ -32,6 +32,55 @@ export type DeviceDiagnosis = {
   server_running?: boolean | null;
   fpga_operating?: boolean | null;
   seconds_since_last_connected?: number | null;
+  /** The board's kernel boot ID. A change between probes proves a reboot. */
+  boot_id?: string | null;
+};
+
+// --- Board diagnostics ---------------------------------------------------
+
+/**
+ * One retained board/server transition. Kinds mirror the gateway's
+ * once-per-transition log codes, so the timeline never fills with repeats of a
+ * steady state. See linien-gateway/app/board_event_store.py.
+ */
+export type BoardEventKind =
+  | 'disconnected'
+  | 'diagnosis'
+  | 'reboot_detected'
+  | 'reboot_requested'
+  | 'telemetry_offline'
+  | 'telemetry_recovered'
+  | 'persistent_log_enabled';
+
+export type BoardEvent = {
+  ts: number;
+  device_key: string;
+  kind: BoardEventKind;
+  detail: string;
+  data?: Record<string, unknown>;
+  boot_id?: string | null;
+};
+
+/** One command's worth of the diagnostics bundle. */
+export type DiagnosticsSection = {
+  name: string;
+  title: string;
+  command: string;
+  output: string;
+  /** Set when the command failed. `output` may still hold partial output. */
+  error: string | null;
+};
+
+export type DiagnosticsBundle = {
+  ok: boolean;
+  error: string | null;
+  collected_at: number;
+  sections: DiagnosticsSection[];
+  /**
+   * Whether the board keeps logs across a reboot. `false` means the next crash
+   * will again leave nothing behind; `null` means it could not be determined.
+   */
+  persistent_journal: boolean | null;
 };
 
 export type DeviceRecovery = {
@@ -50,6 +99,48 @@ export type DeviceRecovery = {
   error?: string | null;
 };
 
+// Red Pitaya (Zynq die) telemetry, served from the gateway's cache.
+// 'unknown' means the gateway has not completed a poll yet; 'stale' means the
+// last good sample is older than the staleness window and must not be shown
+// as a live reading. See linien-gateway/app/rp_telemetry.py.
+export type RpTelemetryState =
+  | 'unknown'
+  | 'not_installed'
+  | 'running'
+  | 'stopped'
+  | 'offline'
+  | 'stale'
+  | 'error'
+  | 'version_mismatch';
+
+export type RpTelemetry = {
+  state: RpTelemetryState;
+  version?: string | null;
+  bundled_version?: string | null;
+  update_available?: boolean;
+  installed?: boolean;
+  port?: number | null;
+  error?: string | null;
+  /** The window the gateway uses to call a reading stale, in seconds. */
+  stale_after_s?: number | null;
+};
+
+// Board health sampled on the same request as the temperature, so it ages by
+// `rp_temperature_age_s` too. Every field is independently optional: a daemon
+// older than 1.2.0 reports none of them, and one it could not read is omitted
+// rather than sent as zero. See linien-gateway/app/rp_telemetry.py.
+export type RpMetrics = {
+  /** Busy percent over the gateway's polling interval, not an instant. */
+  cpu_percent?: number | null;
+  load1?: number | null;
+  mem_total_kb?: number | null;
+  mem_available_kb?: number | null;
+  mem_used_percent?: number | null;
+  uptime_s?: number | null;
+  /** Free space on the board's root filesystem (the SD card). */
+  root_free_kb?: number | null;
+};
+
 export type DeviceStatus = {
   connected: boolean;
   connecting: boolean;
@@ -65,6 +156,18 @@ export type DeviceStatus = {
   stalled?: boolean;
   diagnosis?: DeviceDiagnosis | null;
   recovery?: DeviceRecovery | null;
+  // Red Pitaya die temperature in degrees Celsius and the epoch seconds it was
+  // sampled at. The gateway sends a reading ONLY while rp_telemetry.state is
+  // 'running'; every other state sends null rather than an old number.
+  rp_temperature_c?: number | null;
+  rp_temperature_sampled_at?: number | null;
+  /** Age of the reading when the gateway sent it. Skew-proof, unlike the
+   *  absolute sample time: the UI ages it locally from here. */
+  rp_temperature_age_s?: number | null;
+  rp_telemetry?: RpTelemetry | null;
+  // Null both for a board whose daemon does not report metrics and for a state
+  // that does not vouch for them -- a consumer never has to tell those apart.
+  rp_metrics?: RpMetrics | null;
 };
 
 export type LockIndicatorConfig = {
@@ -344,6 +447,13 @@ export type InfluxCredentials = {
   token: string;
   bucket: string;
   measurement: string;
+};
+
+/** One device's entry in the fleet-wide credentials response. */
+export type InfluxCredentialsEntry = {
+  connected: boolean;
+  credentials: InfluxCredentials | null;
+  error: string | null;
 };
 
 export type InfluxUpdateResult = {
