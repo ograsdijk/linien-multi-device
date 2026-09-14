@@ -55,17 +55,34 @@ logger = logging.getLogger(__name__)
 LOCK_RUNNING_REGISTER_ADDR = 0x4030443C
 FPGA_STATE_PATH = "/sys/class/fpga_manager/fpga0/state"
 
-# Ordered methods for reading the lock-status register over SSH. Both are pure
+# Ordered methods for reading the lock-status register over SSH. All are pure
 # 32-bit register reads (mmap of /dev/mem): reading a status register has no
 # side effects and CANNOT disturb the loaded gateware — that is the
-# fpga_manager/bitstream path, which we never touch. `timeout 2` bounds a
-# possible AXI bus hang if the PL region is unmapped.
+# fpga_manager/bitstream path, which we never touch. Where `timeout` exists it
+# bounds a possible AXI bus hang if the PL region is unmapped (such a hang exits
+# 124, which is what tells the two cases apart in the recorded detail string).
 #   1. busybox/standalone `devmem` — present on many images, fast.
-#   2. python3 /dev/mem mmap — fallback for images without `devmem`. python3 is
-#      always available because linien-server is itself a Python service. The
-#      one-liner reads exactly 4 bytes at the (page-aligned) register address;
-#      only bit 0 is used, so word endianness is irrelevant.
-_LOCK_BIT_DEVMEM_CMD = f"timeout 2 devmem {hex(LOCK_RUNNING_REGISTER_ADDR)}"
+#   2. `busybox devmem` — same applet on images where it is not symlinked.
+#   3. Red Pitaya's own `monitor` tool (/opt/redpitaya/bin) — present on the
+#      stock Red Pitaya OS even when `devmem` is not.
+#   4./5. python3 (then python) /dev/mem mmap — for images without any of the
+#      above, which is the common case on stock Red Pitaya OS.
+#      python3 is available whenever linien-server is (it is a Python service).
+#      The one-liner reads exactly 4 bytes at the (page-aligned) register
+#      address; only bit 0 is used, so word endianness is irrelevant.
+#
+# A non-interactive SSH session gets a minimal PATH on some images, which is by
+# itself enough to make every method "missing" (exit 127), so PATH is extended
+# with the sbin/Red Pitaya directories first.
+#
+# `timeout` is likewise not guaranteed: on a minimal busybox it is absent, and
+# hardcoding it would make EVERY method exit 127 before it even runs. So it is
+# probed once and used only if present — bounding a possible AXI bus hang is a
+# nice-to-have, being able to read the register at all is not.
+_LOCK_CMD_PREFIX = (
+    "export PATH=$PATH:/usr/local/sbin:/usr/sbin:/sbin:/opt/redpitaya/bin; "
+    "if command -v timeout >/dev/null 2>&1; then TO='timeout 2'; else TO=''; fi; "
+)
 _LOCK_BIT_PY_SCRIPT = (
     "import mmap,os,struct;"
     f"A={hex(LOCK_RUNNING_REGISTER_ADDR)};"
@@ -74,8 +91,31 @@ _LOCK_BIT_PY_SCRIPT = (
     "m=mmap.mmap(f,P,mmap.MAP_SHARED,mmap.PROT_READ,offset=b);"
     "print('0x%08x'%struct.unpack('<I',m[A-b:A-b+4])[0])"
 )
-_LOCK_BIT_PY_CMD = f'timeout 2 python3 -c "{_LOCK_BIT_PY_SCRIPT}"'
-_LOCK_BIT_CMDS = (_LOCK_BIT_DEVMEM_CMD, _LOCK_BIT_PY_CMD)
+_ADDR = hex(LOCK_RUNNING_REGISTER_ADDR)
+# (method name, shell command). The name is only used in the recorded detail
+# string that explains *why* a read failed.
+_LOCK_BIT_CMDS: tuple[tuple[str, str], ...] = tuple(
+    (name, _LOCK_CMD_PREFIX + body)
+    for name, body in (
+        ("devmem", f"$TO devmem {_ADDR}"),
+        ("busybox-devmem", f"$TO busybox devmem {_ADDR}"),
+        ("rp-monitor", f"$TO monitor {_ADDR}"),
+        ("python3", f'$TO python3 -c "{_LOCK_BIT_PY_SCRIPT}"'),
+        # Some Red Pitaya images ship only /opt/redpitaya/bin/python.
+        ("python", f'$TO python -c "{_LOCK_BIT_PY_SCRIPT}"'),
+    )
+)
+
+# Exit codes worth spelling out in the failure detail: these are the ones that
+# actually happen in the field, and they call for different fixes.
+_EXIT_CODE_HINTS = {
+    127: "command not found",
+    124: "timed out (AXI read hung — PL region likely unmapped)",
+    126: "not executable",
+}
+# Longest per-method failure text kept in the detail string, so one chatty
+# command cannot bloat the diagnosis payload sent to the UI.
+_LOCK_DETAIL_MAX_CHARS = 120
 
 TCP_PROBE_TIMEOUT_S = 2.0
 SSH_COMMAND_TIMEOUT_S = 5.0
@@ -110,6 +150,10 @@ class ProbeResult:
     # lock_bit is None, this distinguishes "read attempted but unreadable"
     # (e.g. devmem missing / wrong fpga path) from "deliberately not read".
     lock_read_attempted: bool = False
+    # Why the lock read produced nothing, e.g.
+    # "devmem: exit 127 (command not found); python3: exit 1: Permission denied".
+    # Set only when a read was attempted and every method failed.
+    lock_read_detail: str | None = None
 
 
 def _tcp_open(host: str, port: int, timeout: float) -> bool:
@@ -152,43 +196,58 @@ def _read_uptime_and_fpga(conn: Connection) -> tuple[float | None, bool | None]:
     return _parse_uptime_fpga(result.stdout or "")
 
 
-def _run_lock_bit_cmd(conn: Connection, cmd: str) -> int | None:
-    """Run one register-read command and return bit 0 of its value, or None.
+def _run_lock_bit_cmd(conn: Connection, cmd: str) -> tuple[int | None, str | None]:
+    """Run one register-read command; return (bit 0 of its value, failure detail).
 
-    None means "this method yielded nothing" — command missing (exit 127),
-    non-zero exit, empty/unparseable output, or a transport error — so the
-    caller can fall through to the next method.
+    A ``None`` bit means "this method yielded nothing" — command missing (exit
+    127), non-zero exit, empty/unparseable output, or a transport error — so the
+    caller can fall through to the next method. The accompanying detail says
+    which of those it was: without it, an image where *every* method fails is
+    indistinguishable from an image where the register genuinely reads as
+    unavailable, and the user is left with nothing to act on.
     """
     try:
         result = conn.run(cmd, hide=True, warn=True, timeout=SSH_COMMAND_TIMEOUT_S)
-    except Exception:  # noqa: BLE001 - any transport/command error -> try next method
+    except Exception as exc:  # noqa: BLE001 - any transport/command error -> next method
         logger.debug("lock-bit command errored cmd=%r", cmd, exc_info=True)
-        return None
+        return None, f"{type(exc).__name__}: {exc}"
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip().splitlines()
+    stderr_first = stderr[0] if stderr else ""
     if result.exited != 0:
-        return None
-    tokens = (result.stdout or "").strip().split()
+        hint = _EXIT_CODE_HINTS.get(result.exited)
+        detail = f"exit {result.exited}"
+        if hint:
+            detail = f"{detail} ({hint})"
+        if stderr_first:
+            detail = f"{detail}: {stderr_first}"
+        return None, detail
+    tokens = stdout.split()
     if not tokens:
-        return None
+        return None, "exit 0 but no output"
     try:
         value = int(tokens[0], 0)
     except ValueError:
-        return None
-    return value & 1
+        return None, f"unparseable output: {stdout[:40]!r}"
+    return value & 1, None
 
 
-def _read_lock_bit(conn: Connection) -> int | None:
+def _read_lock_bit(conn: Connection) -> tuple[int | None, str | None]:
     """Read bit 0 of the FPGA lock-status register over SSH.
 
-    Tries `devmem`, then a python3 /dev/mem mmap read, returning on the first
-    method that yields a value. Both are pure register reads and cannot disturb
-    the loaded gateware. Returns None only if every method fails (register
-    genuinely unreadable on this image).
+    Tries each method in :data:`_LOCK_BIT_CMDS` in order, returning on the first
+    that yields a value. All are pure register reads and cannot disturb the
+    loaded gateware. Returns ``(None, detail)`` only if every method failed, with
+    ``detail`` naming each method and why it failed.
     """
-    for cmd in _LOCK_BIT_CMDS:
-        bit = _run_lock_bit_cmd(conn, cmd)
+    failures: list[str] = []
+    for name, cmd in _LOCK_BIT_CMDS:
+        bit, detail = _run_lock_bit_cmd(conn, cmd)
         if bit is not None:
-            return bit
-    return None
+            return bit, None
+        failures.append(f"{name}: {(detail or 'no value')[:_LOCK_DETAIL_MAX_CHARS]}")
+    return None, "; ".join(failures)
 
 
 def probe_device(
@@ -228,23 +287,23 @@ def probe_device(
                 and seconds_since_last_connected is not None
                 and uptime_s >= seconds_since_last_connected
             )
+            lock_detail: str | None = None
             if should_read:
                 try:
-                    lock_bit = _read_lock_bit(conn)
-                except Exception:  # noqa: BLE001 - register read is best-effort
+                    lock_bit, lock_detail = _read_lock_bit(conn)
+                except Exception as exc:  # noqa: BLE001 - register read is best-effort
                     logger.debug("lock register read raised host=%s", host, exc_info=True)
                     lock_bit = None
+                    lock_detail = f"{type(exc).__name__}: {exc}"
                 if lock_bit is None:
-                    # The read was warranted but produced nothing — most likely
-                    # `devmem` is absent or FPGA_STATE_PATH is wrong on this image.
-                    # Surface it so the perpetual "lock likely held" fallback is
-                    # debuggable instead of silent.
+                    # The read was warranted but every method produced nothing.
+                    # Log what each one actually said so the perpetual "lock
+                    # likely held" fallback is debuggable instead of silent.
                     logger.warning(
-                        "Lock register read attempted but unreadable for host=%s; "
-                        "check that `devmem` exists and %s is correct on this image. "
-                        "Falling back to inferred lock state.",
+                        "Lock register read attempted but unreadable for host=%s "
+                        "(%s). Falling back to inferred lock state.",
                         host,
-                        FPGA_STATE_PATH,
+                        lock_detail or "no detail",
                     )
             return ProbeResult(
                 server_listening=False,
@@ -253,6 +312,7 @@ def probe_device(
                 fpga_operating=fpga_operating,
                 lock_bit=lock_bit,
                 lock_read_attempted=should_read,
+                lock_read_detail=lock_detail if lock_bit is None else None,
             )
     except AuthenticationException as exc:
         # Reachable, but we can't read board state.
@@ -332,11 +392,11 @@ def classify_diagnosis(
             # unreadable — both the `devmem` and python3 /dev/mem read methods
             # failed (e.g. /dev/mem not accessible to the SSH user).
             lock_state = "likely_held"
+            reason = result.lock_read_detail or "no method returned a value"
             message = (
                 "linien-server is down; the FPGA gateware is still loaded, so the "
-                "lock is likely still held (lock register unreadable — neither "
-                "`devmem` nor a python3 /dev/mem read returned a value; check "
-                "/dev/mem access for the SSH user)."
+                "lock is likely still held (lock register unreadable — "
+                f"{reason})."
             )
 
     return {
@@ -348,6 +408,7 @@ def classify_diagnosis(
         "host_reachable": result.host_reachable,
         "server_running": result.server_listening,
         "fpga_operating": result.fpga_operating,
+        "lock_read_detail": result.lock_read_detail,
         "seconds_since_last_connected": seconds_since_last_connected,
     }
 

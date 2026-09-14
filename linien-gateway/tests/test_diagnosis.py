@@ -78,12 +78,23 @@ def test_classify_crash_lock_confirmed_unlocked():
 def test_classify_crash_lock_likely_when_fpga_operating_but_register_unreadable():
     # Gateware loaded but the lock register couldn't be read (e.g. devmem
     # missing) -> lock is likely still held.
-    result = ProbeResult(False, True, 3600.0, True, None, lock_read_attempted=True)
+    result = ProbeResult(
+        False,
+        True,
+        3600.0,
+        True,
+        None,
+        lock_read_attempted=True,
+        lock_read_detail="devmem: exit 127 (command not found)",
+    )
     d = _classify(result, since=60.0)
     assert d["category"] == CATEGORY_SERVER_CRASHED
     assert d["lock_state"] == "likely_held"
     assert "unreadable" in d["message"].lower()
-    assert "devmem" in d["message"].lower()
+    # The per-method reason is carried into the user-visible message and the
+    # payload, so the UI shows something actionable instead of "unreadable".
+    assert "devmem: exit 127 (command not found)" in d["message"]
+    assert d["lock_read_detail"] == "devmem: exit 127 (command not found)"
 
 
 def test_classify_crash_lock_lost_when_fpga_not_operating():
@@ -106,9 +117,10 @@ def test_classify_crash_lock_unknown_when_fpga_state_unknown():
 
 
 class _FakeResult:
-    def __init__(self, stdout: str, exited: int = 0):
+    def __init__(self, stdout: str, exited: int = 0, stderr: str = ""):
         self.stdout = stdout
         self.exited = exited
+        self.stderr = stderr
 
 
 class _FakeConnection:
@@ -215,6 +227,12 @@ def test_probe_lock_bit_none_when_all_read_methods_fail(monkeypatch):
     assert result.fpga_operating is True
     assert result.lock_bit is None
     assert result.lock_read_attempted is True
+    # Every method is named in the detail, with the exit code translated, so the
+    # operator learns *why* rather than just "unreadable".
+    assert result.lock_read_detail is not None
+    for name, _cmd in diagnosis._LOCK_BIT_CMDS:
+        assert name in result.lock_read_detail
+    assert "command not found" in result.lock_read_detail
 
 
 def test_read_lock_bit_tries_devmem_before_python():
@@ -225,7 +243,7 @@ def test_read_lock_bit_tries_devmem_before_python():
             return _FakeResult("0x00000000\n")  # both would parse to bit 0
 
     conn = _OrderConn()
-    assert diagnosis._read_lock_bit(conn) == 0
+    assert diagnosis._read_lock_bit(conn) == (0, None)
     # Only the first (devmem) method runs because it already returned a value.
     assert len(conn.commands) == 1
     assert "devmem" in conn.commands[0]
