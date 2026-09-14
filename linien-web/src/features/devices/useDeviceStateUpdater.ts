@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from 'react';
 import type { DeviceStatus, StreamMessage } from '../../types';
 import { deviceStatesStore } from '../../state/deviceStatesStore';
+import { markStatusReceived } from './statusFreshness';
 
 // Coalesce frequent param_update messages from multiple devices into a
 // single store update per animation frame. Without this, a busy system
@@ -144,6 +145,9 @@ export const useDeviceStateUpdater = () => {
       }
 
       if (message.type === 'status') {
+        // Before the store write: receipt is what lets the temperature keep
+        // ageing locally, and it happened whether or not anything changed.
+        markStatusReceived(deviceKey, (message as DeviceStatus).rp_temperature_age_s);
         deviceStatesStore.updateDevice(deviceKey, (prev) => ({
           ...prev,
           status: message as DeviceStatus,

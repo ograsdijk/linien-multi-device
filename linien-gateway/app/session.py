@@ -566,6 +566,26 @@ class DeviceSession:
         self._publish_status()
         return True
 
+    def _clear_finished_recovery_locked(self) -> None:
+        """Drop a finished recovery record. Caller must hold ``_state_lock``.
+
+        `failed`/`completed`/`cancelled` are terminal phases, and the record is
+        persisted to devices.json, so nothing ever retracted it: a reboot that
+        timed out at REBOOT_TIMEOUT_S on a board that came back a little later
+        left "Reboot failed: Timed out waiting for the Red Pitaya to reboot" on
+        the card forever, across gateway restarts. A successful connection is
+        proof the board is back, which is the only thing that record reports.
+        The failure itself stays in the log timeline (`device_reboot_failed`).
+        """
+        recovery = self._recovery
+        if recovery is None:
+            return
+        if recovery.get("phase") not in {"completed", "failed", "cancelled"}:
+            # A run still in progress owns the record; never clear it here.
+            return
+        self._recovery = None
+        self._persist_recovery_locked()
+
     def _persist_recovery_locked(self) -> None:
         if self._removed:
             return
@@ -1376,6 +1396,10 @@ class DeviceSession:
                     self._diagnosis_cache = None
                     self._last_diagnosis_category = None
                     self._wants_diagnosis = False
+                    # The board answered, so a finished reboot record has
+                    # nothing left to report -- including a `failed` one whose
+                    # board came back after the wait gave up.
+                    self._clear_finished_recovery_locked()
                 self._register_callbacks()
                 self._stop_event.clear()
                 self._poll_thread = threading.Thread(

@@ -4,9 +4,14 @@ Lets the gateway's telemetry polling, caching, staleness handling, and UI be
 exercised without a physical board. It speaks the same line protocol as
 `rp-telemetry/src/rp_telemetry.c`:
 
-    STATUS\\n   ->  RPT1 57.34\\n     (or RPT1 ERR XADC\\n with --fail)
-    VERSION\\n  ->  RPT1 VERSION 1.1.0\\n
+    STATUS\\n   ->  RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216 ...\\n
+                   (or RPT1 ERR XADC\\n with --fail)
+    VERSION\\n  ->  RPT1 VERSION 1.2.0\\n
     other      ->  RPT1 ERR COMMAND\\n
+
+The host-metric tail is simulated too, so the gateway's parsing, the InfluxDB
+fields and the UI can be exercised without a board. `--no-metrics` suppresses
+it, which is how a board still running the 1.1.0 daemon looks.
 
 This is a *development* tool that runs on your workstation. It is deliberately
 not what gets deployed: the real board runs the C daemon precisely so no Python
@@ -25,13 +30,15 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
 import socket
 import socketserver
 import time
 
 PROTOCOL_ID = "RPT1"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 MAX_REQUEST = 64
+STARTED_AT = time.monotonic()
 CLIENT_TIMEOUT_S = 2.0
 
 
@@ -41,6 +48,33 @@ def simulated_temperature(base_c: float, swing_c: float, period_s: float) -> flo
         return base_c
     phase = (time.time() % period_s) / period_s
     return base_c + swing_c * math.sin(2 * math.pi * phase)
+
+
+def simulated_metrics(options) -> str:
+    """The `key=value` tail of a STATUS line, as the C daemon builds it.
+
+    CPU and memory wander with their own periods so the UI's quantized
+    change-detection (which deliberately ignores small moves) can be seen doing
+    both things: staying quiet, and updating when it should.
+    """
+    if options.no_metrics:
+        return ""
+    cpu = max(0.0, min(100.0, options.cpu + 3.0 * math.sin(time.time() / 47.0)))
+    load1 = max(0.0, cpu / 100.0 * 2.0)
+    total_kb = options.mem_total_kb
+    used_fraction = max(
+        0.0, min(0.99, options.mem_used / 100.0 + 0.05 * math.sin(time.time() / 91.0))
+    )
+    avail_kb = int(total_kb * (1.0 - used_fraction))
+    uptime = time.monotonic() - STARTED_AT + options.uptime_offset
+    try:
+        root_free_kb = shutil.disk_usage("/").free // 1024
+    except OSError:
+        root_free_kb = 0
+    return (
+        f" cpu={cpu:.1f} load1={load1:.2f} memtotal={total_kb} "
+        f"memavail={avail_kb} uptime={uptime:.1f} rootfree={root_free_kb}"
+    )
 
 
 class TelemetryHandler(socketserver.BaseRequestHandler):
@@ -62,7 +96,10 @@ class TelemetryHandler(socketserver.BaseRequestHandler):
                 temperature = simulated_temperature(
                     options.base, options.swing, options.period
                 )
-                response = f"{PROTOCOL_ID} {temperature:.2f}\n"
+                response = (
+                    f"{PROTOCOL_ID} {temperature:.2f}"
+                    f"{simulated_metrics(options)}\n"
+                )
         elif command == "VERSION":
             response = f"{PROTOCOL_ID} VERSION {options.version}\n"
         else:
@@ -101,6 +138,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=VERSION,
         help="version to report; set it to something else to exercise the "
         "gateway's update-available handling",
+    )
+    parser.add_argument(
+        "--cpu", type=float, default=6.0, help="mean reported CPU busy percent"
+    )
+    parser.add_argument(
+        "--mem-used", type=float, default=42.0, help="mean memory used, percent"
+    )
+    parser.add_argument(
+        "--mem-total-kb", type=int, default=509216, help="MemTotal to report, in kB"
+    )
+    parser.add_argument(
+        "--uptime-offset",
+        type=float,
+        default=0.0,
+        help="seconds to add to the simulator's own uptime",
+    )
+    parser.add_argument(
+        "--no-metrics",
+        action="store_true",
+        help="omit the host-metric tail, like a board still running 1.1.0",
     )
     parser.add_argument(
         "--fail",

@@ -121,6 +121,24 @@ export type RpTelemetry = {
   installed?: boolean;
   port?: number | null;
   error?: string | null;
+  /** The window the gateway uses to call a reading stale, in seconds. */
+  stale_after_s?: number | null;
+};
+
+// Board health sampled on the same request as the temperature, so it ages by
+// `rp_temperature_age_s` too. Every field is independently optional: a daemon
+// older than 1.2.0 reports none of them, and one it could not read is omitted
+// rather than sent as zero. See linien-gateway/app/rp_telemetry.py.
+export type RpMetrics = {
+  /** Busy percent over the gateway's polling interval, not an instant. */
+  cpu_percent?: number | null;
+  load1?: number | null;
+  mem_total_kb?: number | null;
+  mem_available_kb?: number | null;
+  mem_used_percent?: number | null;
+  uptime_s?: number | null;
+  /** Free space on the board's root filesystem (the SD card). */
+  root_free_kb?: number | null;
 };
 
 export type DeviceStatus = {
@@ -139,11 +157,17 @@ export type DeviceStatus = {
   diagnosis?: DeviceDiagnosis | null;
   recovery?: DeviceRecovery | null;
   // Red Pitaya die temperature in degrees Celsius and the epoch seconds it was
-  // sampled at. Only present as a live value while rp_telemetry.state is
-  // 'running' -- other states keep the last reading for context.
+  // sampled at. The gateway sends a reading ONLY while rp_telemetry.state is
+  // 'running'; every other state sends null rather than an old number.
   rp_temperature_c?: number | null;
   rp_temperature_sampled_at?: number | null;
+  /** Age of the reading when the gateway sent it. Skew-proof, unlike the
+   *  absolute sample time: the UI ages it locally from here. */
+  rp_temperature_age_s?: number | null;
   rp_telemetry?: RpTelemetry | null;
+  // Null both for a board whose daemon does not report metrics and for a state
+  // that does not vouch for them -- a consumer never has to tell those apart.
+  rp_metrics?: RpMetrics | null;
 };
 
 export type LockIndicatorConfig = {
@@ -423,6 +447,13 @@ export type InfluxCredentials = {
   token: string;
   bucket: string;
   measurement: string;
+};
+
+/** One device's entry in the fleet-wide credentials response. */
+export type InfluxCredentialsEntry = {
+  connected: boolean;
+  credentials: InfluxCredentials | null;
+  error: string | null;
 };
 
 export type InfluxUpdateResult = {

@@ -3,6 +3,7 @@ import { api } from '../../api';
 import type { Device, DeviceStatus } from '../../types';
 import { isDeviceStatus } from '../runtime/messageGuards';
 import { deviceStatesStore } from '../../state/deviceStatesStore';
+import { markStatusReceived } from './statusFreshness';
 import { isStreamFresh } from './streamFreshness';
 
 // How long a streaming device may go without a plot frame before the backstop
@@ -84,6 +85,28 @@ const sameTelemetry = (
   );
 };
 
+const sameMetrics = (
+  a: DeviceStatus['rp_metrics'] | null | undefined,
+  b: DeviceStatus['rp_metrics'] | null | undefined
+) => {
+  if (a === b) return true;
+  if (!a || !b) return !a && !b;
+  // Compared as reported, not quantized. The gateway already decides what is
+  // worth a websocket push; this is the backstop poll, and its job is not to
+  // drop a change the store has not seen yet. CPU and free memory move on
+  // nearly every poll, so a device's card re-renders roughly once per poll --
+  // the same cadence a moving temperature already produced.
+  return (
+    a.cpu_percent === b.cpu_percent &&
+    a.load1 === b.load1 &&
+    a.mem_total_kb === b.mem_total_kb &&
+    a.mem_available_kb === b.mem_available_kb &&
+    a.mem_used_percent === b.mem_used_percent &&
+    a.uptime_s === b.uptime_s &&
+    a.root_free_kb === b.root_free_kb
+  );
+};
+
 export const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceStatus) => {
   if (!a) return false;
   return (
@@ -104,6 +127,7 @@ export const sameDeviceStatus = (a: DeviceStatus | null | undefined, b: DeviceSt
     // and nothing in the UI reads it -- comparing it would mark every device
     // changed every 30 s for no visible difference.
     a.rp_temperature_c === b.rp_temperature_c &&
+    sameMetrics(a.rp_metrics, b.rp_metrics) &&
     sameTelemetry(a.rp_telemetry, b.rp_telemetry)
   );
 };
@@ -168,6 +192,10 @@ export const useDeviceStatusPolling = ({
             if (!isDeviceStatus(status)) {
               continue;
             }
+            // Outside the updater below, which runs only when something
+            // changed: an unchanged status is still a fresh one, and the
+            // temperature's local ageing keys off when it arrived.
+            markStatusReceived(device.key, status.rp_temperature_age_s);
             entries.push({
               deviceKey: device.key,
               updater: (prev) => {

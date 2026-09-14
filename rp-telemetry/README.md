@@ -15,11 +15,29 @@ See the repo README section **Red Pitaya telemetry** for the gateway/UI side.
 ## Protocol
 
 ```text
-->  STATUS\n      <-  RPT1 57.34\n          temperature in °C
+->  STATUS\n      <-  RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216
+                          memavail=311044 uptime=690.2 rootfree=1204880\n
+                          (one line; wrapped here to fit)
                   <-  RPT1 ERR XADC\n       sysfs read failed
-->  VERSION\n     <-  RPT1 VERSION 1.1.0\n
+->  VERSION\n     <-  RPT1 VERSION 1.2.0\n
 ->  anything else <-  RPT1 ERR COMMAND\n
 ```
+
+The temperature (°C) is the first field and always in the same place. What
+follows it is an optional tail of `key=value` host metrics, added in 1.2.0:
+
+| key | meaning |
+| --- | --- |
+| `cpu` | busy percent **since the previous STATUS request** |
+| `load1` | 1-minute load average |
+| `memtotal`, `memavail` | kB; `memavail` is the kernel's MemAvailable (MemFree on kernels too old to have it) |
+| `uptime` | seconds since boot |
+| `rootfree` | free kB on the root filesystem (the SD card) |
+
+Each key is independently optional — a metric the board could not read is left
+out rather than sent as zero — and a reader must ignore keys it does not know.
+That is why this is a tail rather than a new command: a client written against
+1.1.0 parses the temperature from these lines unchanged.
 
 One request per connection; the daemon closes the socket afterwards and returns
 to `accept()`. Requests are capped at 64 bytes and accepted sockets carry a 2 s
@@ -95,7 +113,7 @@ printf 'STATUS\n' | nc <red-pitaya-host> 18864
 ```
 
 ```text
-RPT1 57.34
+RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216 memavail=311044 uptime=690.2 rootfree=1204880
 ```
 
 ## Deployment

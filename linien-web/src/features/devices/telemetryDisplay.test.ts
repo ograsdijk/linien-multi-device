@@ -147,3 +147,46 @@ describe('resolveTemperatureTone', () => {
     expect(resolveTemperatureTone(95)).toBe('critical');
   });
 });
+
+describe('local ageing of a running reading', () => {
+  const running = {
+    connected: true,
+    connecting: false,
+    rp_temperature_c: 57.3,
+    rp_telemetry: { state: 'running' as const, stale_after_s: 90 },
+  };
+
+  it('shows the reading while it is within the staleness window', () => {
+    const display = resolveTelemetryDisplay(running, 45);
+    expect(display.value).toBe('57.3 °C');
+    expect(display.available).toBe(true);
+  });
+
+  it('withdraws a reading that has aged past the window', () => {
+    // The gateway still says `running`: it cannot retract that if its poll
+    // loop, the websocket, or the tab's timers have stopped. The age is what
+    // stops a frozen payload being read as a live temperature.
+    const display = resolveTelemetryDisplay(running, 120);
+    expect(display.value).toBe('unavailable');
+    expect(display.available).toBe(false);
+    expect(display.detail).toBe('No recent reading');
+    expect(display.action).toBeNull();
+  });
+
+  it('uses the window the gateway published, not a local copy', () => {
+    const shortWindow = {
+      ...running,
+      rp_telemetry: { state: 'running' as const, stale_after_s: 20 },
+    };
+    expect(resolveTelemetryDisplay(shortWindow, 30).available).toBe(false);
+    // The same age against the default window is still fresh.
+    expect(resolveTelemetryDisplay(running, 30).available).toBe(true);
+  });
+
+  it('shows the reading when the age is unknown', () => {
+    // No age means no opinion; falling back to "stale" would blank the reading
+    // for any gateway that does not send one.
+    expect(resolveTelemetryDisplay(running, null).value).toBe('57.3 °C');
+    expect(resolveTelemetryDisplay(running).value).toBe('57.3 °C');
+  });
+});

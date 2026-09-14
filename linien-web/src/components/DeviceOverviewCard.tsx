@@ -201,6 +201,7 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
             {device.host}:{device.port}
           </Text>
           <RpTemperatureLine
+            deviceKey={device.key}
             status={{
               connected: slice.connected,
               connecting: slice.connecting,

@@ -11,6 +11,7 @@ import type {
   DeviceGroup,
   DiagnosticsBundle,
   InfluxCredentials,
+  InfluxCredentialsEntry,
   InfluxUpdateResult,
   LockIndicatorConfig,
   LogsTailResponse,
@@ -208,6 +209,10 @@ export const api = {
     }),
   loggingGetCredentials: (key: string) =>
     request<InfluxCredentials>(`/devices/${key}/logging/credentials`),
+  // Every device in one call, so opening the panel does not require selecting
+  // each board in turn to load its settings.
+  loggingGetAllCredentials: () =>
+    request<Record<string, InfluxCredentialsEntry>>(`/devices/logging/credentials`),
   loggingUpdateCredentials: (key: string, payload: InfluxCredentials) =>
     request<InfluxUpdateResult>(`/devices/${key}/logging/credentials`, {
       method: 'PUT',

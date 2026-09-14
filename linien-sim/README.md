@@ -110,6 +110,8 @@ linien-rp-telemetry-sim --port 18864
 linien-rp-telemetry-sim --port 18864 --base 62 --swing 3 --period 120
 linien-rp-telemetry-sim --port 18864 --fail            # always answer ERR XADC
 linien-rp-telemetry-sim --port 18864 --version 0.9.0   # look like an old build
+linien-rp-telemetry-sim --port 18864 --cpu 92 --mem-used 95  # a board in trouble
+linien-rp-telemetry-sim --port 18864 --no-metrics       # a board still on 1.1.0
 ```
 
 Point a device's host at the machine running this and the gateway polls it like
