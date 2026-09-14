@@ -123,8 +123,12 @@ def test_stale_detection_hides_an_old_reading():
     entry.sampled_at = time.time() - 120.0
     fields = manager.status_fields("dev-1")
     assert fields["rp_telemetry"]["state"] == rpt.STATE_STALE
-    # The last value is still carried for context; the UI keys off the state.
-    assert fields["rp_temperature_c"] == 57.3
+    # The reading leaves with the state that vouched for it. Carrying it "for
+    # context" meant every consumer had to remember to check the state, and a
+    # consumer that forgot showed an old number as a current one.
+    assert fields["rp_temperature_c"] is None
+    # The age still ships, so a client can say how long ago the last one was.
+    assert fields["rp_temperature_age_s"] == pytest.approx(120.0, abs=5.0)
 
 
 def test_refused_connection_on_an_uninstalled_board_reads_not_installed():
@@ -2205,3 +2209,240 @@ def test_poll_loop_starts_and_stops_cleanly():
 
     asyncio.run(run())
     assert cycles >= 2
+
+
+def test_status_fields_ship_an_age_not_just_a_sample_time():
+    """The client ages readings locally, so it needs an age, not a timestamp.
+
+    A browser comparing `rp_temperature_sampled_at` against its own clock
+    inherits the skew between the two machines; an age carries none.
+    """
+    device = make_device()
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=57.3)),
+        version_fn=_no_version,
+        stale_after_s=90.0,
+    )
+    asyncio.run(manager.poll_once())
+
+    fields = manager.status_fields("dev-1")
+
+    assert fields["rp_temperature_c"] == 57.3
+    assert fields["rp_temperature_age_s"] == pytest.approx(0.0, abs=5.0)
+    # The window is published too, so the UI ages by the gateway's rule rather
+    # than keeping a second copy of the number that could drift from this one.
+    assert fields["rp_telemetry"]["stale_after_s"] == 90.0
+
+
+def test_an_unpolled_device_has_no_age():
+    device = make_device()
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=57.3)),
+        version_fn=_no_version,
+    )
+
+    fields = manager.status_fields("dev-1")
+
+    assert fields["rp_temperature_c"] is None
+    assert fields["rp_temperature_age_s"] is None
+
+
+# --- host metrics --------------------------------------------------------
+
+
+def _running(temperature_c=57.3, **metrics):
+    return rpt.TelemetryReading(
+        rpt.STATE_RUNNING,
+        temperature_c=temperature_c,
+        metrics=rpt.HostMetrics(**metrics),
+    )
+
+
+def test_host_metrics_reach_the_status_payload():
+    device = make_device()
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(
+            _running(
+                cpu_percent=12.5,
+                load1=0.4,
+                mem_total_kb=509216,
+                mem_available_kb=311044,
+                uptime_s=690.2,
+                root_free_kb=1204880,
+            )
+        ),
+        version_fn=_no_version,
+    )
+    asyncio.run(manager.poll_once())
+
+    metrics = manager.status_fields("dev-1")["rp_metrics"]
+    assert metrics["cpu_percent"] == 12.5
+    assert metrics["load1"] == 0.4
+    assert metrics["mem_available_kb"] == 311044
+    assert metrics["mem_used_percent"] == pytest.approx(38.9, abs=0.1)
+    assert metrics["uptime_s"] == 690.2
+    assert metrics["root_free_kb"] == 1204880
+
+
+def test_a_daemon_that_reports_no_metrics_sends_none():
+    """Boards in the field run the older daemon until they are reinstalled;
+    an empty object would make the UI render a row of blanks."""
+    device = make_device()
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(rpt.TelemetryReading(rpt.STATE_RUNNING, temperature_c=57.3)),
+        version_fn=_no_version,
+    )
+    asyncio.run(manager.poll_once())
+
+    assert manager.status_fields("dev-1")["rp_metrics"] is None
+
+
+def test_metrics_leave_with_the_state_that_vouched_for_them():
+    """Same rule as the temperature: never ship a reading the state does not
+    stand behind. They were sampled on the same request, so they go stale
+    together and cannot disagree about it."""
+    device = make_device()
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(_running(cpu_percent=12.5, mem_total_kb=1000)),
+        version_fn=_no_version,
+        stale_after_s=90.0,
+    )
+    asyncio.run(manager.poll_once())
+    assert manager.status_fields("dev-1")["rp_metrics"] is not None
+
+    manager._entry("dev-1").sampled_at = time.time() - 120.0
+
+    fields = manager.status_fields("dev-1")
+    assert fields["rp_telemetry"]["state"] == rpt.STATE_STALE
+    assert fields["rp_metrics"] is None
+
+
+def test_a_failed_poll_drops_the_cached_metrics():
+    """Otherwise a board that came back before the next successful poll would
+    resurrect the numbers it reported before it went away."""
+    device = make_device()
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(
+            _running(cpu_percent=12.5),
+            rpt.TelemetryReading(rpt.STATE_OFFLINE, error="timed out"),
+        ),
+        version_fn=_no_version,
+    )
+    asyncio.run(manager.poll_once())
+    asyncio.run(manager.poll_once())
+
+    assert manager._entry("dev-1").metrics.is_empty()
+
+
+def test_ordinary_cpu_jitter_does_not_republish():
+    """CPU usage and free memory move on every poll. Pushing a status for each
+    one would mean a websocket message per device per 30 s forever, whether or
+    not anything happened -- so the change signature is deliberately coarse."""
+    device = make_device()
+    manager, _saved, published, _logs = make_manager(
+        [device],
+        read_fn=reading_fn(
+            _running(cpu_percent=3.0, mem_total_kb=1000, mem_available_kb=600),
+            _running(cpu_percent=4.5, mem_total_kb=1000, mem_available_kb=598),
+            _running(cpu_percent=3.5, mem_total_kb=1000, mem_available_kb=601),
+        ),
+        version_fn=_no_version,
+    )
+    for _ in range(3):
+        asyncio.run(manager.poll_once())
+
+    assert published == ["dev-1"]
+
+
+def test_a_board_that_actually_gets_busy_republishes():
+    device = make_device()
+    manager, _saved, published, _logs = make_manager(
+        [device],
+        read_fn=reading_fn(_running(cpu_percent=3.0), _running(cpu_percent=85.0)),
+        version_fn=_no_version,
+    )
+    asyncio.run(manager.poll_once())
+    asyncio.run(manager.poll_once())
+
+    assert published == ["dev-1", "dev-1"]
+
+
+def test_memory_filling_up_republishes():
+    device = make_device()
+    manager, _saved, published, _logs = make_manager(
+        [device],
+        read_fn=reading_fn(
+            _running(mem_total_kb=1000, mem_available_kb=600),
+            _running(mem_total_kb=1000, mem_available_kb=80),
+        ),
+        version_fn=_no_version,
+    )
+    asyncio.run(manager.poll_once())
+    asyncio.run(manager.poll_once())
+
+    assert published == ["dev-1", "dev-1"]
+
+
+def test_host_metrics_are_written_to_influx_with_the_temperature():
+    """The point of collecting them: a series to look back through after a
+    board dies, in the same measurement as everything else it logs."""
+    device = _influx_device()
+    writer = RecordingWriter()
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(
+            _running(
+                temperature_c=57.25,
+                cpu_percent=12.5,
+                load1=0.4,
+                mem_total_kb=1000,
+                mem_available_kb=250,
+                uptime_s=690.2,
+                root_free_kb=1204880,
+            )
+        ),
+        version_fn=_no_version,
+        influx_writer=writer,
+    )
+    manager.set_influx_credentials("dev-1", FakeCredentials())
+    asyncio.run(manager.poll_once())
+
+    (_destination, lines) = writer.calls[0]
+    assert len(lines) == 1
+    line = lines[0]
+    assert line.startswith("linien rp_temperature_c=57.25,")
+    for expected in (
+        "rp_cpu_percent=12.5",
+        "rp_load1=0.4",
+        "rp_mem_used_percent=75",
+        "rp_mem_available_kb=250",
+        "rp_root_free_kb=1204880",
+        "rp_uptime_s=690.2",
+    ):
+        assert expected in line
+
+
+def test_a_metric_the_board_did_not_report_is_absent_not_zero():
+    """An absent field is a gap in the series, which is the truth. A zero is a
+    measurement that never happened, and it would drag every average with it."""
+    device = _influx_device()
+    writer = RecordingWriter()
+    manager, *_ = make_manager(
+        [device],
+        read_fn=reading_fn(_running(temperature_c=57.25, cpu_percent=12.5)),
+        version_fn=_no_version,
+        influx_writer=writer,
+    )
+    manager.set_influx_credentials("dev-1", FakeCredentials())
+    asyncio.run(manager.poll_once())
+
+    line = writer.calls[0][1][0]
+    assert "rp_cpu_percent=12.5" in line
+    assert "rp_load1" not in line
+    assert "rp_mem_used_percent" not in line

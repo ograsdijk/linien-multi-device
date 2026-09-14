@@ -1,6 +1,10 @@
 import { MantineProvider } from '@mantine/core';
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { act, render, screen } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  clearStatusFreshness,
+  markStatusReceived,
+} from '../features/devices/statusFreshness';
 import type { DeviceStatus } from '../types';
 import { RpTemperatureLine } from './RpTemperatureLine';
 
@@ -101,5 +105,92 @@ describe('RpTemperatureLine', () => {
   it('handles a missing status', () => {
     renderLine(null);
     expect(readingLine().textContent).toBe('RP temperature: unavailable');
+  });
+});
+
+describe('RpTemperatureLine ageing', () => {
+  const running = status({
+    rp_temperature_c: 57.3,
+    rp_telemetry: { state: 'running', stale_after_s: 90 },
+  });
+
+  beforeEach(() => {
+    clearStatusFreshness('dev-age');
+  });
+
+  it('shows a reading that has just arrived', () => {
+    markStatusReceived('dev-age', 5);
+    renderLine(running, { deviceKey: 'dev-age' });
+    expect(readingLine().textContent).toBe('RP temperature: 57.3 °C');
+  });
+
+  it('withdraws the reading once it ages out, with no new status', () => {
+    vi.useFakeTimers();
+    try {
+      markStatusReceived('dev-age', 5);
+      renderLine(running, { deviceKey: 'dev-age' });
+      expect(readingLine().textContent).toBe('RP temperature: 57.3 °C');
+
+      // No new payload ever arrives -- the line must notice on its own.
+      act(() => {
+        vi.advanceTimersByTime(120_000);
+      });
+
+      expect(readingLine().textContent).toBe('RP temperature: unavailable');
+      expect(screen.getByText('No recent reading')).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps showing a reading when no device key is given', () => {
+    // Callers that opt out of ageing (tests, any card without a key) must be
+    // unaffected rather than silently blanked.
+    renderLine(running);
+    expect(readingLine().textContent).toBe('RP temperature: 57.3 °C');
+  });
+});
+
+describe('RpTemperatureLine host metrics', () => {
+  const withMetrics = status({
+    rp_temperature_c: 57.3,
+    rp_telemetry: { state: 'running', stale_after_s: 90 },
+    rp_metrics: { cpu_percent: 4.2, mem_used_percent: 41, uptime_s: 273_600 },
+  });
+
+  beforeEach(() => {
+    clearStatusFreshness('dev-metrics');
+  });
+
+  it('shows the board health beside the temperature', () => {
+    renderLine(withMetrics);
+    expect(screen.getByText('CPU 4%')).toBeTruthy();
+    expect(screen.getByText('RAM 41%')).toBeTruthy();
+    expect(screen.getByText('up 3d 4h')).toBeTruthy();
+  });
+
+  it('renders nothing extra for a board that reports no metrics', () => {
+    renderLine(status({ rp_temperature_c: 57.3, rp_telemetry: { state: 'running' } }));
+    expect(screen.queryByText(/^CPU /)).toBeNull();
+  });
+
+  it('withdraws the metrics on the same tick as the temperature', () => {
+    // One ageing timer drives both, so they cannot disagree about whether the
+    // reading they were sampled with is still current.
+    vi.useFakeTimers();
+    try {
+      markStatusReceived('dev-metrics', 5);
+      renderLine(withMetrics, { deviceKey: 'dev-metrics' });
+      expect(screen.getByText('CPU 4%')).toBeTruthy();
+
+      act(() => {
+        vi.advanceTimersByTime(120_000);
+      });
+
+      expect(readingLine().textContent).toBe('RP temperature: unavailable');
+      expect(screen.queryByText('CPU 4%')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -60,7 +60,9 @@ export const isDeviceStatus = (value: unknown): value is DeviceStatus => {
   if (value.auto_relock != null && !isObject(value.auto_relock)) return false;
   if (!isOptionalFiniteNumber(value.rp_temperature_c)) return false;
   if (!isOptionalFiniteNumber(value.rp_temperature_sampled_at)) return false;
+  if (!isOptionalFiniteNumber(value.rp_temperature_age_s)) return false;
   if (value.rp_telemetry != null && !isRpTelemetry(value.rp_telemetry)) return false;
+  if (value.rp_metrics != null && !isObject(value.rp_metrics)) return false;
   return true;
 };
 

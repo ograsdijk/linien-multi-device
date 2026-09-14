@@ -14,6 +14,7 @@ import {
   TextInput,
 } from '@mantine/core';
 import {
+  IconChevronDown,
   IconChevronLeft,
   IconDevices,
   IconPencil,
@@ -227,6 +228,7 @@ function SortableDeviceCard({
             </Text>
             <RpTemperatureLine
               status={status}
+              deviceKey={device.key}
               busy={telemetryBusy}
               onAction={(action) => {
                 // 'update' is an install of the newer bundled binary.
@@ -450,6 +452,27 @@ export function DeviceList({
     }),
     [devices, statuses]
   );
+  // Drives the menu labels. `stopped` is deliberately narrow: a board that is
+  // offline or was never installed is not something "Start on all devices"
+  // can fix, so counting it would promise an action that cannot work.
+  const telemetryInstalledCount = useMemo(
+    () =>
+      devices.reduce(
+        (count, device) =>
+          count + (statuses[device.key]?.rp_telemetry?.installed ? 1 : 0),
+        0
+      ),
+    [devices, statuses]
+  );
+  const telemetryStoppedCount = useMemo(
+    () =>
+      devices.reduce(
+        (count, device) =>
+          count + (statuses[device.key]?.rp_telemetry?.state === 'stopped' ? 1 : 0),
+        0
+      ),
+    [devices, statuses]
+  );
   const connectedDeviceCount = useMemo(
     () => devices.reduce((count, device) => count + (statuses[device.key]?.connected ? 1 : 0), 0),
     [devices, statuses]
@@ -538,36 +561,51 @@ export function DeviceList({
           >
             Connect all
           </Button>
-          <Button
-            size="xs"
-            color="gray"
-            variant="light"
-            loading={telemetryAllBusy}
-            disabled={devices.length === 0}
-            title="Install or update the Red Pitaya telemetry service on every device"
-            onClick={() => setTelemetryAllOpen(true)}
-          >
-            Telemetry: install all
-          </Button>
-          {/* No confirmation, unlike install-all: starting an already-running
-              service is a no-op and cannot damage a board, whereas install
-              rewrites the binary on every device. */}
-          <Button
-            size="xs"
-            color="gray"
-            variant="light"
-            loading={telemetryStartAllBusy}
-            disabled={devices.length === 0}
-            title="Start the Red Pitaya telemetry service on every device"
-            onClick={() => {
-              setTelemetryStartAllBusy(true);
-              onStartTelemetryAll(devices.map((device) => device.key))
-                .catch(() => null)
-                .finally(() => setTelemetryStartAllBusy(false));
-            }}
-          >
-            Telemetry: start all
-          </Button>
+          {/* Both fleet-wide telemetry actions live behind one menu: they are
+              administrative (an install is a one-off or an upgrade, a start
+              follows a reboot), so they do not belong at the same weight as
+              Connect all. The counts answer "do I need this?" without opening
+              anything. Mirrors the per-device telemetry menu above. */}
+          <Menu shadow="md" position="bottom-start" withinPortal>
+            <Menu.Target>
+              <Button
+                size="xs"
+                color="gray"
+                variant="subtle"
+                leftSection={<IconTemperature size={14} />}
+                rightSection={<IconChevronDown size={12} />}
+                loading={telemetryAllBusy || telemetryStartAllBusy}
+                disabled={devices.length === 0}
+                title="Red Pitaya telemetry actions for every device"
+              >
+                Telemetry
+              </Button>
+            </Menu.Target>
+            <Menu.Dropdown>
+              <Menu.Label>Red Pitaya telemetry (all devices)</Menu.Label>
+              <Menu.Item onClick={() => setTelemetryAllOpen(true)}>
+                {telemetryInstalledCount === devices.length
+                  ? 'Update / reinstall on all devices'
+                  : 'Install / update on all devices'}
+              </Menu.Item>
+              {/* No confirmation, unlike install-all: starting an already-running
+                  service is a no-op and cannot damage a board, whereas install
+                  rewrites the binary on every device. */}
+              <Menu.Item
+                disabled={telemetryStoppedCount === 0}
+                onClick={() => {
+                  setTelemetryStartAllBusy(true);
+                  onStartTelemetryAll(devices.map((device) => device.key))
+                    .catch(() => null)
+                    .finally(() => setTelemetryStartAllBusy(false));
+                }}
+              >
+                {telemetryStoppedCount > 0
+                  ? `Start on all devices — ${telemetryStoppedCount} stopped`
+                  : 'Start on all devices — none stopped'}
+              </Menu.Item>
+            </Menu.Dropdown>
+          </Menu>
         </Group>
         <Group gap="xs" align="center">
           <Group gap={4} align="center" title="Connected (total devices)">

@@ -17,6 +17,11 @@ export const TEMPERATURE_CRITICAL_C = 85;
 export type TelemetryTone = 'normal' | 'warn' | 'critical' | 'muted';
 export type TelemetryAction = 'install' | 'update' | 'restart' | 'start' | null;
 
+// Used when the gateway did not say (an older gateway, or a device it has not
+// polled). Matches STALE_AFTER_S in linien-gateway/app/rp_telemetry.py; the
+// payload's own value wins whenever it is present, so the two cannot drift.
+export const DEFAULT_STALE_AFTER_S = 90;
+
 export type TelemetryDisplay = {
   /** Rendered value, e.g. "57.3 °C" or "unavailable". */
   value: string;
@@ -83,12 +88,50 @@ const ACTION_LABEL: Record<Exclude<TelemetryAction, null>, string> = {
  * gateway reports `running` — every other state renders as "unavailable" so an
  * old number is never mistaken for the current one.
  */
+/**
+ * Whether a payload's reading has aged past the gateway's own staleness window.
+ *
+ * A status arrives only when something changes, so `state: running` can be
+ * minutes old -- the gateway cannot retract it if its own poll loop, the
+ * websocket, or the tab's timers have stopped. Ageing the reading locally is
+ * what stops a frozen payload being shown as live. Shared with the host-metrics
+ * line so the temperature and the metrics beside it, which were sampled on the
+ * same request, cannot disagree about whether they are current.
+ */
+export const readingIsStale = (
+  status: DeviceStatus | null | undefined,
+  readingAgeS?: number | null
+): boolean => {
+  const telemetry = status?.rp_telemetry ?? null;
+  if ((telemetry?.state ?? 'unknown') !== 'running') return false;
+  if (typeof readingAgeS !== 'number' || !Number.isFinite(readingAgeS)) return false;
+  const staleAfterS =
+    typeof telemetry?.stale_after_s === 'number' && telemetry.stale_after_s > 0
+      ? telemetry.stale_after_s
+      : DEFAULT_STALE_AFTER_S;
+  return readingAgeS > staleAfterS;
+};
+
 export const resolveTelemetryDisplay = (
-  status: DeviceStatus | null | undefined
+  status: DeviceStatus | null | undefined,
+  /** How old the reading is *now* -- the gateway's age plus the time since the
+   *  payload arrived. Omit to trust the state alone (older callers, tests). */
+  readingAgeS?: number | null
 ): TelemetryDisplay => {
   const telemetry = status?.rp_telemetry ?? null;
   const state: RpTelemetryState = telemetry?.state ?? 'unknown';
   const temperature = status?.rp_temperature_c;
+
+  if (readingIsStale(status, readingAgeS)) {
+    return {
+      value: 'unavailable',
+      available: false,
+      detail: 'No recent reading',
+      action: null,
+      actionLabel: null,
+      tone: 'muted',
+    };
+  }
 
   if (state === 'running' && typeof temperature === 'number' && Number.isFinite(temperature)) {
     const updateAvailable = Boolean(telemetry?.update_available);

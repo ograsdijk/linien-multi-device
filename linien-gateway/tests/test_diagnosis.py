@@ -110,12 +110,23 @@ def test_classify_crash_lock_confirmed_unlocked():
 def test_classify_crash_lock_likely_when_fpga_operating_but_register_unreadable():
     # Gateware loaded but the lock register couldn't be read (e.g. devmem
     # missing) -> lock is likely still held.
-    result = ProbeResult(False, True, 3600.0, True, None, lock_read_attempted=True)
+    result = ProbeResult(
+        False,
+        True,
+        3600.0,
+        True,
+        None,
+        lock_read_attempted=True,
+        lock_read_detail="devmem: exit 127 (command not found)",
+    )
     d = _classify(result, since=60.0)
     assert d["category"] == CATEGORY_SERVER_CRASHED
     assert d["lock_state"] == "likely_held"
     assert "unreadable" in d["message"].lower()
-    assert "devmem" in d["message"].lower()
+    # The per-method reason is carried into the user-visible message and the
+    # payload, so the UI shows something actionable instead of "unreadable".
+    assert "devmem: exit 127 (command not found)" in d["message"]
+    assert d["lock_read_detail"] == "devmem: exit 127 (command not found)"
 
 
 def test_classify_crash_lock_lost_when_fpga_not_operating():
@@ -138,9 +149,10 @@ def test_classify_crash_lock_unknown_when_fpga_state_unknown():
 
 
 class _FakeResult:
-    def __init__(self, stdout: str, exited: int = 0):
+    def __init__(self, stdout: str, exited: int = 0, stderr: str = ""):
         self.stdout = stdout
         self.exited = exited
+        self.stderr = stderr
 
 
 class _FakeConnection:
@@ -192,21 +204,60 @@ def test_probe_reads_lock_register_when_no_reboot(monkeypatch):
     assert result.lock_read_attempted is True
 
 
-def test_probe_skips_register_read_on_low_uptime(monkeypatch):
-    monkeypatch.setattr(diagnosis, "_tcp_open", lambda *a, **k: False)
+def _uptime_only_connection(uptime_s: float):
+    """A board that answers the uptime probe and refuses anything else."""
 
-    class _LowUptimeConn(_FakeConnection):
+    class _Conn(_FakeConnection):
         def run(self, cmd, **_kwargs):
             self.commands.append(cmd)
             if "uptime" in cmd:
-                return _FakeResult("42.0 10.0\n---\noperating\n")
-            raise AssertionError("devmem must not run on low uptime")
+                return _FakeResult(f"{uptime_s}\n---\noperating\n")
+            raise AssertionError("the register must not be read after a reboot")
 
-    monkeypatch.setattr(diagnosis, "Connection", _LowUptimeConn)
-    result = probe_device(_device(), seconds_since_last_connected=10.0)
+    return _Conn
+
+
+def test_probe_skips_register_read_when_the_board_rebooted_while_we_were_away(
+    monkeypatch,
+):
+    # Uptime shorter than our absence: the gateware was reloaded during it, so
+    # whatever the lock register holds describes a different FPGA image.
+    monkeypatch.setattr(diagnosis, "_tcp_open", lambda *a, **k: False)
+    monkeypatch.setattr(diagnosis, "Connection", _uptime_only_connection(42.0))
+
+    result = probe_device(_device(), seconds_since_last_connected=600.0)
+
     assert result.uptime_s == pytest.approx(42.0)
     assert result.lock_bit is None
     assert result.lock_read_attempted is False
+
+
+def test_low_uptime_alone_no_longer_skips_the_register_read(monkeypatch):
+    """A board that booted 42 s ago and was answering us 10 s ago did not
+    reboot in between -- the gateware is the one we were connected to, and its
+    lock register is worth reading.
+
+    The probe used to refuse on low uptime alone, which made it disagree with
+    the classifier (which called the same board "crashed, not rebooted") and
+    produced a confident "lock register unreadable" for a register nobody had
+    read. Both now ask `_looks_rebooted`, so they cannot drift apart again.
+    """
+    monkeypatch.setattr(diagnosis, "_tcp_open", lambda *a, **k: False)
+
+    class _FreshlyBooted(_FakeConnection):
+        def run(self, cmd, **kwargs):
+            if "uptime" in cmd:
+                self.commands.append(cmd)
+                return _FakeResult("42.0 10.0\n---\noperating\n")
+            return super().run(cmd, **kwargs)
+
+    monkeypatch.setattr(diagnosis, "Connection", _FreshlyBooted)
+
+    result = probe_device(_device(), seconds_since_last_connected=10.0)
+
+    assert result.uptime_s == pytest.approx(42.0)
+    assert result.lock_read_attempted is True
+    assert result.lock_bit == 1
 
 
 def test_probe_falls_back_to_python_when_devmem_missing(monkeypatch):
@@ -247,6 +298,12 @@ def test_probe_lock_bit_none_when_all_read_methods_fail(monkeypatch):
     assert result.fpga_operating is True
     assert result.lock_bit is None
     assert result.lock_read_attempted is True
+    # Every method is named in the detail, with the exit code translated, so the
+    # operator learns *why* rather than just "unreadable".
+    assert result.lock_read_detail is not None
+    for name, _cmd in diagnosis._LOCK_BIT_CMDS:
+        assert name in result.lock_read_detail
+    assert "command not found" in result.lock_read_detail
 
 
 def test_read_lock_bit_tries_devmem_before_python():
@@ -257,7 +314,7 @@ def test_read_lock_bit_tries_devmem_before_python():
             return _FakeResult("0x00000000\n")  # both would parse to bit 0
 
     conn = _OrderConn()
-    assert diagnosis._read_lock_bit(conn) == 0
+    assert diagnosis._read_lock_bit(conn) == (0, None)
     # Only the first (devmem) method runs because it already returned a value.
     assert len(conn.commands) == 1
     assert "devmem" in conn.commands[0]
@@ -449,3 +506,44 @@ def test_a_probe_in_flight_across_a_reboot_does_not_relatch_the_boot_id():
 
     assert store.noted == []
 
+
+def test_probe_reads_register_when_last_connected_time_is_unknown(monkeypatch):
+    # seconds_since_last_connected is None for every device after a gateway
+    # restart. The probe used to require it and skip the read, while
+    # classify_diagnosis treated the same board as "not rebooted" -- so the UI
+    # reported the register as unreadable without anyone reading it.
+    monkeypatch.setattr(diagnosis, "_tcp_open", lambda *a, **k: False)
+    monkeypatch.setattr(diagnosis, "Connection", _FakeConnection)
+
+    result = probe_device(_device(), seconds_since_last_connected=None)
+
+    assert result.lock_read_attempted is True
+    assert result.lock_bit == 1
+
+
+def test_probe_and_classify_agree_about_reboots(monkeypatch):
+    # The gate and the classifier must never disagree: whenever the classifier
+    # calls a board "crashed" (not rebooted) with the gateware loaded, the probe
+    # must have attempted the read, so the "unreadable" branch can only ever
+    # describe a real read failure.
+    monkeypatch.setattr(diagnosis, "_tcp_open", lambda *a, **k: False)
+    monkeypatch.setattr(diagnosis, "Connection", _FakeConnection)
+
+    for since in (None, 0.0, 60.0, 3600.0):
+        result = probe_device(_device(), seconds_since_last_connected=since)
+        d = _classify(result, since=since)
+        if d["category"] == CATEGORY_SERVER_CRASHED and result.fpga_operating:
+            assert result.lock_read_attempted is True, f"since={since}"
+
+
+def test_classify_does_not_claim_unreadable_when_read_was_skipped():
+    # Gateware loaded, no read attempted -> still "likely held", but the message
+    # must not blame the board for a read this code declined to perform.
+    d = _classify(
+        ProbeResult(False, True, 3600.0, True, None, lock_read_attempted=False),
+        since=60.0,
+    )
+    assert d["category"] == CATEGORY_SERVER_CRASHED
+    assert d["lock_state"] == "likely_held"
+    assert "not read" in d["message"]
+    assert "unreadable" not in d["message"]
