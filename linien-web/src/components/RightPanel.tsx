@@ -8,6 +8,7 @@ import type {
   AutoLockScanSettings,
   LockIndicatorConfig,
   LockIndicatorSnapshot,
+  LockApproachSettings,
 } from '../types';
 import { useStablePick } from '../hooks/useStablePick';
 import { AutoRelockPanel } from './AutoRelockPanel';
@@ -74,6 +75,7 @@ type RightPanelProps = {
   ) => Promise<AutoLockCalibrationResult>;
   autoLockSettings?: AutoLockScanSettings | null;
   onAutoLockSettingsChange?: (settings: AutoLockScanSettings) => void;
+  lockApproachSettings?: LockApproachSettings | null;
   onStartOptimizationSelection: () => void;
   onAbortOptimizationSelection: () => void;
   onStopTask: (useNew: boolean) => void;
@@ -152,6 +154,7 @@ export function RightPanel(props: RightPanelProps) {
           <Accordion.Control>Locking</Accordion.Control>
           <Accordion.Panel>
             <LockingPanel
+              deviceKey={props.deviceKey}
               params={lockingParams}
               onSetParam={props.onSetParam}
               onStartLock={props.onStartLock}
@@ -161,6 +164,7 @@ export function RightPanel(props: RightPanelProps) {
               onCalibrateAutoLock={props.onCalibrateAutoLock}
               autoLockSettingsConfig={props.autoLockSettings}
               onAutoLockSettingsChange={props.onAutoLockSettingsChange}
+              lockApproachSettings={props.lockApproachSettings}
               onStopLock={props.onStopLock}
               lockMode={props.lockMode}
               onLockModeChange={props.onLockModeChange}

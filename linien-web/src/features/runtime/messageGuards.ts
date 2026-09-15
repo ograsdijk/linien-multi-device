@@ -76,6 +76,9 @@ const isConfigUpdateValue = (configName: unknown, value: unknown): boolean => {
   if (configName === 'auto_relock_config') {
     return isObject(value);
   }
+  if (configName === 'lock_approach_settings') {
+    return isObject(value);
+  }
   return false;
 };
 

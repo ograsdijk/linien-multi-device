@@ -16,9 +16,11 @@ import type {
   AutoLockCalibrationResult,
   AutoLockScanResult,
   AutoLockScanSettings,
+  LockApproachSettings,
 } from '../types';
 import { toClampedNumberOr, toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
 import { DeferredNumberInput } from './DeferredNumberInput';
+import { LockApproachPanel } from './LockApproachPanel';
 
 const DEFAULT_AUTO_LOCK_SETTINGS: AutoLockScanSettings = {
   signal_type: 'pdh',
@@ -34,7 +36,10 @@ const DEFAULT_AUTO_LOCK_SETTINGS: AutoLockScanSettings = {
   monitor_threshold: 0.1,
 };
 
+const formatSigned = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(4)}`;
+
 type LockingPanelProps = {
+  deviceKey?: string;
   params: Record<string, any>;
   onSetParam: (name: string, value: any, writeRegisters?: boolean) => void;
   onStartLock: () => void;
@@ -47,6 +52,7 @@ type LockingPanelProps = {
     options: AutoLockCalibrateRequest
   ) => Promise<AutoLockCalibrationResult>;
   autoLockSettingsConfig?: AutoLockScanSettings | null;
+  lockApproachSettings?: LockApproachSettings | null;
   onAutoLockSettingsChange?: (settings: AutoLockScanSettings) => void;
   onStopLock: () => void;
   lockMode?: 'manual' | 'autolock_scan' | 'autolock';
@@ -58,6 +64,7 @@ type LockingPanelProps = {
 };
 
 export const LockingPanel = memo(function LockingPanel({
+  deviceKey,
   params,
   onSetParam,
   onStartLock,
@@ -66,6 +73,7 @@ export const LockingPanel = memo(function LockingPanel({
   onAutoLockFromScan,
   onCalibrateAutoLock,
   autoLockSettingsConfig,
+  lockApproachSettings,
   onAutoLockSettingsChange,
   onStopLock,
   lockMode,
@@ -131,7 +139,10 @@ export const LockingPanel = memo(function LockingPanel({
       const result = await onAutoLockFromScan(autoLockSettings);
       setAutoLockResult(result);
     } catch (_error) {
-      // Errors are surfaced through global logs + toast notifications.
+      // Errors are surfaced through global logs + toast notifications, but the
+      // previous run's summary must go: it reports a center move that has since
+      // been restored, next to a toast saying the lock failed.
+      setAutoLockResult(null);
     } finally {
       setAutoLockBusy(false);
     }
@@ -429,6 +440,32 @@ export const LockingPanel = memo(function LockingPanel({
                   ? ` | ${(autoLockResult.hz_per_v / 1e6).toFixed(3)} MHz/V`
                   : ''}
               </Text>
+            ) : null}
+            {autoLockResult?.approach?.enabled ? (
+              <Text size="xs" c="dimmed">
+                moved {formatSigned(autoLockResult.approach.center_move_v)} V ·
+                {' '}corrected {formatSigned(autoLockResult.approach.center_correction_v)} V ·
+                {' '}{autoLockResult.approach.attempts.length} attempt
+                {autoLockResult.approach.attempts.length === 1 ? '' : 's'}
+                {' '}({autoLockResult.approach.attempts[
+                  autoLockResult.approach.attempts.length - 1
+                ]?.from_below
+                  ? 'from below'
+                  : 'from above'})
+                {autoLockResult.approach.center_offset_v != null
+                  ? ` · residual ${formatSigned(
+                      autoLockResult.approach.center_offset_v
+                    )} V of ${autoLockResult.approach.capture_tolerance_v.toFixed(4)} V`
+                  : ''}
+              </Text>
+            ) : null}
+            {deviceKey ? (
+              <LockApproachPanel
+                deviceKey={deviceKey}
+                halfRangeSweepV={autoLockSettings.half_range_sweep_v}
+                active={mode === 'autolock_scan'}
+                settingsFromStream={lockApproachSettings}
+              />
             ) : null}
           </Stack>
         </Tabs.Panel>
