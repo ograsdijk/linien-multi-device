@@ -1,28 +1,17 @@
 # TODO
 
-## Autolock Hysteresis Safety
+## Autolock Hysteresis Safety — shipped, needs hardware validation
 
-Problem: large sweep-center jumps can miss the intended lock point on hysteretic piezo/cavity systems.
+Implemented on `feat/autolock-hysteresis`. See the "Guarded center move" section in
+[README.md](README.md) for what it does and how it is configured.
 
-1. Add guarded center move before lock:
-- `max_direct_jump_v`: use direct center set only below this threshold.
-- For larger jumps, perform anti-backlash move:
-  - overshoot by `approach_offset_v`
-  - approach target from fixed direction with ramp (`ramp_step_v`, `ramp_step_delay_ms`)
-  - wait `settle_ms`.
+Remaining, and only doable at a board:
 
-2. Pre-lock verification sweep:
-- After move, run one short sweep and re-detect crossing near expected center (`verify_window_v`).
-- Reuse existing error/monitor thresholds to accept/reject.
-
-3. Retry strategy:
-- If verification fails, retry once with opposite approach direction.
-- If still failing, abort lock and surface clear reason to UI.
-
-4. Config/tunables:
-- `max_direct_jump_v`
-- `approach_offset_v`
-- `ramp_step_v`
-- `ramp_step_delay_ms`
-- `settle_ms`
-- `verify_window_v`
+1. Run **Measure hysteresis** on a real device and record the verdict.
+2. Set `approach_offset_v` and `settle_ms` from that measurement — the shipped
+   defaults are placeholders, not measurements.
+3. Confirm an `exposed_write_registers()` round trip is fast enough for the ramp
+   cadence you end up wanting (`ramp_step_delay_ms`, and the number of steps the
+   offset/step ratio implies).
+4. Enable the guarded move per device once its numbers are known. It is off by
+   default, so until then every device keeps the plain direct set.
