@@ -23,6 +23,52 @@ LOCK_RESULT_POSTGRES_CONFIG_PATH = USER_DATA_PATH / "manual_lock_postgres.json"
 SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
 logger = logging.getLogger(__name__)
 PostgresEventCallback = Callable[[int, str, str, str, dict[str, Any]], None]
+# The guarded-move columns, declared once and rendered into the CREATE, the
+# migration and the INSERT below. Two hand-maintained copies of the same list
+# had nothing keeping them in step.
+APPROACH_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("sweep_center_v", "DOUBLE PRECISION"),
+    ("sweep_amplitude_v", "DOUBLE PRECISION"),
+    ("target_voltage_v", "DOUBLE PRECISION"),
+    ("sweep_center_start_v", "DOUBLE PRECISION"),
+    ("center_move_v", "DOUBLE PRECISION"),
+    ("center_correction_v", "DOUBLE PRECISION"),
+    ("center_offset_v", "DOUBLE PRECISION"),
+    ("capture_tolerance_v", "DOUBLE PRECISION"),
+    ("approach_enabled", "BOOLEAN"),
+    ("approach_direct", "BOOLEAN"),
+    ("approach_from_below", "BOOLEAN"),
+    ("approach_attempts", "INTEGER"),
+    ("approach_detail", "JSONB"),
+)
+
+# psycopg sends a Python str as PostgreSQL ``text`` (StrDumper.oid = 25), and
+# ``text`` does not implicitly coerce to ``jsonb``, so a JSON column needs an
+# explicit cast on the placeholder or every insert fails -- quietly, since the
+# writer swallows errors into a log event.
+_PARAM_CASTS = {"JSONB": "::jsonb"}
+
+
+def _column_definitions() -> str:
+    return "".join(f",\n    {name} {sql}" for name, sql in APPROACH_COLUMNS)
+
+
+def _add_column_clauses() -> str:
+    return ",\n".join(
+        f"    ADD COLUMN IF NOT EXISTS {name} {sql}" for name, sql in APPROACH_COLUMNS
+    )
+
+
+def _insert_names() -> str:
+    return ",\n".join(f"    {name}" for name, _sql in APPROACH_COLUMNS)
+
+
+def _insert_values() -> str:
+    return ",\n".join(
+        f"    %({name})s{_PARAM_CASTS.get(sql, '')}" for name, sql in APPROACH_COLUMNS
+    )
+
+
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS pdh_lock_results (
     id BIGSERIAL PRIMARY KEY,
@@ -42,13 +88,23 @@ CREATE TABLE IF NOT EXISTS pdh_lock_results (
     monitor_trace_y DOUBLE PRECISION[] NOT NULL,
     trace_x_units TEXT NOT NULL DEFAULT 'V',
     trace_y_units TEXT NOT NULL DEFAULT 'V',
-    monitor_trace_y_units TEXT NOT NULL DEFAULT 'V'
+    monitor_trace_y_units TEXT NOT NULL DEFAULT 'V'""" + _column_definitions() + """
 );
 """
 ALTER_TABLE_ADD_LOCK_SOURCE_SQL = """
 ALTER TABLE pdh_lock_results
     ADD COLUMN IF NOT EXISTS lock_source TEXT NOT NULL DEFAULT 'manual_lock';
 """
+# The approach columns landed after the table did, so existing deployments pick
+# them up on the next startup rather than needing a hand-run migration. Same
+# idempotent ADD COLUMN IF NOT EXISTS pattern as lock_source above.
+# Existing deployments pick the approach columns up on the next startup rather
+# than needing a hand-run migration, the same idempotent pattern lock_source uses.
+ALTER_TABLE_ADD_APPROACH_SQL = """
+ALTER TABLE pdh_lock_results
+""" + _add_column_clauses() + """;
+"""
+
 CREATE_INDEX_CREATED_SQL = """
 CREATE INDEX IF NOT EXISTS idx_pdh_lock_results_created_at
     ON pdh_lock_results (created_at DESC);
@@ -74,7 +130,8 @@ INSERT INTO pdh_lock_results (
     monitor_trace_y,
     trace_x_units,
     trace_y_units,
-    monitor_trace_y_units
+    monitor_trace_y_units,
+""" + _insert_names() + """
 ) VALUES (
     %(laser_name)s,
     %(lock_source)s,
@@ -91,7 +148,8 @@ INSERT INTO pdh_lock_results (
     %(monitor_trace_y)s,
     %(trace_x_units)s,
     %(trace_y_units)s,
-    %(monitor_trace_y_units)s
+    %(monitor_trace_y_units)s,
+""" + _insert_values() + """
 );
 """
 
@@ -159,6 +217,13 @@ class LockResultPostgresService:
         self._config_path = config_path
         self._config = load_lock_result_postgres_config(config_path)
         self._status = LockResultPostgresStatus(active=False)
+        # Whether this process has applied the schema to the configured
+        # database yet. _ensure_table only ran from test_connection(), i.e. when
+        # someone re-saved the settings in the UI, so an upgraded gateway that
+        # nobody touched would INSERT columns that had never been added -- and
+        # the failure was swallowed by the best-effort writer, taking manual and
+        # auto-relock logging down with it.
+        self._schema_ready = False
         self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=max_queue_size)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -209,6 +274,7 @@ class LockResultPostgresService:
                 key: payload.get(key, defaults[key]) for key in defaults.keys()
             }
             self._config = LockResultPostgresConfig(**normalized)
+            self._schema_ready = False
             save_lock_result_postgres_config(self._config, self._config_path)
             if not self._config.enabled:
                 self._status.active = False
@@ -276,17 +342,24 @@ class LockResultPostgresService:
                 "connect_timeout": max(1, int(round(cfg.connect_timeout_s))),
             }
 
+    @staticmethod
+    def _apply_schema(cur: Any) -> None:
+        """Create the table and bring an older one up to date. Idempotent."""
+        cur.execute(CREATE_TABLE_SQL)
+        cur.execute(ALTER_TABLE_ADD_LOCK_SOURCE_SQL)
+        cur.execute(ALTER_TABLE_ADD_APPROACH_SQL)
+        cur.execute(CREATE_INDEX_CREATED_SQL)
+        cur.execute(CREATE_INDEX_LASER_SQL)
+
     def _ensure_table(self) -> None:
         if psycopg is None:
             raise RuntimeError("psycopg is not installed in gateway environment.")
         connect_kwargs = self._connect_kwargs()
         with psycopg.connect(**connect_kwargs) as conn:
             with conn.cursor() as cur:
-                cur.execute(CREATE_TABLE_SQL)
-                cur.execute(ALTER_TABLE_ADD_LOCK_SOURCE_SQL)
-                cur.execute(CREATE_INDEX_CREATED_SQL)
-                cur.execute(CREATE_INDEX_LASER_SQL)
+                self._apply_schema(cur)
             conn.commit()
+        self._schema_ready = True
 
     def _write_row(self, row: dict[str, Any]) -> None:
         if psycopg is None:
@@ -297,8 +370,14 @@ class LockResultPostgresService:
         connect_kwargs = self._connect_kwargs()
         with psycopg.connect(**connect_kwargs) as conn:
             with conn.cursor() as cur:
+                # The first write of a process migrates before inserting, on the
+                # same connection. Nothing else guarantees the columns INSERT_SQL
+                # names actually exist on the target database.
+                if not self._schema_ready:
+                    self._apply_schema(cur)
                 cur.execute(INSERT_SQL, row)
             conn.commit()
+        self._schema_ready = True
 
     def _mark_test(self, ok: bool, error: str | None) -> None:
         now = time.time()
