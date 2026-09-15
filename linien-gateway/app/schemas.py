@@ -146,6 +146,137 @@ class AutoLockScanSettings(BaseModel):
     )
 
 
+class LockApproachSettings(BaseModel):
+    """Guarded sweep-center move (anti-backlash approach + pre-lock verification).
+
+    Voltages are sweep volts (x-axis), the same units as ``sweep_center``. The
+    acceptance window is NOT configured as a voltage: it is derived from the
+    calibrated feature width, because a lock succeeds whenever the DC point lands
+    between the two lobe extrema. Field names/defaults must match the engine
+    dataclass (lock_approach.py); the parity test enforces this. Disabled by
+    default -- a device that has not been characterised keeps the plain direct set.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    capture_fraction: float = Field(
+        default=0.5, ge=0.0, le=4.0,
+        description=(
+            "Acceptance window as a fraction of the calibrated feature half-width "
+            "(auto-lock half_range_sweep_v)."
+        ),
+    )
+    max_correction_span: float = Field(
+        default=4.0, ge=0.0, le=64.0,
+        description=(
+            "Reject a re-detection further than this many feature half-widths out "
+            "as a neighbouring crossing. Used when no sideband offset is known. "
+            "0 disables the guard entirely rather than rejecting everything."
+        ),
+    )
+    max_direct_jump_v: float = Field(
+        default=2.0, ge=0.0, le=2.0,
+        description="Skip the direct probe for jumps larger than this.",
+    )
+    approach_offset_v: float = Field(
+        default=0.05, ge=0.0, le=2.0,
+        description="Overshoot past the target before ramping back in (0 disables).",
+    )
+    ramp_step_v: float = Field(
+        default=0.005, ge=0.0001, le=2.0,
+        description="Maximum size of one ramp step during the final approach.",
+    )
+    ramp_step_delay_ms: int = Field(
+        default=20, ge=0, le=5000,
+        description="Dwell after each ramp step.",
+    )
+    settle_ms: int = Field(
+        default=300, ge=0, le=60000,
+        description="Dwell after the last set-point, before verification.",
+    )
+    approach_from_below: bool = True
+    max_approach_iterations: int = Field(
+        default=2, ge=1, le=10,
+        description="Correction attempts per approach direction.",
+    )
+
+
+class LockApproachAttempt(BaseModel):
+    """One approach attempt and what the verification sweep measured after it."""
+
+    model_config = ConfigDict(extra="forbid")
+    attempt: int
+    from_below: bool
+    direct: bool
+    set_points: int
+    commanded_voltage: float
+    # Where the crossing was re-detected, and how far that is from the commanded
+    # center. None when the verification sweep produced no usable detection.
+    detected_voltage: Optional[float] = None
+    offset_v: Optional[float] = None
+    accepted: bool = False
+    detail: str = ""
+
+
+class LockApproachReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+    accepted: bool
+    # The crossing the detector originally picked, and the center actually
+    # commanded at the end -- equal unless a correction was applied.
+    target_voltage: float
+    commanded_voltage: float
+    # Center before anything moved, and the signed distance actually travelled.
+    start_voltage: float
+    center_move_v: float
+    # commanded - target: how much correction the hysteresis needed. 0.0 means
+    # the detected target was used untouched.
+    center_correction_v: float
+    # Residual offset at acceptance, and the window it had to fall inside.
+    # Residual at acceptance, or the last offset measured when it failed.
+    center_offset_v: Optional[float] = None
+    capture_tolerance_v: float
+    # None when no usable neighbour guard could be derived for this signal.
+    rejection_bound_v: Optional[float] = None
+    attempts: list[LockApproachAttempt] = Field(default_factory=list)
+
+
+# Every value classify_hysteresis can return. Constrained rather than a bare str
+# so the classifier and the UI (which maps each to a colour) cannot drift.
+LockApproachVerdict = Literal[
+    "backlash", "creep", "drift_or_creep", "negligible", "inconclusive"
+]
+
+
+class LockApproachProbeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    settle_ms_options: list[int] = Field(
+        default_factory=lambda: [50, 500],
+        min_length=1,
+        max_length=6,
+        description="Settle times to measure at, in ms. Two or more separate creep from backlash.",
+    )
+
+
+class LockApproachSample(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    from_below: bool
+    settle_ms: int
+    offset_v: Optional[float] = None
+    detected_voltage: Optional[float] = None
+    detail: str = ""
+
+
+class LockApproachProbeResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_voltage: float
+    start_voltage: float
+    capture_tolerance_v: float
+    samples: list[LockApproachSample]
+    verdict: LockApproachVerdict
+    detail: str
+
+
 class AutoLockScanResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target_index: int
@@ -159,7 +290,13 @@ class AutoLockScanResult(BaseModel):
     monitor_level: Optional[float] = None
     hz_per_v: Optional[float] = None
     sideband_offset_v: Optional[float] = None
+    # PDH discriminator slope at the carrier crossing, plot units per MHz.
+    # AutoLockScanResult.to_dict() always emits this key, and the model forbids
+    # extras, so leaving it undeclared made every successful auto_lock_scan fail
+    # response validation with a 500 -- after the lock had already started.
+    discriminator_slope_v_per_mhz: Optional[float] = None
     detail: Optional[str] = None
+    approach: Optional[LockApproachReport] = None
 
 
 class AutoLockCalibrateRequest(BaseModel):

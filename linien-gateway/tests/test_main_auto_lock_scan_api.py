@@ -276,3 +276,113 @@ def test_calibrate_endpoint_maps_runtime_error(monkeypatch):
     )
     assert response.status_code == 409
     assert "No unlocked trace available" in response.text
+
+
+def test_the_real_engine_payload_passes_response_validation(monkeypatch):
+    """Guard the response_model against the engine's actual dict.
+
+    The other tests in this module hand-write the response body, so a key the
+    engine emits but the schema does not declare slips through them -- and
+    extra='forbid' turns that into a 500 *after* the lock has been started.
+    """
+    from app.auto_lock_scan import AutoLockScanResult as EngineResult
+
+    engine_result = EngineResult(
+        target_index=1024,
+        target_voltage=0.2,
+        target_slope_rising=True,
+        score=0.9,
+        left_excursion=0.15,
+        right_excursion=0.16,
+        pair_excursion=0.31,
+        symmetry=0.91,
+        monitor_level=None,
+        hz_per_v=2.0e6,
+        sideband_offset_v=0.1,
+        discriminator_slope_v_per_mhz=0.5,
+    )
+
+    class EngineSession(DummyAutoLockSession):
+        def auto_lock_from_scan(self, payload):
+            self.last_payload = payload
+            body = engine_result.to_dict()
+            body["detail"] = "Auto-lock started from scan."
+            return body
+
+    session = EngineSession()
+    device = type(
+        "Device", (), {"key": "test-device", "name": "test-device", "parameters": {}}
+    )()
+    monkeypatch.setattr(main.device_store, "get_device", lambda _key: device)
+    monkeypatch.setattr(main.device_store, "save_device", lambda _device: None)
+    monkeypatch.setattr(main.device_config_store, "set_config", lambda *_a, **_k: {})
+    monkeypatch.setattr(main, "_session_for_device", lambda _device: session)
+    monkeypatch.setattr(
+        main.lock_result_postgres, "enqueue_lock_result", lambda _row: True
+    )
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/devices/test-device/control/auto_lock_scan",
+        json=main.AutoLockScanSettings().model_dump(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["discriminator_slope_v_per_mhz"] == 0.5
+
+
+def test_a_guarded_move_report_survives_response_validation(monkeypatch):
+    """The approach block is built as a plain dict in session.py; it has to
+    match LockApproachReport field-for-field or the same 500 returns."""
+    from app.session import DeviceSession
+
+    report = DeviceSession._approach_report(
+        enabled=True,
+        accepted=True,
+        target_v=0.2,
+        commanded_v=0.23,
+        start_center_v=-0.3,
+        offset_v=0.002,
+        tolerance_v=0.01,
+        bound_v=0.08,
+        attempts=[
+            {
+                "attempt": 1,
+                "from_below": True,
+                "direct": True,
+                "set_points": 1,
+                "commanded_voltage": 0.2,
+                "detected_voltage": 0.23,
+                "offset_v": 0.03,
+                "accepted": False,
+                "detail": "off by +0.0300 V",
+            }
+        ],
+    )
+
+    class ApproachSession(DummyAutoLockSession):
+        def auto_lock_from_scan(self, payload):
+            body = super().auto_lock_from_scan(payload)
+            body["approach"] = report
+            return body
+
+    session = ApproachSession()
+    device = type(
+        "Device", (), {"key": "test-device", "name": "test-device", "parameters": {}}
+    )()
+    monkeypatch.setattr(main.device_store, "get_device", lambda _key: device)
+    monkeypatch.setattr(main.device_store, "save_device", lambda _device: None)
+    monkeypatch.setattr(main.device_config_store, "set_config", lambda *_a, **_k: {})
+    monkeypatch.setattr(main, "_session_for_device", lambda _device: session)
+    monkeypatch.setattr(
+        main.lock_result_postgres, "enqueue_lock_result", lambda _row: True
+    )
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/devices/test-device/control/auto_lock_scan",
+        json=main.AutoLockScanSettings().model_dump(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["approach"]["center_move_v"] == 0.53

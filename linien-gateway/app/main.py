@@ -31,6 +31,7 @@ from .config import (
 from .device_config_store import (
     CONFIG_AUTO_LOCK_SCAN,
     CONFIG_AUTO_RELOCK,
+    CONFIG_LOCK_APPROACH,
     CONFIG_LOCK_INDICATOR,
     DeviceConfigStore,
 )
@@ -57,6 +58,9 @@ from .schemas import (
     AutoLockCalibrationResult,
     AutoLockScanResult,
     AutoLockScanSettings,
+    LockApproachProbeRequest,
+    LockApproachProbeResult,
+    LockApproachSettings,
     AutoRelockConfig,
     AutoRelockEnabledUpdate,
     AutoRelockState,
@@ -545,6 +549,7 @@ def _seed_config_store_from_device(device: Device) -> None:
         CONFIG_AUTO_LOCK_SCAN,
         CONFIG_LOCK_INDICATOR,
         CONFIG_AUTO_RELOCK,
+        CONFIG_LOCK_APPROACH,
     ):
         if config_name in existing:
             continue
@@ -569,6 +574,8 @@ def _normalize_config_payload(config_name: str, value: dict) -> dict:
         return AutoLockScanSettings.model_validate(value).model_dump()
     if config_name == CONFIG_AUTO_RELOCK:
         return AutoRelockConfig.model_validate(value).model_dump()
+    if config_name == CONFIG_LOCK_APPROACH:
+        return LockApproachSettings.model_validate(value).model_dump()
     raise HTTPException(status_code=422, detail=f"Unknown config name: {config_name}")
 
 
@@ -655,6 +662,11 @@ def update_device(key: str, payload: DevicePatch) -> DeviceOut:
 @app.delete("/api/devices/{key}")
 def delete_device(key: str) -> dict:
     device = _get_device_or_404(key)
+    existing = session_registry.get(key)
+    if existing is not None:
+        # Outside the key lock: a guarded center move takes seconds, and every
+        # other request for this device would queue behind it.
+        existing.await_relock_action()
     with session_registry.lock_for(key):
         session = session_registry.remove(key)
         if session is not None:
@@ -727,6 +739,7 @@ def connect_device(key: str) -> dict:
 @app.post("/api/devices/{key}/disconnect")
 def disconnect_device(key: str) -> dict:
     session = _get_session(key)
+    session.await_relock_action()
     with session_registry.lock_for(key):
         try:
             session.disconnect()
@@ -1119,6 +1132,37 @@ def auto_lock_candidates(key: str, payload: AutoLockScanSettings | None = None) 
     return {"found": True, "candidate": candidate, "reason": None}
 
 
+def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:
+    """Board-event payload for a started auto-lock.
+
+    Includes the guarded-move numbers when one ran, so how far the center
+    travelled and how much hysteresis correction it needed are on the per-device
+    record rather than only in the HTTP response.
+    """
+    details: dict[str, Any] = {
+        "target_voltage": result.get("target_voltage"),
+        "target_index": result.get("target_index"),
+        "score": result.get("score"),
+    }
+    details.update(_approach_event_details(result.get("approach")))
+    return details
+
+
+def _approach_event_details(approach: Any) -> dict[str, Any]:
+    """The guarded-move numbers, for either a started or an aborted auto-lock."""
+    if not isinstance(approach, dict):
+        return {}
+    attempts = approach.get("attempts") or []
+    return {
+        "center_move_v": approach.get("center_move_v"),
+        "center_correction_v": approach.get("center_correction_v"),
+        "center_offset_v": approach.get("center_offset_v"),
+        "capture_tolerance_v": approach.get("capture_tolerance_v"),
+        "approach_attempts": len(attempts),
+        "approach_from_below": attempts[-1].get("from_below") if attempts else None,
+    }
+
+
 @app.post(
     "/api/devices/{key}/control/auto_lock_scan",
     response_model=AutoLockScanResult,
@@ -1139,13 +1183,18 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
     try:
         result = session.auto_lock_from_scan(settings_payload)
     except RuntimeError as exc:
+        report = getattr(exc, "report", None)
+        details: dict[str, Any] = {"error": str(exc)}
+        if isinstance(report, dict):
+            details.update(_approach_event_details(report))
+            _enqueue_auto_lock_row(session, key, success=False, approach=report)
         _emit_log(
             level=logging.ERROR,
             source="auto_lock_scan",
             code="auto_lock_scan_failed",
             message="Auto-lock from scan failed.",
             device_key=key,
-            details={"error": str(exc)},
+            details=details,
         )
         raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
@@ -1164,12 +1213,25 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
         code="auto_lock_scan_started",
         message="Auto-lock from scan started.",
         device_key=key,
-        details={
-            "target_voltage": result.get("target_voltage"),
-            "target_index": result.get("target_index"),
-            "score": result.get("score"),
-        },
+        details=_auto_lock_event_details(result),
     )
+    _enqueue_auto_lock_row(session, key, success=True, approach=result.get("approach"))
+    return result
+
+
+def _enqueue_auto_lock_row(
+    session: Any,
+    key: str,
+    *,
+    success: bool,
+    approach: Any = None,
+) -> None:
+    """Record an auto-lock attempt in postgres, successful or not.
+
+    Aborted attempts are written too: they carry the largest measured offsets,
+    so leaving them out would keep the most informative rows out of the very
+    table you would characterise a laser's hysteresis from.
+    """
     try:
         device = device_store.get_device(key)
         device_name = device.name if device is not None else key
@@ -1177,6 +1239,8 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
             device_name=device_name,
             device_key=key,
             lock_source="auto_lock_scan",
+            success=success,
+            approach=approach if isinstance(approach, dict) else None,
         )
         enqueued = lock_result_postgres.enqueue_lock_result(row)
         if not enqueued:
@@ -1215,7 +1279,6 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
             device_key=key,
             details={"error": str(exc)},
         )
-    return result
 
 
 @app.post(
@@ -1303,6 +1366,58 @@ def update_auto_lock_scan_settings(key: str, payload: AutoLockScanSettings) -> d
     _persist_config_block(device, CONFIG_AUTO_LOCK_SCAN, settings_payload)
     _publish_config_update(device.key, CONFIG_AUTO_LOCK_SCAN, settings_payload)
     return settings_payload
+
+
+@app.get(
+    "/api/devices/{key}/lock-approach-settings", response_model=LockApproachSettings
+)
+def get_lock_approach_settings(key: str) -> dict:
+    session = _get_session(key)
+    return session.get_lock_approach_settings()
+
+
+@app.put(
+    "/api/devices/{key}/lock-approach-settings", response_model=LockApproachSettings
+)
+def update_lock_approach_settings(key: str, payload: LockApproachSettings) -> dict:
+    device = _get_device_or_404(key)
+    session = _session_for_device(device)
+    settings_payload = session.update_lock_approach_settings(payload.model_dump())
+    _persist_config_block(device, CONFIG_LOCK_APPROACH, settings_payload)
+    _publish_config_update(device.key, CONFIG_LOCK_APPROACH, settings_payload)
+    return settings_payload
+
+
+@app.post(
+    "/api/devices/{key}/control/lock_approach/measure",
+    response_model=LockApproachProbeResult,
+)
+def measure_lock_approach(key: str, payload: LockApproachProbeRequest) -> dict:
+    """Measure the actuator displacement from each direction, without locking.
+
+    This is how approach_offset_v and settle_ms get set from data: the verdict
+    says whether the board shows backlash, creep, or neither.
+    """
+    session = _get_session(key)
+    try:
+        result = session.measure_lock_approach(payload.settle_ms_options)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    _emit_log(
+        level=logging.INFO,
+        source="auto_lock_scan",
+        code="lock_approach_measured",
+        message="Lock approach measured.",
+        device_key=key,
+        details={
+            "verdict": result.get("verdict"),
+            "detail": result.get("detail"),
+            "capture_tolerance_v": result.get("capture_tolerance_v"),
+        },
+    )
+    return result
 
 
 @app.get("/api/devices/{key}/auto-relock", response_model=AutoRelockState)
