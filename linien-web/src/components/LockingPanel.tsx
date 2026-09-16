@@ -421,6 +421,14 @@ export const LockingPanel = memo(function LockingPanel({
                 />
               </Group>
             ) : null}
+            {deviceKey ? (
+              <LockApproachPanel
+                deviceKey={deviceKey}
+                halfRangeSweepV={autoLockSettings.half_range_sweep_v}
+                active={mode === 'autolock_scan'}
+                settingsFromStream={lockApproachSettings}
+              />
+            ) : null}
             <Button
               variant="light"
               color="blue"
@@ -458,14 +466,6 @@ export const LockingPanel = memo(function LockingPanel({
                     )} V of ${autoLockResult.approach.capture_tolerance_v.toFixed(4)} V`
                   : ''}
               </Text>
-            ) : null}
-            {deviceKey ? (
-              <LockApproachPanel
-                deviceKey={deviceKey}
-                halfRangeSweepV={autoLockSettings.half_range_sweep_v}
-                active={mode === 'autolock_scan'}
-                settingsFromStream={lockApproachSettings}
-              />
             ) : null}
           </Stack>
         </Tabs.Panel>
