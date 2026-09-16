@@ -27,6 +27,7 @@ import {
   getXBuffer,
   padYRange,
   refreshThemeCache,
+  sweepIndexToVoltage,
   toFinite,
   toRgba,
   writeSeriesInto,
@@ -172,10 +173,14 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
       if (inputs.lockAxis) {
         return ticks.map((v) => (v * dtMicroSeconds).toFixed(1));
       }
-      const min = inputs.sweepCenterValue - inputs.sweepAmplitudeValue;
-      const max = inputs.sweepCenterValue + inputs.sweepAmplitudeValue;
-      const spacing = (max - min) / (Math.max(inputs.pointCount, 2) - 1);
-      return ticks.map((v) => (min + v * spacing).toFixed(2));
+      return ticks.map((v) =>
+        sweepIndexToVoltage(
+          v,
+          inputs.pointCount,
+          inputs.sweepCenterValue,
+          inputs.sweepAmplitudeValue
+        ).toFixed(2)
+      );
     };
   }, []);
 
@@ -187,10 +192,12 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
       if (inputs.lockAxis) {
         return `${(val * dtMicroSeconds).toFixed(2)} us`;
       }
-      const min = inputs.sweepCenterValue - inputs.sweepAmplitudeValue;
-      const max = inputs.sweepCenterValue + inputs.sweepAmplitudeValue;
-      const spacing = (max - min) / (Math.max(inputs.pointCount, 2) - 1);
-      return `${(min + val * spacing).toFixed(3)} V`;
+      return `${sweepIndexToVoltage(
+        val,
+        inputs.pointCount,
+        inputs.sweepCenterValue,
+        inputs.sweepAmplitudeValue
+      ).toFixed(3)} V`;
     };
   }, []);
 
