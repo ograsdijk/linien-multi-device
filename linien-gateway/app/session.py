@@ -126,6 +126,38 @@ class TrajectoryRefinementAborted(RuntimeError):
         super().__init__(message)
         self.refinement = refinement
 
+    @property
+    def failure_kind(self) -> str:
+        """Which kind of failure ended the walk, for callers and operators.
+
+        ``"identity"`` means a changed slope or sideband spacing -- the walk
+        lost the feature and was tracking a different crossing, which is the
+        failure this machinery exists to catch. ``"position"`` means the same
+        feature simply would not hold still long enough to be verified, which
+        points at drift or settle time, not at the detector. ``"other"`` is
+        anything else (no fresh sweep, a lost connection).
+        """
+        return str(self.refinement.get("failure_kind", "other"))
+
+
+class _TrackingIdentityChanged(ValueError):
+    """The tracked candidate is no longer the feature refinement started on."""
+
+
+# Samples per calibrated feature half-width that refinement aims for when it
+# has to narrow a scan. NOT a detector requirement: find_auto_lock_target needs
+# only two points either side of the crossing (see _half_range_to_points and the
+# candidate loop in auto_lock_scan). This is a target for the narrowing walk to
+# stop at, and nothing may use it to reject a detection the detector accepted.
+_STRICT_DETECTOR_SAMPLES = 10.0
+# Scan-width reduction per refinement stage. Gradual on purpose: this actuator's
+# apparent feature position moves with scan geometry, so a large jump changes
+# the thing being tracked more than it improves the resolution of it.
+_REFINEMENT_NARROW_FACTOR = 0.75
+# Stages before refinement gives up. Each stage costs several sweeps, and a
+# feature that has not resolved in this many is not going to.
+_MAX_REFINEMENT_STAGES = 8
+
 # How long a disconnect waits for an in-flight relock action to finish before
 # going ahead anyway. A guarded center move takes seconds; abandoning one
 # mid-ramp leaves the sweep center on an arbitrary set-point.
@@ -3282,6 +3314,7 @@ class DeviceSession:
     def _trajectory_refine_auto_lock(
         self,
         settings: AutoLockScanSettings,
+        approach: ApproachSettings,
         start_center_v: float,
         start_amplitude_v: float,
         *,
@@ -3289,22 +3322,26 @@ class DeviceSession:
         initial_center_v: float,
         initial_amplitude_v: float,
         initial_resolution: float,
+        initial_detector: str = "coarse",
         trace_length: int,
     ) -> tuple[Any, dict[str, Any]]:
         """Track an under-resolved feature through gradual scan changes.
 
         The actuator's apparent carrier position may change with scan trajectory,
         so each stage throws away its predecessor's voltage and redetects on a
-        newly acquired trace. A failed tracking run restores both axes. The
-        caller has already produced a successful strict detection -- that is
-        the only way to reach this method -- so refinement starts from it
-        instead of repeating the same detection a second time.
+        newly acquired trace. A failed tracking run restores both axes.
+
+        Reached only when the strict detector REJECTED the live trace, so the
+        seed is normally a coarse candidate (``initial_detector="coarse"``) and
+        the loop narrows until strict agrees. Refinement exists to rescue a scan
+        that cannot be locked as it stands; it must never be handed a strict
+        detection that already succeeded, because it can only discard it.
         """
         stages: list[dict[str, Any]] = []
         target, center_v, amplitude_v, resolution = (
             initial_target, initial_center_v, initial_amplitude_v, initial_resolution
         )
-        detector = "strict"
+        detector = str(initial_detector)
         coarse_metrics: dict[str, Any] | None = None
         try:
             stages.append({
@@ -3318,31 +3355,46 @@ class DeviceSession:
             def _check_identity(candidate: Any) -> None:
                 nonlocal identity_sideband
                 if candidate.target_slope_rising != identity_slope:
-                    raise ValueError("Tracking candidate changed discriminator slope identity.")
+                    raise _TrackingIdentityChanged(
+                        "Tracking candidate changed discriminator slope identity."
+                    )
                 if identity_sideband is not None and candidate.sideband_offset_v is not None:
                     # Sideband spacing should survive geometry changes. Allow a
                     # generous 35% while the wide trace is under-resolved.
                     if abs(candidate.sideband_offset_v - identity_sideband) > max(
                         0.35 * identity_sideband, 2.0 * abs(amplitude_v) / trace_length
                     ):
-                        raise ValueError("Tracking candidate changed PDH sideband identity.")
+                        raise _TrackingIdentityChanged(
+                            "Tracking candidate changed PDH sideband identity."
+                        )
                 elif candidate.sideband_offset_v is not None:
                     # Wide coarse scans may not resolve ±Ω. Once a later scan
                     # does, make that spacing part of the identity thereafter.
                     identity_sideband = candidate.sideband_offset_v
 
-            # Narrow in <=25% reductions. A coarse-only detection gets one or
-            # more increasingly resolved attempts even if calibration predicts
-            # enough samples: it may have failed a strict shape/SNR gate.
+            # Narrow in <=25% reductions until the STRICT detector accepts a
+            # trace -- that, not a sample count, is the thing refinement is
+            # trying to obtain, and it is the only exit that can start a lock.
+            # Narrowing further once strict agrees would spend sweeps (and,
+            # on a feature that moves with geometry, accuracy) for nothing.
             # Centre moves are intentionally separate;
             # they are known to perturb this DFB's apparent feature position.
             narrow_count = 0
-            while resolution < 10.0 or detector == "coarse":
-                if narrow_count >= 8:
-                    raise ValueError("No strict candidate after eight trajectory refinement stages.")
-                target_amplitude = float(settings.half_range_sweep_v) * (trace_length - 1) / (2.0 * 10.0)
-                next_amplitude = amplitude_v * 0.75
-                if resolution < 10.0:
+            while detector == "coarse":
+                if narrow_count >= _MAX_REFINEMENT_STAGES:
+                    raise ValueError(
+                        f"No strict candidate after {_MAX_REFINEMENT_STAGES} "
+                        "trajectory refinement stages."
+                    )
+                # Floor the walk at the amplitude that gives the detector the
+                # sample count it needs; there is no point narrowing past it.
+                target_amplitude = (
+                    float(settings.half_range_sweep_v)
+                    * (trace_length - 1)
+                    / (2.0 * _STRICT_DETECTOR_SAMPLES)
+                )
+                next_amplitude = amplitude_v * _REFINEMENT_NARROW_FACTOR
+                if resolution < _STRICT_DETECTOR_SAMPLES:
                     # Stop precisely at the requested resolution where possible.
                     next_amplitude = max(target_amplitude, next_amplitude)
                 next_amplitude = min(amplitude_v, next_amplitude)
@@ -3427,14 +3479,41 @@ class DeviceSession:
                 settings, after=verify_after
             )
             _check_identity(strict_two)
-            tolerance = max(float(settings.half_range_sweep_v) * 0.5, 2.0 * abs(amplitude_v) / max(1, trace_length - 1))
-            if (
-                abs(strict_one.target_voltage - strict_two.target_voltage) > tolerance
-                or abs(verify_center - center_v) > 1e-6
-                or abs(verify_amplitude - amplitude_v) > 1e-6
-                or strict_one.target_slope_rising != strict_two.target_slope_rising
-            ):
-                raise ValueError("Final strict detections were not consistent at unchanged scan geometry.")
+            # One definition of "the feature moved too far", shared with the
+            # guarded move, rather than a second inline literal that silently
+            # diverges from capture_fraction the moment anyone changes it.
+            # Floored at one sample: nothing can be resolved finer than that.
+            window = acceptance_window_v(
+                approach, settings.half_range_sweep_v, strict_two.sideband_offset_v
+            )
+            tolerance = max(
+                window.tolerance_v, 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
+            )
+            # Four distinct failures. They used to share one message with no
+            # numbers in it, which says nothing about which one fired.
+            if abs(verify_center - center_v) > 1e-6:
+                raise ValueError(
+                    f"Sweep center moved between the two final detections: "
+                    f"{center_v:.6f} V then {verify_center:.6f} V."
+                )
+            if abs(verify_amplitude - amplitude_v) > 1e-6:
+                raise ValueError(
+                    f"Sweep amplitude moved between the two final detections: "
+                    f"{amplitude_v:.6f} V then {verify_amplitude:.6f} V."
+                )
+            if strict_one.target_slope_rising != strict_two.target_slope_rising:
+                raise _TrackingIdentityChanged(
+                    "The two final detections disagreed on the discriminator slope."
+                )
+            drift_v = abs(strict_one.target_voltage - strict_two.target_voltage)
+            if drift_v > tolerance:
+                raise ValueError(
+                    f"The two final detections were {drift_v * 1e3:.3f} mV apart, "
+                    f"outside the {tolerance * 1e3:.3f} mV acceptance window "
+                    f"(capture_fraction {float(approach.capture_fraction):g} x feature "
+                    f"half-width {float(settings.half_range_sweep_v) * 1e3:.3f} mV). "
+                    "The feature is moving faster than the scan can be verified."
+                )
             stages.append({
                 "kind": "final_verify", "center_v": center_v, "amplitude_v": amplitude_v,
                 "target_voltage": strict_two.target_voltage, "resolution_samples": resolution,
@@ -3461,6 +3540,13 @@ class DeviceSession:
                 "stages": stages,
                 "restored": restored,
                 "failure": str(exc),
+                "failure_kind": (
+                    "identity"
+                    if isinstance(exc, _TrackingIdentityChanged)
+                    else "position"
+                    if isinstance(exc, ValueError)
+                    else "other"
+                ),
             }
             raise TrajectoryRefinementAborted(
                 f"Trajectory-aware auto-lock refinement failed: {exc} "
@@ -3524,37 +3610,48 @@ class DeviceSession:
             sweep_center, sweep_amplitude, _preferred_slope_rising, _modulation_frequency_hz = (
                 self._snapshot_sweep_params(require_unlocked=True)
             )
-            # Preserve the fast, historical path when the calibration says this
-            # trace resolves the feature and the strict detector accepts it. A
-            # strict rejection here fails fast (422): calibration explicitly
-            # rejected this trace, so there is no detection to refine from.
+            # A strict detection is authoritative: if the calibrated detector
+            # accepts this trace, lock on it. Refinement used to run whenever
+            # the sample count was below a hardcoded 10, which meant it could
+            # only ever discard a target the detector had just accepted -- and
+            # on a feature that moves with scan geometry, its own verification
+            # then refused the lock outright.
             error_trace, monitor_trace = self._snapshot_auto_lock_traces()
-            direct, direct_center, direct_amplitude, resolution = (
-                self._capture_auto_lock_target(
-                    settings, traces=(error_trace, monitor_trace)
+            try:
+                direct, _center, _amplitude, _resolution = (
+                    self._capture_auto_lock_target(
+                        settings, traces=(error_trace, monitor_trace)
+                    )
                 )
-            )
-            # A dead trace cannot be a real direct detection. This branch keeps
-            # deterministic controller test doubles (which replace the detector)
-            # on the historical path without weakening a physical scan.
-            simulated_direct = float(np.ptp(error_trace)) < float(settings.min_amplitude)
-            if resolution >= 10.0 or simulated_direct:
-                result = direct
-            else:
+            except ValueError as strict_error:
+                # The detector REJECTED this trace -- the case refinement was
+                # written for. Seed the walk with a coarse candidate and narrow
+                # until strict agrees. A RuntimeError (no trace, already locked)
+                # is not a detection problem and still propagates.
+                coarse, coarse_center, coarse_amplitude, coarse_resolution, _metrics = (
+                    self._coarse_auto_lock_target(settings)
+                )
                 try:
                     result, refinement = self._trajectory_refine_auto_lock(
                         settings,
+                        approach,
                         sweep_center,
                         sweep_amplitude,
-                        initial_target=direct,
-                        initial_center_v=direct_center,
-                        initial_amplitude_v=direct_amplitude,
-                        initial_resolution=resolution,
+                        initial_target=coarse,
+                        initial_center_v=coarse_center,
+                        initial_amplitude_v=coarse_amplitude,
+                        initial_resolution=coarse_resolution,
+                        initial_detector="coarse",
                         trace_length=len(error_trace),
                     )
-                except Exception:
-                    # _trajectory_refine_auto_lock already restores both axes.
+                except TrajectoryRefinementAborted as refine_error:
+                    # Nothing to fall back to: the strict detector never
+                    # accepted anything. Report the original rejection, which is
+                    # what the operator has to act on, with the walk's history.
+                    refine_error.refinement["strict_rejection"] = str(strict_error)
                     raise
+            else:
+                result = direct
             try:
                 # The refinement final verification leaves geometry untouched;
                 # guarded handover therefore starts from the exact verified scan.
