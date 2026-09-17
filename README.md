@@ -509,10 +509,10 @@ Line-based TCP on port **18864**, one request per (short-lived) connection:
 ```text
 ->  STATUS\n      <-  RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216
                           memavail=311044 uptime=690.2 rootfree=1204880
-                          v5=4.987\n
+                          vccaux=1.802\n
                           (one line; wrapped here to fit)
                   <-  RPT1 ERR XADC\n       sysfs read failed
-->  VERSION\n     <-  RPT1 VERSION 1.3.0\n
+->  VERSION\n     <-  RPT1 VERSION 1.4.0\n
 ->  anything else <-  RPT1 ERR COMMAND\n
 ```
 
@@ -526,7 +526,7 @@ follows it is an optional tail of `key=value` host metrics, added in 1.2.0:
 | `memtotal`, `memavail` | kB; `memavail` is the kernel's MemAvailable (MemFree on kernels too old to have it) |
 | `uptime` | seconds since boot |
 | `rootfree` | free kB on the root filesystem (the SD card) |
-| `v5` | board +5 V supply in volts, from the XADC VP/VN pair (1.3.0+); see below |
+| `vccaux` | FPGA auxiliary rail in volts, nominally 1.8 V, from the PS XADC (1.4.0+); see below |
 
 Each key is independently optional — a metric the board could not read is left
 out rather than sent as zero — and a reader must ignore keys it does not know.
@@ -683,18 +683,20 @@ Each device card shows, under the host/IP:
 Laser A
 192.168.1.42:18862
 RP temperature: 57.3 °C
-CPU 4% · RAM 41% · disk 1.1 GB · 5V 4.98 V · up 3d 4h
+CPU 4% · RAM 41% · disk 1.1 GB · VCCAUX 1.80 V · up 3d 4h
 ```
 
 The second line is the board's own health, sampled on the same request as the
 temperature and therefore withdrawn with it the moment the reading goes stale.
 `CPU` is the busy fraction between the gateway's last two polls, not an instant.
 Memory turns amber above 90 % used and red above 97 %; free disk turns amber
-below 200 MB and red below 50 MB. `5V` is the board's supply as measured by the
-XADC (daemon 1.3.0+). It is shown without any colour threshold and is meant for
-comparing boards, not for judging them. At one sample per poll it cannot catch
-brief droops. Boards running a telemetry daemon older than 1.2.0 report no
-metrics and show only the temperature line; 1.2.0 boards show no `5V`.
+below 200 MB and red below 50 MB. `VCCAUX` is the board's FPGA auxiliary rail,
+nominally 1.8 V, as measured by the XADC (daemon 1.4.0+). It is shown without
+any colour threshold and is meant for comparing boards, not for judging them.
+It is a regulated output rather than the board's 5 V input, and at one sample
+per poll it cannot catch brief droops. Boards running a telemetry daemon older
+than 1.2.0 report no metrics and show only the temperature line; boards older
+than 1.4.0 show no `VCCAUX`.
 
 and when it is unavailable, the reason plus a one-click remedy:
 
@@ -721,7 +723,7 @@ the Red Pitaya makes no extra HTTP/TLS request.
 - Alongside it, the board's host metrics from the same sample:
   **`rp_cpu_percent`**, **`rp_load1`**, **`rp_mem_used_percent`**,
   **`rp_mem_available_kb`**, **`rp_root_free_kb`**, **`rp_uptime_s`** and
-  **`rp_supply_voltage_v`** (daemon 1.3.0+) — one
+  **`rp_vccaux_v`** (daemon 1.4.0+) — one
   point per device per cycle, not one per metric. A metric the board did not
   report is **absent** from the point rather than written as zero: a gap in the
   series is the truth, a zero is a measurement that never happened. Boards

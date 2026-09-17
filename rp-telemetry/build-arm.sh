@@ -109,6 +109,31 @@ esac
 
 cp "${here}/build/rp-telemetry-armv7" "${bundle_dir}/rp-telemetry-armv7"
 
+# Record what went into the bundled binary. CI compares the source hash here
+# against the working tree, which is what catches a daemon edit that was never
+# followed by a rebuild -- the version string alone cannot, since editing the
+# C file without bumping RPT_VERSION leaves it unchanged. Backend-agnostic on
+# purpose: it records the inputs, not the compiler's output, so a Docker build
+# and a zig build of the same source both satisfy it.
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+version="$(sed -n 's/^#define RPT_VERSION "\([^"]*\)".*/\1/p' "${here}/src/rp_telemetry.c")"
+
+cat >"${here}/build-stamp.txt" <<STAMP
+# Written by build-arm.sh. Do not edit by hand -- rerun the script instead.
+# source_sha256 is the hash of src/rp_telemetry.c as it was when the bundled
+# binary in linien-gateway/app/assets/ was built.
+version=${version}
+source_sha256=$(sha256 "${here}/src/rp_telemetry.c")
+backend=${backend}
+STAMP
+
 echo
 echo "Backend: ${backend}"
 echo "Built: ${here}/build/rp-telemetry-armv7"

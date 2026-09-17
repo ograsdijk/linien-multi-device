@@ -17,10 +17,10 @@ See the repo README section **Red Pitaya telemetry** for the gateway/UI side.
 ```text
 ->  STATUS\n      <-  RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216
                           memavail=311044 uptime=690.2 rootfree=1204880
-                          v5=4.987\n
+                          vccaux=1.802\n
                           (one line; wrapped here to fit)
                   <-  RPT1 ERR XADC\n       sysfs read failed
-->  VERSION\n     <-  RPT1 VERSION 1.3.0\n
+->  VERSION\n     <-  RPT1 VERSION 1.4.0\n
 ->  anything else <-  RPT1 ERR COMMAND\n
 ```
 
@@ -34,7 +34,7 @@ follows it is an optional tail of `key=value` host metrics, added in 1.2.0:
 | `memtotal`, `memavail` | kB; `memavail` is the kernel's MemAvailable (MemFree on kernels too old to have it) |
 | `uptime` | seconds since boot |
 | `rootfree` | free kB on the root filesystem (the SD card) |
-| `v5` | board +5 V supply in volts, from the XADC VP/VN pair (1.3.0+); see below |
+| `vccaux` | FPGA auxiliary rail in volts, nominally 1.8 V, from the PS XADC (1.4.0+); see below |
 
 Each key is independently optional — a metric the board could not read is left
 out rather than sent as zero — and a reader must ignore keys it does not know.
@@ -137,32 +137,58 @@ gateway uploads the binary over SSH, installs it atomically at
 `/usr/local/bin/rp-telemetry`, writes `rp-telemetry.service`, enables it at
 boot, starts it, and verifies the protocol answers.
 
-## Supply voltage (`v5`)
+## Rail voltage (`vccaux`)
 
-On the Gen 1 STEMlab 125-14 the +5 V input is wired to the XADC's dedicated
-VP/VN pair through a 56.0 kΩ / 4.99 kΩ divider. The daemon reads
-`in_voltage8_vpvn_raw` and `in_voltage8_vpvn_scale` from **the same PS XADC
-directory it already chose for the temperature**. It never scans other devices
-for the channel, so the PS-only rule below applies unchanged. The scale is
-mV per LSB (1000 / 4096 on the kernel's xilinx-xadc driver) and is read once
-at discovery; the raw value is read per request.
+The daemon reports the FPGA auxiliary rail, nominally 1.8 V, from **the same PS
+XADC directory it already chose for the temperature**. It never scans other
+devices for the channel, so the PS-only rule below applies unchanged. The scale
+is mV per LSB and is read once at discovery; the raw value is read per request.
 
 ```text
-v5 = raw * scale / 1000 * (56000 + 4990) / 4990      (~ raw * 0.002984 V)
+vccaux = raw * scale / 1000        (no divider: an internal rail is direct)
 ```
 
-If the channel is missing, or a value falls outside 3.0–6.5 V (a garbled read,
-not a health judgement), `v5` is simply omitted. One sample per STATUS request
-(~30 s) shows static or slowly drifting supply levels and differences between
-boards, ports and cables. It **cannot** see millisecond brownouts, so a steady
-reading does not rule out a transient droop.
+The channel is matched by **name suffix** (`*_vccaux_raw`), not by a fixed
+index — see "Why not the 5 V input" below for why that matters. If the channel
+is missing, or a value falls outside 0.5–3.0 V (a garbled read, not a health
+judgement), `vccaux` is simply omitted.
 
-To check a board by hand:
+What it is worth: `vccaux` is a *regulated output*, so a 5 V input that sags a
+little is hidden by the regulator, and one sample per STATUS request (~30 s)
+shows only slow drift and differences between boards. It **cannot** see
+millisecond brownouts, so a steady reading does not rule out a transient droop.
+
+To check a board by hand — note the explicit device, never a glob:
 
 ```bash
-grep -H . /sys/bus/iio/devices/iio:device*/in_voltage8_vpvn_*
-readlink -f /sys/bus/iio/devices/iio:device*   # use only the f8007100 one
+# Confirm which device is the PS XADC first (safe: resolves a symlink only).
+readlink /sys/bus/iio/devices/iio:device0
+# Then read only that one.
+cat /sys/bus/iio/devices/iio:device0/in_voltage1_vccaux_{raw,scale}
 ```
+
+> **Never `cat` or `grep` across `/sys/bus/iio/devices/*/`.** The glob includes
+> the FPGA-backed device, and reading it hangs the AXI bus and reboots the
+> board. Listing with `ls` is safe; reading is not.
+
+## Why not the 5 V input
+
+Version 1.3.0 tried to report the board's +5 V input, which on the Gen 1
+STEMlab 125-14 reaches the XADC's VP/VN pair through a 56.0 kΩ / 4.99 kΩ
+divider. It reported nothing on every board, for two independent reasons:
+
+1. The kernel's `xilinx-xadc` driver declares VP/VN with no name suffix, so the
+   attribute would be `in_voltage8_raw` — the `in_voltage8_vpvn_raw` the daemon
+   looked for cannot exist.
+2. More fundamentally, the PS XADC exposes **only** the internal rails
+   (`vccint`, `vccaux`, `vccbram`, `vccpint`, `vccpaux`, `vccoddr`, `vrefp`,
+   `vrefn`) plus temperature. External channels are created only when the
+   devicetree declares an `xlnx,channels` node, and these images declare none.
+
+The external channels do appear on the PL XADC wizard — the device that reboots
+the board when read. Exposing VP/VN safely would need a devicetree change in
+each board's boot partition, redone after every image update. Not worth it; see
+TROUBLESHOOTING.md.
 
 ## Which XADC it reads
 

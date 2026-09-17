@@ -94,11 +94,59 @@ cat /sys/devices/soc0/axi/f8007100.adc/iio:device*/in_temp0_raw
 `linien-server` is running. That is the thing that reboots the board, and it will
 do it from the shell just as readily as from the daemon.
 
+> This bites hardest through a **glob**. `grep . /sys/bus/iio/devices/*/in_*`
+> looks harmless and reboots the board instantly, because the wildcard includes
+> the FPGA device. `ls` across the glob is fine — it only lists names. Reading
+> is not. Always name the device explicitly, and confirm which one it is with
+> `readlink` first.
+
 Check the deployed version:
 
 ```sh
-printf 'VERSION\n' | nc 127.0.0.1 18864     # expect: RPT1 VERSION 1.3.0
+printf 'VERSION\n' | nc 127.0.0.1 18864     # expect: RPT1 VERSION 1.4.0
 ```
 
 A board still answering `1.0.0` is running the unsafe discovery — reinstall it
 from the gateway's telemetry panel (Update).
+
+## `vccaux` is missing, or: why the +5 V input is not reported
+
+**Symptom.** A board runs 1.4.0 but the STATUS line carries no `vccaux`, and the
+journal says `no usable vccaux channel in ...`.
+
+**What the PS XADC actually exposes.** Only the internal rails and temperature:
+
+```
+in_temp0_raw
+in_voltage0_vccint_raw    in_voltage4_vccpaux_raw
+in_voltage1_vccaux_raw    in_voltage5_vccoddr_raw
+in_voltage2_vccbram_raw   in_voltage6_vrefp_raw
+in_voltage3_vccpint_raw   in_voltage7_vrefn_raw
+```
+
+If `*_vccaux_raw` is absent from the PS device the rail cannot be reported, and
+the daemon simply omits the key. List the device (listing is safe) to check:
+
+```sh
+readlink /sys/bus/iio/devices/iio:device0      # expect .../f8007100.adc/...
+ls /sys/bus/iio/devices/iio:device0 | grep raw
+```
+
+**Why not the board's +5 V input?** Version 1.3.0 tried exactly that, through
+the XADC's VP/VN pair, and reported nothing on every board:
+
+1. The kernel's `xilinx-xadc` driver declares VP/VN with **no name suffix**, so
+   the attribute would be `in_voltage8_raw`, never `in_voltage8_vpvn_raw`.
+2. External channels (VP/VN and VAUX) are created **only** when the devicetree
+   declares an `xlnx,channels` node. These images declare none, so the PS device
+   has no channel 8 at all.
+
+The external channels do exist on `83c00000.xadc_wiz` — the PL device that
+reboots the board when read. Getting VP/VN onto the safe device would mean
+adding `xlnx,channels { channel@0 { reg = <0>; }; }` to the `f8007100.adc` node,
+which means patching the DTB in each board's boot partition and redoing it after
+every image update. That was judged not worth it.
+
+**Consequence for supply diagnosis.** `vccaux` is a regulated output, so it does
+not measure the input rail, and one sample per 30 s poll cannot see a brief
+droop. A steady `vccaux` is **not** evidence against a transient brownout.

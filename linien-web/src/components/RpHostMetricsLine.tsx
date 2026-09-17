@@ -21,13 +21,14 @@ type RpHostMetricsLineProps = {
 };
 
 /**
- * "CPU 4% · RAM 41% · disk 1.1 GB · 5V 4.98 V · up 3d 4h" under the temperature.
+ * "CPU 4% · RAM 41% · disk 1.1 GB · VCCAUX 1.80 V · up 3d 4h" under the
+ * temperature.
  *
  * Sampled on the same request as the temperature, so it is gated on the same
  * age: when the reading goes stale this line disappears rather than leaving a
  * live-looking CPU figure beside a withdrawn temperature. A board running a
  * daemon older than 1.2.0 reports no metrics and renders nothing; one older
- * than 1.3.0 reports no supply voltage, and that segment is simply absent.
+ * than 1.4.0 reports no rail voltage, and that segment is simply absent.
  */
 export function RpHostMetricsLine({ status, deviceKey, nowMs }: RpHostMetricsLineProps) {
   const segments = resolveHostMetrics(

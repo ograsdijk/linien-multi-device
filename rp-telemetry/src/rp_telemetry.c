@@ -13,11 +13,11 @@
  *
  *     ->  "STATUS\n"     <-  "RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216
  *                             memavail=311044 uptime=690.2 rootfree=1204880
- *                             v5=4.987\n"
+ *                             vccaux=1.802\n"
  *                             (one line; temperature in degrees Celsius,
  *                              followed by zero or more key=value host metrics)
  *                        <-  "RPT1 ERR XADC\n"    (sysfs read failed)
- *     ->  "VERSION\n"    <-  "RPT1 VERSION 1.3.0\n"
+ *     ->  "VERSION\n"    <-  "RPT1 VERSION 1.4.0\n"
  *     ->  anything else  <-  "RPT1 ERR COMMAND\n"
  *
  * The key=value tail is an *extension*: every key is independently optional,
@@ -41,19 +41,26 @@
  *
  *     temperature_c = (raw + offset) * scale / 1000.0
  *
- * Supply voltage (`v5`, since 1.3.0): on the Gen 1 board the +5 V input
- * reaches the XADC's dedicated VP/VN pair through a 56.0k / 4.99k divider.
- * Its channel is looked up *only* on the device already chosen for the
- * temperature -- never by scanning for it -- so it inherits the PS-only
- * guarantee above. `in_voltage8_vpvn_scale` is in mV per LSB (the kernel's
- * xilinx-xadc driver reports 1000 mV / 2^12 for VP/VN) and is read once at
- * discovery; `in_voltage8_vpvn_raw` is read per request.
+ * Rail voltage (`vccaux`, since 1.4.0): the FPGA auxiliary supply, nominally
+ * 1.8 V, read from the same PS XADC device already chosen for the temperature
+ * -- never by scanning for it -- so it inherits the PS-only guarantee above.
+ * `<channel>_vccaux_scale` is in mV per LSB and is read once at discovery;
+ * `<channel>_vccaux_raw` is read per request.
  *
- *     v5 = raw * scale / 1000.0 * (Rtop + Rbottom) / Rbottom
+ *     vccaux = raw * scale / 1000.0
  *
- * It is sampled once per STATUS request (every ~30 s from the gateway), so it
- * shows static or slowly varying supply levels, not millisecond droops. A
- * missing channel or an implausible value just leaves `v5` out.
+ * The channel is found by *name suffix*, not by a fixed index: 1.3.0 tried to
+ * read the +5 V input through the XADC's VP/VN pair at a hardcoded
+ * `in_voltage8_vpvn_raw` and reported nothing on every board, because the
+ * xilinx-xadc driver gives VP/VN no name suffix and, more to the point, this
+ * board's devicetree declares no external channels at all. Only the internal
+ * rails exist on the PS device. See TROUBLESHOOTING.md.
+ *
+ * What this is and is not: `vccaux` is a *regulated output*, not the board's
+ * +5 V input, so a supply that sags a little is hidden by the regulator. It is
+ * sampled once per STATUS request (every ~30 s from the gateway), so it shows
+ * static or slowly varying rail levels, never millisecond droops. A missing
+ * channel or an implausible value just leaves `vccaux` out.
  *
  * The service answers only the fixed protocol above: there is no code path
  * that executes anything supplied by a client. It is intended for a trusted
@@ -86,7 +93,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define RPT_VERSION "1.3.0"
+#define RPT_VERSION "1.4.0"
 #define RPT_PROTOCOL "RPT1"
 
 #define DEFAULT_PORT 18864
@@ -119,15 +126,20 @@
 /* Substring of the PL XADC wizard's device path ("83c00000.xadc_wiz"). */
 #define PL_XADC_MARKER "adc_wiz"
 
-/* Supply-monitor channel of the XADC's VP/VN pair, and the Gen 1 board's
- * divider from +5 V onto it. */
-#define V5_RAW_FILE "in_voltage8_vpvn_raw"
-#define V5_SCALE_FILE "in_voltage8_vpvn_scale"
-#define V5_DIVIDER_TOP_OHM 56000.0
-#define V5_DIVIDER_BOTTOM_OHM 4990.0
+/*
+ * The rail reported alongside the temperature: the FPGA auxiliary supply,
+ * nominally 1.8 V. Matched by name suffix over the chosen device's channels
+ * rather than by a fixed index -- the index is stable in the xilinx-xadc
+ * channel table today, but this daemon has already shipped one release that
+ * reported nothing because it hardcoded a channel filename.
+ */
+#define RAIL_KEY "vccaux"
+#define RAIL_CHANNEL_PREFIX "in_voltage"
+#define RAIL_SUFFIX_RAW "_" RAIL_KEY "_raw"
+#define RAIL_SUFFIX_SCALE "_" RAIL_KEY "_scale"
 /* Rejects garbled sysfs values only; this is not a health threshold. */
-#define V5_MIN_PLAUSIBLE_V 3.0
-#define V5_MAX_PLAUSIBLE_V 6.5
+#define RAIL_MIN_PLAUSIBLE_V 0.5
+#define RAIL_MAX_PLAUSIBLE_V 3.0
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -195,10 +207,10 @@ struct xadc {
     char raw_path[PATH_MAX_LEN];
     long offset;
     double scale;
-    /* VP/VN supply channel on the same device; see xadc_read_supply_v5(). */
-    int have_v5;
-    char v5_raw_path[PATH_MAX_LEN];
-    double v5_scale;
+    /* Rail channel on the same device; see xadc_read_rail(). */
+    int have_rail;
+    char rail_raw_path[PATH_MAX_LEN];
+    double rail_scale;
     /* Refuse anything but the PS XADC. Set when scanning the real
      * /sys/bus/iio/devices; see main(). */
     int strict;
@@ -262,37 +274,74 @@ static int xadc_rank(const char *iio_root, const char *name)
 }
 
 /*
- * Look for the VP/VN supply channel in `device_dir` -- the directory of the
- * device just chosen for the temperature, and no other. Never fails the
- * discovery: a device without the channel simply reports no `v5`.
+ * True for a channel file named like "in_voltage1_vccaux_raw". Matching on the
+ * suffix rather than a fixed index is deliberate; see RAIL_KEY above.
  */
-static void xadc_discover_v5(struct xadc *x, const char *device_dir)
+static int is_rail_raw_file(const char *name)
 {
+    size_t prefix_len = strlen(RAIL_CHANNEL_PREFIX);
+    size_t suffix_len = strlen(RAIL_SUFFIX_RAW);
+    size_t len = strlen(name);
+    if (len <= prefix_len + suffix_len) {
+        return 0;
+    }
+    if (strncmp(name, RAIL_CHANNEL_PREFIX, prefix_len) != 0) {
+        return 0;
+    }
+    return strcmp(name + len - suffix_len, RAIL_SUFFIX_RAW) == 0;
+}
+
+/*
+ * Look for the rail channel in `device_dir` -- the directory of the device just
+ * chosen for the temperature, and no other. Never fails the discovery: a device
+ * without the channel simply reports no `vccaux`.
+ */
+static void xadc_discover_rail(struct xadc *x, const char *device_dir)
+{
+    char channel[PATH_MAX_LEN] = "";
     char raw[PATH_MAX_LEN];
     char scale_path[PATH_MAX_LEN];
     double scale = 0.0;
-    x->have_v5 = 0;
+    x->have_rail = 0;
     if (device_dir[0] == '\0') {
         return;
     }
-    if (snprintf(raw, sizeof(raw), "%s/" V5_RAW_FILE, device_dir) >=
-            (int)sizeof(raw) ||
-        snprintf(scale_path, sizeof(scale_path), "%s/" V5_SCALE_FILE,
-                 device_dir) >= (int)sizeof(scale_path)) {
-        return;
+    DIR *dir = opendir(device_dir);
+    if (dir != NULL) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (is_rail_raw_file(entry->d_name)) {
+                if (snprintf(channel, sizeof(channel), "%s", entry->d_name) >=
+                    (int)sizeof(channel)) {
+                    channel[0] = '\0';
+                }
+                break;
+            }
+        }
+        closedir(dir);
     }
-    if (!path_exists(raw) || read_double_file(scale_path, &scale) != 0 ||
+    /* The scale file is the same channel with the suffix swapped. */
+    size_t stem = channel[0] == '\0'
+                      ? 0
+                      : strlen(channel) - strlen(RAIL_SUFFIX_RAW);
+    if (channel[0] == '\0' ||
+        snprintf(raw, sizeof(raw), "%s/%s", device_dir, channel) >=
+            (int)sizeof(raw) ||
+        snprintf(scale_path, sizeof(scale_path),
+                 "%s/%.*s" RAIL_SUFFIX_SCALE, device_dir, (int)stem,
+                 channel) >= (int)sizeof(scale_path) ||
+        !path_exists(raw) || read_double_file(scale_path, &scale) != 0 ||
         !isfinite(scale) || scale <= 0.0) {
         fprintf(stderr,
-                "rp-telemetry: no usable " V5_RAW_FILE " in %s; "
-                "v5 will not be reported\n",
+                "rp-telemetry: no usable " RAIL_KEY " channel in %s; "
+                RAIL_KEY " will not be reported\n",
                 device_dir);
         return;
     }
-    memcpy(x->v5_raw_path, raw, strlen(raw) + 1);
-    x->v5_scale = scale;
-    x->have_v5 = 1;
-    fprintf(stderr, "rp-telemetry: reading 5 V supply from %s\n", raw);
+    memcpy(x->rail_raw_path, raw, strlen(raw) + 1);
+    x->rail_scale = scale;
+    x->have_rail = 1;
+    fprintf(stderr, "rp-telemetry: reading " RAIL_KEY " from %s\n", raw);
 }
 
 /*
@@ -388,9 +437,9 @@ static int xadc_discover(struct xadc *x, const char *iio_root)
     if (found == 0) {
         fprintf(stderr, "rp-telemetry: reading temperature from %s\n",
                 x->raw_path);
-        xadc_discover_v5(x, best_dir);
+        xadc_discover_rail(x, best_dir);
     } else {
-        x->have_v5 = 0;
+        x->have_rail = 0;
     }
     return found;
 }
@@ -419,34 +468,33 @@ static int xadc_read_temperature(struct xadc *x, const char *iio_root,
     return 0;
 }
 
-/* Board +5 V from a VP/VN reading: undo the XADC scale (mV/LSB), then the
- * onboard divider. */
-static double v5_from_raw(long raw, double scale_mv)
+/* Rail volts from a raw reading: the XADC scale is mV per LSB. An internal
+ * rail is measured directly, so there is no divider to undo. */
+static double rail_volts_from_raw(long raw, double scale_mv)
 {
-    double xadc_v = (double)raw * scale_mv / 1000.0;
-    return xadc_v * (V5_DIVIDER_TOP_OHM + V5_DIVIDER_BOTTOM_OHM) /
-           V5_DIVIDER_BOTTOM_OHM;
+    return (double)raw * scale_mv / 1000.0;
 }
 
 /*
- * Read the board supply in volts. Returns 0 on success. Best-effort: it never
- * re-runs discovery (the temperature read owns that) and never logs, so a
- * board whose channel vanished just stops reporting `v5`.
+ * Read the rail in volts. Returns 0 on success. Best-effort: it never re-runs
+ * discovery (the temperature read owns that) and never logs, so a board whose
+ * channel vanished just stops reporting `vccaux`.
  */
-static int xadc_read_supply_v5(const struct xadc *x, double *out)
+static int xadc_read_rail(const struct xadc *x, double *out)
 {
-    if (!x->ready || !x->have_v5) {
+    if (!x->ready || !x->have_rail) {
         return -1;
     }
     long raw = 0;
-    if (read_long_file(x->v5_raw_path, &raw) != 0) {
+    if (read_long_file(x->rail_raw_path, &raw) != 0) {
         return -1;
     }
-    double v5 = v5_from_raw(raw, x->v5_scale);
-    if (!isfinite(v5) || v5 < V5_MIN_PLAUSIBLE_V || v5 > V5_MAX_PLAUSIBLE_V) {
+    double volts = rail_volts_from_raw(raw, x->rail_scale);
+    if (!isfinite(volts) || volts < RAIL_MIN_PLAUSIBLE_V ||
+        volts > RAIL_MAX_PLAUSIBLE_V) {
         return -1;
     }
-    *out = v5;
+    *out = volts;
     return 0;
 }
 
@@ -844,9 +892,10 @@ static void handle_client(int fd, struct xadc *x, const char *iio_root,
             snprintf(response, sizeof(response), "%s %.2f", RPT_PROTOCOL,
                      temperature);
             append_metrics(response, sizeof(response), m);
-            double v5 = 0.0;
-            if (xadc_read_supply_v5(x, &v5) == 0) {
-                append_kv(response, sizeof(response), " v5=%.3f", v5);
+            double rail = 0.0;
+            if (xadc_read_rail(x, &rail) == 0) {
+                append_kv(response, sizeof(response), " " RAIL_KEY "=%.3f",
+                          rail);
             }
             /* append_metrics never fills the buffer to the brim; it reserves
              * room for exactly this. */

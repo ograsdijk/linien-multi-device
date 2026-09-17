@@ -46,3 +46,13 @@ app = ["assets/*"]
 override-dependencies = [
   "numpy>=2",
 ]
+
+# Test-only dependencies. Declared as a PEP 735 group so CI installs exactly
+# what a developer runs (`uv sync --group dev`) instead of pip-installing
+# pytest ad hoc and drifting.
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  # FastAPI's TestClient is httpx-based; it is not pulled in by fastapi itself.
+  "httpx>=0.27",
+]

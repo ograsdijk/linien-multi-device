@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -134,6 +135,40 @@ def test_the_bundled_binary_is_the_one_the_gateway_claims_to_ship():
     assert int.from_bytes(binary[18:20], "little") == 40  # EM_ARM
 
 
+def _build_stamp() -> dict[str, str]:
+    stamp = Path(__file__).resolve().parents[2] / "rp-telemetry" / "build-stamp.txt"
+    values: dict[str, str] = {}
+    for line in stamp.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip()
+    return values
+
+
+def test_the_bundled_binary_was_built_from_the_current_daemon_source():
+    """Catch a daemon edit that was never followed by a rebuild.
+
+    The version check above only fires when RPT_VERSION moves. Editing the C
+    file without bumping it -- a bug fix, say -- leaves the stale binary
+    looking correct, and every board keeps running the unfixed daemon. The
+    stamp records the source hash at build time instead, so any edit shows up.
+    """
+    source = (
+        Path(__file__).resolve().parents[2] / "rp-telemetry" / "src" / "rp_telemetry.c"
+    )
+    current = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    assert _build_stamp().get("source_sha256") == current, (
+        "rp_telemetry.c has changed since app/assets/rp-telemetry-armv7 was "
+        "built. Run rp-telemetry/build-arm.sh and commit both the binary and "
+        "rp-telemetry/build-stamp.txt."
+    )
+
+
+def test_the_build_stamp_agrees_with_the_bundled_version():
+    assert _build_stamp().get("version") == rpt.BUNDLED_VERSION
+
 
 # --- host metrics tail ----------------------------------------------------
 #
@@ -232,27 +267,28 @@ def test_the_gateway_read_limit_admits_a_full_metric_line():
     assert rpt.MAX_RESPONSE_BYTES >= int(match.group(1))
 
 
-# --- supply voltage (v5, daemon 1.3.0) --------------------------------------
+# --- rail voltage (vccaux, daemon 1.4.0) ------------------------------------
 
 
-def test_the_supply_voltage_is_parsed():
+def test_the_rail_voltage_is_parsed():
     reading = rpt.parse_status_line(
         "RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216 memavail=311044 "
-        "uptime=690.2 rootfree=1204880 v5=4.987\n"
+        "uptime=690.2 rootfree=1204880 vccaux=1.802\n"
     )
 
     assert reading.state == rpt.STATE_RUNNING
     assert reading.error is None
     metrics = reading.metrics
-    assert metrics.supply_voltage_v == 4.987
+    assert metrics.vccaux_v == 1.802
     # ...without disturbing anything already on the line.
     assert metrics.cpu_percent == 3.2
     assert metrics.root_free_kb == 1204880
     assert metrics.uptime_s == 690.2
 
 
-def test_a_1_2_0_line_without_v5_is_not_an_error():
-    """Every board runs 1.2.0 until it is reinstalled: no v5 is normal."""
+def test_a_1_3_0_line_without_vccaux_is_not_an_error():
+    """Every board runs an older daemon until it is reinstalled, and 1.3.0
+    reported no rail on any board at all: an absent key is normal."""
     reading = rpt.parse_status_line(
         "RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216 memavail=311044 "
         "uptime=690.2 rootfree=1204880\n"
@@ -260,61 +296,85 @@ def test_a_1_2_0_line_without_v5_is_not_an_error():
 
     assert reading.state == rpt.STATE_RUNNING
     assert reading.error is None
-    assert reading.metrics.supply_voltage_v is None
+    assert reading.metrics.vccaux_v is None
     assert not reading.metrics.is_empty()
 
 
-def test_a_malformed_supply_voltage_is_dropped_alone():
-    for raw in ("abc", "", "nan", "inf", "-inf", "4,98", "4.98V", "0x5"):
-        reading = rpt.parse_status_line(f"RPT1 57.34 cpu=3.2 v5={raw} uptime=9\n")
+def test_the_dead_v5_key_from_1_3_0_is_ignored():
+    """1.3.0 shipped a `v5` key that never had a working source. If some board
+    somewhere still emits one, it must be ignored like any unknown key rather
+    than parsed into the rail field."""
+    reading = rpt.parse_status_line("RPT1 57.34 cpu=3.2 v5=4.987\n")
+
+    assert reading.state == rpt.STATE_RUNNING
+    assert reading.error is None
+    assert reading.metrics.vccaux_v is None
+    assert reading.metrics.cpu_percent == 3.2
+
+
+def test_a_malformed_rail_voltage_is_dropped_alone():
+    for raw in ("abc", "", "nan", "inf", "-inf", "1,80", "1.80V", "0x5"):
+        reading = rpt.parse_status_line(
+            f"RPT1 57.34 cpu=3.2 vccaux={raw} uptime=9\n"
+        )
         assert reading.state == rpt.STATE_RUNNING, raw
         assert reading.temperature_c == 57.34, raw
-        assert reading.metrics.supply_voltage_v is None, raw
+        assert reading.metrics.vccaux_v is None, raw
         assert reading.metrics.cpu_percent == 3.2, raw
         assert reading.metrics.uptime_s == 9.0, raw
 
 
-def test_an_implausible_supply_voltage_is_dropped_alone():
-    for raw in ("0", "0.2", "2.999", "6.501", "12.2", "-5"):
-        reading = rpt.parse_status_line(f"RPT1 57.34 memtotal=1000 v5={raw}\n")
+def test_an_implausible_rail_voltage_is_dropped_alone():
+    for raw in ("0", "0.2", "0.499", "3.001", "12.2", "-1.8"):
+        reading = rpt.parse_status_line(f"RPT1 57.34 memtotal=1000 vccaux={raw}\n")
         assert reading.state == rpt.STATE_RUNNING, raw
         assert reading.error is None, raw
-        assert reading.metrics.supply_voltage_v is None, raw
+        assert reading.metrics.vccaux_v is None, raw
         assert reading.metrics.mem_total_kb == 1000, raw
 
 
 def test_the_plausibility_bounds_are_inclusive_and_not_a_health_check():
-    """3.0-6.5 V only rejects garbage: a sagging 4.5 V board is reported."""
-    for raw, expected in (("3.0", 3.0), ("4.5", 4.5), ("6.5", 6.5)):
-        reading = rpt.parse_status_line(f"RPT1 57.34 v5={raw}\n")
-        assert reading.metrics.supply_voltage_v == expected
+    """0.5-3.0 V only rejects garbage: a sagging 1.6 V rail is reported."""
+    for raw, expected in (("0.5", 0.5), ("1.6", 1.6), ("3.0", 3.0)):
+        reading = rpt.parse_status_line(f"RPT1 57.34 vccaux={raw}\n")
+        assert reading.metrics.vccaux_v == expected
 
 
-def test_the_c_daemon_uses_named_divider_constants():
+def test_the_c_daemon_and_the_gateway_agree_on_the_bounds():
     source = _c_source()
-    top = re.search(r"#define V5_DIVIDER_TOP_OHM ([\d.]+)", source)
-    bottom = re.search(r"#define V5_DIVIDER_BOTTOM_OHM ([\d.]+)", source)
-    assert top is not None and float(top.group(1)) == 56000.0
-    assert bottom is not None and float(bottom.group(1)) == 4990.0
-    low = re.search(r"#define V5_MIN_PLAUSIBLE_V ([\d.]+)", source)
-    high = re.search(r"#define V5_MAX_PLAUSIBLE_V ([\d.]+)", source)
-    assert float(low.group(1)) == rpt.MIN_PLAUSIBLE_SUPPLY_V
-    assert float(high.group(1)) == rpt.MAX_PLAUSIBLE_SUPPLY_V
+    low = re.search(r"#define RAIL_MIN_PLAUSIBLE_V ([\d.]+)", source)
+    high = re.search(r"#define RAIL_MAX_PLAUSIBLE_V ([\d.]+)", source)
+    assert low is not None and float(low.group(1)) == rpt.MIN_PLAUSIBLE_RAIL_V
+    assert high is not None and float(high.group(1)) == rpt.MAX_PLAUSIBLE_RAIL_V
+    # The wire key the daemon emits is the one the gateway parses.
+    key = re.search(r'#define RAIL_KEY "(\w+)"', source)
+    assert key is not None and key.group(1) in rpt._METRIC_PARSERS
 
 
-def test_the_vpvn_channel_is_only_looked_up_on_the_chosen_device():
-    """No parallel scan: the channel names appear once, as constants, and the
-    only function that builds their paths is handed the directory that
-    xadc_discover() already accepted as the PS XADC."""
+def test_the_rail_channel_is_only_looked_up_on_the_chosen_device():
+    """No parallel scan: only one function builds a rail channel path, and it
+    is handed the directory xadc_discover() already accepted as the PS XADC."""
     source = _c_source()
-    assert source.count('"in_voltage8_vpvn_raw"') == 1
-    assert source.count('"in_voltage8_vpvn_scale"') == 1
-    assert source.count("V5_RAW_FILE") == 3  # define, path build, log message
-    assert source.count("V5_SCALE_FILE") == 2  # define, path build
-    # xadc_discover_v5 is called from exactly one place: after a device has
+    discovery = source[
+        source.index("static void xadc_discover_rail(") : source.index(
+            "static int xadc_read_rail("
+        )
+    ]
+    # Every use of the channel-name suffixes lives inside discovery (plus the
+    # #defines themselves and the is_rail_raw_file() helper just above it).
+    body = source[source.index("static int is_rail_raw_file(") :]
+    assert body.count("RAIL_SUFFIX_RAW") == source.count("RAIL_SUFFIX_RAW") - 1
+    assert "RAIL_SUFFIX_SCALE" in discovery
+    assert source.count("RAIL_SUFFIX_SCALE") == 2  # the define and this use
+    # xadc_discover_rail is called from exactly one place: after a device has
     # been committed by the ranked, PL-refusing discovery.
-    calls = re.findall(r"xadc_discover_v5\(x, (\w+)\)", source)
+    calls = re.findall(r"xadc_discover_rail\(x, (\w+)\)", source)
     assert calls == ["best_dir"]
+    # No channel filename carries a hardcoded index -- that bug is what 1.4.0
+    # fixed, so the prefix constant must stay index-free. Comments are stripped
+    # first: they name the old `in_voltage8_vpvn_raw` on purpose.
+    code = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    assert re.search(r'"in_voltage\d', code) is None
     # The PL refusal is untouched.
     assert '#define PL_XADC_MARKER "adc_wiz"' in source
     assert '#define PS_XADC_MARKER "f8007100"' in source

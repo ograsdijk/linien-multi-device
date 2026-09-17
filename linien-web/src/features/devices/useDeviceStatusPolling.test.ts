@@ -63,13 +63,13 @@ describe('sameDeviceStatus', () => {
     ).toBe(false);
   });
 
-  it('notices a supply-voltage change the gateway did not push', () => {
-    // A drift inside one 50 mV push bin only reaches the store via this poll.
-    const metrics = { cpu_percent: 4, uptime_s: 60, supply_voltage_v: 4.99 };
+  it('notices a rail-voltage change the gateway did not push', () => {
+    // A drift inside one 10 mV push bin only reaches the store via this poll.
+    const metrics = { cpu_percent: 4, uptime_s: 60, vccaux_v: 1.802 };
     expect(
       sameDeviceStatus(
         status({ rp_metrics: metrics }),
-        status({ rp_metrics: { ...metrics, supply_voltage_v: 4.96 } })
+        status({ rp_metrics: { ...metrics, vccaux_v: 1.798 } })
       )
     ).toBe(false);
     expect(

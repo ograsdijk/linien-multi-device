@@ -20,7 +20,7 @@ export const CPU_WARN_PERCENT = 85;
 
 export type HostMetricsSegment = {
   /** Stable identifier for tests and React keys. */
-  id: 'cpu' | 'memory' | 'disk' | 'supply' | 'uptime';
+  id: 'cpu' | 'memory' | 'disk' | 'vccaux' | 'uptime';
   text: string;
   tone: TelemetryTone;
   /** Longer form for the element's title attribute. */
@@ -113,17 +113,18 @@ export const resolveHostMetrics = (
     });
   }
 
-  const supply = metrics.supply_voltage_v;
-  if (typeof supply === 'number' && Number.isFinite(supply)) {
+  const vccaux = metrics.vccaux_v;
+  if (typeof vccaux === 'number' && Number.isFinite(vccaux)) {
     segments.push({
-      id: 'supply',
-      text: `5V ${supply.toFixed(2)} V`,
+      id: 'vccaux',
+      text: `VCCAUX ${vccaux.toFixed(2)} V`,
       // Deliberately no threshold yet: the number is for comparing boards and
-      // correlating with reboots, not for declaring a supply good or bad.
+      // correlating with reboots, not for declaring a rail good or bad.
       tone: 'normal',
       title:
-        '5 V supply, measured by the Zynq XADC through the board’s divider. ' +
-        'Sampled once per poll, so brief droops are not captured.',
+        'FPGA auxiliary rail (nominally 1.8 V), measured by the Zynq XADC. ' +
+        'A regulated output rather than the board’s 5 V input, sampled once ' +
+        'per poll, so brief droops are not captured.',
     });
   }
 

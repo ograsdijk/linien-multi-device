@@ -93,44 +93,48 @@ describe('resolveHostMetrics', () => {
     expect(cpu.title).toBe('CPU busy since the previous poll');
   });
 
-  it('shows the 5 V supply between disk and uptime', () => {
-    const withSupply = status({
+  it('shows the vccaux rail between disk and uptime', () => {
+    const withRail = status({
       ...healthy,
-      rp_metrics: { ...healthy.rp_metrics, supply_voltage_v: 4.982 },
+      rp_metrics: { ...healthy.rp_metrics, vccaux_v: 1.802 },
     });
-    expect(text(resolveHostMetrics(withSupply, 5))).toEqual([
+    expect(text(resolveHostMetrics(withRail, 5))).toEqual([
       'CPU 4%',
       'RAM 41%',
       'disk 1.1 GB',
-      '5V 4.98 V',
+      'VCCAUX 1.80 V',
       'up 3d 4h',
     ]);
   });
 
-  it('omits the supply for a daemon that does not report it', () => {
-    const noSupply = status({ rp_metrics: { cpu_percent: 4, supply_voltage_v: null } });
-    expect(resolveHostMetrics(noSupply, 5).map((s) => s.id)).toEqual(['cpu']);
-    expect(resolveHostMetrics(healthy, 5).map((s) => s.id)).not.toContain('supply');
+  it('omits the rail for a daemon that does not report it', () => {
+    const noRail = status({ rp_metrics: { cpu_percent: 4, vccaux_v: null } });
+    expect(resolveHostMetrics(noRail, 5).map((s) => s.id)).toEqual(['cpu']);
+    expect(resolveHostMetrics(healthy, 5).map((s) => s.id)).not.toContain('vccaux');
   });
 
-  it('does not judge the supply voltage', () => {
+  it('does not judge the rail voltage', () => {
     // No threshold yet: the number is for comparing boards.
-    for (const volts of [4.5, 5.0, 5.4]) {
-      const board = status({ rp_metrics: { supply_voltage_v: volts } });
-      expect(toneOf(resolveHostMetrics(board, 5), 'supply')).toBe('normal');
+    for (const volts of [1.7, 1.8, 1.9]) {
+      const board = status({ rp_metrics: { vccaux_v: volts } });
+      expect(toneOf(resolveHostMetrics(board, 5), 'vccaux')).toBe('normal');
     }
   });
 
-  it('says the supply reading cannot capture brief droops', () => {
-    const [supply] = resolveHostMetrics(
-      status({ rp_metrics: { supply_voltage_v: 5 } }),
-      5
-    );
-    expect(supply.title).toMatch(/brief droops are not captured/);
+  it('says the rail reading cannot capture brief droops', () => {
+    const [rail] = resolveHostMetrics(status({ rp_metrics: { vccaux_v: 1.8 } }), 5);
+    expect(rail.title).toMatch(/brief droops are not captured/);
   });
 
-  it('withdraws the supply with the rest once stale', () => {
-    const board = status({ rp_metrics: { supply_voltage_v: 5 } });
+  it('says the rail is not the 5 V input', () => {
+    // The field it replaced claimed to be the board supply; this one must not
+    // be mistaken for it.
+    const [rail] = resolveHostMetrics(status({ rp_metrics: { vccaux_v: 1.8 } }), 5);
+    expect(rail.title).toMatch(/regulated output/);
+  });
+
+  it('withdraws the rail with the rest once stale', () => {
+    const board = status({ rp_metrics: { vccaux_v: 1.8 } });
     expect(resolveHostMetrics(board, 200)).toEqual([]);
   });
 });

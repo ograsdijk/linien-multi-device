@@ -2272,7 +2272,7 @@ def test_host_metrics_reach_the_status_payload():
                 mem_available_kb=311044,
                 uptime_s=690.2,
                 root_free_kb=1204880,
-                supply_voltage_v=4.987,
+                vccaux_v=1.802,
             )
         ),
         version_fn=_no_version,
@@ -2280,7 +2280,7 @@ def test_host_metrics_reach_the_status_payload():
     asyncio.run(manager.poll_once())
 
     metrics = manager.status_fields("dev-1")["rp_metrics"]
-    assert metrics["supply_voltage_v"] == 4.987
+    assert metrics["vccaux_v"] == 1.802
     assert metrics["cpu_percent"] == 12.5
     assert metrics["load1"] == 0.4
     assert metrics["mem_available_kb"] == 311044
@@ -2407,7 +2407,7 @@ def test_host_metrics_are_written_to_influx_with_the_temperature():
                 mem_available_kb=250,
                 uptime_s=690.2,
                 root_free_kb=1204880,
-                supply_voltage_v=4.987,
+                vccaux_v=1.802,
             )
         ),
         version_fn=_no_version,
@@ -2427,7 +2427,7 @@ def test_host_metrics_are_written_to_influx_with_the_temperature():
         "rp_mem_available_kb=250",
         "rp_root_free_kb=1204880",
         "rp_uptime_s=690.2",
-        "rp_supply_voltage_v=4.987",
+        "rp_vccaux_v=1.802",
     ):
         assert expected in line
 
@@ -2452,9 +2452,9 @@ def test_a_metric_the_board_did_not_report_is_absent_not_zero():
     assert "rp_mem_used_percent" not in line
 
 
-def test_a_1_2_0_daemon_reports_no_supply_voltage_anywhere():
-    """No v5 is the normal state of an un-updated board: None in the payload,
-    no field in the point, and no error."""
+def test_an_older_daemon_reports_no_rail_voltage_anywhere():
+    """No vccaux is the normal state of an un-updated board: None in the
+    payload, no field in the point, and no error."""
     device = _influx_device()
     writer = RecordingWriter()
     manager, *_ = make_manager(
@@ -2469,30 +2469,30 @@ def test_a_1_2_0_daemon_reports_no_supply_voltage_anywhere():
     fields = manager.status_fields("dev-1")
     assert fields["rp_telemetry"]["state"] == rpt.STATE_RUNNING
     assert fields["rp_telemetry"]["error"] is None
-    assert fields["rp_metrics"]["supply_voltage_v"] is None
+    assert fields["rp_metrics"]["vccaux_v"] is None
     line = writer.calls[0][1][0]
-    assert "rp_supply_voltage_v" not in line
+    assert "rp_vccaux_v" not in line
     assert "rp_cpu_percent=12.5" in line
 
 
-def test_the_supply_voltage_is_in_the_temperatures_point():
+def test_the_rail_voltage_is_in_the_temperatures_point():
     """Same sample, same point: one line, not a second measurement or write."""
     sample = rpt.TelemetrySample(
         device=None,
         temperature_c=57.25,
         sampled_at=0.0,
-        metrics=rpt.HostMetrics(supply_voltage_v=4.912, uptime_s=12.0),
+        metrics=rpt.HostMetrics(vccaux_v=1.794, uptime_s=12.0),
     )
     assert rpt.RpTelemetryManager._influx_fields(sample) == {
         "rp_temperature_c": 57.25,
-        "rp_supply_voltage_v": 4.912,
+        "rp_vccaux_v": 1.794,
         "rp_uptime_s": 12.0,
     }
 
 
 def _published_after(*voltages):
     device = make_device()
-    readings = [_running(temperature_c=57.3, supply_voltage_v=v) for v in voltages]
+    readings = [_running(temperature_c=57.3, vccaux_v=v) for v in voltages]
     manager, _saved, published, _logs = make_manager(
         [device], read_fn=reading_fn(*readings), version_fn=_no_version
     )
@@ -2501,14 +2501,14 @@ def _published_after(*voltages):
     return published
 
 
-def test_supply_jitter_within_a_50_mv_bin_does_not_republish():
-    assert _published_after(4.991, 4.996, 4.988) == ["dev-1"]
+def test_rail_jitter_within_a_10_mv_bin_does_not_republish():
+    assert _published_after(1.801, 1.803, 1.798) == ["dev-1"]
 
 
-def test_a_supply_move_across_a_50_mv_bin_republishes():
-    assert _published_after(4.990, 4.930) == ["dev-1", "dev-1"]
+def test_a_rail_move_across_a_10_mv_bin_republishes():
+    assert _published_after(1.800, 1.788) == ["dev-1", "dev-1"]
 
 
-def test_the_supply_voltage_appearing_republishes():
-    """A board reinstalled with 1.3.0 starts reporting it."""
-    assert _published_after(None, 4.99) == ["dev-1", "dev-1"]
+def test_the_rail_voltage_appearing_republishes():
+    """A board reinstalled with 1.4.0 starts reporting it."""
+    assert _published_after(None, 1.80) == ["dev-1", "dev-1"]

@@ -36,7 +36,7 @@ import socketserver
 import time
 
 PROTOCOL_ID = "RPT1"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 MAX_REQUEST = 64
 STARTED_AT = time.monotonic()
 CLIENT_TIMEOUT_S = 2.0
@@ -67,11 +67,11 @@ def simulated_metrics(options) -> str:
     )
     avail_kb = int(total_kb * (1.0 - used_fraction))
     uptime = time.monotonic() - STARTED_AT + options.uptime_offset
-    # A slow wander of +-30 mV, so the 50 mV push binning can be seen working.
-    supply = (
+    # A slow wander of +-6 mV, so the 10 mV push binning can be seen working.
+    rail = (
         ""
-        if options.supply_v <= 0
-        else f" v5={options.supply_v + 0.03 * math.sin(time.time() / 73.0):.3f}"
+        if options.vccaux_v <= 0
+        else f" vccaux={options.vccaux_v + 0.006 * math.sin(time.time() / 73.0):.3f}"
     )
     try:
         root_free_kb = shutil.disk_usage("/").free // 1024
@@ -80,7 +80,7 @@ def simulated_metrics(options) -> str:
     return (
         f" cpu={cpu:.1f} load1={load1:.2f} memtotal={total_kb} "
         f"memavail={avail_kb} uptime={uptime:.1f} rootfree={root_free_kb}"
-        f"{supply}"
+        f"{rail}"
     )
 
 
@@ -162,10 +162,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds to add to the simulator's own uptime",
     )
     parser.add_argument(
-        "--supply-v",
+        "--vccaux-v",
         type=float,
-        default=5.0,
-        help="mean 5 V supply to report; 0 omits v5, like a 1.2.0 board",
+        default=1.8,
+        help="mean vccaux rail to report; 0 omits vccaux, like a 1.3.0 board",
     )
     parser.add_argument(
         "--no-metrics",

@@ -151,11 +151,11 @@ export type RpMetrics = {
   /** Free space on the board's root filesystem (the SD card). */
   root_free_kb?: number | null;
   /**
-   * Board +5 V supply in volts, from the XADC VP/VN pair (daemon 1.3.0+).
-   * One sample per poll: shows slow drift and board-to-board differences,
-   * not brief droops.
+   * FPGA auxiliary rail in volts, nominally 1.8 V, from the PS XADC (daemon
+   * 1.4.0+). A regulated output, not the board's +5 V input, and one sample
+   * per poll: shows slow drift and board-to-board differences, not droops.
    */
-  supply_voltage_v?: number | null;
+  vccaux_v?: number | null;
 };
 
 export type DeviceStatus = {

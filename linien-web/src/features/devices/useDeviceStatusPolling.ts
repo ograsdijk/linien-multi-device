@@ -104,7 +104,7 @@ const sameMetrics = (
     a.mem_used_percent === b.mem_used_percent &&
     a.uptime_s === b.uptime_s &&
     a.root_free_kb === b.root_free_kb &&
-    a.supply_voltage_v === b.supply_voltage_v
+    a.vccaux_v === b.vccaux_v
   );
 };
 
