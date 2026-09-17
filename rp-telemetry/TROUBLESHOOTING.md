@@ -150,3 +150,7 @@ every image update. That was judged not worth it.
 **Consequence for supply diagnosis.** `vccaux` is a regulated output, so it does
 not measure the input rail, and one sample per 30 s poll cannot see a brief
 droop. A steady `vccaux` is **not** evidence against a transient brownout.
+
+The way to get evidence about a droop is the XADC's hardware alarm comparators,
+exposed on the same safe device under `events/`. That is investigated but not
+implemented; see the "XADC undervoltage alarms" section in [todo.md](../todo.md).

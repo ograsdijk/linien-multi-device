@@ -158,6 +158,11 @@ little is hidden by the regulator, and one sample per STATUS request (~30 s)
 shows only slow drift and differences between boards. It **cannot** see
 millisecond brownouts, so a steady reading does not rule out a transient droop.
 
+> Catching a brief droop would mean the XADC's hardware alarm comparators,
+> which the same PS device already exposes under `events/`. Investigated but
+> not implemented — the mechanics, the cost, and what to check first are
+> written up in [todo.md](../todo.md).
+
 To check a board by hand — note the explicit device, never a glob:
 
 ```bash
