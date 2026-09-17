@@ -1482,27 +1482,65 @@ def test_a_coarse_sideband_estimate_does_not_become_the_identity(monkeypatch):
     assert refinement["stages"][-1]["kind"] == "final_verify"
 
 
-def test_a_sideband_change_across_a_geometry_change_is_still_an_identity_change(monkeypatch):
-    """The protection that matters is kept: once a strict detection establishes
-    the spacing, a later strict one at comparable resolution that disagrees is
-    a different crossing, and the walk must not follow it."""
-    session = _identity_session(monkeypatch, coarse_sideband=None,
-                                strict_sideband=0.05)
-    captures = iter([
-        (_result(0.449, 0.05), 0.4, 0.3, 20.0),   # narrow -> sets identity
-        (_result(0.449, 0.20), 0.4, 0.2, 25.0),   # narrow -> 4x the spacing
-    ])
+def test_a_recentring_stage_that_changes_the_spacing_is_an_identity_change(monkeypatch):
+    """Where the check still protects. A re-centring stage commands the biggest
+    moves and does NOT improve resolution, so its spacing is comparable to the
+    standing identity and a disagreement means the walk has been carried onto a
+    different crossing."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
     monkeypatch.setattr(
-        session, "_capture_auto_lock_target",
-        lambda settings, traces=None, after=None: next(captures),
+        session, "_coarse_auto_lock_target",
+        # Same resolution as the identity, four times the spacing.
+        lambda settings, after=None: (_result(0.9, 0.20), 0.4, 0.6, 20.0, {}),
     )
 
     with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
-        _walk_from_coarse(session)
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            ApproachSettings.from_mapping(session.lock_approach_settings),
+            0.4, 0.6,
+            initial_target=_result(0.9, 0.05),  # far out -> forces a recentre
+            initial_center_v=0.4, initial_amplitude_v=0.6,
+            initial_resolution=20.0,
+            initial_detector="strict", trace_length=2048,
+        )
     assert excinfo.value.failure_kind == "identity"
     # The numbers that decided it, which the message used to omit entirely.
     failure = excinfo.value.refinement["failure"]
     assert "200.000 mV" in failure and "50.000 mV" in failure
+
+
+def test_a_better_resolved_spacing_is_adopted_however_small_the_gain(monkeypatch):
+    """The field failure: an 8.78-sample detection was judged against a
+    6.07-sample identity because 1.45x missed a 1.5x margin. The spacing is
+    biased by resolution (16.9 mV at 6.1 samples, 23.6 mV at 8.8 on the same
+    feature), so comparing across a resolution change tests the sweep width."""
+    session = _identity_session(monkeypatch, coarse_sideband=None,
+                                strict_sideband=0.05)
+    captures = [
+        (_result(0.449, 0.016854), 0.45, 0.3, 6.07),     # sets the identity
+        (_result(0.449, 0.023591), 0.45, 0.09, 8.78),    # 1.45x better resolved
+    ]
+    calls = {"n": 0}
+
+    def _capture(settings, traces=None, after=None):
+        # Settles on the final geometry and stays there, so the verification
+        # pair sees the same thing the last narrowing stage did.
+        item = captures[min(calls["n"], len(captures) - 1)]
+        calls["n"] += 1
+        return item
+
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _capture)
+
+    result, refinement = _walk_from_coarse(session)
+
+    assert result.sideband_offset_v == pytest.approx(0.023591)
+    assert refinement["stages"][-1]["kind"] == "final_verify"
 
 
 def test_the_final_pair_is_judged_on_position_not_sideband_spacing(monkeypatch):

@@ -167,11 +167,6 @@ _REFINEMENT_GENTLE_APPROACH = 4.0
 # to be able to cross the full sweep range: from 1 V to a few mV takes ~11
 # stages at the factors above, so the budget is that with headroom.
 _MAX_REFINEMENT_STAGES = 16
-# How much better resolved a strict detection must be before it is allowed to
-# REPLACE the standing sideband identity rather than be judged against it. Well
-# clear of 1 so two detections at the same geometry -- the final verification
-# pair -- always compare against each other instead of one silently adopting.
-_IDENTITY_RESOLUTION_MARGIN = 1.5
 # Gentlest narrowing the adaptive rule may fall back to. A stage that barely
 # changes the width measures nothing and burns the budget, so a feature whose
 # position is this sensitive to width is one the walk should give up on rather
@@ -3454,17 +3449,26 @@ class DeviceSession:
                 if not check_sideband:
                     return
                 if identity_sideband is not None and candidate.sideband_offset_v is not None:
-                    # A strict detection on a meaningfully better resolved trace
-                    # REPLACES the identity rather than being judged against it.
-                    # The whole point of narrowing is to measure the signal
-                    # better, so rejecting the better measurement for disagreeing
-                    # with the worse one rejects the improvement it was sent to
-                    # get: an identity set at 3.0 samples per half-width refused
-                    # the 6.1-sample detection that followed it.
-                    if (
-                        detector == "strict"
-                        and resolution_samples
-                        > _IDENTITY_RESOLUTION_MARGIN * identity_resolution
+                    # ANY better resolved strict detection REPLACES the
+                    # identity rather than being judged against it. The measured
+                    # spacing is biased by resolution -- 16.9 mV at 6.1 samples
+                    # per half-width and 23.6 mV at 8.8 on the same feature --
+                    # so comparing across a resolution change tests the sweep
+                    # width, not the identity of the crossing. Narrowing exists
+                    # to measure better; rejecting the better measurement for
+                    # disagreeing with the worse one rejects the improvement it
+                    # was sent to get.
+                    #
+                    # This used to demand a 1.5x improvement, so that two
+                    # detections at one geometry would compare rather than adopt.
+                    # The final pair no longer checks the spacing at all, so that
+                    # margin protected nothing -- and once narrowing became
+                    # adaptive the stages got gentler, a 1.45x stage slipped
+                    # under it, and the check fired on the bias it was meant to
+                    # tolerate. Equal or worse resolution still compares, which
+                    # is what a re-centring stage does.
+                    if detector == "strict" and resolution_samples > (
+                        identity_resolution * 1.001
                     ):
                         identity_sideband = candidate.sideband_offset_v
                         identity_resolution = resolution_samples
