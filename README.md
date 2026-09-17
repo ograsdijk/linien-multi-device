@@ -72,8 +72,10 @@ Linien laser-lock devices from one interface.
 ## Prerequisites
 
 - Python 3.10+
-- Node.js 20 (the Docker build and `package-lock.json` target Node 20; 18 may work but
-  is not what the build is validated against).
+- Node.js 22.22+ (24 or 26 also fine). Running the web tests on Node 20 fails
+  outright: `jsdom` 30 requires `^22.22.2 || ^24.15.0 || >=26.0.0`. CI runs 24.
+  The Docker image still builds the UI on `node:20-bookworm-slim`, which works
+  because that stage only runs `npm ci && npm run build` and never the tests.
 - [`uv`](https://docs.astral.sh/uv/) is recommended for the gateway. The project pins
   `numpy>=2` and reconciles it against `linien-common`/`linien-client 2.1.0` via a
   `[tool.uv]` override; a plain `pip install` does **not** honor that override and will
