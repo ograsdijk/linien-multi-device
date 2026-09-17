@@ -1751,8 +1751,8 @@ def test_a_narrowing_that_moves_the_feature_too_far_gentles_the_next_one(monkeyp
 # refused for not being centred. Narrowing is the way out: the rail moves
 # outward with the amplitude.
 
-def test_the_widest_safe_narrowing_keeps_the_target_in_view():
-    safe = DeviceSession._widest_safe_narrowing_v(
+def test_the_minimum_safe_amplitude_keeps_the_target_in_view():
+    safe = DeviceSession._min_safe_amplitude_v(
         amplitude_v=0.8, offset_v=0.39, shift_per_fraction=0.136, floor_v=0.128
     )
     assert safe is not None
@@ -1762,7 +1762,7 @@ def test_the_widest_safe_narrowing_keeps_the_target_in_view():
 
 
 def test_no_narrowing_is_safe_when_the_target_is_beyond_the_whole_scan():
-    assert DeviceSession._widest_safe_narrowing_v(
+    assert DeviceSession._min_safe_amplitude_v(
         amplitude_v=0.8, offset_v=0.95, shift_per_fraction=0.136, floor_v=0.128
     ) is None
 
@@ -1822,3 +1822,53 @@ def test_a_centre_on_the_rail_is_recognised_despite_float_noise():
         0.2, 0.59, 0.8, signal_width_v=0.064, max_signal_widths=1.0
     )
     assert pinned == pytest.approx(1.0 - 0.8, abs=1e-12)
+
+
+def test_a_rail_blocked_narrowing_never_cuts_below_the_safe_floor(monkeypatch):
+    """The field regression. Target 0.6795 V, centre pinned at the 0.2 V rail:
+    the floor that keeps it in view is 0.533 V, but the narrowing schedule
+    wanted 0.4 V and min() took the schedule. The window then ended at 0.6 V,
+    the target was cropped, and the detector found a crossing 247 mV away."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    widths: list[float] = []
+    monkeypatch.setattr(
+        session, "_set_sweep_geometry",
+        lambda c, a: (widths.append(float(a)), time.time())[1],
+    )
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    pinned = (_result(0.6795310210063508, 0.03204689789936493), 1.0 - 0.8, 0.8, 2.275)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (*pinned, {}),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: pinned,
+    )
+
+    try:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            ApproachSettings.from_mapping(session.lock_approach_settings),
+            0.0, 0.8,
+            initial_target=_result(0.6795310210063508, 0.03204689789936493),
+            initial_center_v=1.0 - 0.8, initial_amplitude_v=0.8,
+            initial_resolution=2.275, initial_detector="coarse",
+            trace_length=2048,
+        )
+    except session_module.TrajectoryRefinementAborted:
+        pass  # the stub never converges; the cut size is what this asserts
+
+    narrowed = [w for w in widths if w < 0.8 - 1e-9]
+    assert narrowed, "pinned at the rail and never changed the width"
+    offset = abs(0.6795310210063508 - (1.0 - 0.8))
+    floor = DeviceSession._min_safe_amplitude_v(0.8, offset, None, 0.128)
+    assert floor == pytest.approx(0.533, abs=0.01)
+    assert narrowed[0] >= floor - 1e-9, (
+        f"cut to {narrowed[0]:.3f} V, below the {floor:.3f} V floor: the target "
+        f"at offset {offset:.3f} V would fall outside the new window"
+    )
+    assert offset <= narrowed[0], "target cropped out of the new window"

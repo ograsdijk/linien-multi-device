@@ -3253,13 +3253,19 @@ class DeviceSession:
             return False
 
     @staticmethod
-    def _widest_safe_narrowing_v(
+    def _min_safe_amplitude_v(
         amplitude_v: float,
         offset_v: float,
         shift_per_fraction: float | None,
         floor_v: float,
     ) -> float | None:
-        """Gentlest width cut that still leaves the target inside the window.
+        """Smallest amplitude that still leaves the target inside the window.
+
+        A FLOOR on the next amplitude, not a ceiling: narrowing below it crops
+        the target out of view. Named for what it returns, because reading it as
+        a ceiling and taking min() of the two produced exactly the cropping it
+        exists to prevent -- a 0.533 V floor cut to 0.400 V, putting a target at
+        0.6795 V outside a window ending at 0.600 V.
 
         Used when the sweep rails block further re-centring: the centre cannot
         exceed +/-(1 - amplitude), so a target beyond that is unreachable until
@@ -3662,7 +3668,7 @@ class DeviceSession:
                         # Narrowing is the way out: the rail moves outward with
                         # the amplitude. Take the gentlest cut that keeps the
                         # target in view and let the next stage centre on it.
-                        safe = self._widest_safe_narrowing_v(
+                        safe = self._min_safe_amplitude_v(
                             amplitude_v,
                             float(target.target_voltage) - center_v,
                             shift_per_fraction,
@@ -3677,7 +3683,9 @@ class DeviceSession:
                                 "Move the laser closer to the feature, or start "
                                 "from a narrower scan."
                             )
-                        next_amplitude = min(next_amplitude, safe)
+                        # A floor: never narrow past what keeps the target in
+                        # view, even though the schedule wanted a bigger cut.
+                        next_amplitude = max(next_amplitude, safe)
                         stages.append({
                             "kind": "rail_blocked", "center_v": center_v,
                             "amplitude_v": amplitude_v,
