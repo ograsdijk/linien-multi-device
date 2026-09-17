@@ -1482,14 +1482,15 @@ def test_a_coarse_sideband_estimate_does_not_become_the_identity(monkeypatch):
     assert refinement["stages"][-1]["kind"] == "final_verify"
 
 
-def test_two_strict_detections_must_still_agree_on_the_sideband(monkeypatch):
+def test_a_sideband_change_across_a_geometry_change_is_still_an_identity_change(monkeypatch):
     """The protection that matters is kept: once a strict detection establishes
-    the spacing, a later strict one that disagrees is a different crossing."""
+    the spacing, a later strict one at comparable resolution that disagrees is
+    a different crossing, and the walk must not follow it."""
     session = _identity_session(monkeypatch, coarse_sideband=None,
                                 strict_sideband=0.05)
     captures = iter([
-        (_result(0.449, 0.05), 0.4, 0.2, 20.0),   # narrow -> sets identity
-        (_result(0.449, 0.20), 0.4, 0.2, 20.0),   # strict_one: 4x the spacing
+        (_result(0.449, 0.05), 0.4, 0.3, 20.0),   # narrow -> sets identity
+        (_result(0.449, 0.20), 0.4, 0.2, 25.0),   # narrow -> 4x the spacing
     ])
     monkeypatch.setattr(
         session, "_capture_auto_lock_target",
@@ -1499,6 +1500,31 @@ def test_two_strict_detections_must_still_agree_on_the_sideband(monkeypatch):
     with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
         _walk_from_coarse(session)
     assert excinfo.value.failure_kind == "identity"
+    # The numbers that decided it, which the message used to omit entirely.
+    failure = excinfo.value.refinement["failure"]
+    assert "200.000 mV" in failure and "50.000 mV" in failure
+
+
+def test_the_final_pair_is_judged_on_position_not_sideband_spacing(monkeypatch):
+    """Both detections are at ONE unchanged geometry, where same slope and same
+    voltage already means the same crossing. The sideband fit has its own
+    scatter, so checking it there only adds a way to fail."""
+    session = _identity_session(monkeypatch, coarse_sideband=None,
+                                strict_sideband=0.05)
+    captures = iter([
+        (_result(0.449, 0.05), 0.4, 0.2, 20.0),   # narrow -> sets identity
+        (_result(0.449, 0.05), 0.4, 0.2, 20.0),   # strict_one
+        (_result(0.449, 0.20), 0.4, 0.2, 20.0),   # strict_two: same spot, 4x fit
+    ])
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: next(captures),
+    )
+
+    result, refinement = _walk_from_coarse(session)
+
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+    assert result.target_voltage == pytest.approx(0.449)
 
 
 # ------------------------------- narrowing must not crop the tracked feature
@@ -1606,3 +1632,71 @@ def test_an_unmeasured_signal_width_falls_back_to_the_scan_rule():
         0.0, 1.0, 0.6, signal_width_v=None, max_signal_widths=1.0
     )
     assert moved == pytest.approx(0.15)
+
+
+# ------------------------------- narrowing moves the feature too (field case)
+#
+# Changing the ramp width changes the actuator's trajectory, so the apparent
+# resonance moves with it. Measured on this device: one 2x narrowing (0.6 ->
+# 0.3 V) moved the target 73 mV -- more than the 65 mV signal width that bounds
+# a commanded centre step. The walk bounded the moves it commanded and then made
+# a bigger one by changing the width.
+
+def test_the_allowance_is_the_same_for_a_width_change_and_a_centre_step():
+    settings = AutoLockScanSettings.from_mapping(
+        {"signal_type": "pdh", "max_center_step_signal_widths": 1.0}
+    )
+    allowance = DeviceSession._center_step_allowance_v(settings, 0.6, 0.0325)
+    assert allowance == pytest.approx(0.065)  # one signal width, not 0.25 x 0.6
+
+    step = DeviceSession._bounded_recenter_v(
+        0.0, 1.0, 0.6, signal_width_v=2 * 0.0325, max_signal_widths=1.0
+    )
+    assert step == pytest.approx(allowance)
+
+
+def test_a_narrowing_that_moves_the_feature_too_far_gentles_the_next_one(monkeypatch):
+    """The field numbers: a 50% width cut moved the target 73 mV against a
+    65 mV allowance, so the next cut must be gentler than 50%."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    widths: list[float] = []
+    monkeypatch.setattr(
+        session, "_set_sweep_geometry",
+        lambda c, a: (widths.append(a), time.time())[1],
+    )
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    # Each capture reports the geometry it was asked for, and a target that has
+    # moved 73 mV per 50% width cut -- 146 mV per unit fraction.
+    state = {"target": 0.5457}
+
+    def _capture(settings, traces=None, after=None):
+        amplitude = widths[-1]
+        state["target"] -= 0.1464 * (1.0 - amplitude / 0.6) if amplitude < 0.6 else 0.0
+        return _result(state["target"], 0.0325), 0.4, amplitude, 0.001778 * 2047 / (2 * amplitude)
+
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _capture)
+
+    try:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            ApproachSettings.from_mapping(session.lock_approach_settings),
+            0.4, 0.6,
+            initial_target=_result(0.5457, 0.0325),
+            initial_center_v=0.4, initial_amplitude_v=0.6,
+            initial_resolution=3.03,
+            initial_detector="strict", trace_length=2048,
+        )
+    except session_module.TrajectoryRefinementAborted:
+        pass  # convergence is not what this asserts
+
+    assert len(widths) >= 2
+    first_cut = 1.0 - widths[0] / 0.6
+    second_cut = 1.0 - widths[1] / widths[0]
+    assert first_cut == pytest.approx(0.5)      # no measurement yet
+    assert second_cut < first_cut, (
+        f"kept cutting {second_cut:.0%} after a {first_cut:.0%} cut moved the "
+        "feature past its allowance"
+    )

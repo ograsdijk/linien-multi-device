@@ -172,6 +172,14 @@ _MAX_REFINEMENT_STAGES = 16
 # clear of 1 so two detections at the same geometry -- the final verification
 # pair -- always compare against each other instead of one silently adopting.
 _IDENTITY_RESOLUTION_MARGIN = 1.5
+# Gentlest narrowing the adaptive rule may fall back to. A stage that barely
+# changes the width measures nothing and burns the budget, so a feature whose
+# position is this sensitive to width is one the walk should give up on rather
+# than creep after.
+_REFINEMENT_MAX_NARROW_FACTOR = 0.9
+# Width changes below this fraction cannot measure the shift they cause: the
+# detector's own scatter swamps it and the ratio explodes.
+_REFINEMENT_MIN_MEASURABLE_FRACTION = 0.05
 
 # How long a disconnect waits for an in-flight relock action to finish before
 # going ahead anyway. A guarded center move takes seconds; abandoning one
@@ -3238,6 +3246,25 @@ class DeviceSession:
             return False
 
     @staticmethod
+    def _center_step_allowance_v(
+        settings: AutoLockScanSettings,
+        amplitude_v: float,
+        sideband_offset_v: float | None,
+    ) -> float:
+        """How far one stage may move the apparent feature, in sweep volts.
+
+        One allowance for both ways a stage can move it -- commanding the centre
+        and changing the width -- because the risk is the same either way:
+        travelling further than the distance to a neighbouring feature in a
+        single step can leave the walk tracking the wrong one.
+        """
+        allowance = 0.25 * abs(float(amplitude_v))
+        widths = float(settings.max_center_step_signal_widths)
+        if sideband_offset_v is not None and widths > 0.0:
+            allowance = min(allowance, widths * 2.0 * abs(float(sideband_offset_v)))
+        return allowance
+
+    @staticmethod
     def _bounded_recenter_v(
         center_v: float,
         target_v: float,
@@ -3417,12 +3444,15 @@ class DeviceSession:
                 *,
                 detector: str = "strict",
                 resolution_samples: float = 0.0,
+                check_sideband: bool = True,
             ) -> None:
                 nonlocal identity_sideband, identity_resolution
                 if candidate.target_slope_rising != identity_slope:
                     raise _TrackingIdentityChanged(
                         "Tracking candidate changed discriminator slope identity."
                     )
+                if not check_sideband:
+                    return
                 if identity_sideband is not None and candidate.sideband_offset_v is not None:
                     # A strict detection on a meaningfully better resolved trace
                     # REPLACES the identity rather than being judged against it.
@@ -3441,11 +3471,18 @@ class DeviceSession:
                         return
                     # Sideband spacing should survive geometry changes. Allow a
                     # generous 35% while the wide trace is under-resolved.
-                    if abs(candidate.sideband_offset_v - identity_sideband) > max(
+                    tolerance = max(
                         0.35 * identity_sideband, 2.0 * abs(amplitude_v) / trace_length
-                    ):
+                    )
+                    if abs(candidate.sideband_offset_v - identity_sideband) > tolerance:
                         raise _TrackingIdentityChanged(
-                            "Tracking candidate changed PDH sideband identity."
+                            "Tracking candidate changed PDH sideband identity: "
+                            f"measured {candidate.sideband_offset_v * 1e3:.3f} mV by the "
+                            f"{detector} detector at {resolution_samples:.2f} samples per "
+                            f"half-width, against an identity of "
+                            f"{identity_sideband * 1e3:.3f} mV established at "
+                            f"{identity_resolution:.2f} samples "
+                            f"(tolerance {tolerance * 1e3:.3f} mV)."
                         )
                 elif candidate.sideband_offset_v is not None and detector == "strict":
                     # Wide scans may not resolve ±Ω. Once a later one does, make
@@ -3467,6 +3504,14 @@ class DeviceSession:
             # Centre moves are intentionally separate;
             # they are known to perturb this DFB's apparent feature position.
             narrow_count = 0
+            # Narrowing the scan moves the feature too: changing the ramp width
+            # changes the actuator's trajectory, and the apparent resonance
+            # follows. Measured on this device at 73 mV for one 2x narrowing --
+            # larger than the 65 mV signal width the centre steps are bounded
+            # by, so an unbounded width change is the bigger move of the two.
+            # Each stage measures it (shift per unit fractional width change)
+            # and the next stage is sized from what was actually observed.
+            shift_per_fraction: float | None = None
             while detector == "coarse" or scan_too_wide_to_lock(
                 settings, amplitude_v, target.sideband_offset_v
             ):
@@ -3499,6 +3544,17 @@ class DeviceSession:
                     if amplitude_v > _REFINEMENT_GENTLE_APPROACH * target_amplitude
                     else _REFINEMENT_NARROW_FACTOR
                 )
+                # Hold the width-induced shift to the same allowance a centre
+                # step gets: never move the feature further than the distance to
+                # a neighbour in one go, whichever way it is moved.
+                step_allowance = self._center_step_allowance_v(
+                    settings, amplitude_v, target.sideband_offset_v
+                )
+                if shift_per_fraction and shift_per_fraction > 1e-9:
+                    gentlest = 1.0 - (step_allowance / shift_per_fraction)
+                    factor = min(
+                        _REFINEMENT_MAX_NARROW_FACTOR, max(factor, gentlest)
+                    )
                 next_amplitude = amplitude_v * factor
                 # Stop precisely at the goal rather than overshooting past it.
                 next_amplitude = max(target_amplitude, next_amplitude)
@@ -3538,6 +3594,8 @@ class DeviceSession:
                     if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
                         narrow_count += 1
                         continue
+                before_v = float(target.target_voltage)
+                before_amplitude = abs(amplitude_v)
                 moved_at = self._set_sweep_geometry(center_v, next_amplitude)
                 try:
                     target, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
@@ -3550,10 +3608,27 @@ class DeviceSession:
                         settings, after=moved_at
                     )
                     detector = "coarse"
+                # What the width change actually did to the apparent position.
+                width_shift_v = abs(float(target.target_voltage) - before_v)
+                width_fraction = (
+                    1.0 - (abs(amplitude_v) / before_amplitude)
+                    if before_amplitude > 1e-12 else 0.0
+                )
+                if width_fraction > _REFINEMENT_MIN_MEASURABLE_FRACTION:
+                    observed = width_shift_v / width_fraction
+                    # Keep the worst seen: one gentle stage must not talk the
+                    # walk back into a step a harsher one already showed is big.
+                    shift_per_fraction = (
+                        observed if shift_per_fraction is None
+                        else max(shift_per_fraction, observed)
+                    )
                 stages.append({
                     "kind": "narrow", "center_v": center_v, "amplitude_v": amplitude_v,
                     "target_voltage": target.target_voltage, "resolution_samples": resolution,
                     "detector": detector, "metrics": coarse_metrics if detector == "coarse" else None,
+                    "sideband_offset_v": target.sideband_offset_v,
+                    "width_shift_v": width_shift_v,
+                    "shift_per_fraction_v": shift_per_fraction,
                 })
                 _check_identity(target, detector=detector, resolution_samples=resolution)
                 narrow_count += 1
@@ -3599,12 +3674,23 @@ class DeviceSession:
                 strict_one, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
                     settings, after=time.time()
                 )
-            _check_identity(strict_one, resolution_samples=resolution)
+            # Sideband spacing is a derived quantity with its own measurement
+            # noise. It earns its keep ACROSS geometry changes, where the target
+            # voltage legitimately moves and another invariant is needed. These
+            # two detections are at one unchanged geometry, where the position
+            # check below is strictly stronger: same slope and same voltage is
+            # the same crossing, whatever the sideband fit did. Applying it here
+            # only adds a way to fail.
+            _check_identity(
+                strict_one, resolution_samples=resolution, check_sideband=False
+            )
             verify_after = time.time()
             strict_two, verify_center, verify_amplitude, _ = self._capture_auto_lock_target(
                 settings, after=verify_after
             )
-            _check_identity(strict_two, resolution_samples=resolution)
+            _check_identity(
+                strict_two, resolution_samples=resolution, check_sideband=False
+            )
             # One definition of "the feature moved too far", shared with the
             # guarded move, rather than a second inline literal that silently
             # diverges from capture_fraction the moment anyone changes it.
