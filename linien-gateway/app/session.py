@@ -175,6 +175,18 @@ _REFINEMENT_MAX_NARROW_FACTOR = 0.9
 # Width changes below this fraction cannot measure the shift they cause: the
 # detector's own scatter swamps it and the ratio explodes.
 _REFINEMENT_MIN_MEASURABLE_FRACTION = 0.05
+# Share of the half-span the target may sit at and still count as "inside the
+# window" when the rails force a narrowing that has not been centred first.
+# Below 1 so the edge is not the acceptance criterion.
+_WINDOW_KEEP_FRACTION = 0.9
+# Below this, a commanded centre move is no move at all -- the rails have pinned
+# it and stepping again would spin.
+_CENTER_MOVE_EPSILON_V = 1e-6
+# Slack on the sweep-rail comparison, comfortably above double-precision noise
+# on 1.0 - amplitude and far below anything the hardware resolves.
+_RAIL_EPSILON_V = 1e-9
+# Fixed-point rounds for the safe-narrowing solve. It converges in three.
+_SAFE_NARROWING_ITERATIONS = 5
 
 # How long a disconnect waits for an in-flight relock action to finish before
 # going ahead anyway. A guarded center move takes seconds; abandoning one
@@ -3241,6 +3253,41 @@ class DeviceSession:
             return False
 
     @staticmethod
+    def _widest_safe_narrowing_v(
+        amplitude_v: float,
+        offset_v: float,
+        shift_per_fraction: float | None,
+        floor_v: float,
+    ) -> float | None:
+        """Gentlest width cut that still leaves the target inside the window.
+
+        Used when the sweep rails block further re-centring: the centre cannot
+        exceed +/-(1 - amplitude), so a target beyond that is unreachable until
+        the amplitude comes down and takes the rail outward with it. Narrowing
+        is then the only way forward, even though the target is not yet centred.
+
+        Two effects race. A smaller window brings its own edge closer to the
+        target, and the width change moves the target as well (measured as
+        ``shift_per_fraction``). Solve for the widest amplitude where the target
+        still sits inside after the shift that reaching it causes -- widest, not
+        smallest, because a gentler cut both moves the feature less and leaves
+        more room. ``None`` when no cut is safe.
+        """
+        amplitude = abs(float(amplitude_v))
+        offset = abs(float(offset_v))
+        spf = max(0.0, float(shift_per_fraction or 0.0))
+        if amplitude <= 1e-12:
+            return None
+        candidate = max(float(floor_v), 1e-9)
+        for _ in range(_SAFE_NARROWING_ITERATIONS):
+            fraction = max(0.0, 1.0 - (candidate / amplitude))
+            needed = (offset + spf * fraction) / _WINDOW_KEEP_FRACTION
+            candidate = max(needed, float(floor_v))
+        if candidate >= amplitude:
+            return None
+        return candidate
+
+    @staticmethod
     def _center_step_allowance_v(
         settings: AutoLockScanSettings,
         amplitude_v: float,
@@ -3296,7 +3343,13 @@ class DeviceSession:
             bound = min(bound, float(max_signal_widths) * abs(float(signal_width_v)))
         lo, hi = center_v - bound, center_v + bound
         rail_lo, rail_hi = -1.0 + amplitude, 1.0 - amplitude
-        if rail_lo <= rail_hi and rail_lo <= center_v <= rail_hi:
+        # Tolerant comparison: 1.0 - 0.8 is 0.19999999999999996, and a centre
+        # sitting exactly on that rail reads back as 0.2 often enough that an
+        # exact test let a 4e-17 difference decide between honouring the rails
+        # and ignoring them entirely.
+        if rail_lo <= rail_hi and (
+            rail_lo - _RAIL_EPSILON_V <= center_v <= rail_hi + _RAIL_EPSILON_V
+        ):
             lo, hi = max(lo, rail_lo), min(hi, rail_hi)
         return min(hi, max(lo, float(target_v)))
 
@@ -3579,25 +3632,60 @@ class DeviceSession:
                         ),
                         max_signal_widths=settings.max_center_step_signal_widths,
                     )
-                    moved_at = self._set_sweep_geometry(new_center, amplitude_v)
-                    target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
-                        settings, after=moved_at
-                    )
-                    _check_identity(target, detector="coarse", resolution_samples=resolution)
-                    stages.append({"kind": "recenter", "center_v": center_v,
-                                   "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
-                                   "resolution_samples": resolution, "detector": "coarse",
-                                   "metrics": coarse_metrics})
-                    # One bounded step may not be enough to reach a feature far
-                    # from the centre, and narrowing anyway crops the very
-                    # feature being tracked out of the next window: a run that
-                    # recentred 0.2 -> 0.35 V with the target at 0.771 V then
-                    # narrowed to +/-0.3 V, whose window ends at 0.65 V, and the
-                    # detector duly found a different crossing. Step again
-                    # instead, and only narrow once the target is inside.
-                    if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
-                        narrow_count += 1
-                        continue
+                    if abs(new_center - center_v) > _CENTER_MOVE_EPSILON_V:
+                        moved_at = self._set_sweep_geometry(new_center, amplitude_v)
+                        target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
+                            settings, after=moved_at
+                        )
+                        _check_identity(target, detector="coarse", resolution_samples=resolution)
+                        stages.append({"kind": "recenter", "center_v": center_v,
+                                       "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
+                                       "resolution_samples": resolution, "detector": "coarse",
+                                       "metrics": coarse_metrics})
+                        # One bounded step may not be enough to reach a feature
+                        # far from the centre, and narrowing anyway crops the
+                        # very feature being tracked out of the next window: a
+                        # run that recentred 0.2 -> 0.35 V with the target at
+                        # 0.771 V then narrowed to +/-0.3 V, whose window ends at
+                        # 0.65 V, and the detector duly found a different
+                        # crossing. Step again instead, and only narrow once the
+                        # target is inside.
+                        if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
+                            narrow_count += 1
+                            continue
+                    else:
+                        # The rails pin the centre at +/-(1 - amplitude), so the
+                        # target is unreachable at this width however many steps
+                        # are taken -- and the previous rule then refused to
+                        # narrow because it was not centred, which is a deadlock
+                        # that burned all 16 stages without one width change.
+                        # Narrowing is the way out: the rail moves outward with
+                        # the amplitude. Take the gentlest cut that keeps the
+                        # target in view and let the next stage centre on it.
+                        safe = self._widest_safe_narrowing_v(
+                            amplitude_v,
+                            float(target.target_voltage) - center_v,
+                            shift_per_fraction,
+                            target_amplitude,
+                        )
+                        if safe is None:
+                            raise ValueError(
+                                "The sweep rails pin the center at "
+                                f"{center_v:+.4f} V and the target is "
+                                f"{float(target.target_voltage):+.4f} V, which no "
+                                "narrowing can bring into view without losing it. "
+                                "Move the laser closer to the feature, or start "
+                                "from a narrower scan."
+                            )
+                        next_amplitude = min(next_amplitude, safe)
+                        stages.append({
+                            "kind": "rail_blocked", "center_v": center_v,
+                            "amplitude_v": amplitude_v,
+                            "target_voltage": target.target_voltage,
+                            "resolution_samples": resolution, "detector": detector,
+                            "rail_v": 1.0 - abs(amplitude_v),
+                            "next_amplitude_v": next_amplitude,
+                        })
                 before_v = float(target.target_voltage)
                 before_amplitude = abs(amplitude_v)
                 moved_at = self._set_sweep_geometry(center_v, next_amplitude)

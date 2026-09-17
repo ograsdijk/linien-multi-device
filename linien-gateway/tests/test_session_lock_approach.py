@@ -1503,9 +1503,11 @@ def test_a_recentring_stage_that_changes_the_spacing_is_an_identity_change(monke
         session._trajectory_refine_auto_lock(
             AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
             ApproachSettings.from_mapping(session.lock_approach_settings),
-            0.4, 0.6,
+            0.0, 0.6,
             initial_target=_result(0.9, 0.05),  # far out -> forces a recentre
-            initial_center_v=0.4, initial_amplitude_v=0.6,
+            # Centre off the rail (+/-0.4 at this amplitude) so the stage really
+            # re-centres rather than taking the rail-blocked path.
+            initial_center_v=0.0, initial_amplitude_v=0.6,
             initial_resolution=20.0,
             initial_detector="strict", trace_length=2048,
         )
@@ -1738,3 +1740,85 @@ def test_a_narrowing_that_moves_the_feature_too_far_gentles_the_next_one(monkeyp
         f"kept cutting {second_cut:.0%} after a {first_cut:.0%} cut moved the "
         "feature past its allowance"
     )
+
+
+# --------------------------------------------- the sweep rails (field case)
+#
+# Two runs at amplitude 0.8 V, whose rails pin the centre at +/-0.2 V, with the
+# target at ~0.59 V. The walk stepped the centre 0 -> 0.063 -> 0.127 -> 0.191 ->
+# 0.200 and then spent THIRTEEN more stages re-detecting at 0.2 without one
+# width change, because re-centring could not progress and narrowing was
+# refused for not being centred. Narrowing is the way out: the rail moves
+# outward with the amplitude.
+
+def test_the_widest_safe_narrowing_keeps_the_target_in_view():
+    safe = DeviceSession._widest_safe_narrowing_v(
+        amplitude_v=0.8, offset_v=0.39, shift_per_fraction=0.136, floor_v=0.128
+    )
+    assert safe is not None
+    assert 0.45 < safe < 0.55              # a real cut, not a token one
+    assert abs(0.39) < 0.9 * safe          # target still inside afterwards
+    assert 1.0 - safe > 0.5                # rail moved 0.20 -> ~0.51
+
+
+def test_no_narrowing_is_safe_when_the_target_is_beyond_the_whole_scan():
+    assert DeviceSession._widest_safe_narrowing_v(
+        amplitude_v=0.8, offset_v=0.95, shift_per_fraction=0.136, floor_v=0.128
+    ) is None
+
+
+def test_a_rail_pinned_walk_narrows_instead_of_stalling(monkeypatch):
+    """The deadlock: re-centring blocked by the rail, narrowing blocked by not
+    being centred. It must make a width change rather than burn the budget."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    widths: list[float] = []
+
+    def _set(center, amplitude):
+        widths.append(float(amplitude))
+        return time.time()
+
+    monkeypatch.setattr(session, "_set_sweep_geometry", _set)
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    # Centre already pinned at the rail; target far beyond it, as in the field.
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (
+            _result(0.59, 0.0320), 1.0 - 0.8, 0.8, 2.275, {}
+        ),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (
+            _result(0.59, 0.0320), 1.0 - 0.8, 0.8, 2.275
+        ),
+    )
+
+    try:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            ApproachSettings.from_mapping(session.lock_approach_settings),
+            0.0, 0.8,
+            initial_target=_result(0.59, 0.0320),
+            initial_center_v=1.0 - 0.8, initial_amplitude_v=0.8,
+            initial_resolution=2.275,
+            initial_detector="coarse", trace_length=2048,
+        )
+    except session_module.TrajectoryRefinementAborted:
+        pass  # the stub never converges; the stall is what this asserts
+
+    narrowed = [w for w in widths if w < 0.8 - 1e-9]
+    assert narrowed, "pinned at the rail and never changed the width"
+    assert narrowed[0] < 0.6  # a useful cut, moving the rail outward
+
+
+def test_a_centre_on_the_rail_is_recognised_despite_float_noise():
+    """1.0 - 0.8 is 0.19999999999999996; a centre reading back as 0.2 is on the
+    rail, not past it. An exact comparison let 4e-17 decide whether the rails
+    applied at all."""
+    pinned = DeviceSession._bounded_recenter_v(
+        0.2, 0.59, 0.8, signal_width_v=0.064, max_signal_widths=1.0
+    )
+    assert pinned == pytest.approx(1.0 - 0.8, abs=1e-12)
