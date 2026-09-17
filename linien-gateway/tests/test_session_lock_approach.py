@@ -1499,3 +1499,81 @@ def test_two_strict_detections_must_still_agree_on_the_sideband(monkeypatch):
     with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
         _walk_from_coarse(session)
     assert excinfo.value.failure_kind == "identity"
+
+
+# ------------------------------- narrowing must not crop the tracked feature
+
+def _cropping_session(monkeypatch, coarse_targets):
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    geometry: list[tuple[float, float]] = []
+    monkeypatch.setattr(
+        session, "_set_sweep_geometry",
+        lambda c, a: (geometry.append((c, a)), time.time())[1],
+    )
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    coarse = iter(coarse_targets)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: next(coarse),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (
+            _result(0.62, 0.0325), 0.6, 0.13, 20.0
+        ),
+    )
+    return session, geometry
+
+
+def test_narrowing_waits_until_the_target_is_inside_the_next_window(monkeypatch):
+    """The field failure: centre stepped 0.2 -> 0.35 V with the target reading
+    0.771 V, then narrowed to +/-0.3 V whose window ends at 0.65 V. The feature
+    being tracked was cropped out and the detector found a different crossing."""
+    session, geometry = _cropping_session(monkeypatch, [
+        # Still 421 mV out after the first bounded step -- must not narrow yet.
+        (_result(0.7712, 0.0325), 0.35, 0.6, 3.03, {}),
+        (_result(0.7712, 0.0325), 0.50, 0.6, 3.03, {}),
+        (_result(0.7712, 0.0325), 0.65, 0.6, 3.03, {}),
+        (_result(0.62, 0.0325), 0.62, 0.6, 3.03, {}),
+    ])
+
+    session._trajectory_refine_auto_lock(
+        AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+        ApproachSettings.from_mapping(session.lock_approach_settings),
+        0.2, 0.6,
+        initial_target=_result(0.622991283778572, 0.0325),
+        initial_center_v=0.2, initial_amplitude_v=0.6,
+        initial_resolution=3.0333333333333337,
+        initial_detector="strict", trace_length=2048,
+    )
+
+    # Every width change must leave the tracked target inside the new window.
+    for center, amplitude in geometry:
+        if amplitude < 0.6:
+            assert abs(0.62 - center) <= amplitude, (
+                f"narrowed to +/-{amplitude} around {center}, cropping the target"
+            )
+
+
+def test_a_better_resolved_detection_replaces_the_identity(monkeypatch):
+    """A spacing measured at 3.0 samples per half-width is an estimate. The
+    6.1-sample detection that narrowing was sent to get must not be rejected
+    for disagreeing with it."""
+    session = _identity_session(monkeypatch, coarse_sideband=None,
+                                strict_sideband=0.050)
+
+    result, refinement = session._trajectory_refine_auto_lock(
+        AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+        ApproachSettings.from_mapping(session.lock_approach_settings),
+        0.35, 0.6,
+        initial_target=_result(0.48, 0.0325),  # poorly resolved estimate
+        initial_center_v=0.35, initial_amplitude_v=0.6,
+        initial_resolution=3.03,
+        initial_detector="coarse", trace_length=2048,
+    )
+
+    assert result.sideband_offset_v == pytest.approx(0.050)
+    assert refinement["stages"][-1]["kind"] == "final_verify"

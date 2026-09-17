@@ -167,6 +167,11 @@ _REFINEMENT_GENTLE_APPROACH = 4.0
 # to be able to cross the full sweep range: from 1 V to a few mV takes ~11
 # stages at the factors above, so the budget is that with headroom.
 _MAX_REFINEMENT_STAGES = 16
+# How much better resolved a strict detection must be before it is allowed to
+# REPLACE the standing sideband identity rather than be judged against it. Well
+# clear of 1 so two detections at the same geometry -- the final verification
+# pair -- always compare against each other instead of one silently adopting.
+_IDENTITY_RESOLUTION_MARGIN = 1.5
 
 # How long a disconnect waits for an in-flight relock action to finish before
 # going ahead anyway. A guarded center move takes seconds; abandoning one
@@ -3388,14 +3393,38 @@ class DeviceSession:
             })
             identity_slope = target.target_slope_rising
             identity_sideband = target.sideband_offset_v
+            # Resolution the standing sideband identity was measured at. A
+            # spacing read off a barely-resolved trace is an estimate, not a
+            # reference the rest of the walk must match.
+            identity_resolution = resolution if identity_sideband is not None else 0.0
 
-            def _check_identity(candidate: Any, *, detector: str = "strict") -> None:
-                nonlocal identity_sideband
+            def _check_identity(
+                candidate: Any,
+                *,
+                detector: str = "strict",
+                resolution_samples: float = 0.0,
+            ) -> None:
+                nonlocal identity_sideband, identity_resolution
                 if candidate.target_slope_rising != identity_slope:
                     raise _TrackingIdentityChanged(
                         "Tracking candidate changed discriminator slope identity."
                     )
                 if identity_sideband is not None and candidate.sideband_offset_v is not None:
+                    # A strict detection on a meaningfully better resolved trace
+                    # REPLACES the identity rather than being judged against it.
+                    # The whole point of narrowing is to measure the signal
+                    # better, so rejecting the better measurement for disagreeing
+                    # with the worse one rejects the improvement it was sent to
+                    # get: an identity set at 3.0 samples per half-width refused
+                    # the 6.1-sample detection that followed it.
+                    if (
+                        detector == "strict"
+                        and resolution_samples
+                        > _IDENTITY_RESOLUTION_MARGIN * identity_resolution
+                    ):
+                        identity_sideband = candidate.sideband_offset_v
+                        identity_resolution = resolution_samples
+                        return
                     # Sideband spacing should survive geometry changes. Allow a
                     # generous 35% while the wide trace is under-resolved.
                     if abs(candidate.sideband_offset_v - identity_sideband) > max(
@@ -3414,6 +3443,7 @@ class DeviceSession:
                     # not over any real change in the feature. It is declared
                     # tracking-only; defining the identity is not tracking.
                     identity_sideband = candidate.sideband_offset_v
+                    identity_resolution = resolution_samples
 
             # Narrow in <=25% reductions until the STRICT detector accepts a
             # trace -- that, not a sample count, is the thing refinement is
@@ -3472,11 +3502,21 @@ class DeviceSession:
                     target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
                         settings, after=moved_at
                     )
-                    _check_identity(target, detector="coarse")
+                    _check_identity(target, detector="coarse", resolution_samples=resolution)
                     stages.append({"kind": "recenter", "center_v": center_v,
                                    "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
                                    "resolution_samples": resolution, "detector": "coarse",
                                    "metrics": coarse_metrics})
+                    # One bounded step may not be enough to reach a feature far
+                    # from the centre, and narrowing anyway crops the very
+                    # feature being tracked out of the next window: a run that
+                    # recentred 0.2 -> 0.35 V with the target at 0.771 V then
+                    # narrowed to +/-0.3 V, whose window ends at 0.65 V, and the
+                    # detector duly found a different crossing. Step again
+                    # instead, and only narrow once the target is inside.
+                    if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
+                        narrow_count += 1
+                        continue
                 moved_at = self._set_sweep_geometry(center_v, next_amplitude)
                 try:
                     target, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
@@ -3494,7 +3534,7 @@ class DeviceSession:
                     "target_voltage": target.target_voltage, "resolution_samples": resolution,
                     "detector": detector, "metrics": coarse_metrics if detector == "coarse" else None,
                 })
-                _check_identity(target, detector=detector)
+                _check_identity(target, detector=detector, resolution_samples=resolution)
                 narrow_count += 1
                 # Keep the feature inside the central half, but bound a centre
                 # adjustment to 25% of the present half-range.
@@ -3514,7 +3554,7 @@ class DeviceSession:
                         "target_voltage": target.target_voltage, "resolution_samples": resolution,
                         "detector": "coarse", "metrics": coarse_metrics,
                     })
-                    _check_identity(target, detector="coarse")
+                    _check_identity(target, detector="coarse", resolution_samples=resolution)
 
             # The coarse result only guides geometry. Demand two fresh strict
             # detections at the final unchanged geometry before any guarded move.
@@ -3531,12 +3571,12 @@ class DeviceSession:
                 strict_one, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
                     settings, after=time.time()
                 )
-            _check_identity(strict_one)
+            _check_identity(strict_one, resolution_samples=resolution)
             verify_after = time.time()
             strict_two, verify_center, verify_amplitude, _ = self._capture_auto_lock_target(
                 settings, after=verify_after
             )
-            _check_identity(strict_two)
+            _check_identity(strict_two, resolution_samples=resolution)
             # One definition of "the feature moved too far", shared with the
             # guarded move, rather than a second inline literal that silently
             # diverges from capture_fraction the moment anyone changes it.
