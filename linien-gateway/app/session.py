@@ -37,6 +37,8 @@ from .auto_lock_scan import (
     feature_resolution_samples,
     find_coarse_auto_lock_target,
     find_auto_lock_target,
+    max_lockable_amplitude_v,
+    scan_too_wide_to_lock,
 )
 from .auto_relock import AutoRelockConfig, AutoRelockController
 from .device_recovery import RecoveryCancelled, reboot_device
@@ -150,13 +152,21 @@ class _TrackingIdentityChanged(ValueError):
 # candidate loop in auto_lock_scan). This is a target for the narrowing walk to
 # stop at, and nothing may use it to reject a detection the detector accepted.
 _STRICT_DETECTOR_SAMPLES = 10.0
-# Scan-width reduction per refinement stage. Gradual on purpose: this actuator's
-# apparent feature position moves with scan geometry, so a large jump changes
-# the thing being tracked more than it improves the resolution of it.
+# Scan-width reduction per refinement stage for the last approach. Gradual on
+# purpose: this actuator's apparent feature position moves with scan geometry
+# (a 9% width change was measured to move it 5.4 mV), so a large step near the
+# goal can drop the feature out of the window it was supposed to land in.
 _REFINEMENT_NARROW_FACTOR = 0.75
-# Stages before refinement gives up. Each stage costs several sweeps, and a
-# feature that has not resolved in this many is not going to.
-_MAX_REFINEMENT_STAGES = 8
+# Reduction while still far from the goal. The window is many signal widths wide
+# there, so a half-step is safe and each one saved is a stage of drift avoided:
+# 0.75x alone needs ~18 stages to cross the full range, 0.5x first needs ~11.
+_REFINEMENT_COARSE_NARROW_FACTOR = 0.5
+# "Far from the goal" -- more than this multiple of the target amplitude.
+_REFINEMENT_GENTLE_APPROACH = 4.0
+# Stages before refinement gives up. Each costs several sweeps, and the walk has
+# to be able to cross the full sweep range: from 1 V to a few mV takes ~11
+# stages at the factors above, so the budget is that with headroom.
+_MAX_REFINEMENT_STAGES = 16
 
 # How long a disconnect waits for an in-flight relock action to finish before
 # going ahead anyway. A guarded center move takes seconds; abandoning one
@@ -3380,23 +3390,41 @@ class DeviceSession:
             # Centre moves are intentionally separate;
             # they are known to perturb this DFB's apparent feature position.
             narrow_count = 0
-            while detector == "coarse":
+            while detector == "coarse" or scan_too_wide_to_lock(
+                settings, amplitude_v, target.sideband_offset_v
+            ):
                 if narrow_count >= _MAX_REFINEMENT_STAGES:
                     raise ValueError(
-                        f"No strict candidate after {_MAX_REFINEMENT_STAGES} "
+                        f"No lockable scan after {_MAX_REFINEMENT_STAGES} "
                         "trajectory refinement stages."
                     )
-                # Floor the walk at the amplitude that gives the detector the
-                # sample count it needs; there is no point narrowing past it.
+                # Two floors, whichever is wider: the amplitude that gives the
+                # detector the samples it needs, and the one that puts the error
+                # signal over min_signal_scan_fraction of the span.
                 target_amplitude = (
                     float(settings.half_range_sweep_v)
                     * (trace_length - 1)
                     / (2.0 * _STRICT_DETECTOR_SAMPLES)
                 )
-                next_amplitude = amplitude_v * _REFINEMENT_NARROW_FACTOR
-                if resolution < _STRICT_DETECTOR_SAMPLES:
-                    # Stop precisely at the requested resolution where possible.
-                    next_amplitude = max(target_amplitude, next_amplitude)
+                width_amplitude = max_lockable_amplitude_v(
+                    settings, target.sideband_offset_v
+                )
+                if width_amplitude is not None:
+                    target_amplitude = min(target_amplitude, width_amplitude)
+                # Step size adapts to the margin. While the signal is a speck on
+                # the scan, the next window is still many signal widths wide and
+                # a half-step is safe; close to the goal, narrow gently, because
+                # a width change of a few percent visibly moves this actuator's
+                # apparent feature position and a big jump can drop it out of
+                # the new window entirely.
+                factor = (
+                    _REFINEMENT_COARSE_NARROW_FACTOR
+                    if amplitude_v > _REFINEMENT_GENTLE_APPROACH * target_amplitude
+                    else _REFINEMENT_NARROW_FACTOR
+                )
+                next_amplitude = amplitude_v * factor
+                # Stop precisely at the goal rather than overshooting past it.
+                next_amplitude = max(target_amplitude, next_amplitude)
                 next_amplitude = min(amplitude_v, next_amplitude)
                 if next_amplitude >= amplitude_v - 1e-9:
                     break
@@ -3601,6 +3629,9 @@ class DeviceSession:
 
         approach_report: dict[str, Any] | None = None
         refinement: dict[str, Any] | None = None
+        # A walk that aborted has already put the operator's geometry back, so
+        # there is nothing left to defer.
+        refinement_failed = False
         with self._exclusive_center_move("auto-lock from scan"):
             # Snapshot the restore-to geometry inside the lock: _move_and_lock
             # re-reads the center for the same reason (see its docstring) --
@@ -3618,7 +3649,7 @@ class DeviceSession:
             # then refused the lock outright.
             error_trace, monitor_trace = self._snapshot_auto_lock_traces()
             try:
-                direct, _center, _amplitude, _resolution = (
+                direct, direct_center, direct_amplitude, direct_resolution = (
                     self._capture_auto_lock_target(
                         settings, traces=(error_trace, monitor_trace)
                     )
@@ -3652,6 +3683,44 @@ class DeviceSession:
                     raise
             else:
                 result = direct
+                # The detector is happy, but on a scan this wide the centre move
+                # that follows is one long hysteretic jump and lands on the
+                # wrong feature. Narrow around the target first so the centre
+                # walks there in bounded steps instead.
+                if scan_too_wide_to_lock(
+                    settings, direct_amplitude, direct.sideband_offset_v
+                ):
+                    try:
+                        result, refinement = self._trajectory_refine_auto_lock(
+                            settings,
+                            approach,
+                            sweep_center,
+                            sweep_amplitude,
+                            initial_target=direct,
+                            initial_center_v=direct_center,
+                            initial_amplitude_v=direct_amplitude,
+                            initial_resolution=direct_resolution,
+                            initial_detector="strict",
+                            trace_length=len(error_trace),
+                        )
+                    except TrajectoryRefinementAborted as refine_error:
+                        # Unlike the rejection path there IS something to fall
+                        # back to. Narrowing is an improvement on a detection
+                        # that already passed, so failing to narrow must not
+                        # cost the lock -- except when the walk lost the feature
+                        # itself, which is the one failure that means the target
+                        # can no longer be trusted.
+                        if refine_error.failure_kind == "identity":
+                            raise
+                        logger.warning(
+                            "Auto-lock narrowing failed (%s); locking on the "
+                            "direct detection at the original scan instead.",
+                            refine_error,
+                        )
+                        refinement = dict(refine_error.refinement)
+                        refinement["fell_back_to_direct"] = True
+                        result = direct
+                        refinement_failed = True
             try:
                 # The refinement final verification leaves geometry untouched;
                 # guarded handover therefore starts from the exact verified scan.
@@ -3668,7 +3737,7 @@ class DeviceSession:
                         exc.refinement = refinement
                 raise
             else:
-                if refinement is not None:
+                if refinement is not None and not refinement_failed:
                     # Do NOT restore now: while locked, sweep_center is the
                     # lock's operating point (_move_and_lock set it to the
                     # target just before start_lock), so writing the old center

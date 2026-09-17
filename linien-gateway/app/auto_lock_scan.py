@@ -48,6 +48,14 @@ class AutoLockScanSettings:
     min_amplitude: float = 0.01  # whole-trace dead-signal floor, plot units
     smooth_window_pts: int = 5
     monitor_threshold: float = 0.1  # monitor (PD) level at the lock point, plot units (+)
+    # Smallest share of the scan span the whole error signal (sideband to
+    # sideband, 2x sideband_offset_v) may occupy before the scan counts as too
+    # wide to lock from. NOT about resolving the feature: on a hysteretic
+    # actuator the centre move that puts the laser on the target is one large
+    # jump, and its error grows with its length, so a feature that is a speck
+    # on a wide scan is reached by a leap that lands on the wrong one. Narrowing
+    # around it first turns that leap into a staircase. 0 disables the test.
+    min_signal_scan_fraction: float = 0.25
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "AutoLockScanSettings":
@@ -73,6 +81,50 @@ def feature_resolution_samples(
     if n_points < 2 or span_v <= 1e-12:
         return 0.0
     return float(settings.half_range_sweep_v) * (n_points - 1) / span_v
+
+
+def scan_too_wide_to_lock(
+    settings: AutoLockScanSettings,
+    sweep_amplitude_v: float,
+    sideband_offset_v: float | None,
+) -> bool:
+    """Is the scan so wide that the centre move to the target is a leap?
+
+    Measured sideband to sideband -- the full width of the PDH error signal as
+    it appears on the plot, ``2 x sideband_offset_v`` -- against the scan span.
+    That ratio, not a sample count, is what bounds the commanded centre move:
+    the target can sit up to a half-span away, so a signal occupying a quarter
+    of the scan means a move of at most about two signal widths.
+
+    The test needs a measured sideband spacing and does not apply without one --
+    a dispersive signal has no sidebands, and a PDH scan that did not resolve
+    ±Ω has not measured the width this rule is about. Treating an unmeasured
+    spacing as "too wide" would narrow every such scan, including ones that lock
+    perfectly well; a scan too wide to lock is better caught by the guarded
+    move, which reports the landing it actually got.
+    """
+    fraction = float(settings.min_signal_scan_fraction)
+    if fraction <= 0.0:
+        return False
+    if str(settings.signal_type) != "pdh":
+        return False
+    span_v = 2.0 * abs(float(sweep_amplitude_v))
+    if span_v <= 1e-12:
+        return False
+    if sideband_offset_v is None:
+        return False
+    signal_width_v = 2.0 * abs(float(sideband_offset_v))
+    return signal_width_v < fraction * span_v
+
+
+def max_lockable_amplitude_v(
+    settings: AutoLockScanSettings, sideband_offset_v: float | None
+) -> float | None:
+    """Widest half-span satisfying :func:`scan_too_wide_to_lock`, or None."""
+    fraction = float(settings.min_signal_scan_fraction)
+    if fraction <= 0.0 or sideband_offset_v is None:
+        return None
+    return abs(float(sideband_offset_v)) / fraction
 
 
 @dataclass

@@ -1297,3 +1297,98 @@ def test_the_final_gate_widens_with_capture_fraction(monkeypatch):
 
     assert result.target_voltage == pytest.approx(FIELD_NARROWED_TARGET_V)
     assert refinement["stages"][-1]["kind"] == "final_verify"
+
+
+# --------------------------------------- narrowing a scan too wide to lock from
+
+def _wide_scan_session(monkeypatch, *, amplitude: float, sideband_offset_v: float):
+    session, board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.parameters.sweep_center.value = 0.0
+    session.parameters.sweep_amplitude.value = amplitude
+    session.plot_state.last_plot_data = [np.linspace(-1e4, 1e4, 2048)] * 3
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (
+            _result(FEATURE_V, sideband_offset_v), 0.0, amplitude, 50.0
+        ),
+    )
+    return session, board
+
+
+def test_a_wide_scan_narrows_even_though_the_detector_accepted_it(monkeypatch):
+    """The detector is happy at any width; the centre move is not. A signal
+    filling 5% of the scan is reached by a jump that lands on a neighbour."""
+    session, _board = _wide_scan_session(
+        monkeypatch, amplitude=1.0, sideband_offset_v=0.025
+    )
+    seen: dict[str, Any] = {}
+
+    def _refine(settings, approach, center, amplitude, **kwargs):
+        seen.update(kwargs)
+        return _result(FEATURE_V, 0.025), {"attempted": True, "stages": []}
+
+    monkeypatch.setattr(session, "_trajectory_refine_auto_lock", _refine)
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert seen["initial_detector"] == "strict"  # seeded from the good detection
+    assert payload["refinement"]["attempted"] is True
+
+
+def test_a_scan_that_shows_the_signal_well_is_left_alone(monkeypatch):
+    """The regression guard: this must not put narrowing back on scans that
+    already lock."""
+    session, _board = _wide_scan_session(
+        monkeypatch, amplitude=0.2, sideband_offset_v=0.05
+    )
+    monkeypatch.setattr(
+        session, "_trajectory_refine_auto_lock",
+        lambda *a, **k: pytest.fail("narrowed a scan that was already lockable"),
+    )
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert "refinement" not in payload
+    assert float(session.parameters.sweep_amplitude.value) == pytest.approx(0.2)
+
+
+def test_a_failed_narrowing_still_locks_on_the_detection_it_started_from(monkeypatch):
+    """Narrowing improves a detection that already passed, so failing to narrow
+    must not cost the lock."""
+    session, board = _wide_scan_session(
+        monkeypatch, amplitude=1.0, sideband_offset_v=0.025
+    )
+
+    def _refine(*_a, **_k):
+        raise session_module.TrajectoryRefinementAborted(
+            "could not settle", {"stages": [], "failure_kind": "position"}
+        )
+
+    monkeypatch.setattr(session, "_trajectory_refine_auto_lock", _refine)
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert board.lock_started is True
+    assert payload["refinement"]["fell_back_to_direct"] is True
+    assert payload["target_voltage"] == pytest.approx(FEATURE_V)
+
+
+def test_losing_the_feature_while_narrowing_does_not_fall_back(monkeypatch):
+    """A changed slope or sideband spacing means the walk was tracking a
+    different crossing -- the target is no longer trustworthy, so there is
+    nothing safe to fall back to."""
+    session, _board = _wide_scan_session(
+        monkeypatch, amplitude=1.0, sideband_offset_v=0.025
+    )
+
+    def _refine(*_a, **_k):
+        raise session_module.TrajectoryRefinementAborted(
+            "slope changed", {"stages": [], "failure_kind": "identity"}
+        )
+
+    monkeypatch.setattr(session, "_trajectory_refine_auto_lock", _refine)
+
+    with pytest.raises(session_module.TrajectoryRefinementAborted):
+        session.auto_lock_from_scan(None)

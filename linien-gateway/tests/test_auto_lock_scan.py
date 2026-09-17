@@ -9,6 +9,8 @@ from app.auto_lock_scan import (
     feature_resolution_samples,
     find_coarse_auto_lock_target,
     find_auto_lock_target,
+    max_lockable_amplitude_v,
+    scan_too_wide_to_lock,
 )
 from app.schemas import AutoLockScanSettings as SchemaAutoLockScanSettings
 
@@ -509,3 +511,51 @@ def test_calibrate_monitor_aware_anchor():
         include_monitor=True,
     )
     assert calib.target_voltage > 0.2
+
+
+# ------------------------------------------------- scan too wide to lock from
+
+def _settings(**kw):
+    return AutoLockScanSettings.from_mapping({"signal_type": "pdh", **kw})
+
+
+def test_a_signal_filling_a_quarter_of_the_scan_is_lockable():
+    # sideband +/-0.05 V -> 0.1 V wide signal; exactly a quarter of a 0.4 V span.
+    assert not scan_too_wide_to_lock(_settings(), sweep_amplitude_v=0.2,
+                                     sideband_offset_v=0.05)
+
+
+def test_a_signal_that_is_a_speck_on_the_scan_is_not():
+    """The failure this exists for: the centre move to a target that far away
+    is one long hysteretic jump, and it lands on a different feature."""
+    assert scan_too_wide_to_lock(_settings(), sweep_amplitude_v=1.0,
+                                 sideband_offset_v=0.05)
+
+
+def test_the_fraction_is_configurable():
+    wide = dict(sweep_amplitude_v=1.0, sideband_offset_v=0.05)
+    assert scan_too_wide_to_lock(_settings(), **wide)
+    assert not scan_too_wide_to_lock(_settings(min_signal_scan_fraction=0.05), **wide)
+    assert not scan_too_wide_to_lock(_settings(min_signal_scan_fraction=0.0), **wide)
+
+
+def test_an_unmeasured_sideband_spacing_does_not_force_narrowing():
+    """None means "could not measure", not "too wide". Reading it as too wide
+    narrows every dispersive device and every scan that did not resolve the
+    sidebands -- including ones that lock perfectly well."""
+    assert not scan_too_wide_to_lock(_settings(), sweep_amplitude_v=1.0,
+                                     sideband_offset_v=None)
+    assert not scan_too_wide_to_lock(
+        _settings(signal_type="dispersive"), sweep_amplitude_v=1.0,
+        sideband_offset_v=0.001,
+    )
+
+
+def test_the_goal_amplitude_is_the_widest_scan_that_passes():
+    settings = _settings()
+    amp = max_lockable_amplitude_v(settings, 0.05)
+    assert amp == pytest.approx(0.2)
+    assert not scan_too_wide_to_lock(settings, sweep_amplitude_v=amp,
+                                     sideband_offset_v=0.05)
+    assert scan_too_wide_to_lock(settings, sweep_amplitude_v=amp * 1.01,
+                                 sideband_offset_v=0.05)

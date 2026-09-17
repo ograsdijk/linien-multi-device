@@ -131,6 +131,15 @@ class AutoLockScanSettings(BaseModel):
         default=0.2, ge=0.0, le=1.0,
         description="Min weaker/stronger lobe ratio (dimensionless).",
     )
+    min_signal_scan_fraction: float = Field(
+        default=0.25, ge=0.0, le=1.0,
+        description=(
+            "Smallest share of the scan span the whole PDH error signal "
+            "(sideband to sideband) may occupy before the scan is treated as "
+            "too wide to lock from and is narrowed around the target first. "
+            "0 disables the test."
+        ),
+    )
     single_error_min: float = Field(
         default=0.1, ge=0.0, le=4.0,
         description="Min stronger single lobe when single-side allowed (plot units).",
