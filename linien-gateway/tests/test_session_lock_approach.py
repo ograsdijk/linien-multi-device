@@ -1577,3 +1577,32 @@ def test_a_better_resolved_detection_replaces_the_identity(monkeypatch):
 
     assert result.sideband_offset_v == pytest.approx(0.050)
     assert refinement["stages"][-1]["kind"] == "final_verify"
+
+
+def test_the_centre_step_is_bounded_by_the_signal_not_the_scan_width():
+    """0.25 x a 0.6 V half-range is 150 mV -- 4.6 sideband spacings on this
+    device, enough for one step to vault over a neighbouring feature. The scan
+    width is an operator setting; the distance to the next feature is not."""
+    scan_width_bound = DeviceSession._bounded_recenter_v(0.2, 1.0, 0.6)
+    assert scan_width_bound == pytest.approx(0.35)  # 150 mV
+
+    signal_bound = DeviceSession._bounded_recenter_v(
+        0.2, 1.0, 0.6, signal_width_v=2 * 0.0325, max_signal_widths=1.0
+    )
+    assert signal_bound == pytest.approx(0.2 + 0.065)  # one signal width
+
+
+def test_the_scan_width_rule_still_caps_a_huge_signal_width():
+    """Whichever is tighter: a broad signal must not license a bigger step than
+    the scan-width rule allowed."""
+    moved = DeviceSession._bounded_recenter_v(
+        0.0, 1.0, 0.4, signal_width_v=0.9, max_signal_widths=4.0
+    )
+    assert moved == pytest.approx(0.1)  # 0.25 x 0.4, not 4 x 0.9
+
+
+def test_an_unmeasured_signal_width_falls_back_to_the_scan_rule():
+    moved = DeviceSession._bounded_recenter_v(
+        0.0, 1.0, 0.6, signal_width_v=None, max_signal_widths=1.0
+    )
+    assert moved == pytest.approx(0.15)

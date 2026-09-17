@@ -59,6 +59,7 @@ def test_auto_lock_scan_endpoint_passes_payload(monkeypatch):
         "smooth_window_pts": 7,
         "monitor_threshold": 0.1,
         "min_signal_scan_fraction": 0.25,
+        "max_center_step_signal_widths": 1.0,
     }
     response = client.post("/api/devices/test-device/control/auto_lock_scan", json=payload)
     assert response.status_code == 200

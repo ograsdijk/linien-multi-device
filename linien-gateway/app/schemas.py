@@ -140,6 +140,15 @@ class AutoLockScanSettings(BaseModel):
             "0 disables the test."
         ),
     )
+    max_center_step_signal_widths: float = Field(
+        default=1.0, ge=0.0, le=20.0,
+        description=(
+            "Largest centre step a refinement stage may take, in whole "
+            "error-signal widths (sideband to sideband). Bounds the step by the "
+            "distance to the next feature rather than by the scan width. "
+            "Ignored when no sideband spacing was measured."
+        ),
+    )
     single_error_min: float = Field(
         default=0.1, ge=0.0, le=4.0,
         description="Min stronger single lobe when single-side allowed (plot units).",

@@ -56,6 +56,14 @@ class AutoLockScanSettings:
     # on a wide scan is reached by a leap that lands on the wrong one. Narrowing
     # around it first turns that leap into a staircase. 0 disables the test.
     min_signal_scan_fraction: float = 0.25
+    # Largest centre step a refinement stage may take, in whole error-signal
+    # widths (sideband to sideband). The scan width is an operator setting and
+    # says nothing about whether a step is safe; what matters is the distance to
+    # the NEXT feature, which for PDH is the sideband spacing. One signal width
+    # is two sideband spacings, so the default keeps a step from vaulting over a
+    # neighbour while still crossing a wide scan in a handful of stages. Ignored
+    # when no sideband spacing has been measured.
+    max_center_step_signal_widths: float = 1.0
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "AutoLockScanSettings":

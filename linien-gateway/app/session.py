@@ -3239,7 +3239,12 @@ class DeviceSession:
 
     @staticmethod
     def _bounded_recenter_v(
-        center_v: float, target_v: float, amplitude_v: float
+        center_v: float,
+        target_v: float,
+        amplitude_v: float,
+        *,
+        signal_width_v: float | None = None,
+        max_signal_widths: float = 0.0,
     ) -> float:
         """Where to put the sweep centre for one bounded step toward the target.
 
@@ -3258,6 +3263,15 @@ class DeviceSession:
         """
         amplitude = abs(float(amplitude_v))
         bound = 0.25 * amplitude
+        # The scan width is an operator setting and says nothing about whether a
+        # step is safe. What does is the distance to the NEXT feature: a step
+        # longer than that can vault over a neighbour and land the walk on the
+        # wrong one. On a device with 32.5 mV sidebands, a quarter of a 0.6 V
+        # half-range is 150 mV -- 4.6 sideband spacings in a single write.
+        # Bound by the measured signal width where one is known; the scan-width
+        # rule remains the fallback when it is not.
+        if signal_width_v and max_signal_widths > 0.0:
+            bound = min(bound, float(max_signal_widths) * abs(float(signal_width_v)))
         lo, hi = center_v - bound, center_v + bound
         rail_lo, rail_hi = -1.0 + amplitude, 1.0 - amplitude
         if rail_lo <= rail_hi and rail_lo <= center_v <= rail_hi:
@@ -3496,7 +3510,14 @@ class DeviceSession:
                 # stage because it can itself move the apparent resonance.
                 if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
                     new_center = self._bounded_recenter_v(
-                        center_v, float(target.target_voltage), amplitude_v
+                        center_v,
+                        float(target.target_voltage),
+                        amplitude_v,
+                        signal_width_v=(
+                            None if target.sideband_offset_v is None
+                            else 2.0 * abs(float(target.sideband_offset_v))
+                        ),
+                        max_signal_widths=settings.max_center_step_signal_widths,
                     )
                     moved_at = self._set_sweep_geometry(new_center, amplitude_v)
                     target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
@@ -3542,7 +3563,14 @@ class DeviceSession:
                 inner = 0.5 * abs(amplitude_v)
                 if abs(offset) > inner:
                     new_center = self._bounded_recenter_v(
-                        center_v, float(target.target_voltage), amplitude_v
+                        center_v,
+                        float(target.target_voltage),
+                        amplitude_v,
+                        signal_width_v=(
+                            None if target.sideband_offset_v is None
+                            else 2.0 * abs(float(target.sideband_offset_v))
+                        ),
+                        max_signal_widths=settings.max_center_step_signal_widths,
                     )
                     moved_at = self._set_sweep_geometry(new_center, amplitude_v)
                     target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
