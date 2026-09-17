@@ -209,11 +209,28 @@ def find_coarse_auto_lock_target(
     if n < 16:
         raise ValueError("Trace is too short for coarse auto-lock tracking.")
     noise = _robust_noise(raw)
+    # The monitor discriminates crossings the error signal alone cannot tell
+    # apart, so tracking has to honour it too: a walk that steers onto the wrong
+    # crossing spends its whole stage budget before the strict detector at the
+    # end rejects it. Same baseline/contrast test the strict detector applies,
+    # and gated on the same calibrated use_monitor.
+    monitor = (
+        _sanitize_trace(np.asarray(monitor_trace_v, dtype=float))
+        if monitor_trace_v is not None
+        else None
+    )
+    if monitor is not None and len(monitor) != n:
+        monitor = None
+    use_monitor = bool(settings.use_monitor) and monitor is not None
+    monitor_baseline = _monitor_baseline(monitor) if monitor is not None else None
+    locked_above = str(settings.monitor_mode) != "locked_below"
     half_pts = _half_range_to_points(settings.half_range_sweep_v, n, sweep_amplitude_v)
     max_gap = max(3, min(n // 4, half_pts * 6))
     slope = bool(preferred_slope_rising) if preferred_slope_rising is not None else True
-    options: list[tuple[float, int, float, float, float, int, float | None]] = []
-    # (score, crossing index, left, right, pair, smoothing width, sideband pts)
+    options: list[tuple[float, int, float, float, float, int, float | None, float | None]] = []
+    # (score, crossing index, left, right, pair, smoothing width, sideband pts,
+    #  monitor level)
+    monitor_rejects = 0
 
     exclusion = max(3, half_pts)
 
@@ -290,6 +307,26 @@ def find_coarse_auto_lock_target(
             # is wasted on the many pairs this rejects.
             for k in np.flatnonzero((snr >= 6.0) & (symmetry >= 0.12)):
                 cross = int(crosses[k])
+                contrast: float | None = None
+                if monitor is not None and monitor_baseline is not None:
+                    level = _monitor_on_resonance(
+                        monitor, cross, half_pts, locked_above
+                    )
+                    if level is not None:
+                        contrast = (
+                            level - monitor_baseline
+                            if locked_above
+                            else monitor_baseline - level
+                        )
+                    if use_monitor:
+                        # Wrong side of baseline: not this feature. The absolute
+                        # monitor_threshold is deliberately NOT applied here --
+                        # tracking has to survive a scan whose coarse window
+                        # blurs the peak, and the strict detections that
+                        # actually authorise the lock still enforce it.
+                        if contrast is None or contrast <= 0.0:
+                            monitor_rejects += 1
+                            continue
                 sidebands = (
                     _two_sided_sidebands(opposite, cross)
                     if str(settings.signal_type) == "pdh"
@@ -300,18 +337,33 @@ def find_coarse_auto_lock_target(
                 # carrier pair remains useful for tracking only; strict final
                 # detection still has to establish the full PDH identity.
                 sideband_bonus = 1.15 if sidebands is not None else 1.0
+                pair_score = (
+                    float(snr[k]) * (0.5 + 0.5 * float(symmetry[k])) * sideband_bonus
+                )
+                if use_monitor and contrast is not None:
+                    # Same tie-breaker weight the strict detector uses, scaled
+                    # by SNR because this score is in SNR units, not excursion.
+                    pair_score *= 1.0 + _MONITOR_SCORE_WEIGHT * contrast
                 options.append((
-                    float(snr[k]) * (0.5 + 0.5 * float(symmetry[k])) * sideband_bonus,
+                    pair_score,
                     cross,
                     float(left_exc[k]),
                     float(right_exc[k]),
                     float(pair[k]),
                     width,
                     sidebands,
+                    None if contrast is None else contrast + float(monitor_baseline),
                 ))
     if not options:
+        if monitor_rejects:
+            raise ValueError(
+                f"No trackable extrema pair: {monitor_rejects} candidate(s) were "
+                "rejected by the monitor as being on the wrong side of its baseline."
+            )
         raise ValueError("No extrema pair with robust signal-to-noise was found for tracking.")
-    score, crossing, left_exc, right_exc, pair, width, sideband_pts = max(options, key=lambda item: item[0])
+    (
+        score, crossing, left_exc, right_exc, pair, width, sideband_pts, monitor_level
+    ) = max(options, key=lambda item: item[0])
     sideband_offset_v: float | None = None
     hz_per_v: float | None = None
     if str(settings.signal_type) == "pdh":
@@ -328,7 +380,7 @@ def find_coarse_auto_lock_target(
         right_excursion=float(right_exc),
         pair_excursion=float(pair),
         symmetry=float(min(left_exc, right_exc) / max(left_exc, right_exc, 1e-12)),
-        monitor_level=None,
+        monitor_level=monitor_level,
         hz_per_v=hz_per_v,
         sideband_offset_v=sideband_offset_v,
     )

@@ -559,3 +559,76 @@ def test_the_goal_amplitude_is_the_widest_scan_that_passes():
                                      sideband_offset_v=0.05)
     assert scan_too_wide_to_lock(settings, sweep_amplitude_v=amp * 1.01,
                                  sideband_offset_v=0.05)
+
+
+# ------------------------------------- the coarse tracker honours the monitor
+#
+# The coarse detector steers the narrowing walk. It used to accept
+# monitor_trace_v and ignore it, so on a device where the monitor is the only
+# thing telling two crossings apart, the walk could track onto the wrong one and
+# burn its whole stage budget before the strict detections at the end noticed.
+
+
+def _two_identical_features(n=2048):
+    """Two crossings the error signal cannot tell apart, at -0.4 and +0.4."""
+    return (
+        _dispersive(n, amplitude=0.4, width=0.03, center=-0.4)
+        + _dispersive(n, amplitude=0.4, width=0.03, center=+0.4)
+    )
+
+
+def _monitor_peak_at(center, n=2048, height=0.8):
+    """A transmission peak marking one of them as the real feature."""
+    x = np.linspace(-1.0, 1.0, n)
+    return height * np.exp(-0.5 * ((x - center) / 0.03) ** 2)
+
+
+def _coarse(error, monitor, **kw):
+    settings = AutoLockScanSettings.from_mapping(
+        {"signal_type": "dispersive", "half_range_sweep_v": 0.06, **kw}
+    )
+    return find_coarse_auto_lock_target(
+        error_trace_v=error,
+        monitor_trace_v=monitor,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=settings,
+        preferred_slope_rising=True,
+    )
+
+
+def test_the_coarse_tracker_picks_the_crossing_the_monitor_marks():
+    error = _two_identical_features()
+    for marked in (-0.4, 0.4):
+        candidate = _coarse(error, _monitor_peak_at(marked), use_monitor=True)
+        assert candidate.result.target_voltage == pytest.approx(marked, abs=0.05)
+
+
+def test_the_coarse_tracker_ignores_the_monitor_when_it_is_not_calibrated_in():
+    """use_monitor is set by calibration; an uncalibrated monitor must not
+    start gating candidates."""
+    error = _two_identical_features()
+    a = _coarse(error, _monitor_peak_at(-0.4), use_monitor=False)
+    b = _coarse(error, _monitor_peak_at(0.4), use_monitor=False)
+    assert a.result.target_voltage == pytest.approx(b.result.target_voltage)
+
+
+def test_a_monitor_that_rejects_everything_says_so():
+    """'no signal-to-noise' would send the operator after the wrong problem."""
+    error = _two_identical_features()
+    # A monitor that DIPS at both crossings, on a device configured for peaks:
+    # every candidate sits below the baseline the rest of the trace sets.
+    monitor = (
+        1.0
+        - _monitor_peak_at(-0.4, height=1.0)
+        - _monitor_peak_at(0.4, height=1.0)
+    )
+    with pytest.raises(ValueError, match="rejected by the monitor"):
+        _coarse(error, monitor, use_monitor=True)
+
+
+def test_the_coarse_tracker_reports_the_monitor_level_it_used():
+    candidate = _coarse(
+        _two_identical_features(), _monitor_peak_at(0.4), use_monitor=True
+    )
+    assert candidate.result.monitor_level is not None
