@@ -3232,6 +3232,33 @@ class DeviceSession:
             )
             return False
 
+    @staticmethod
+    def _bounded_recenter_v(
+        center_v: float, target_v: float, amplitude_v: float
+    ) -> float:
+        """Where to put the sweep centre for one bounded step toward the target.
+
+        Capped at a quarter of the present half-range, because a centre move
+        itself shifts this actuator's apparent feature position: small steps
+        keep that shift measurable instead of compounding into a jump onto a
+        neighbouring feature.
+
+        The FPGA sweep is bounded, but the rail clamp must never turn that small
+        step into a large one. An operator scanning at a centre the rails would
+        not permit -- 0.653 V at amplitude 0.6, which runs to 1.25 V -- had the
+        clamp yank the centre 253 mV in a single write, four times the intended
+        bound and precisely the uncontrolled move this stage exists to avoid.
+        The rails are therefore honoured only when the centre already respects
+        them, and never at the cost of exceeding the step bound.
+        """
+        amplitude = abs(float(amplitude_v))
+        bound = 0.25 * amplitude
+        lo, hi = center_v - bound, center_v + bound
+        rail_lo, rail_hi = -1.0 + amplitude, 1.0 - amplitude
+        if rail_lo <= rail_hi and rail_lo <= center_v <= rail_hi:
+            lo, hi = max(lo, rail_lo), min(hi, rail_hi)
+        return min(hi, max(lo, float(target_v)))
+
     def _set_sweep_geometry(self, center_v: float, amplitude_v: float) -> float:
         """Atomically command both scan axes and return the completion timestamp."""
         with self._rpyc_lock:
@@ -3362,7 +3389,7 @@ class DeviceSession:
             identity_slope = target.target_slope_rising
             identity_sideband = target.sideband_offset_v
 
-            def _check_identity(candidate: Any) -> None:
+            def _check_identity(candidate: Any, *, detector: str = "strict") -> None:
                 nonlocal identity_sideband
                 if candidate.target_slope_rising != identity_slope:
                     raise _TrackingIdentityChanged(
@@ -3377,9 +3404,15 @@ class DeviceSession:
                         raise _TrackingIdentityChanged(
                             "Tracking candidate changed PDH sideband identity."
                         )
-                elif candidate.sideband_offset_v is not None:
-                    # Wide coarse scans may not resolve ±Ω. Once a later scan
-                    # does, make that spacing part of the identity thereafter.
+                elif candidate.sideband_offset_v is not None and detector == "strict":
+                    # Wide scans may not resolve ±Ω. Once a later one does, make
+                    # that spacing part of the identity thereafter -- but only
+                    # from a STRICT detection. The coarse tracker measures the
+                    # spacing a different way, so letting it set the baseline
+                    # means later strict detections are compared against another
+                    # algorithm's estimate and rejected over the disagreement,
+                    # not over any real change in the feature. It is declared
+                    # tracking-only; defining the identity is not tracking.
                     identity_sideband = candidate.sideband_offset_v
 
             # Narrow in <=25% reductions until the STRICT detector accepts a
@@ -3432,16 +3465,14 @@ class DeviceSession:
                 # motion is deliberately its own bounded, freshly-redetected
                 # stage because it can itself move the apparent resonance.
                 if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
-                    new_center = center_v + max(
-                        -0.25 * amplitude_v,
-                        min(0.25 * amplitude_v, float(target.target_voltage) - center_v),
+                    new_center = self._bounded_recenter_v(
+                        center_v, float(target.target_voltage), amplitude_v
                     )
-                    new_center = max(-1.0 + amplitude_v, min(1.0 - amplitude_v, new_center))
                     moved_at = self._set_sweep_geometry(new_center, amplitude_v)
                     target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
                         settings, after=moved_at
                     )
-                    _check_identity(target)
+                    _check_identity(target, detector="coarse")
                     stages.append({"kind": "recenter", "center_v": center_v,
                                    "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
                                    "resolution_samples": resolution, "detector": "coarse",
@@ -3463,17 +3494,16 @@ class DeviceSession:
                     "target_voltage": target.target_voltage, "resolution_samples": resolution,
                     "detector": detector, "metrics": coarse_metrics if detector == "coarse" else None,
                 })
-                _check_identity(target)
+                _check_identity(target, detector=detector)
                 narrow_count += 1
                 # Keep the feature inside the central half, but bound a centre
                 # adjustment to 25% of the present half-range.
                 offset = float(target.target_voltage) - center_v
                 inner = 0.5 * abs(amplitude_v)
                 if abs(offset) > inner:
-                    new_center = center_v + max(-0.25 * amplitude_v, min(0.25 * amplitude_v, offset))
-                    # The FPGA sweep is physically bounded. A trajectory move
-                    # must not turn an edge feature into an out-of-range scan.
-                    new_center = max(-1.0 + amplitude_v, min(1.0 - amplitude_v, new_center))
+                    new_center = self._bounded_recenter_v(
+                        center_v, float(target.target_voltage), amplitude_v
+                    )
                     moved_at = self._set_sweep_geometry(new_center, amplitude_v)
                     target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
                         settings, after=moved_at
@@ -3484,7 +3514,7 @@ class DeviceSession:
                         "target_voltage": target.target_voltage, "resolution_samples": resolution,
                         "detector": "coarse", "metrics": coarse_metrics,
                     })
-                    _check_identity(target)
+                    _check_identity(target, detector="coarse")
 
             # The coarse result only guides geometry. Demand two fresh strict
             # detections at the final unchanged geometry before any guarded move.

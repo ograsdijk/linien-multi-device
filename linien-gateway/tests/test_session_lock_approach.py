@@ -1392,3 +1392,110 @@ def test_losing_the_feature_while_narrowing_does_not_fall_back(monkeypatch):
 
     with pytest.raises(session_module.TrajectoryRefinementAborted):
         session.auto_lock_from_scan(None)
+
+
+# ------------------------------------------- bounded re-centering (field case)
+#
+# From a run at centre 0.6530 V, amplitude 0.6 V. That scan runs to 1.25 V, so
+# the centre sits outside the +/-(1 - amplitude) rails. The rail clamp rewrote a
+# bounded 150 mV step as a 253 mV jump to 0.4 V in one register write, and the
+# walk never recovered: the next coarse detection came back 255 mV away.
+
+def _recenter(center, target, amplitude):
+    return DeviceSession._bounded_recenter_v(center, target, amplitude)
+
+
+def test_the_rail_clamp_cannot_exceed_the_step_bound():
+    """The field failure: centre 0.653 V at amplitude 0.6 was yanked to 0.4 V,
+    four times the intended bound, by the rail clamp alone."""
+    moved = _recenter(0.6530146813051192, 0.47586712261846614, 0.6)
+    assert moved == pytest.approx(0.6530146813051192 - 0.15)  # one bounded step
+    assert moved != pytest.approx(0.4)
+
+
+def test_a_centre_inside_the_rails_still_respects_them():
+    # Target beyond the rail; amplitude 0.6 -> rails at +/-0.4.
+    assert _recenter(0.3, 0.9, 0.6) == pytest.approx(0.4)
+    assert _recenter(-0.3, -0.9, 0.6) == pytest.approx(-0.4)
+
+
+def test_a_near_target_is_reached_exactly():
+    assert _recenter(0.5, 0.52, 0.6) == pytest.approx(0.52)
+
+
+def test_the_step_is_capped_at_a_quarter_of_the_half_range():
+    assert _recenter(0.0, 1.0, 0.2) == pytest.approx(0.05)
+    assert _recenter(0.0, -1.0, 0.2) == pytest.approx(-0.05)
+
+
+# ------------------------------------ the coarse tracker cannot set the identity
+
+def _identity_session(monkeypatch, coarse_sideband, strict_sideband):
+    """Walk that detects coarse once, then strict, with differing sidebands."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (
+            _result(0.22, coarse_sideband), 0.4, 0.6, 3.0, {}
+        ),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (
+            _result(0.449, strict_sideband), 0.4, 0.2, 20.0
+        ),
+    )
+    return session
+
+
+def _walk_from_coarse(session):
+    return session._trajectory_refine_auto_lock(
+        AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+        ApproachSettings.from_mapping(session.lock_approach_settings),
+        0.653, 0.6,
+        initial_target=_result(0.4758, None),  # wide scan resolved no sideband
+        initial_center_v=0.653,
+        initial_amplitude_v=0.6,
+        initial_resolution=3.03,
+        initial_detector="coarse",
+        trace_length=2048,
+    )
+
+
+def test_a_coarse_sideband_estimate_does_not_become_the_identity(monkeypatch):
+    """The field failure: the wide scan resolved no sideband, the coarse tracker
+    measured 33.1 mV, and the next strict detection was then rejected for
+    disagreeing with another algorithm's estimate rather than for any change in
+    the feature. Coarse tracking is declared never sufficient to authorise a
+    lock; defining what the lock must match is not tracking."""
+    session = _identity_session(monkeypatch, coarse_sideband=0.0331,
+                                strict_sideband=0.0500)
+
+    result, refinement = _walk_from_coarse(session)
+
+    assert result.target_voltage == pytest.approx(0.449)
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+
+
+def test_two_strict_detections_must_still_agree_on_the_sideband(monkeypatch):
+    """The protection that matters is kept: once a strict detection establishes
+    the spacing, a later strict one that disagrees is a different crossing."""
+    session = _identity_session(monkeypatch, coarse_sideband=None,
+                                strict_sideband=0.05)
+    captures = iter([
+        (_result(0.449, 0.05), 0.4, 0.2, 20.0),   # narrow -> sets identity
+        (_result(0.449, 0.20), 0.4, 0.2, 20.0),   # strict_one: 4x the spacing
+    ])
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: next(captures),
+    )
+
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        _walk_from_coarse(session)
+    assert excinfo.value.failure_kind == "identity"
