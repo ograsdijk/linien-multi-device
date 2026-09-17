@@ -116,6 +116,20 @@ export function DiagnosticsModal({
           ) : null}
         </Group>
 
+        {bundle?.reboot_status ? (
+          <Alert
+            color={bundle.reboot_status.power_on_reset ? 'orange' : 'blue'}
+            variant="light"
+            title={
+              bundle.reboot_status.power_on_reset
+                ? 'Last reset: the board lost power'
+                : 'Last reset: the board reset itself'
+            }
+          >
+            {bundle.reboot_status.description}
+          </Alert>
+        ) : null}
+
         {offerPersistentLog ? (
           <Alert color="yellow" variant="light" title="This board keeps no logs">
             Its journal lives in RAM, so the next reset will again take the

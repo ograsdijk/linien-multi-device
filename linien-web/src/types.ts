@@ -81,6 +81,17 @@ export type DiagnosticsBundle = {
    * will again leave nothing behind; `null` means it could not be determined.
    */
   persistent_journal: boolean | null;
+  /**
+   * Decoded Zynq REBOOT_STATUS register, or null when the board could not be
+   * read. `power_on_reset` true means no reset-cause bit was set, which is
+   * what losing power leaves behind (as opposed to the board resetting
+   * itself).
+   */
+  reboot_status?: {
+    value: number;
+    power_on_reset: boolean;
+    description: string;
+  } | null;
 };
 
 export type DeviceRecovery = {

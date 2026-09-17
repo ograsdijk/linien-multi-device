@@ -55,6 +55,28 @@ DMESG_LINES = 200
 # megabytes of repeated kernel messages, and the tail is the interesting end.
 SECTION_MAX_CHARS = 20_000
 
+# SLCR REBOOT_STATUS, and the marker the section prints its value behind so
+# the decoder can find it without re-running anything.
+REBOOT_STATUS_ADDR = "0xF8000258"
+REBOOT_STATUS_PREFIX = "REBOOT_STATUS="
+# Bit -> what caused the last reset. Bits 16-19 are as documented for the
+# Zynq-7000 (UG585 section 6.3.12); 20-22 follow the same order the TRM lists
+# the reset sources in, but I could not verify them against the manual here --
+# hence `unverified`, and hence the raw value stays in the section output.
+#
+# Confirm per image before trusting a decode: `reboot` the board and read it,
+# then pull the power and read it again. A power cycle must come back with
+# nothing set (power-on reset clears the register); a warm reboot must not.
+REBOOT_STATUS_BITS: tuple[tuple[int, str, str, bool], ...] = (
+    (16, "SWDT_RST", "system watchdog timeout", False),
+    (17, "AWDT0_RST", "CPU0 watchdog timeout", False),
+    (18, "AWDT1_RST", "CPU1 watchdog timeout", False),
+    (19, "SLC_RST", "software reboot (SLCR), e.g. `reboot`", False),
+    (20, "DBG_RST", "debug reset over JTAG", True),
+    (21, "SRST_B", "external reset pin asserted", True),
+    (22, "POR", "power-on reset", True),
+)
+
 JOURNALD_DROPIN_DIR = "/etc/systemd/journald.conf.d"
 # `99-` so it wins: systemd applies drop-ins in lexical order, and a `00-`
 # prefix loses to the conventional `99-*.conf` a vendor image may already
@@ -301,6 +323,30 @@ _SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
         True,
     ),
     (
+        "reboot_status",
+        "Zynq reset-cause register",
+        # SLCR REBOOT_STATUS (0xF8000258). The one reading that separates "the
+        # power actually dropped" from "something reset the board": it is
+        # sticky through every reset EXCEPT power-on, which clears it. The
+        # kernel log cannot answer that, because a board that lost power wrote
+        # nothing before it went.
+        #
+        # Three ways to read a PS register, because these images differ: the
+        # busybox applet, devmem2 where it was installed, and Red Pitaya's own
+        # `monitor`. Reading SLCR touches nothing in the FPGA fabric.
+        'V=""; '
+        "if command -v devmem >/dev/null 2>&1; then "
+        'V=$(devmem ' + REBOOT_STATUS_ADDR + ' 32 2>/dev/null); '
+        "elif command -v devmem2 >/dev/null 2>&1; then "
+        'V=$(devmem2 ' + REBOOT_STATUS_ADDR + ' w 2>/dev/null '
+        '| sed -n "s/.*: 0x/0x/p" | tail -n 1); '
+        "elif command -v monitor >/dev/null 2>&1; then "
+        'V=$(monitor ' + REBOOT_STATUS_ADDR + ' 2>/dev/null); fi; '
+        'if [ -n "$V" ]; then echo "' + REBOOT_STATUS_PREFIX + '$V"; '
+        'else echo "no way to read ' + REBOOT_STATUS_ADDR + '"; fi',
+        True,
+    ),
+    (
         "pstore",
         "Crash dump remnants",
         "cat /sys/fs/pstore/* 2>/dev/null || echo \"no pstore records\"",
@@ -373,7 +419,27 @@ def collect_diagnostics(
         "collected_at": collected_at,
         "sections": sections,
         "persistent_journal": _persistent_journal(sections),
+        "reboot_status": _reboot_status_summary(sections),
     }
+
+
+def _reboot_status_summary(sections: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Decoded reset cause for the bundle header, or None if unavailable."""
+    for section in sections:
+        if section.get("name") != "reboot_status":
+            continue
+        value = parse_reboot_status(section.get("output", ""))
+        description = describe_reboot_status(value)
+        if description is None:
+            return None
+        return {
+            "value": value,
+            "power_on_reset": not any(
+                value & (1 << bit) for bit, _n, _m, _u in REBOOT_STATUS_BITS
+            ),
+            "description": description,
+        }
+    return None
 
 
 def _run_section(
@@ -410,6 +476,55 @@ def _run_section(
         "output": _truncate(stdout),
         "error": section_error,
     }
+
+
+def parse_reboot_status(output: str) -> int | None:
+    """The register value the `reboot_status` section printed, or None."""
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if not line.startswith(REBOOT_STATUS_PREFIX):
+            continue
+        rest = line[len(REBOOT_STATUS_PREFIX) :].split()
+        if not rest:
+            return None
+        token = rest[0]
+        try:
+            return int(token, 16) if token.lower().startswith("0x") else int(token, 10)
+        except ValueError:
+            return None
+    return None
+
+
+def describe_reboot_status(value: int | None) -> str | None:
+    """Plain-language reading of REBOOT_STATUS, or None if there is nothing.
+
+    Deliberately hedged. An empty register is the interesting case -- it means
+    the last reset was a power-on reset, i.e. the board lost power rather than
+    rebooting itself -- but only the watchdog and software bits are verified
+    here, so anything resting on the others says so.
+    """
+    if value is None:
+        return None
+    causes = [
+        (name, meaning, unverified)
+        for bit, name, meaning, unverified in REBOOT_STATUS_BITS
+        if value & (1 << bit)
+    ]
+    # Bits 31:24 are scratch space for the BootROM and u-boot, not a cause.
+    state = (value >> 24) & 0xFF
+    tail = f" (boot state 0x{state:02x})" if state else ""
+    if not causes:
+        return (
+            f"0x{value:08x}: no reset-cause bit set, which is what a power-on "
+            "reset leaves behind -- the board lost power rather than resetting "
+            "itself. Confirm the register behaves that way on this image "
+            "before relying on it." + tail
+        )
+    listed = "; ".join(
+        f"{name} ({meaning}{', bit position unverified' if unverified else ''})"
+        for name, meaning, unverified in causes
+    )
+    return f"0x{value:08x}: {listed}." + tail
 
 
 def _persistent_journal(sections: list[dict[str, Any]]) -> bool | None:

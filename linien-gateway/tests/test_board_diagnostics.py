@@ -296,6 +296,91 @@ def test_persistence_is_unknown_when_journald_could_not_be_asked():
     assert bundle["persistent_journal"] is None
 
 
+# --- reset cause ---------------------------------------------------------
+#
+# SLCR REBOOT_STATUS is the one reading that separates "the power dropped"
+# from "the board reset itself", which the kernel log cannot answer: a board
+# that lost power wrote nothing before it went.
+
+
+def _reboot_bundle(stdout):
+    conn = FakeConnection(rules={bd.REBOOT_STATUS_ADDR: FakeResult(stdout=stdout)})
+    return bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
+
+
+def test_an_empty_reset_register_reads_as_lost_power():
+    bundle = _reboot_bundle("REBOOT_STATUS=0x00000000")
+
+    status = bundle["reboot_status"]
+    assert status["value"] == 0
+    assert status["power_on_reset"] is True
+    assert "lost power" in status["description"]
+
+
+def test_a_software_reboot_is_not_reported_as_lost_power():
+    bundle = _reboot_bundle("REBOOT_STATUS=0x00080000")
+
+    status = bundle["reboot_status"]
+    assert status["power_on_reset"] is False
+    assert "SLC_RST" in status["description"]
+
+
+def test_a_watchdog_reset_names_the_watchdog():
+    assert "system watchdog" in bd.describe_reboot_status(1 << 16)
+    assert "CPU0 watchdog" in bd.describe_reboot_status(1 << 17)
+    assert "CPU1 watchdog" in bd.describe_reboot_status(1 << 18)
+
+
+def test_the_unverified_bits_say_so():
+    """16-19 are documented; the rest follow the TRM's ordering and have not
+    been confirmed here, so a decode resting on them must not read as fact."""
+    assert "unverified" in bd.describe_reboot_status(1 << 22)
+    assert "unverified" not in bd.describe_reboot_status(1 << 19)
+
+
+def test_the_bootloader_scratch_byte_is_not_a_reset_cause():
+    """Bits 31:24 are scratch space for the BootROM and u-boot."""
+    described = bd.describe_reboot_status(0xF0000000)
+
+    assert "boot state 0xf0" in described
+    assert "no reset-cause bit set" in described
+
+
+def test_a_board_with_no_way_to_read_the_register_reports_nothing():
+    bundle = _reboot_bundle("no way to read 0xF8000258")
+
+    assert bundle["reboot_status"] is None
+    # ...and the section is still in the bundle, so the operator sees why.
+    section = next(s for s in bundle["sections"] if s["name"] == "reboot_status")
+    assert "no way to read" in section["output"]
+
+
+def test_a_garbled_register_value_is_not_guessed_at():
+    assert bd.parse_reboot_status("REBOOT_STATUS=junk") is None
+    assert bd.parse_reboot_status("REBOOT_STATUS=") is None
+    assert bd.parse_reboot_status("") is None
+    assert bd.describe_reboot_status(None) is None
+
+
+def test_a_decimal_register_value_is_accepted_too():
+    """`monitor` prints hex, busybox devmem can print either."""
+    assert bd.parse_reboot_status("REBOOT_STATUS=524288") == 1 << 19
+
+
+def test_reading_the_register_never_touches_the_fpga():
+    """The PL-backed XADC hangs the AXI bus when the Linien bitstream is
+    loaded; the same caution applies to anything else read over /dev/mem."""
+    section = next(s for s in bd._SECTIONS if s[0] == "reboot_status")
+    command = section[2]
+
+    import re
+
+    # The only address the command dereferences is the SLCR one. Anything in
+    # the FPGA's address space (0x4000_0000 and up on this SoC) must not appear.
+    addresses = set(re.findall(r"0x[0-9A-Fa-f]{6,}", command))
+    assert addresses == {bd.REBOOT_STATUS_ADDR}
+
+
 # --- enabling persistence ------------------------------------------------
 
 
