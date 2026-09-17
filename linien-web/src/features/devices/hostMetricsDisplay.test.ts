@@ -92,6 +92,47 @@ describe('resolveHostMetrics', () => {
     const [cpu] = resolveHostMetrics(status({ rp_metrics: { cpu_percent: 4 } }), 5);
     expect(cpu.title).toBe('CPU busy since the previous poll');
   });
+
+  it('shows the 5 V supply between disk and uptime', () => {
+    const withSupply = status({
+      ...healthy,
+      rp_metrics: { ...healthy.rp_metrics, supply_voltage_v: 4.982 },
+    });
+    expect(text(resolveHostMetrics(withSupply, 5))).toEqual([
+      'CPU 4%',
+      'RAM 41%',
+      'disk 1.1 GB',
+      '5V 4.98 V',
+      'up 3d 4h',
+    ]);
+  });
+
+  it('omits the supply for a daemon that does not report it', () => {
+    const noSupply = status({ rp_metrics: { cpu_percent: 4, supply_voltage_v: null } });
+    expect(resolveHostMetrics(noSupply, 5).map((s) => s.id)).toEqual(['cpu']);
+    expect(resolveHostMetrics(healthy, 5).map((s) => s.id)).not.toContain('supply');
+  });
+
+  it('does not judge the supply voltage', () => {
+    // No threshold yet: the number is for comparing boards.
+    for (const volts of [4.5, 5.0, 5.4]) {
+      const board = status({ rp_metrics: { supply_voltage_v: volts } });
+      expect(toneOf(resolveHostMetrics(board, 5), 'supply')).toBe('normal');
+    }
+  });
+
+  it('says the supply reading cannot capture brief droops', () => {
+    const [supply] = resolveHostMetrics(
+      status({ rp_metrics: { supply_voltage_v: 5 } }),
+      5
+    );
+    expect(supply.title).toMatch(/brief droops are not captured/);
+  });
+
+  it('withdraws the supply with the rest once stale', () => {
+    const board = status({ rp_metrics: { supply_voltage_v: 5 } });
+    expect(resolveHostMetrics(board, 200)).toEqual([]);
+  });
 });
 
 describe('formatting', () => {

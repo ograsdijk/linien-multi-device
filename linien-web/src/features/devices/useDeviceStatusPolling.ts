@@ -103,7 +103,8 @@ const sameMetrics = (
     a.mem_available_kb === b.mem_available_kb &&
     a.mem_used_percent === b.mem_used_percent &&
     a.uptime_s === b.uptime_s &&
-    a.root_free_kb === b.root_free_kb
+    a.root_free_kb === b.root_free_kb &&
+    a.supply_voltage_v === b.supply_voltage_v
   );
 };
 

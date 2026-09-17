@@ -20,7 +20,7 @@ export const CPU_WARN_PERCENT = 85;
 
 export type HostMetricsSegment = {
   /** Stable identifier for tests and React keys. */
-  id: 'cpu' | 'memory' | 'disk' | 'uptime';
+  id: 'cpu' | 'memory' | 'disk' | 'supply' | 'uptime';
   text: string;
   tone: TelemetryTone;
   /** Longer form for the element's title attribute. */
@@ -110,6 +110,20 @@ export const resolveHostMetrics = (
             ? 'warn'
             : 'normal',
       title: 'Free space on the board’s root filesystem (SD card)',
+    });
+  }
+
+  const supply = metrics.supply_voltage_v;
+  if (typeof supply === 'number' && Number.isFinite(supply)) {
+    segments.push({
+      id: 'supply',
+      text: `5V ${supply.toFixed(2)} V`,
+      // Deliberately no threshold yet: the number is for comparing boards and
+      // correlating with reboots, not for declaring a supply good or bad.
+      tone: 'normal',
+      title:
+        '5 V supply, measured by the Zynq XADC through the board’s divider. ' +
+        'Sampled once per poll, so brief droops are not captured.',
     });
   }
 

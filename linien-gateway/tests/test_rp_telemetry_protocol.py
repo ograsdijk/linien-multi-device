@@ -230,3 +230,91 @@ def test_the_gateway_read_limit_admits_a_full_metric_line():
     match = re.search(r"#define MAX_RESPONSE (\d+)", _c_source())
     assert match is not None
     assert rpt.MAX_RESPONSE_BYTES >= int(match.group(1))
+
+
+# --- supply voltage (v5, daemon 1.3.0) --------------------------------------
+
+
+def test_the_supply_voltage_is_parsed():
+    reading = rpt.parse_status_line(
+        "RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216 memavail=311044 "
+        "uptime=690.2 rootfree=1204880 v5=4.987\n"
+    )
+
+    assert reading.state == rpt.STATE_RUNNING
+    assert reading.error is None
+    metrics = reading.metrics
+    assert metrics.supply_voltage_v == 4.987
+    # ...without disturbing anything already on the line.
+    assert metrics.cpu_percent == 3.2
+    assert metrics.root_free_kb == 1204880
+    assert metrics.uptime_s == 690.2
+
+
+def test_a_1_2_0_line_without_v5_is_not_an_error():
+    """Every board runs 1.2.0 until it is reinstalled: no v5 is normal."""
+    reading = rpt.parse_status_line(
+        "RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216 memavail=311044 "
+        "uptime=690.2 rootfree=1204880\n"
+    )
+
+    assert reading.state == rpt.STATE_RUNNING
+    assert reading.error is None
+    assert reading.metrics.supply_voltage_v is None
+    assert not reading.metrics.is_empty()
+
+
+def test_a_malformed_supply_voltage_is_dropped_alone():
+    for raw in ("abc", "", "nan", "inf", "-inf", "4,98", "4.98V", "0x5"):
+        reading = rpt.parse_status_line(f"RPT1 57.34 cpu=3.2 v5={raw} uptime=9\n")
+        assert reading.state == rpt.STATE_RUNNING, raw
+        assert reading.temperature_c == 57.34, raw
+        assert reading.metrics.supply_voltage_v is None, raw
+        assert reading.metrics.cpu_percent == 3.2, raw
+        assert reading.metrics.uptime_s == 9.0, raw
+
+
+def test_an_implausible_supply_voltage_is_dropped_alone():
+    for raw in ("0", "0.2", "2.999", "6.501", "12.2", "-5"):
+        reading = rpt.parse_status_line(f"RPT1 57.34 memtotal=1000 v5={raw}\n")
+        assert reading.state == rpt.STATE_RUNNING, raw
+        assert reading.error is None, raw
+        assert reading.metrics.supply_voltage_v is None, raw
+        assert reading.metrics.mem_total_kb == 1000, raw
+
+
+def test_the_plausibility_bounds_are_inclusive_and_not_a_health_check():
+    """3.0-6.5 V only rejects garbage: a sagging 4.5 V board is reported."""
+    for raw, expected in (("3.0", 3.0), ("4.5", 4.5), ("6.5", 6.5)):
+        reading = rpt.parse_status_line(f"RPT1 57.34 v5={raw}\n")
+        assert reading.metrics.supply_voltage_v == expected
+
+
+def test_the_c_daemon_uses_named_divider_constants():
+    source = _c_source()
+    top = re.search(r"#define V5_DIVIDER_TOP_OHM ([\d.]+)", source)
+    bottom = re.search(r"#define V5_DIVIDER_BOTTOM_OHM ([\d.]+)", source)
+    assert top is not None and float(top.group(1)) == 56000.0
+    assert bottom is not None and float(bottom.group(1)) == 4990.0
+    low = re.search(r"#define V5_MIN_PLAUSIBLE_V ([\d.]+)", source)
+    high = re.search(r"#define V5_MAX_PLAUSIBLE_V ([\d.]+)", source)
+    assert float(low.group(1)) == rpt.MIN_PLAUSIBLE_SUPPLY_V
+    assert float(high.group(1)) == rpt.MAX_PLAUSIBLE_SUPPLY_V
+
+
+def test_the_vpvn_channel_is_only_looked_up_on_the_chosen_device():
+    """No parallel scan: the channel names appear once, as constants, and the
+    only function that builds their paths is handed the directory that
+    xadc_discover() already accepted as the PS XADC."""
+    source = _c_source()
+    assert source.count('"in_voltage8_vpvn_raw"') == 1
+    assert source.count('"in_voltage8_vpvn_scale"') == 1
+    assert source.count("V5_RAW_FILE") == 3  # define, path build, log message
+    assert source.count("V5_SCALE_FILE") == 2  # define, path build
+    # xadc_discover_v5 is called from exactly one place: after a device has
+    # been committed by the ranked, PL-refusing discovery.
+    calls = re.findall(r"xadc_discover_v5\(x, (\w+)\)", source)
+    assert calls == ["best_dir"]
+    # The PL refusal is untouched.
+    assert '#define PL_XADC_MARKER "adc_wiz"' in source
+    assert '#define PS_XADC_MARKER "f8007100"' in source

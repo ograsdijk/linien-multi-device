@@ -6,7 +6,7 @@ exercised without a physical board. It speaks the same line protocol as
 
     STATUS\\n   ->  RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216 ...\\n
                    (or RPT1 ERR XADC\\n with --fail)
-    VERSION\\n  ->  RPT1 VERSION 1.2.0\\n
+    VERSION\\n  ->  RPT1 VERSION 1.3.0\\n
     other      ->  RPT1 ERR COMMAND\\n
 
 The host-metric tail is simulated too, so the gateway's parsing, the InfluxDB
@@ -36,7 +36,7 @@ import socketserver
 import time
 
 PROTOCOL_ID = "RPT1"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 MAX_REQUEST = 64
 STARTED_AT = time.monotonic()
 CLIENT_TIMEOUT_S = 2.0
@@ -67,6 +67,12 @@ def simulated_metrics(options) -> str:
     )
     avail_kb = int(total_kb * (1.0 - used_fraction))
     uptime = time.monotonic() - STARTED_AT + options.uptime_offset
+    # A slow wander of +-30 mV, so the 50 mV push binning can be seen working.
+    supply = (
+        ""
+        if options.supply_v <= 0
+        else f" v5={options.supply_v + 0.03 * math.sin(time.time() / 73.0):.3f}"
+    )
     try:
         root_free_kb = shutil.disk_usage("/").free // 1024
     except OSError:
@@ -74,6 +80,7 @@ def simulated_metrics(options) -> str:
     return (
         f" cpu={cpu:.1f} load1={load1:.2f} memtotal={total_kb} "
         f"memavail={avail_kb} uptime={uptime:.1f} rootfree={root_free_kb}"
+        f"{supply}"
     )
 
 
@@ -153,6 +160,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="seconds to add to the simulator's own uptime",
+    )
+    parser.add_argument(
+        "--supply-v",
+        type=float,
+        default=5.0,
+        help="mean 5 V supply to report; 0 omits v5, like a 1.2.0 board",
     )
     parser.add_argument(
         "--no-metrics",

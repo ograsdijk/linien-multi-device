@@ -61,8 +61,22 @@ def daemon_binary(tmp_path_factory) -> Path:
     return out
 
 
-def make_iio_root(tmp_path, *, raw="2504", offset="-2219", scale="123.040771484"):
-    """Build a fake /sys/bus/iio/devices tree with a non-zero device index."""
+# The kernel's xilinx-xadc driver: VP/VN is 12 bits over 1000 mV.
+VPVN_SCALE = "0.244140625"
+
+
+def expected_v5(raw: int, scale: float = float(VPVN_SCALE)) -> float:
+    """What the daemon should report for a VP/VN reading, computed
+    independently of the C code: XADC volts, then undo 56.0k over 4.99k."""
+    return raw * scale / 1000.0 * (56000.0 + 4990.0) / 4990.0
+
+
+def make_iio_root(tmp_path, *, raw="2504", offset="-2219", scale="123.040771484",
+                  vpvn_raw=None, vpvn_scale=VPVN_SCALE):
+    """Build a fake /sys/bus/iio/devices tree with a non-zero device index.
+
+    The VP/VN supply channel is only created when `vpvn_raw` is given, so
+    every older test sees a device without it."""
     root = tmp_path / "iio"
     # Deliberately not iio:device0 -- the daemon must discover, not assume.
     device = root / "iio_device3"
@@ -74,10 +88,15 @@ def make_iio_root(tmp_path, *, raw="2504", offset="-2219", scale="123.040771484"
         (device / "in_temp0_offset").write_text(offset)
     if scale is not None:
         (device / "in_temp0_scale").write_text(scale)
+    if vpvn_raw is not None:
+        (device / "in_voltage8_vpvn_raw").write_text(vpvn_raw)
+        if vpvn_scale is not None:
+            (device / "in_voltage8_vpvn_scale").write_text(vpvn_scale)
     return root, device
 
 
-def make_board_like_iio_root(tmp_path, *, ps=True, pl=True):
+def make_board_like_iio_root(tmp_path, *, ps=True, pl=True, ps_vpvn=None,
+                             pl_vpvn=None):
     """Reproduce a Red Pitaya's IIO tree: two devices, both named "xadc".
 
         iio:device0 -> /sys/devices/soc0/axi/f8007100.adc/...      (PS, safe)
@@ -92,8 +111,11 @@ def make_board_like_iio_root(tmp_path, *, ps=True, pl=True):
     root = tmp_path / "iio"
     root.mkdir(parents=True)
 
-    def add(link_name, device_dir, raw):
+    def add(link_name, device_dir, raw, vpvn):
         device_dir.mkdir(parents=True)
+        if vpvn is not None:
+            (device_dir / "in_voltage8_vpvn_raw").write_text(vpvn)
+            (device_dir / "in_voltage8_vpvn_scale").write_text(VPVN_SCALE)
         (device_dir / "name").write_text("xadc\n")
         (device_dir / "in_temp0_raw").write_text(raw)
         (device_dir / "in_temp0_offset").write_text("-2219")
@@ -101,10 +123,11 @@ def make_board_like_iio_root(tmp_path, *, ps=True, pl=True):
         (root / link_name).symlink_to(device_dir, target_is_directory=True)
 
     if ps:
-        add("iio_device0", soc / "f8007100.adc" / "iio_device0", "2504")
+        add("iio_device0", soc / "f8007100.adc" / "iio_device0", "2504", ps_vpvn)
     if pl:
         # A distinct value, so a test can tell which device was read.
-        add("iio_device1", soc / "83c00000.xadc_wiz" / "iio_device1", "3000")
+        add("iio_device1", soc / "83c00000.xadc_wiz" / "iio_device1", "3000",
+            pl_vpvn)
     return root
 
 
@@ -437,9 +460,9 @@ def test_daemon_is_quiet_during_normal_requests(daemon, tmp_path):
         server.request(b"STATUS\n")
     server.process.terminate()
     _stdout, stderr = server.process.communicate(timeout=5)
-    # Exactly the two startup lines (the device it settled on, and the
-    # listening port) -- nothing per request.
-    assert len(stderr.decode().strip().splitlines()) == 2
+    # Exactly the three startup lines (the device it settled on, whether it
+    # has a supply channel, and the listening port) -- nothing per request.
+    assert len(stderr.decode().strip().splitlines()) == 3
 
 
 # --- host metrics --------------------------------------------------------
@@ -598,7 +621,7 @@ def test_a_garbled_proc_file_drops_only_its_own_metric(daemon, tmp_path):
 def test_the_response_fits_the_gateways_read_limit(daemon, tmp_path):
     """The gateway caps one line at MAX_RESPONSE_BYTES and drops the peer past
     it, so a full metric tail must fit with room to spare."""
-    root, _device = make_iio_root(tmp_path)
+    root, _device = make_iio_root(tmp_path, vpvn_raw="1676")
     proc = make_proc_root(tmp_path)
     server = daemon(root, proc)
 
@@ -607,4 +630,145 @@ def test_the_response_fits_the_gateways_read_limit(daemon, tmp_path):
     response = server.request(b"STATUS\n")
 
     assert b"cpu=" in response
+    assert b" v5=" in response
+    assert response.endswith(b"\n")
     assert len(response) <= rpt.MAX_RESPONSE_BYTES
+
+
+# --- supply voltage (v5) -------------------------------------------------
+#
+# The +5 V rail reaches the XADC's VP/VN pair through a 56.0k / 4.99k divider.
+# The channel is only ever looked up on the device already chosen for the
+# temperature.
+
+
+def _v5(response: bytes) -> float | None:
+    return _metrics(response).supply_voltage_v
+
+
+def test_status_reports_the_supply_voltage(daemon, tmp_path):
+    root, _device = make_iio_root(tmp_path, vpvn_raw="1676")
+    server = daemon(root, make_proc_root(tmp_path))
+
+    response = server.request(b"STATUS\n")
+
+    # 1676 * 0.244140625 mV = 0.40918 V at the pin -> 5.001 V on the rail.
+    assert response.rstrip(b"\n").endswith(f" v5={expected_v5(1676):.3f}".encode())
+    assert f"{expected_v5(1676):.3f}" == "5.001"
+    assert _v5(response) == round(expected_v5(1676), 3)
+    # ...alongside, not instead of, everything else.
+    metrics = _metrics(response)
+    assert metrics.mem_total_kb == 509216
+    assert metrics.uptime_s == 690.2
+
+
+@pytest.mark.parametrize("raw", ["1600", "1640", "1700", "1740"])
+def test_the_supply_conversion_matches_the_divider(daemon, tmp_path, raw):
+    """4.77 V .. 5.19 V: the range where tens of mV between boards matter."""
+    root, _device = make_iio_root(tmp_path, vpvn_raw=raw)
+    server = daemon(root)
+
+    value = _v5(server.request(b"STATUS\n"))
+
+    assert value is not None
+    assert abs(value - expected_v5(int(raw))) <= 0.0005
+
+
+def test_the_supply_scale_is_read_from_sysfs_not_assumed(daemon, tmp_path):
+    """A different scale (a different driver) must change the result."""
+    root, _device = make_iio_root(tmp_path, vpvn_raw="3352", vpvn_scale="0.1220703125")
+    server = daemon(root)
+
+    assert _v5(server.request(b"STATUS\n")) == round(
+        expected_v5(3352, 0.1220703125), 3
+    )
+
+
+def test_a_device_without_the_vpvn_channel_omits_v5_only(daemon, tmp_path):
+    root, _device = make_iio_root(tmp_path)  # no in_voltage8_vpvn_*
+    server = daemon(root, make_proc_root(tmp_path))
+
+    response = server.request(b"STATUS\n")
+
+    assert b"v5=" not in response
+    metrics = _metrics(response)
+    assert metrics.supply_voltage_v is None
+    assert metrics.load1 == 0.41
+    assert metrics.mem_total_kb == 509216
+
+    server.process.terminate()
+    _stdout, stderr = server.process.communicate(timeout=5)
+    assert "v5 will not be reported" in stderr.decode()
+
+
+@pytest.mark.parametrize("scale", [None, "garbage", "0", "-0.24", "nan"])
+def test_a_missing_or_bad_supply_scale_omits_v5(daemon, tmp_path, scale):
+    root, _device = make_iio_root(tmp_path, vpvn_raw="1676", vpvn_scale=scale)
+    server = daemon(root)
+
+    response = server.request(b"STATUS\n")
+
+    assert response.startswith(b"RPT1 ")
+    assert b"ERR" not in response
+    assert b"v5=" not in response
+
+
+@pytest.mark.parametrize("raw", ["0", "4095", "-1676", "garbage", ""])
+def test_an_implausible_supply_reading_omits_v5_only(daemon, tmp_path, raw):
+    """0 V and 12.2 V are a broken read, not a board to report."""
+    root, _device = make_iio_root(tmp_path, vpvn_raw=raw)
+    server = daemon(root, make_proc_root(tmp_path))
+
+    response = server.request(b"STATUS\n")
+
+    assert b"v5=" not in response
+    assert _metrics(response).mem_total_kb == 509216
+
+
+def test_the_supply_channel_vanishing_at_runtime_is_harmless(daemon, tmp_path):
+    root, device = make_iio_root(tmp_path, vpvn_raw="1676")
+    server = daemon(root)
+    assert b"v5=" in server.request(b"STATUS\n")
+
+    (device / "in_voltage8_vpvn_raw").unlink()
+    response = server.request(b"STATUS\n")
+    assert response.startswith(b"RPT1 ")
+    assert b"ERR" not in response
+    assert b"v5=" not in response
+
+    (device / "in_voltage8_vpvn_raw").write_text("1676")
+    assert b"v5=5.001" in server.request(b"STATUS\n")
+    assert server.process.poll() is None
+
+
+def test_the_supply_is_read_from_the_ps_xadc_only(daemon, tmp_path):
+    """Both devices carry a VP/VN channel; the PL one must never be read."""
+    root = make_board_like_iio_root(tmp_path, ps_vpvn="1676", pl_vpvn="1500")
+    server = daemon(root)
+
+    assert _v5(server.request(b"STATUS\n")) == round(expected_v5(1676), 3)
+
+    server.process.terminate()
+    _stdout, stderr = server.process.communicate(timeout=5)
+    text = stderr.decode()
+    assert "iio_device0/in_voltage8_vpvn_raw" in text
+    assert "iio_device1/in_voltage8" not in text
+
+
+def test_a_ps_xadc_without_vpvn_does_not_fall_back_to_the_pl_one(daemon, tmp_path):
+    """The channel is not a reason to pick a different device."""
+    root = make_board_like_iio_root(tmp_path, pl_vpvn="1676")
+    server = daemon(root)
+
+    response = server.request(b"STATUS\n")
+
+    ps_temperature = (2504 + -2219) * 123.040771484 / 1000.0
+    assert response.startswith(f"RPT1 {ps_temperature:.2f}".encode())
+    assert b"v5=" not in response
+
+
+def test_a_pl_only_board_with_vpvn_still_reports_an_error(daemon, tmp_path):
+    root = make_board_like_iio_root(tmp_path, ps=False, pl_vpvn="1676")
+    server = daemon(root)
+
+    assert server.request(b"STATUS\n") == b"RPT1 ERR XADC\n"

@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_ID = "RPT1"
 # Must match RPT_VERSION in rp-telemetry/src/rp_telemetry.c.
-BUNDLED_VERSION = "1.2.0"
+BUNDLED_VERSION = "1.3.0"
 
 DEFAULT_TELEMETRY_PORT = 18864
 CONNECT_TIMEOUT_S = 1.0
@@ -97,6 +97,7 @@ INFLUX_METRIC_FIELDS = {
     "mem_available_kb": "rp_mem_available_kb",
     "root_free_kb": "rp_root_free_kb",
     "uptime_s": "rp_uptime_s",
+    "supply_voltage_v": "rp_supply_voltage_v",
 }
 # Reasons a sampled temperature is not written, surfaced to the operator.
 INFLUX_SKIP_DISABLED = "influx_logging_disabled"
@@ -155,6 +156,11 @@ MAX_PLAUSIBLE_MEMORY_KB = 64 * 1024 * 1024
 MAX_PLAUSIBLE_DISK_KB = 16 * 1024 * 1024 * 1024
 # Ten years. An uptime past this is a broken clock or a garbled field.
 MAX_PLAUSIBLE_UPTIME_S = 10 * 365 * 24 * 3600.0
+# Board +5 V supply. Wide on purpose: this rejects garbled values, it does not
+# judge whether a supply is healthy -- that call is left to whoever compares
+# boards in the UI or InfluxDB.
+MIN_PLAUSIBLE_SUPPLY_V = 3.0
+MAX_PLAUSIBLE_SUPPLY_V = 6.5
 
 BUNDLED_BINARY_PATH = Path(__file__).resolve().parent / "assets" / "rp-telemetry-armv7"
 
@@ -234,6 +240,10 @@ class HostMetrics:
     mem_available_kb: int | None = None
     uptime_s: float | None = None
     root_free_kb: int | None = None
+    # +5 V input as seen by the XADC's VP/VN pair (daemon 1.3.0+). Sampled
+    # once per poll, so it shows static or slow supply changes, not brief
+    # droops.
+    supply_voltage_v: float | None = None
 
     @property
     def mem_used_percent(self) -> float | None:
@@ -361,6 +371,12 @@ _METRIC_PARSERS: dict[str, tuple[str, Any]] = {
     "rootfree": (
         "root_free_kb",
         lambda raw: _bounded_int(raw, 0, MAX_PLAUSIBLE_DISK_KB),
+    ),
+    "v5": (
+        "supply_voltage_v",
+        lambda raw: _bounded_float(
+            raw, MIN_PLAUSIBLE_SUPPLY_V, MAX_PLAUSIBLE_SUPPLY_V
+        ),
     ),
 }
 
@@ -645,6 +661,10 @@ def _metrics_signature(metrics: HostMetrics) -> tuple:
     on every poll, and load is a second view of a quantity CPU usage already
     triggers on. Both still reach the UI -- through the 30 s status poll, which
     carries whatever the cache holds regardless of this signature.
+
+    The supply voltage is binned at 50 mV: XADC noise on a steady supply stays
+    well inside one bin, while a sag worth looking at pushes promptly. A
+    reading that sits right on a bin edge can still push once per poll.
     """
     return (
         _quantize(metrics.cpu_percent, 5.0),
@@ -654,6 +674,7 @@ def _metrics_signature(metrics: HostMetrics) -> tuple:
             None if metrics.root_free_kb is None else float(metrics.root_free_kb),
             102400.0,
         ),
+        _quantize(metrics.supply_voltage_v, 0.05),
     )
 
 
@@ -832,6 +853,7 @@ class RpTelemetryManager:
                 "mem_used_percent": metrics.mem_used_percent,
                 "uptime_s": metrics.uptime_s,
                 "root_free_kb": metrics.root_free_kb,
+                "supply_voltage_v": metrics.supply_voltage_v,
             },
             "rp_telemetry": {
                 "state": state,

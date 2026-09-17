@@ -6,16 +6,18 @@
  * spends its entire life blocked in accept(). There is no polling loop, no
  * timer, no thread, no HTTP, no JSON, and no periodic logging. A request costs
  * one accept(), one recv(), one open/read/close of a single sysfs file, one
- * send(), and one close().
+ * send(), and one close() -- plus the few /proc reads and the one extra
+ * sysfs read described below.
  *
  * Protocol (line oriented, one request per connection):
  *
  *     ->  "STATUS\n"     <-  "RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216
- *                             memavail=311044 uptime=690.2 rootfree=1204880\n"
+ *                             memavail=311044 uptime=690.2 rootfree=1204880
+ *                             v5=4.987\n"
  *                             (one line; temperature in degrees Celsius,
  *                              followed by zero or more key=value host metrics)
  *                        <-  "RPT1 ERR XADC\n"    (sysfs read failed)
- *     ->  "VERSION\n"    <-  "RPT1 VERSION 1.2.0\n"
+ *     ->  "VERSION\n"    <-  "RPT1 VERSION 1.3.0\n"
  *     ->  anything else  <-  "RPT1 ERR COMMAND\n"
  *
  * The key=value tail is an *extension*: every key is independently optional,
@@ -39,6 +41,20 @@
  *
  *     temperature_c = (raw + offset) * scale / 1000.0
  *
+ * Supply voltage (`v5`, since 1.3.0): on the Gen 1 board the +5 V input
+ * reaches the XADC's dedicated VP/VN pair through a 56.0k / 4.99k divider.
+ * Its channel is looked up *only* on the device already chosen for the
+ * temperature -- never by scanning for it -- so it inherits the PS-only
+ * guarantee above. `in_voltage8_vpvn_scale` is in mV per LSB (the kernel's
+ * xilinx-xadc driver reports 1000 mV / 2^12 for VP/VN) and is read once at
+ * discovery; `in_voltage8_vpvn_raw` is read per request.
+ *
+ *     v5 = raw * scale / 1000.0 * (Rtop + Rbottom) / Rbottom
+ *
+ * It is sampled once per STATUS request (every ~30 s from the gateway), so it
+ * shows static or slowly varying supply levels, not millisecond droops. A
+ * missing channel or an implausible value just leaves `v5` out.
+ *
  * The service answers only the fixed protocol above: there is no code path
  * that executes anything supplied by a client. It is intended for a trusted
  * lab LAN, consistent with the rest of this repo's security model.
@@ -57,6 +73,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -69,7 +86,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define RPT_VERSION "1.2.0"
+#define RPT_VERSION "1.3.0"
 #define RPT_PROTOCOL "RPT1"
 
 #define DEFAULT_PORT 18864
@@ -101,6 +118,16 @@
 #define PS_XADC_MARKER "f8007100"
 /* Substring of the PL XADC wizard's device path ("83c00000.xadc_wiz"). */
 #define PL_XADC_MARKER "adc_wiz"
+
+/* Supply-monitor channel of the XADC's VP/VN pair, and the Gen 1 board's
+ * divider from +5 V onto it. */
+#define V5_RAW_FILE "in_voltage8_vpvn_raw"
+#define V5_SCALE_FILE "in_voltage8_vpvn_scale"
+#define V5_DIVIDER_TOP_OHM 56000.0
+#define V5_DIVIDER_BOTTOM_OHM 4990.0
+/* Rejects garbled sysfs values only; this is not a health threshold. */
+#define V5_MIN_PLAUSIBLE_V 3.0
+#define V5_MAX_PLAUSIBLE_V 6.5
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -168,6 +195,10 @@ struct xadc {
     char raw_path[PATH_MAX_LEN];
     long offset;
     double scale;
+    /* VP/VN supply channel on the same device; see xadc_read_supply_v5(). */
+    int have_v5;
+    char v5_raw_path[PATH_MAX_LEN];
+    double v5_scale;
     /* Refuse anything but the PS XADC. Set when scanning the real
      * /sys/bus/iio/devices; see main(). */
     int strict;
@@ -231,6 +262,40 @@ static int xadc_rank(const char *iio_root, const char *name)
 }
 
 /*
+ * Look for the VP/VN supply channel in `device_dir` -- the directory of the
+ * device just chosen for the temperature, and no other. Never fails the
+ * discovery: a device without the channel simply reports no `v5`.
+ */
+static void xadc_discover_v5(struct xadc *x, const char *device_dir)
+{
+    char raw[PATH_MAX_LEN];
+    char scale_path[PATH_MAX_LEN];
+    double scale = 0.0;
+    x->have_v5 = 0;
+    if (device_dir[0] == '\0') {
+        return;
+    }
+    if (snprintf(raw, sizeof(raw), "%s/" V5_RAW_FILE, device_dir) >=
+            (int)sizeof(raw) ||
+        snprintf(scale_path, sizeof(scale_path), "%s/" V5_SCALE_FILE,
+                 device_dir) >= (int)sizeof(scale_path)) {
+        return;
+    }
+    if (!path_exists(raw) || read_double_file(scale_path, &scale) != 0 ||
+        !isfinite(scale) || scale <= 0.0) {
+        fprintf(stderr,
+                "rp-telemetry: no usable " V5_RAW_FILE " in %s; "
+                "v5 will not be reported\n",
+                device_dir);
+        return;
+    }
+    memcpy(x->v5_raw_path, raw, strlen(raw) + 1);
+    x->v5_scale = scale;
+    x->have_v5 = 1;
+    fprintf(stderr, "rp-telemetry: reading 5 V supply from %s\n", raw);
+}
+
+/*
  * Locate the IIO device exposing in_temp0_raw and cache the raw path plus the
  * (constant) offset and scale. Prefers the PS XADC and refuses FPGA-backed
  * devices outright; see xadc_rank(). Called once at startup; retried lazily
@@ -244,6 +309,7 @@ static int xadc_discover(struct xadc *x, const char *iio_root)
     }
     int found = -1;
     int best_rank = 2; /* worse than any acceptable rank */
+    char best_dir[PATH_MAX_LEN] = "";
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') {
@@ -309,6 +375,11 @@ static int xadc_discover(struct xadc *x, const char *iio_root)
         x->ready = 1;
         found = 0;
         best_rank = rank;
+        /* Always fits: `raw` is this directory plus a file name. */
+        if (snprintf(best_dir, sizeof(best_dir), "%s/%s", iio_root,
+                     entry->d_name) >= (int)sizeof(best_dir)) {
+            best_dir[0] = '\0';
+        }
         if (rank == 0) {
             break; /* the PS XADC; nothing can be better */
         }
@@ -317,6 +388,9 @@ static int xadc_discover(struct xadc *x, const char *iio_root)
     if (found == 0) {
         fprintf(stderr, "rp-telemetry: reading temperature from %s\n",
                 x->raw_path);
+        xadc_discover_v5(x, best_dir);
+    } else {
+        x->have_v5 = 0;
     }
     return found;
 }
@@ -342,6 +416,37 @@ static int xadc_read_temperature(struct xadc *x, const char *iio_root,
         }
     }
     *out = ((double)(raw + x->offset)) * x->scale / 1000.0;
+    return 0;
+}
+
+/* Board +5 V from a VP/VN reading: undo the XADC scale (mV/LSB), then the
+ * onboard divider. */
+static double v5_from_raw(long raw, double scale_mv)
+{
+    double xadc_v = (double)raw * scale_mv / 1000.0;
+    return xadc_v * (V5_DIVIDER_TOP_OHM + V5_DIVIDER_BOTTOM_OHM) /
+           V5_DIVIDER_BOTTOM_OHM;
+}
+
+/*
+ * Read the board supply in volts. Returns 0 on success. Best-effort: it never
+ * re-runs discovery (the temperature read owns that) and never logs, so a
+ * board whose channel vanished just stops reporting `v5`.
+ */
+static int xadc_read_supply_v5(const struct xadc *x, double *out)
+{
+    if (!x->ready || !x->have_v5) {
+        return -1;
+    }
+    long raw = 0;
+    if (read_long_file(x->v5_raw_path, &raw) != 0) {
+        return -1;
+    }
+    double v5 = v5_from_raw(raw, x->v5_scale);
+    if (!isfinite(v5) || v5 < V5_MIN_PLAUSIBLE_V || v5 > V5_MAX_PLAUSIBLE_V) {
+        return -1;
+    }
+    *out = v5;
     return 0;
 }
 
@@ -739,6 +844,10 @@ static void handle_client(int fd, struct xadc *x, const char *iio_root,
             snprintf(response, sizeof(response), "%s %.2f", RPT_PROTOCOL,
                      temperature);
             append_metrics(response, sizeof(response), m);
+            double v5 = 0.0;
+            if (xadc_read_supply_v5(x, &v5) == 0) {
+                append_kv(response, sizeof(response), " v5=%.3f", v5);
+            }
             /* append_metrics never fills the buffer to the brim; it reserves
              * room for exactly this. */
             size_t used = strlen(response);

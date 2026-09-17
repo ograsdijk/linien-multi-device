@@ -63,6 +63,23 @@ describe('sameDeviceStatus', () => {
     ).toBe(false);
   });
 
+  it('notices a supply-voltage change the gateway did not push', () => {
+    // A drift inside one 50 mV push bin only reaches the store via this poll.
+    const metrics = { cpu_percent: 4, uptime_s: 60, supply_voltage_v: 4.99 };
+    expect(
+      sameDeviceStatus(
+        status({ rp_metrics: metrics }),
+        status({ rp_metrics: { ...metrics, supply_voltage_v: 4.96 } })
+      )
+    ).toBe(false);
+    expect(
+      sameDeviceStatus(
+        status({ rp_metrics: metrics }),
+        status({ rp_metrics: { ...metrics } })
+      )
+    ).toBe(true);
+  });
+
   it('notices telemetry appearing or disappearing', () => {
     expect(sameDeviceStatus(status({ rp_telemetry: null }), status())).toBe(false);
     expect(sameDeviceStatus(status(), status({ rp_telemetry: null }))).toBe(false);
