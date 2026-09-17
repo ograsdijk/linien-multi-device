@@ -6,7 +6,7 @@ checked in as a build artifact of this directory: build it from source with
 
 ```bash
 cd rp-telemetry
-./build-arm.sh          # Docker-based armv7 cross build, no local toolchain
+./build-arm.sh          # armv7 cross build via Docker or zig, no local toolchain
 # or, with a toolchain installed:
 make bundle
 ```

@@ -65,13 +65,25 @@ If the sysfs entries are missing or unreadable, the daemon answers
 
 ### Cross-compile for the Red Pitaya (recommended)
 
-Needs Docker; no ARM toolchain on your machine. Works from Linux, macOS, and
-Windows (Git Bash).
+Needs either Docker or [zig](https://ziglang.org/download/); no ARM toolchain
+on your machine. Works from Linux, macOS, and Windows (Git Bash).
 
 ```bash
 cd rp-telemetry
 ./build-arm.sh
 ```
+
+Docker is used when its daemon is reachable, zig otherwise; force one with
+`BUILD_BACKEND=zig` / `BUILD_BACKEND=docker`. Docker builds against glibc and
+zig against musl, both static. The daemon uses nothing but file I/O and
+sockets — no NSS, locale, or `dlopen` — so the two are interchangeable here.
+
+> **Rebuild whenever `RPT_VERSION` changes.** The gateway decides a board is
+> up to date by comparing the version the board reports against
+> `BUNDLED_VERSION`. If the committed binary is older than that constant,
+> installing deploys the old daemon, the board keeps reporting the old
+> version, and the UI shows an "update available" banner that reinstalling
+> never clears.
 
 Output:
 

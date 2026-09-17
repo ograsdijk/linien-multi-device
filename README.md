@@ -560,7 +560,7 @@ temperature_c = (raw + offset) * scale / 1000.0
 Installation is always an **explicit operator action** — the gateway never
 installs the daemon just because a device exists or connects.
 
-Build the ARM binary once (Docker, no local toolchain needed):
+Build the ARM binary once (Docker or zig, no local toolchain needed):
 
 ```bash
 cd rp-telemetry
