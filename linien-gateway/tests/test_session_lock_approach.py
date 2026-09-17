@@ -950,3 +950,155 @@ def test_the_stored_samples_survive_as_json(monkeypatch):
     stored = json.loads(rows[0]["approach_detail"])
     assert len(stored) == 4
     assert {item["from_below"] for item in stored} == {True, False}
+
+
+# ------------------------------------------------ refined-lock geometry restore
+
+
+REFINED_AMPLITUDE_V = 0.05
+
+
+def _refined_session(monkeypatch):
+    """A session whose auto-lock goes through trajectory refinement.
+
+    The refinement is stubbed to do what the real one leaves behind on
+    success: a scan narrowed around the feature. Sweep starts are recorded in
+    the same event list as register writes, so ordering can be asserted.
+    """
+    session, board = _make_session(monkeypatch, _no_error)
+    events: list[tuple[str, float, float]] = []
+    board.on_write_registers = lambda: events.append((
+        "write",
+        float(session.parameters.sweep_center.value),
+        float(session.parameters.sweep_amplitude.value),
+    ))
+    session.parameters.fetch_additional_signals = FakeParam(False)
+    session.parameters.task = FakeParam(None)
+
+    def _start_sweep() -> None:
+        session.parameters.lock.value = False
+        events.append(("sweep", float("nan"), float("nan")))
+
+    def _start_lock() -> None:
+        board.lock_started = True
+        session.parameters.lock.value = True
+        events.append(("lock", float(session.parameters.sweep_center.value), float("nan")))
+
+    session.control.exposed_start_sweep = _start_sweep
+    session.control.exposed_start_lock = _start_lock
+    # A live-looking trace, so the dead-signal shortcut does not skip refinement.
+    session.plot_state.last_plot_data = [np.linspace(-1e4, 1e4, 256)] * 3
+    monkeypatch.setattr(
+        session,
+        "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (
+            _result(FEATURE_V), START_CENTER_V, 1.0, 2.0  # under-resolved
+        ),
+    )
+
+    def _refine(settings, center, amplitude, **_kwargs):
+        session.parameters.sweep_center.value = FEATURE_V
+        session.parameters.sweep_amplitude.value = REFINED_AMPLITUDE_V
+        return _result(FEATURE_V), {"attempted": True, "stages": []}
+
+    monkeypatch.setattr(session, "_trajectory_refine_auto_lock", _refine)
+    return session, board, events
+
+
+def test_a_refined_lock_keeps_its_operating_point_while_locked(monkeypatch):
+    """Restoring the old center after start_lock moved the lock's hold point
+    by (target - original center) and dropped the lock."""
+    session, board, events = _refined_session(monkeypatch)
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert board.lock_started
+    assert "refinement" in payload
+    lock_at = [e for e in events if e[0] == "lock"][-1][1]
+    assert lock_at == pytest.approx(FEATURE_V, abs=0.02)
+    after_lock = events[events.index(next(e for e in events if e[0] == "lock")) + 1 :]
+    assert after_lock == []  # nothing written while locked
+    assert session.parameters.sweep_center.value == pytest.approx(lock_at)
+
+
+def test_a_refined_lock_restores_the_scan_when_the_sweep_restarts(monkeypatch):
+    session, _board, events = _refined_session(monkeypatch)
+    session.auto_lock_from_scan(None)
+    events.clear()
+
+    session.stop_lock()
+
+    assert events[0][0] == "sweep"  # unlocked first ...
+    assert events[1] == ("write", START_CENTER_V, 1.0)  # ... then restored
+    assert session.parameters.sweep_center.value == START_CENTER_V
+    assert session.parameters.sweep_amplitude.value == 1.0
+
+    # One-shot: a later sweep start does not write it again.
+    events.clear()
+    session.start_sweep()
+    assert [event[0] for event in events] == ["sweep"]
+
+
+def test_the_operators_own_geometry_cancels_a_pending_restore(monkeypatch):
+    session, _board, events = _refined_session(monkeypatch)
+    monkeypatch.setattr(session, "_update_persistent_setting", lambda *_a: None)
+    session.auto_lock_from_scan(None)
+
+    session.set_param("sweep_amplitude", 0.3, write_registers=False)
+    session.start_sweep()
+
+    assert session.parameters.sweep_amplitude.value == 0.3
+    assert session.parameters.sweep_center.value != START_CENTER_V
+
+
+# ----------------------------------------- auto-relock lock-result rows
+
+
+def _recorded_rows(monkeypatch, session):
+    rows: list[dict] = []
+    monkeypatch.setattr(
+        session,
+        "_write_lock_result_to_postgres",
+        lambda **kwargs: rows.append(kwargs),
+    )
+    monkeypatch.setattr(session, "_emit_log_event", lambda **_kwargs: None)
+    return rows
+
+
+def test_a_relock_that_moved_nothing_writes_no_failure_row(monkeypatch):
+    """E.g. a laser far off resonance fails detection on every relock tick;
+    a row per tick with no approach data would skew the failure statistics."""
+    session, _board = _make_session(monkeypatch, _no_error)
+    rows = _recorded_rows(monkeypatch, session)
+    session.parameters.lock.value = True  # "already locked": nothing moves
+
+    with pytest.raises(RuntimeError, match="already locked"):
+        session._start_auto_relock()
+
+    assert rows == []
+
+
+def test_a_relock_whose_guarded_move_aborted_writes_a_failure_row(monkeypatch):
+    session, board = _make_session(monkeypatch, _unrepeatable(0.03))
+    rows = _recorded_rows(monkeypatch, session)
+
+    with pytest.raises(RuntimeError, match="Auto-lock aborted"):
+        session._start_auto_relock()
+
+    assert board.lock_started is False
+    assert len(rows) == 1
+    assert rows[0]["success"] is False
+    assert rows[0]["lock_source"] == "auto_relock"
+    assert isinstance(rows[0]["approach"], dict)
+    assert rows[0]["approach"]["attempts"]
+
+
+def test_a_successful_relock_writes_its_row(monkeypatch):
+    session, board = _make_session(monkeypatch, _no_error)
+    rows = _recorded_rows(monkeypatch, session)
+
+    session._start_auto_relock()
+
+    assert board.lock_started
+    assert len(rows) == 1
+    assert rows[0].get("success", True) is True

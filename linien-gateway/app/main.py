@@ -1144,6 +1144,15 @@ def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:
         "target_index": result.get("target_index"),
         "score": result.get("score"),
     }
+    refinement = result.get("refinement")
+    if isinstance(refinement, dict):
+        details.update({
+            "refinement_trigger": refinement.get("trigger"),
+            "refinement_stages": len(refinement.get("stages") or []),
+            "refinement_initial_resolution_samples": refinement.get("initial_resolution_samples"),
+            "refinement_final_center_v": refinement.get("final_center_v"),
+            "refinement_final_amplitude_v": refinement.get("final_amplitude_v"),
+        })
     details.update(_approach_event_details(result.get("approach")))
     return details
 
@@ -1185,6 +1194,9 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
     except RuntimeError as exc:
         report = getattr(exc, "report", None)
         details: dict[str, Any] = {"error": str(exc)}
+        refinement = getattr(exc, "refinement", None)
+        if isinstance(refinement, dict):
+            details["refinement"] = refinement
         if isinstance(report, dict):
             details.update(_approach_event_details(report))
             _enqueue_auto_lock_row(session, key, success=False, approach=report)
@@ -1196,16 +1208,30 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
             device_key=key,
             details=details,
         )
+        if isinstance(refinement, dict):
+            raise HTTPException(
+                status_code=409,
+                detail={"message": str(exc), "refinement": refinement},
+            )
         raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
+        details = {"error": str(exc)}
+        refinement = getattr(exc, "refinement", None)
+        if isinstance(refinement, dict):
+            details["refinement"] = refinement
         _emit_log(
             level=logging.ERROR,
             source="auto_lock_scan",
             code="auto_lock_scan_failed",
             message="Auto-lock from scan failed.",
             device_key=key,
-            details={"error": str(exc)},
+            details=details,
         )
+        if isinstance(refinement, dict):
+            raise HTTPException(
+                status_code=422,
+                detail={"message": str(exc), "refinement": refinement},
+            )
         raise HTTPException(status_code=422, detail=str(exc))
     _emit_log(
         level=logging.INFO,

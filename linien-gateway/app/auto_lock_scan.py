@@ -60,6 +60,21 @@ class AutoLockScanSettings:
         return cls(**values)
 
 
+def feature_resolution_samples(
+    settings: AutoLockScanSettings, n_points: int, sweep_amplitude_v: float
+) -> float:
+    """Calibrated feature half-width expressed in samples of this sweep.
+
+    This is deliberately based on the calibrated physical width, rather than a
+    magic sweep-voltage threshold: a broad discriminator can be safely found on
+    a wide sweep while a narrow one cannot.
+    """
+    span_v = 2.0 * abs(float(sweep_amplitude_v))
+    if n_points < 2 or span_v <= 1e-12:
+        return 0.0
+    return float(settings.half_range_sweep_v) * (n_points - 1) / span_v
+
+
 @dataclass
 class AutoLockScanResult:
     target_index: int
@@ -95,6 +110,186 @@ class AutoLockScanResult:
             "sideband_offset_v": self.sideband_offset_v,
             "discriminator_slope_v_per_mhz": self.discriminator_slope_v_per_mhz,
         }
+
+
+@dataclass
+class CoarseAutoLockCandidate:
+    """Tracking-only candidate; never sufficient to start a lock."""
+
+    result: AutoLockScanResult
+    metrics: dict[str, Any]
+
+
+def _robust_noise(values: np.ndarray) -> float:
+    """Robust point-to-point noise floor, insensitive to the PDH lobes."""
+    diff = np.diff(values)
+    if len(diff) < 2:
+        return 1e-9
+    mad = 1.4826 * float(np.median(np.abs(diff - np.median(diff))))
+    # Quantised ADC traces often have a zero MAD because most adjacent values
+    # repeat. Use the typical non-zero code step as the resolution floor rather
+    # than reporting an artificial multi-million SNR.
+    nonzero = np.abs(diff[np.abs(diff) > 0.0])
+    quantization = float(np.median(nonzero)) if len(nonzero) else 1e-9
+    return max(1e-9, mad, quantization)
+
+
+def find_coarse_auto_lock_target(
+    *,
+    error_trace_v: np.ndarray,
+    monitor_trace_v: np.ndarray | None,
+    sweep_center_v: float,
+    sweep_amplitude_v: float,
+    settings: AutoLockScanSettings,
+    preferred_slope_rising: bool | None = None,
+    modulation_frequency_hz: float | None = None,
+) -> CoarseAutoLockCandidate:
+    """Find a plausible PDH/dispersive lobe pair for scan *tracking* only.
+
+    Unlike the strict crossing detector this does not rely on a five-point
+    smoother swallowing a narrow lobe. It searches adjacent extrema pairs at
+    three scales, scores their excursion against robust point noise, and, for
+    PDH, requires an opposite-slope sideband pair. Callers must still obtain
+    two strict detections before a lock can be started.
+    """
+    raw = _sanitize_trace(np.asarray(error_trace_v, dtype=float))
+    n = len(raw)
+    if n < 16:
+        raise ValueError("Trace is too short for coarse auto-lock tracking.")
+    noise = _robust_noise(raw)
+    half_pts = _half_range_to_points(settings.half_range_sweep_v, n, sweep_amplitude_v)
+    max_gap = max(3, min(n // 4, half_pts * 6))
+    slope = bool(preferred_slope_rising) if preferred_slope_rising is not None else True
+    options: list[tuple[float, int, float, float, float, int, float | None]] = []
+    # (score, crossing index, left, right, pair, smoothing width, sideband pts)
+
+    exclusion = max(3, half_pts)
+
+    def _opposite_slope_crossings(signal: np.ndarray) -> np.ndarray:
+        """Sorted sideband crossing indices usable by `_two_sided_sidebands`.
+
+        Whether a crossing qualifies (in bounds, slope opposite the carrier's)
+        does not depend on which carrier it is paired with, so it is decided
+        once per smoothing width rather than once per candidate pair.
+        """
+        if str(settings.signal_type) != "pdh":
+            return np.empty(0, dtype=int)
+        kept = []
+        for idx in _extract_crossing_candidates(signal):
+            if idx <= 3 or idx >= n - 4:
+                continue
+            # _extract_crossing_candidates returns whichever endpoint is nearer
+            # zero, so its index is not guaranteed to be the right endpoint of
+            # the sign-change bracket. A local central slope is orientation-safe.
+            rising = float(signal[idx + 1] - signal[idx - 1]) > 0.0
+            if rising != slope:
+                kept.append(int(idx))
+        return np.unique(np.asarray(kept, dtype=int))
+
+    def _two_sided_sidebands(opposite: np.ndarray, crossing: int) -> float | None:
+        # Nearest qualifying crossing on each side, at least `exclusion` away.
+        left_pos = int(np.searchsorted(opposite, crossing - exclusion, side="right")) - 1
+        right_pos = int(np.searchsorted(opposite, crossing + exclusion, side="left"))
+        if left_pos < 0 or right_pos >= len(opposite):
+            return None
+        left_offset = crossing - int(opposite[left_pos])
+        right_offset = int(opposite[right_pos]) - crossing
+        if abs(left_offset - right_offset) > 0.35 * max(left_offset, right_offset):
+            return None
+        return (left_offset + right_offset) / 2.0
+
+    for width in (1, 3, 5):
+        signal = _moving_average(raw, width)
+        mins = [i for i in range(1, n - 1) if signal[i] <= signal[i - 1] and signal[i] < signal[i + 1]]
+        maxs = [i for i in range(1, n - 1) if signal[i] >= signal[i - 1] and signal[i] > signal[i + 1]]
+        lefts, rights = (mins, maxs) if slope else (maxs, mins)
+        rights_arr = np.asarray(rights, dtype=int)
+        opposite = _opposite_slope_crossings(signal)
+        abs_signal = np.abs(signal)
+        positions = np.arange(max_gap + 1)
+        for left in lefts:
+            # Every right extremum within max_gap after this left one.
+            lo = int(np.searchsorted(rights_arr, left, side="right"))
+            hi = int(np.searchsorted(rights_arr, left + max_gap, side="right"))
+            if lo >= hi:
+                continue
+            pair_rights = rights_arr[lo:hi]
+            # The crossing of [left, right] is the first minimum of |signal|
+            # over that segment -- np.argmin's tie rule -- so one running
+            # first-argmin from `left` serves every right at once.
+            window = abs_signal[left : int(pair_rights[-1]) + 1]
+            running_min = np.minimum.accumulate(window)
+            improved = np.empty(len(window), dtype=bool)
+            improved[0] = True
+            improved[1:] = window[1:] < running_min[:-1]
+            first_argmin = np.maximum.accumulate(
+                np.where(improved, positions[: len(window)], 0)
+            )
+            crosses = left + first_argmin[pair_rights - left]
+            left_exc = np.abs(signal[left] - signal[crosses])
+            right_exc = np.abs(signal[pair_rights] - signal[crosses])
+            pair = left_exc + right_exc
+            symmetry = np.minimum(left_exc, right_exc) / np.maximum(
+                np.maximum(left_exc, right_exc), 1e-12
+            )
+            snr = pair / noise
+            # Prefer balanced high-SNR pairs; require both lobes to be real.
+            # Checked before the sideband search, which is the costly part and
+            # is wasted on the many pairs this rejects.
+            for k in np.flatnonzero((snr >= 6.0) & (symmetry >= 0.12)):
+                cross = int(crosses[k])
+                sidebands = (
+                    _two_sided_sidebands(opposite, cross)
+                    if str(settings.signal_type) == "pdh"
+                    else None
+                )
+                # A resolvable ±Ω pair gets a preference, but wide scans can
+                # genuinely under-resolve the sidebands. In that case the
+                # carrier pair remains useful for tracking only; strict final
+                # detection still has to establish the full PDH identity.
+                sideband_bonus = 1.15 if sidebands is not None else 1.0
+                options.append((
+                    float(snr[k]) * (0.5 + 0.5 * float(symmetry[k])) * sideband_bonus,
+                    cross,
+                    float(left_exc[k]),
+                    float(right_exc[k]),
+                    float(pair[k]),
+                    width,
+                    sidebands,
+                ))
+    if not options:
+        raise ValueError("No extrema pair with robust signal-to-noise was found for tracking.")
+    score, crossing, left_exc, right_exc, pair, width, sideband_pts = max(options, key=lambda item: item[0])
+    sideband_offset_v: float | None = None
+    hz_per_v: float | None = None
+    if str(settings.signal_type) == "pdh":
+        if sideband_pts is not None:
+            sideband_offset_v = float(sideband_pts) * (2.0 * abs(float(sweep_amplitude_v)) / (n - 1))
+        if modulation_frequency_hz and sideband_offset_v is not None and sideband_offset_v > 1e-12:
+            hz_per_v = float(modulation_frequency_hz) / sideband_offset_v
+    target = AutoLockScanResult(
+        target_index=int(crossing),
+        target_voltage=_index_to_voltage(crossing, n, sweep_center_v, sweep_amplitude_v),
+        target_slope_rising=slope,
+        score=float(score),
+        left_excursion=float(left_exc),
+        right_excursion=float(right_exc),
+        pair_excursion=float(pair),
+        symmetry=float(min(left_exc, right_exc) / max(left_exc, right_exc, 1e-12)),
+        monitor_level=None,
+        hz_per_v=hz_per_v,
+        sideband_offset_v=sideband_offset_v,
+    )
+    return CoarseAutoLockCandidate(target, {
+        "method": "multiscale_extrema_pair",
+        "smooth_window_pts": width,
+        "robust_noise": noise,
+        "snr": pair / noise,
+        "pair_excursion": pair,
+        "symmetry": target.symmetry,
+        "sideband_offset_v": sideband_offset_v,
+        "sideband_evidence": "two_sided" if sideband_offset_v is not None else "unresolved",
+    })
 
 
 @dataclass

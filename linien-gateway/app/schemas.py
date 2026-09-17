@@ -297,6 +297,10 @@ class AutoLockScanResult(BaseModel):
     discriminator_slope_v_per_mhz: Optional[float] = None
     detail: Optional[str] = None
     approach: Optional[LockApproachReport] = None
+    # A trajectory-aware run records every temporary geometry and detection so
+    # operators can see when scan-history motion, rather than a bad lock point,
+    # drove the refinement.
+    refinement: Optional[dict[str, Any]] = None
 
 
 class AutoLockCalibrateRequest(BaseModel):

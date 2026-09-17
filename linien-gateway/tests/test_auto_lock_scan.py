@@ -6,6 +6,8 @@ import pytest
 from app.auto_lock_scan import (
     AutoLockScanSettings,
     calibrate_auto_lock_settings,
+    feature_resolution_samples,
+    find_coarse_auto_lock_target,
     find_auto_lock_target,
 )
 from app.schemas import AutoLockScanSettings as SchemaAutoLockScanSettings
@@ -29,6 +31,33 @@ def _pdh_triplet(n=2048, carrier=0.4, sideband=0.15, width=0.03, sb_off=0.3):
         + _dispersive(n, amplitude=-sideband, width=width, center=-sb_off)
         + _dispersive(n, amplitude=-sideband, width=width, center=+sb_off)
     )
+
+
+def test_feature_resolution_is_calibrated_width_per_sample_not_scan_threshold():
+    settings = AutoLockScanSettings(half_range_sweep_v=0.04)
+    # Same physical scan amplitude, doubled samples -> doubled resolution.
+    assert feature_resolution_samples(settings, 2048, 1.0) == pytest.approx(40.94)
+    assert feature_resolution_samples(settings, 1024, 1.0) == pytest.approx(20.46)
+    # Same ADC depth, halving scan amplitude also doubles the feature samples.
+    assert feature_resolution_samples(settings, 2048, 0.5) == pytest.approx(81.88)
+
+
+def test_coarse_tracker_requires_pdh_sidebands_and_reports_snr_metrics():
+    error = _pdh_triplet(n=2048, width=0.012, sb_off=0.25)
+    coarse = find_coarse_auto_lock_target(
+        error_trace_v=error,
+        monitor_trace_v=None,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=AutoLockScanSettings(signal_type="pdh", half_range_sweep_v=0.01),
+        preferred_slope_rising=True,
+        modulation_frequency_hz=20e6,
+    )
+    assert abs(coarse.result.target_voltage) < 0.03
+    assert coarse.result.sideband_offset_v is not None
+    assert coarse.metrics["method"] == "multiscale_extrema_pair"
+    assert coarse.metrics["snr"] > 6
+
 
 
 def test_finds_rising_crossing_near_center():

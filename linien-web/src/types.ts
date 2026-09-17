@@ -367,6 +367,27 @@ export type AutoLockScanResult = {
   sideband_offset_v?: number | null;
   detail?: string | null;
   approach?: LockApproachReport | null;
+  refinement?: {
+    attempted: boolean;
+    trigger?: string;
+    original_center_v: number;
+    original_amplitude_v: number;
+    final_center_v?: number;
+    final_amplitude_v?: number;
+    initial_resolution_samples?: number;
+    stages?: Array<{
+      kind: string;
+      center_v?: number;
+      amplitude_v?: number;
+      target_voltage?: number;
+      resolution_samples?: number;
+      detector?: string;
+      consistent?: boolean;
+      detail?: string;
+    }>;
+    restored?: boolean;
+    failure?: string;
+  } | null;
 };
 
 export type AutoLockCalibrateRequest = {

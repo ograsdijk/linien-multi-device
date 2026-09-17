@@ -18,6 +18,7 @@ import type {
   AutoLockScanSettings,
   LockApproachSettings,
 } from '../types';
+import { ApiError } from '../api';
 import { toClampedNumberOr, toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
 import { DeferredNumberInput } from './DeferredNumberInput';
 import { LockApproachPanel } from './LockApproachPanel';
@@ -101,6 +102,8 @@ export const LockingPanel = memo(function LockingPanel({
   );
   const [autoLockBusy, setAutoLockBusy] = useState(false);
   const [autoLockResult, setAutoLockResult] = useState<AutoLockScanResult | null>(null);
+  const [autoLockError, setAutoLockError] = useState<string | null>(null);
+  const [autoLockFailureRefinement, setAutoLockFailureRefinement] = useState<AutoLockScanResult['refinement']>(null);
   const [calibrateOpen, setCalibrateOpen] = useState(false);
   const [calibrateBusy, setCalibrateBusy] = useState(false);
   const [calibrateMonitor, setCalibrateMonitor] = useState(false);
@@ -135,14 +138,21 @@ export const LockingPanel = memo(function LockingPanel({
 
   const runAutoLockFromScan = async () => {
     setAutoLockBusy(true);
+    setAutoLockError(null);
+    setAutoLockFailureRefinement(null);
     try {
       const result = await onAutoLockFromScan(autoLockSettings);
       setAutoLockResult(result);
-    } catch (_error) {
+    } catch (error) {
       // Errors are surfaced through global logs + toast notifications, but the
       // previous run's summary must go: it reports a center move that has since
       // been restored, next to a toast saying the lock failed.
       setAutoLockResult(null);
+      setAutoLockError(error instanceof Error ? error.message : String(error));
+      if (error instanceof ApiError && error.detail && typeof error.detail === 'object') {
+        const value = error.detail as { refinement?: AutoLockScanResult['refinement'] };
+        setAutoLockFailureRefinement(value.refinement ?? null);
+      }
     } finally {
       setAutoLockBusy(false);
     }
@@ -464,6 +474,30 @@ export const LockingPanel = memo(function LockingPanel({
                   ? ` · residual ${formatSigned(
                       autoLockResult.approach.center_offset_v
                     )} V of ${autoLockResult.approach.capture_tolerance_v.toFixed(4)} V`
+                  : ''}
+              </Text>
+            ) : null}
+            {autoLockResult?.refinement ? (
+              <Text size="xs" c="dimmed">
+                scan refinement: {autoLockResult.refinement.stages?.length ?? 0} stages ·
+                {' '}resolution {autoLockResult.refinement.initial_resolution_samples?.toFixed(1) ?? '?'} samples
+                {autoLockResult.refinement.final_amplitude_v != null
+                  ? ` · final ±${autoLockResult.refinement.final_amplitude_v.toFixed(4)} V`
+                  : ''}
+                {autoLockResult.refinement.final_center_v != null
+                  ? ` at ${autoLockResult.refinement.final_center_v.toFixed(4)} V`
+                  : ''}
+              </Text>
+            ) : null}
+            {autoLockError ? (
+              <Text size="xs" c="red">{autoLockError}</Text>
+            ) : null}
+            {autoLockFailureRefinement ? (
+              <Text size="xs" c="red">
+                refinement stopped after {autoLockFailureRefinement.stages?.length ?? 0} stages
+                {autoLockFailureRefinement.restored ? ' · original scan restored' : ''}
+                {autoLockFailureRefinement.failure
+                  ? ` · ${autoLockFailureRefinement.failure}`
                   : ''}
               </Text>
             ) : null}

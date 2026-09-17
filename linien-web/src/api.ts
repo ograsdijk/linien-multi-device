@@ -54,6 +54,12 @@ const API_BASE = (envBase || browserBase || 'http://localhost:8000/api').replace
   ''
 );
 
+export class ApiError extends Error {
+  constructor(message: string, public readonly detail: unknown = null) {
+    super(message);
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
@@ -66,11 +72,15 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const raw = await res.text().catch(() => '');
     const contentType = res.headers.get('content-type') ?? '';
     let detail: string | null = null;
+    let structuredDetail: unknown = null;
     if (contentType.includes('application/json') && raw) {
       try {
         const payload = JSON.parse(raw);
         if (payload && typeof payload.detail === 'string') {
           detail = payload.detail;
+        } else if (payload?.detail && typeof payload.detail.message === 'string') {
+          detail = payload.detail.message;
+          structuredDetail = payload.detail;
         } else if (payload != null) {
           detail = JSON.stringify(payload);
         }
@@ -78,7 +88,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
         // Not valid JSON despite the header — fall back to the raw text.
       }
     }
-    throw new Error(detail || raw || res.statusText);
+    throw new ApiError(detail || raw || res.statusText, structuredDetail);
   }
   if (res.status === 204) {
     return undefined as T;
