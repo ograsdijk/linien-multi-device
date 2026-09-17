@@ -177,12 +177,18 @@ def test_a_failed_write_leaves_the_events_pending_not_lost(tmp_path):
     path = tmp_path / "board_events.json"
     store = BoardEventStore(path, flush_interval_s=0.0)
     store.record("dev-1", KIND_DISCONNECTED, detail="precious")
+    # record() starts its own background write. Drain it before touching
+    # _path, or the two race: when the writer thread wins it reads the good
+    # path, the write succeeds, nothing is left dirty, and the assertion below
+    # fails for a reason that has nothing to do with the behaviour under test.
+    store.flush(block=True)
 
     # Make the write fail (the parent is a file, so mkdir cannot succeed),
     # then let it succeed.
     blocker = tmp_path / "blocker"
     blocker.write_text("not a directory", encoding="utf-8")
     store._path = blocker / "board_events.json"
+    store.record("dev-1", KIND_DISCONNECTED, detail="also precious")
     store.flush(block=True)
     assert store._dirty is True
 
@@ -190,7 +196,10 @@ def test_a_failed_write_leaves_the_events_pending_not_lost(tmp_path):
     store.flush(block=True)
 
     reloaded = make_store(tmp_path)
-    assert [event["detail"] for event in reloaded.events("dev-1")] == ["precious"]
+    assert [event["detail"] for event in reloaded.events("dev-1")] == [
+        "also precious",
+        "precious",
+    ]
 
 
 def test_concurrent_recording_never_publishes_a_torn_file(tmp_path):
