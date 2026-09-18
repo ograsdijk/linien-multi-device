@@ -276,7 +276,7 @@ def plan_refinement_step(
     on the returned step, re-detects, and calls this again for the next one.
     """
     if detector == "strict" and not scan_too_wide_to_lock(
-        settings, amplitude_v, sideband_offset_v
+        settings, amplitude_v, sideband_offset_v, trace_points=trace_length
     ):
         return RefinementStep(
             "done", center_v, amplitude_v, "goal met: strict detector accepts this scan"

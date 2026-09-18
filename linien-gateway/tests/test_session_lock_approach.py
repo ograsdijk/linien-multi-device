@@ -2041,3 +2041,42 @@ def test_every_refinement_geometry_write_waits_for_the_calibrated_settle(monkeyp
 
     assert settles, "expected the walk to command at least one geometry write"
     assert all(s == pytest.approx(0.25) for s in settles), settles
+
+
+def test_a_narrowing_that_does_not_take_is_reported_not_repeated(monkeypatch):
+    """A width register that clamps or quantizes must not cost 16 stages.
+
+    The planner is a pure function of the geometry it is given, so if the
+    realized amplitude comes back unchanged it will ask for exactly the same
+    width again, and the walk spends its whole budget before reporting only
+    that it ran out of stages -- saying nothing about why.
+    """
+    session, _board = _make_session(monkeypatch, _no_error, approach={"enabled": False})
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    monkeypatch.setattr(session, "_set_sweep_geometry",
+                        lambda c, a, settle_s=0.0: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    # The device reports the original width back however narrow the request.
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (_result(0.5341, 0.032), 0.2, 0.8, 2.275),
+    )
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (_result(0.5341, 0.032), 0.2, 0.8, 2.275, {}),
+    )
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            ApproachSettings.from_mapping(session.lock_approach_settings),
+            0.2, 0.8,
+            initial_target=_result(0.5341, 0.032),
+            initial_center_v=0.2, initial_amplitude_v=0.8,
+            initial_resolution=2.275, initial_detector="coarse", trace_length=2048,
+        )
+
+    message = str(excinfo.value)
+    assert "did not change" in message
+    assert "not following the commanded value" in message
+    # One stage, not the full budget.
+    assert len(excinfo.value.refinement["stages"]) <= 3

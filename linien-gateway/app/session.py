@@ -3423,7 +3423,8 @@ class DeviceSession:
             # and the next stage is sized from what was actually observed.
             shift_per_fraction: float | None = None
             while detector == "coarse" or scan_too_wide_to_lock(
-                settings, amplitude_v, target.sideband_offset_v
+                settings, amplitude_v, target.sideband_offset_v,
+                trace_points=trace_length,
             ):
                 if narrow_count >= _MAX_REFINEMENT_STAGES:
                     raise ValueError(
@@ -3536,6 +3537,25 @@ class DeviceSession:
                     "bounds": step.bounds,
                 })
                 identity.check(target, amplitude_v=amplitude_v, detector=detector, resolution_samples=resolution)
+                # Checked after the identity guard: if the walk has lost the
+                # feature, that is the more specific diagnosis. A narrowing that
+                # did not narrow would otherwise be re-planned identically next
+                # stage, and the walk would spend its whole budget asking for
+                # the same width before reporting only that it ran out of
+                # stages. The realized amplitude is read back from the device,
+                # so a register that quantizes or clamps the request surfaces on
+                # the first stage rather than the sixteenth.
+                if (
+                    step.action == "narrow"
+                    and step.amplitude_v < before_amplitude
+                    and abs(amplitude_v) >= before_amplitude
+                ):
+                    raise ValueError(
+                        f"The scan width did not change: {before_amplitude:.4f} V "
+                        f"was asked to narrow to {step.amplitude_v:.4f} V and read "
+                        f"back {abs(amplitude_v):.4f} V. The sweep amplitude is not "
+                        "following the commanded value."
+                    )
                 narrow_count += 1
                 # A target still outside the inner window is the next stage's
                 # business: plan_refinement_step weighs it against the crop
@@ -3759,7 +3779,8 @@ class DeviceSession:
                 # wrong feature. Narrow around the target first so the centre
                 # walks there in bounded steps instead.
                 if scan_too_wide_to_lock(
-                    settings, direct_amplitude, direct.sideband_offset_v
+                    settings, direct_amplitude, direct.sideband_offset_v,
+                    trace_points=len(error_trace),
                 ):
                     try:
                         result, refinement = self._trajectory_refine_auto_lock(

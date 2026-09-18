@@ -129,6 +129,13 @@ def _spacing_is_measurable(
     -- and once it has narrowed enough to resolve the feature, the spacing
     becomes measurable on its own merits.
     """
+    if float(settings.half_range_sweep_v) <= 0.0:
+        # Uncalibrated: there is no feature width to compare a scan against, so
+        # this test has no opinion. `_half_range_to_points` would floor to two
+        # samples and make every scan look unresolvable, which would send an
+        # uncalibrated device into the refinement walk instead of to the
+        # explicit "calibrate first" refusal that exists for it.
+        return True
     feature_pts = 2.0 * _half_range_to_points(
         settings.half_range_sweep_v, n_points, sweep_amplitude_v
     )
@@ -154,6 +161,8 @@ def scan_too_wide_to_lock(
     settings: AutoLockScanSettings,
     sweep_amplitude_v: float,
     sideband_offset_v: float | None,
+    *,
+    trace_points: int | None = None,
 ) -> bool:
     """Is the scan so wide that the centre move to the target is a leap?
 
@@ -179,7 +188,17 @@ def scan_too_wide_to_lock(
     if span_v <= 1e-12:
         return False
     if sideband_offset_v is None:
-        return False
+        # Two different silences. A scan that simply resolved no sideband may
+        # still lock perfectly well, and narrowing every such scan would be
+        # wrong. But a scan too coarse to resolve the feature at all could not
+        # have measured a spacing whatever the signal did -- that silence is
+        # itself the answer, and the widest scans in a 119-scan run are exactly
+        # where a spacing is withheld while the strict detector still succeeds.
+        # Without this the walk would stop there and try to lock from a scan
+        # carrying five samples of feature.
+        return trace_points is not None and not _spacing_is_measurable(
+            settings, int(trace_points), sweep_amplitude_v
+        )
     signal_width_v = 2.0 * abs(float(sideband_offset_v))
     return signal_width_v < fraction * span_v
 
@@ -529,7 +548,9 @@ def _half_range_to_points(
         return max(2, min(24, n_points // 16))
     span_v = 2.0 * amplitude
     points_per_v = float(n_points - 1) / span_v
-    points = int(round(max(0.001, float(half_range_sweep_v)) * points_per_v))
+    # No millivolt floor here either: `points` is clamped to [2, half-trace]
+    # below, which is the same guard expressed in the units that matter.
+    points = int(round(max(0.0, float(half_range_sweep_v)) * points_per_v))
     return max(2, min(points, (n_points // 2) - 1))
 
 
@@ -1215,8 +1236,19 @@ def calibrate_auto_lock_settings(
     feature_half_width_v = (
         half_width_pts * pts_to_v if pts_to_v > 0.0 else float(base.half_range_sweep_v)
     )
-    half_range_sweep_v = _clamp(
-        factors.half_range_margin * feature_half_width_v, 0.001, 2.0
+    # Bound the calibrated width by the scan that measured it, not by absolute
+    # volts: the narrowest meaningful feature is the two samples `half_width_pts`
+    # is already floored at, and the widest is the half-trace `_peak_offsets`
+    # searched. A fixed millivolt floor would silently widen the calibration of
+    # any laser whose feature is finer than it -- this one's is 1.8 mV.
+    half_range_sweep_v = (
+        _clamp(
+            factors.half_range_margin * feature_half_width_v,
+            2.0 * pts_to_v,
+            ((n_points // 2) - 1) * pts_to_v,
+        )
+        if pts_to_v > 0.0
+        else float(base.half_range_sweep_v)
     )
 
     # Re-measure excursions over the derived window so the calibrated thresholds

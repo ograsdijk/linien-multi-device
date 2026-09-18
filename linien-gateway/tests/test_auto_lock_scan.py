@@ -805,3 +805,62 @@ def test_the_same_scan_narrowed_enough_to_resolve_it_reports_a_spacing():
     strict, coarse = _detect(trace, 0.2649, 0.4, settings)
     assert strict.sideband_offset_v == pytest.approx(_FIELD_SIDEBAND_V, rel=0.1)
     assert coarse.sideband_offset_v == pytest.approx(_FIELD_SIDEBAND_V, rel=0.1)
+
+
+# --- Nothing may be scaled in absolute volts ---------------------------------
+#
+# Every threshold has to be expressed against something the device measures --
+# the calibrated feature width, the sample pitch, the scan span -- so that a
+# laser with narrower features or a gentler actuator is not silently mis-served
+# by a constant chosen on one device.
+
+def test_a_feature_finer_than_a_millivolt_calibrates_to_its_real_width():
+    """A 1 mV floor would have widened this laser's calibration by 3x.
+
+    The characterization device calibrates to 1.5 mV, which cleared the old
+    floor by less than a factor of two; a tighter cavity or a finer scan would
+    not have. The floor's real job -- keeping the width above a couple of
+    samples -- is already done in sample units.
+    """
+    n, amplitude = 2048, 0.1
+    pts_to_v = 2.0 * amplitude / (n - 1)          # 97.7 uV per sample
+    half_width_v = 4.0 * pts_to_v                 # 0.39 mV: well under a millivolt
+    x = np.linspace(-amplitude, amplitude, n)
+    u = x / half_width_v
+    error = 0.3 * u / (1.0 + u * u)
+
+    cal = calibrate_auto_lock_settings(
+        error_trace_v=error, monitor_trace_v=None,
+        sweep_center_v=0.0, sweep_amplitude_v=amplitude,
+        base=AutoLockScanSettings(signal_type="dispersive"),
+        preferred_slope_rising=True,
+    )
+    settings = cal.settings if hasattr(cal, "settings") else cal
+    assert settings.half_range_sweep_v < 0.001          # the old floor
+    assert settings.half_range_sweep_v >= 2.0 * pts_to_v  # but not below two samples
+
+
+def test_a_scan_too_coarse_to_measure_a_spacing_counts_as_too_wide():
+    """Two different silences, and only one of them means "go ahead".
+
+    Withholding the spacing on an unresolvable scan (as the detectors now do)
+    made `scan_too_wide_to_lock` fall through to False, so a walk whose strict
+    detector happened to succeed at ±0.625 V would have stopped and locked from
+    a scan carrying five samples of feature. Measured on the 119-scan run: the
+    strict detector succeeds on 8 of 10 scans at that width.
+    """
+    # The width calibrate_auto_lock_settings derives from the run's own
+    # narrowest scan, not an assumed one: 1.524 mV.
+    settings = _field_settings(half_range_sweep_v=0.001524)
+    wide = 0.625
+    assert feature_resolution_samples(settings, 2048, wide) == pytest.approx(2.5, abs=0.05)
+
+    # Unmeasurable because the scan cannot resolve the feature -> too wide.
+    assert scan_too_wide_to_lock(settings, wide, None, trace_points=2048) is True
+    # Resolvable scan that simply reported no sideband -> no opinion, as before.
+    assert scan_too_wide_to_lock(settings, 0.1, None, trace_points=2048) is False
+    # Callers that cannot say how long the trace was keep the old behaviour.
+    assert scan_too_wide_to_lock(settings, wide, None) is False
+    # An uncalibrated device belongs at the "calibrate first" refusal, not here.
+    blank = dataclasses.replace(settings, half_range_sweep_v=0.0)
+    assert scan_too_wide_to_lock(blank, wide, None, trace_points=2048) is False
