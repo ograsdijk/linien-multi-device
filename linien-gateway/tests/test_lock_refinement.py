@@ -14,12 +14,15 @@ run, the failure observed, the code restored) before being written down here
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.auto_lock_scan import AutoLockScanSettings
 from app.lock_refinement import (
     IdentityGuard,
     _TrackingIdentityChanged,
+    bounded_recenter_v,
     min_safe_amplitude_v,
     plan_refinement_step,
 )
@@ -30,6 +33,13 @@ def _settings(**overrides):
     for name, value in overrides.items():
         setattr(settings, name, value)
     return settings
+
+
+def _target(sideband_offset_v, *, slope_rising=True):
+    """The two fields IdentityGuard reads off a detection."""
+    return SimpleNamespace(
+        target_slope_rising=slope_rising, sideband_offset_v=sideband_offset_v
+    )
 
 
 # ------------------------------------------------------------ field case 1
@@ -50,14 +60,21 @@ def test_rail_pinned_offset_floors_the_amplitude_near_0_533_v():
         sideband_offset_v=0.032, detector="coarse", trace_length=2048,
         shift_per_fraction=None,
     )
-    assert step.action == "rail_escape"
-    # A real cut, not a token one, and comfortably above the 0.4 V the
-    # (buggy) min() schedule would have picked.
-    assert step.amplitude_v >= 0.52
-    assert step.amplitude_v == pytest.approx(0.533, abs=0.01)
-    # The floor itself must actually contain the target -- the whole point
-    # of the floor existing.
-    assert 0.4795 < 0.9 * step.amplitude_v
+    # The centre sits on the rail for the CURRENT width (1 - 0.8 = 0.2), but a
+    # stage that narrows also moves the rail outward, so it narrows and
+    # recentres in one write rather than stalling.
+    assert step.action == "narrow"
+    assert step.center_v > 0.2, "held at the rail instead of moving with the cut"
+    assert step.amplitude_v < 0.8, "no width change"
+    # The invariant the old 0.533 V floor existed to enforce, stated directly:
+    # the target must still be inside the window this step creates. The floor
+    # is legitimately lower now, because the centre closes part of the gap in
+    # the same write.
+    residual = abs((0.2 + 0.4795) - step.center_v)
+    assert residual <= 0.9 * step.amplitude_v + 1e-9, (
+        f"cut to +/-{step.amplitude_v:.4f} around {step.center_v:.4f}, leaving "
+        f"the target {residual:.4f} out -- cropped out of its own window"
+    )
 
 
 def test_rail_pinned_offset_floors_the_amplitude_near_0_533_v__fails_on_min():
@@ -92,15 +109,21 @@ def test_a_centre_on_the_rail_is_recognised_despite_float_noise():
         half_range_sweep_v=0.128, min_signal_scan_fraction=0.25,
         max_center_step_signal_widths=1.0,
     )
-    step = plan_refinement_step(
-        settings,
-        center_v=0.2, amplitude_v=0.8, target_v=0.59,
-        sideband_offset_v=0.032, detector="coarse", trace_length=2048,
-        shift_per_fraction=0.136,
+    # Where the rails genuinely bind -- a centre move at an UNCHANGED width --
+    # a centre reading back as the literal 0.2 must still be recognised as
+    # sitting on the 1.0 - 0.8 rail, so the step is capped there rather than
+    # being allowed past it.
+    pinned = bounded_recenter_v(
+        0.2, 0.59, 0.8, signal_width_v=0.064, max_signal_widths=1.0
     )
-    # Recognised as pinned (rail escape), not treated as room to recentre.
-    assert step.action == "rail_escape"
-    assert step.center_v == pytest.approx(0.2)
+    assert pinned == pytest.approx(1.0 - 0.8, abs=1e-12)
+    # With the rail taken at the width the scan will HAVE, the same step is
+    # free to move: that is what turns the old stall into progress.
+    loosened = bounded_recenter_v(
+        0.2, 0.59, 0.8, signal_width_v=0.064, max_signal_widths=1.0,
+        rail_amplitude_v=0.4,
+    )
+    assert loosened > 0.2
 
 
 def test_a_centre_on_the_rail_is_recognised_despite_float_noise__fails_on_exact_compare():
@@ -134,11 +157,19 @@ def test_a_target_421_mv_outside_the_next_window_recentres_not_narrows():
         sideband_offset_v=0.0325, detector="coarse", trace_length=2048,
         shift_per_fraction=None,
     )
-    next_amplitude = step.bounds["shift_capped_v"]
-    outside_by = abs(target_v - center_v) - 0.5 * next_amplitude
+    scheduled = step.bounds["shift_capped_v"]
+    outside_by = abs(target_v - center_v) - 0.5 * scheduled
     assert outside_by == pytest.approx(0.421, abs=0.001)
-    assert step.action == "recenter"
-    assert step.action != "narrow"
+    # The step must not commit to the scheduled cut while the target is that
+    # far out. It may now narrow, but only together with a centre move and
+    # only to a width that still contains the target -- the crop the original
+    # bug produced is what must not happen, not narrowing as such.
+    assert step.center_v > center_v, "narrowed without moving the centre at all"
+    residual = abs(target_v - step.center_v)
+    assert residual <= 0.9 * step.amplitude_v + 1e-9, (
+        f"target {residual:.4f} V from the new centre, outside the "
+        f"+/-{step.amplitude_v:.4f} V window this step creates"
+    )
 
 
 def test_a_target_421_mv_outside_the_next_window__fails_if_the_centring_check_is_skipped():
@@ -157,12 +188,19 @@ def test_a_target_421_mv_outside_the_next_window__fails_if_the_centring_check_is
         sideband_offset_v=0.0325, detector="coarse", trace_length=2048,
         shift_per_fraction=None,
     )
-    next_amplitude = step.bounds["shift_capped_v"]  # what an unconditional narrow would use
-    window_after_narrow = 0.5 * next_amplitude
-    # The target the "narrow anyway" bug would have committed to is still
-    # outside the window the narrow itself produces -- the crop.
-    assert abs(target_v - center_v) > window_after_narrow
-    assert step.action != "narrow"  # the real planner refuses to do this
+    scheduled = step.bounds["shift_capped_v"]  # what an unconditional narrow uses
+    # The bug: narrow to the scheduled width around the UNMOVED centre. The
+    # target is then outside the window that narrow produces -- the crop.
+    assert abs(target_v - center_v) > 0.9 * scheduled, (
+        "this case no longer reproduces the crop; pick numbers that do"
+    )
+    # The real planner does not commit to that geometry: it moves the centre in
+    # the same write and floors the width so the target stays in view.
+    assert not (
+        step.center_v == pytest.approx(center_v)
+        and step.amplitude_v == pytest.approx(scheduled)
+    )
+    assert abs(target_v - step.center_v) <= 0.9 * step.amplitude_v + 1e-9
 
 
 # ------------------------------------------------------------ field case 4
@@ -252,3 +290,40 @@ def test_identity_guard_adopts_any_better_resolved_strict_detection():
     # A tiny resolution gain (barely above the 1.001x margin) still adopts
     # rather than being judged against the old, worse-resolved spacing.
     guard.check(_Better(), amplitude_v=0.5, detector="strict", resolution_samples=6.01)
+
+
+def test_two_readings_from_one_estimator_that_disagree_are_an_identity_change():
+    """Where the sideband rule still bites. Two readings from the SAME
+    estimator at the same resolution, four times apart, is a different
+    crossing. The walk-level path that used to cover this no longer emits a
+    pure re-centring stage, so it is asserted directly on the guard."""
+    guard = IdentityGuard(_target(0.05), 20.0, trace_length=2048, detector="coarse")
+
+    with pytest.raises(_TrackingIdentityChanged) as excinfo:
+        guard.check(
+            _target(0.20), amplitude_v=0.6, detector="coarse",
+            resolution_samples=20.0,
+        )
+    assert "200.000 mV" in str(excinfo.value)
+    assert "50.000 mV" in str(excinfo.value)
+
+
+def test_a_coarse_reading_is_never_judged_against_a_strict_baseline():
+    """The field failure: strict established 17.497 mV, coarse then read
+    32.369 mV of the same untroubled feature. Across eight runs the two
+    estimators sit a systematic ~1.75x apart, so the comparison tests which
+    algorithm ran, not whether the crossing changed."""
+    guard = IdentityGuard(_target(0.017497), 4.07, trace_length=2048, detector="strict")
+
+    # Must be taken as the coarse estimator's own first reading, not a breach.
+    guard.check(
+        _target(0.032369), amplitude_v=0.4477, detector="coarse",
+        resolution_samples=4.07,
+    )
+
+    # ...and the strict baseline is untouched, so strict is still policed.
+    with pytest.raises(_TrackingIdentityChanged):
+        guard.check(
+            _target(0.20), amplitude_v=0.4477, detector="strict",
+            resolution_samples=4.07,
+        )

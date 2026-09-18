@@ -3461,6 +3461,10 @@ class DeviceSession:
                     if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
                         narrow_count += 1
                         continue
+                    # The recentre landed it inside; narrow from where the
+                    # re-detection actually found the centre, not the planner's
+                    # pre-move value.
+                    next_center = center_v
                 elif step.action == "rail_escape":
                     next_amplitude = step.amplitude_v
                     stages.append({
@@ -3473,11 +3477,13 @@ class DeviceSession:
                         "next_amplitude_v": next_amplitude,
                         "bounds": step.bounds,
                     })
-                else:  # "narrow" -- no centring or rail escape was needed
+                    next_center = center_v
+                else:  # "narrow" -- narrows and recentres in one write
                     next_amplitude = step.amplitude_v
+                    next_center = step.center_v
                 before_v = float(target.target_voltage)
                 before_amplitude = abs(amplitude_v)
-                moved_at = self._set_sweep_geometry(center_v, next_amplitude)
+                moved_at = self._set_sweep_geometry(next_center, next_amplitude)
                 try:
                     target, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
                         settings, after=moved_at

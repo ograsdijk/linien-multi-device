@@ -124,6 +124,8 @@ def bounded_recenter_v(
     *,
     signal_width_v: float | None = None,
     max_signal_widths: float = 0.0,
+    rail_amplitude_v: float | None = None,
+    step_budget_v: float | None = None,
 ) -> float:
     """Where to put the sweep centre for one bounded step toward the target.
 
@@ -151,8 +153,22 @@ def bounded_recenter_v(
     # rule remains the fallback when it is not.
     if signal_width_v and max_signal_widths > 0.0:
         bound = min(bound, float(max_signal_widths) * abs(float(signal_width_v)))
+    if step_budget_v is not None:
+        # A combined narrow-and-recentre stage moves the feature by BOTH
+        # effects, so the caller hands down what is left of the stage's single
+        # allowance after the width change has claimed its share. One event,
+        # one budget -- otherwise a combined stage perturbs twice as much as
+        # the single-axis one it replaces.
+        bound = min(bound, max(0.0, float(step_budget_v)))
     lo, hi = center_v - bound, center_v + bound
-    rail_lo, rail_hi = -1.0 + amplitude, 1.0 - amplitude
+    # Rails come from the amplitude the scan will HAVE, which is not the one it
+    # has now when this write also narrows: the rail moves outward as the width
+    # comes down (1 - 0.8 = 0.20, but 1 - 0.4477 = 0.55). Evaluating them at the
+    # old width is what pinned the centre and produced the rail deadlock.
+    rail_amplitude = (
+        amplitude if rail_amplitude_v is None else abs(float(rail_amplitude_v))
+    )
+    rail_lo, rail_hi = -1.0 + rail_amplitude, 1.0 - rail_amplitude
     # Tolerant comparison: 1.0 - 0.8 is 0.19999999999999996, and a centre
     # sitting exactly on that rail reads back as 0.2 often enough that an
     # exact test let a 4e-17 difference decide between honouring the rails
@@ -277,6 +293,10 @@ def plan_refinement_step(
     width_amplitude = max_lockable_amplitude_v(settings, sideband_offset_v)
     if width_amplitude is not None:
         target_amplitude = min(target_amplitude, width_amplitude)
+    # Sideband to sideband: the full width of the error signal on the plot.
+    signal_width = (
+        None if sideband_offset_v is None else 2.0 * abs(float(sideband_offset_v))
+    )
 
     # Step size adapts to the margin. While the signal is a speck on the scan,
     # the next window is still many signal widths wide and a half-step is
@@ -314,73 +334,110 @@ def plan_refinement_step(
             "done", center_v, amplitude_v, "narrowing schedule reached its floor", bounds
         )
 
-    # Do not narrow an edge feature out of the next window. Centre motion is
-    # deliberately its own bounded, freshly-redetected step because it can
-    # itself move the apparent resonance.
-    if abs(target_v - center_v) > _INNER_WINDOW_FRACTION * next_amplitude:
-        new_center = bounded_recenter_v(
-            center_v,
-            target_v,
-            amplitude_v,
-            signal_width_v=(
-                None if sideband_offset_v is None else 2.0 * abs(float(sideband_offset_v))
-            ),
-            max_signal_widths=settings.max_center_step_signal_widths,
-        )
-        # A step this planner itself capped at the rail -- rather than at the
-        # step bound -- cannot be made to progress by taking it again: the
-        # rail will still be exactly where it was. Escaping only once the
-        # step measured EXACTLY zero (the old rule) let a centre a hair off
-        # the rail creep towards it one stage at a time, each one a step that
-        # visibly moved yet could not possibly reach the target. Checking
-        # "did this step land on the rail, short of the target" catches that
-        # on the very first rail-limited step instead of after however many
-        # a hair's width takes to close.
-        rail_lo, rail_hi = -1.0 + abs(amplitude_v), 1.0 - abs(amplitude_v)
-        rail_limited = rail_lo <= rail_hi and (
-            abs(new_center - rail_lo) <= _RAIL_EPSILON_V
-            or abs(new_center - rail_hi) <= _RAIL_EPSILON_V
-        ) and abs(target_v - new_center) > _CENTER_MOVE_EPSILON_V
-        if not rail_limited and abs(new_center - center_v) > _CENTER_MOVE_EPSILON_V:
-            return RefinementStep(
-                "recenter",
-                new_center,
-                next_amplitude,
-                "target outside the next window; bounded recentre",
-                bounds,
-            )
-        # The rails pin the centre at +/-(1 - amplitude), so the target is
-        # unreachable at this width however many steps are taken -- and
-        # refusing to narrow because it is not centred is a deadlock that can
-        # burn the whole stage budget without one width change. Narrowing is
-        # the way out: the rail moves outward with the amplitude. Take the
-        # gentlest cut that keeps the target in view and let the next stage
-        # centre on it.
+    # Narrow and recentre in the SAME register write.
+    #
+    # Held apart, a narrowing stage shrinks the window around a centre the
+    # feature is not at, so the feature ends up proportionally further off
+    # centre and the next stage has to spend itself putting it back. Nine such
+    # centre-only stages in one field run accumulated 111 mV of wander and made
+    # no width progress at all, and each one is its own hysteretic event -- on
+    # this actuator the count of geometry changes is itself the cost, so
+    # alternating pays it twice.
+    #
+    # Two things make the combination safe. The rails are evaluated at the
+    # amplitude the scan will have, where they are looser. And the centre gets
+    # only what is left of the stage's single movement allowance after the
+    # predicted width-induced shift has claimed its share, so a combined stage
+    # perturbs the feature no more than the single-axis stage it replaces.
+    width_fraction = max(0.0, 1.0 - (next_amplitude / amplitude_v))
+    predicted_width_shift = (shift_per_fraction or 0.0) * width_fraction
+    centre_budget = max(0.0, step_allowance - predicted_width_shift)
+    combined_center = bounded_recenter_v(
+        center_v,
+        target_v,
+        amplitude_v,
+        signal_width_v=signal_width,
+        max_signal_widths=settings.max_center_step_signal_widths,
+        rail_amplitude_v=next_amplitude,
+        step_budget_v=centre_budget,
+    )
+    bounds = {
+        **bounds,
+        "centre_budget_v": centre_budget,
+        "predicted_width_shift_v": predicted_width_shift,
+        "rail_v": 1.0 - abs(next_amplitude),
+    }
+
+    # Crop guard, on the RESIDUAL offset -- what is left after the centre has
+    # moved, not the gap before it. Measuring it before the move is what forced
+    # the old rail-escape path to floor the amplitude so hard that the feature
+    # was parked at 90% of the new half-range, tripping the next stage's
+    # centring rule immediately.
+    residual_offset = target_v - combined_center
+    if abs(residual_offset) > _INNER_WINDOW_FRACTION * next_amplitude:
         safe = min_safe_amplitude_v(
-            amplitude_v, target_v - center_v, shift_per_fraction, target_amplitude
+            amplitude_v, residual_offset, shift_per_fraction, target_amplitude
         )
         if safe is None:
+            # Nothing this stage can do keeps the feature in view: the centre is
+            # as close as one bounded step and the rails allow, and no width
+            # that still narrows leaves the target inside.
             reason = (
-                "The sweep rails pin the center at "
-                f"{center_v:+.4f} V and the target is "
-                f"{target_v:+.4f} V, which no "
-                "narrowing can bring into view without losing it. "
-                "Move the laser closer to the feature, or start "
-                "from a narrower scan."
+                f"The sweep rails hold the center at {combined_center:+.4f} V "
+                f"and the target is {target_v:+.4f} V, which no narrowing can "
+                "bring into view without losing it. Move the laser closer to "
+                "the feature, or start from a narrower scan."
             )
             return RefinementStep("refuse", center_v, amplitude_v, reason, bounds)
-        # A floor: never narrow past what keeps the target in view, even
-        # though the schedule wanted a bigger cut.
-        bounds = {**bounds, "crop_floor_v": safe, "rail_v": 1.0 - abs(amplitude_v)}
-        return RefinementStep(
-            "rail_escape",
-            center_v,
-            max(next_amplitude, safe),
-            "sweep rails pin the centre; narrowing moves the rail outward",
-            bounds,
-        )
+        if safe > next_amplitude:
+            # Narrow less, and recompute the centre against the looser rail and
+            # the smaller width-induced shift that a gentler cut implies.
+            next_amplitude = min(amplitude_v, safe)
+            width_fraction = max(0.0, 1.0 - (next_amplitude / amplitude_v))
+            predicted_width_shift = (shift_per_fraction or 0.0) * width_fraction
+            centre_budget = max(0.0, step_allowance - predicted_width_shift)
+            combined_center = bounded_recenter_v(
+                center_v,
+                target_v,
+                amplitude_v,
+                signal_width_v=signal_width,
+                max_signal_widths=settings.max_center_step_signal_widths,
+                rail_amplitude_v=next_amplitude,
+                step_budget_v=centre_budget,
+            )
+            bounds = {
+                **bounds,
+                "crop_floor_v": safe,
+                "centre_budget_v": centre_budget,
+                "predicted_width_shift_v": predicted_width_shift,
+                "rail_v": 1.0 - abs(next_amplitude),
+            }
+        if next_amplitude >= amplitude_v - _NARROW_SCHEDULE_EPSILON_V:
+            # The crop floor has eaten the whole cut. Move the centre alone and
+            # let the next stage narrow from closer in.
+            if abs(combined_center - center_v) > _CENTER_MOVE_EPSILON_V:
+                return RefinementStep(
+                    "recenter",
+                    combined_center,
+                    amplitude_v,
+                    "no width change is safe yet; bounded recentre first",
+                    bounds,
+                )
+            return RefinementStep(
+                "refuse",
+                center_v,
+                amplitude_v,
+                (
+                    f"The center is pinned at {center_v:+.4f} V and the target "
+                    f"is {target_v:+.4f} V, which neither a bounded center step "
+                    "nor any safe narrowing can reach."
+                ),
+                bounds,
+            )
 
-    return RefinementStep("narrow", center_v, next_amplitude, "scheduled narrowing", bounds)
+    return RefinementStep(
+        "narrow", combined_center, next_amplitude, "scheduled narrowing", bounds
+    )
 
 
 class IdentityGuard:

@@ -13,6 +13,7 @@ diagnostic and a real board.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -354,6 +355,12 @@ def test_a_known_sideband_offset_tightens_the_neighbour_guard(monkeypatch):
     session, _board = _make_session(
         monkeypatch, _creep(0.05), sideband_offset_v=0.1
     )
+    # This is a test of the guarded move's neighbour guard, not of the walk.
+    # At amplitude 1.0 a 0.2 V signal is under a quarter of the span, so the
+    # scan counts as too wide and refinement would run first -- and once it
+    # recentres onto the crept feature there is no displacement left for the
+    # guard to reject. Disable the width rule so the guard is what is measured.
+    session.auto_lock_scan_settings["min_signal_scan_fraction"] = 0.0
 
     with pytest.raises(RuntimeError) as excinfo:
         session.auto_lock_from_scan(None)
@@ -1493,10 +1500,21 @@ def test_a_recentring_stage_that_changes_the_spacing_is_an_identity_change(monke
     session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
     monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a: time.time())
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    # A flipped discriminator slope: checked on every detection whatever path
+    # the stage took, so it is the walk-level assertion that identity failures
+    # still propagate. The sideband-spacing rule, which only bites when two
+    # readings from the SAME estimator disagree, is covered directly against
+    # IdentityGuard in test_lock_refinement.py.
+    # 0.5 V is inside the +/-0.6 V scan: a target beyond the window is refused
+    # on geometry before any detection happens, which is not what this covers.
+    flipped = dataclasses.replace(_result(0.5, 0.20), target_slope_rising=False)
     monkeypatch.setattr(
         session, "_coarse_auto_lock_target",
-        # Same detector, same resolution as the baseline, four times the spacing.
-        lambda settings, after=None: (_result(0.9, 0.20), 0.4, 0.6, 20.0, {}),
+        lambda settings, after=None: (flipped, 0.4, 0.6, 20.0, {}),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (flipped, 0.4, 0.6, 20.0),
     )
 
     with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
@@ -1504,17 +1522,13 @@ def test_a_recentring_stage_that_changes_the_spacing_is_an_identity_change(monke
             AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
             ApproachSettings.from_mapping(session.lock_approach_settings),
             0.0, 0.6,
-            initial_target=_result(0.9, 0.05),  # far out -> forces a recentre
-            # Centre off the rail (+/-0.4 at this amplitude) so the stage really
-            # re-centres rather than taking the rail-blocked path.
+            initial_target=_result(0.5, 0.05),  # far out -> forces a geometry step
             initial_center_v=0.0, initial_amplitude_v=0.6,
             initial_resolution=20.0,
             initial_detector="coarse", trace_length=2048,
         )
     assert excinfo.value.failure_kind == "identity"
-    # The numbers that decided it, which the message used to omit entirely.
-    failure = excinfo.value.refinement["failure"]
-    assert "200.000 mV" in failure and "50.000 mV" in failure
+    assert "slope" in excinfo.value.refinement["failure"]
 
 
 def test_a_coarse_reading_is_not_judged_against_a_strict_baseline(monkeypatch):
@@ -1871,10 +1885,10 @@ def test_a_rail_blocked_narrowing_never_cuts_below_the_safe_floor(monkeypatch):
         monkeypatch, _no_error, approach={"enabled": False}
     )
     session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
-    widths: list[float] = []
+    writes: list[tuple[float, float]] = []
     monkeypatch.setattr(
         session, "_set_sweep_geometry",
-        lambda c, a: (widths.append(float(a)), time.time())[1],
+        lambda c, a: (writes.append((float(c), float(a))), time.time())[1],
     )
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
     pinned = (_result(0.6795310210063508, 0.03204689789936493), 1.0 - 0.8, 0.8, 2.275)
@@ -1900,13 +1914,21 @@ def test_a_rail_blocked_narrowing_never_cuts_below_the_safe_floor(monkeypatch):
     except session_module.TrajectoryRefinementAborted:
         pass  # the stub never converges; the cut size is what this asserts
 
-    narrowed = [w for w in widths if w < 0.8 - 1e-9]
+    target = 0.6795310210063508
+    narrowed = [(c, a) for c, a in writes if a < 0.8 - 1e-9]
     assert narrowed, "pinned at the rail and never changed the width"
-    offset = abs(0.6795310210063508 - (1.0 - 0.8))
-    floor = DeviceSession._min_safe_amplitude_v(0.8, offset, None, 0.128)
-    assert floor == pytest.approx(0.533, abs=0.01)
-    assert narrowed[0] >= floor - 1e-9, (
-        f"cut to {narrowed[0]:.3f} V, below the {floor:.3f} V floor: the target "
-        f"at offset {offset:.3f} V would fall outside the new window"
+    # The durable property, whether or not the centre moved in the same write:
+    # a width change must never put the target outside the window it creates.
+    # Asserting a floor computed from the PRE-move offset would now be wrong --
+    # the centre closes part of the gap in the same write, so a smaller
+    # amplitude is legitimately safe.
+    for center, amplitude in narrowed:
+        residual = abs(target - center)
+        assert residual <= 0.9 * amplitude + 1e-9, (
+            f"cut to +/-{amplitude:.4f} V around {center:.4f} V, leaving the "
+            f"target {residual:.4f} V out -- cropped out of its own window"
+        )
+    # And the centre must actually be helping, not held at the rail.
+    assert narrowed[0][0] > (1.0 - 0.8) + 1e-6, (
+        "narrowed without moving the centre; the rail still pins it"
     )
-    assert offset <= narrowed[0], "target cropped out of the new window"
