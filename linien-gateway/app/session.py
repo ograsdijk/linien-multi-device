@@ -3383,7 +3383,8 @@ class DeviceSession:
             stages.append({
                 "kind": "initial", "center_v": center_v, "amplitude_v": amplitude_v,
                 "target_voltage": target.target_voltage, "resolution_samples": resolution,
-                "detector": detector, "metrics": coarse_metrics,
+                "detector": detector, "sideband_offset_v": target.sideband_offset_v,
+                "metrics": coarse_metrics,
             })
             identity = IdentityGuard(target, resolution, trace_length=trace_length)
 
@@ -3445,7 +3446,8 @@ class DeviceSession:
                     stages.append({"kind": "recenter", "center_v": center_v,
                                    "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
                                    "resolution_samples": resolution, "detector": "coarse",
-                                   "metrics": coarse_metrics})
+                                   "sideband_offset_v": target.sideband_offset_v,
+                                   "metrics": coarse_metrics, "bounds": step.bounds})
                     # One bounded step may not be enough to reach a feature
                     # far from the centre, and narrowing anyway crops the
                     # very feature being tracked out of the next window: a
@@ -3464,8 +3466,10 @@ class DeviceSession:
                         "amplitude_v": amplitude_v,
                         "target_voltage": target.target_voltage,
                         "resolution_samples": resolution, "detector": detector,
+                        "sideband_offset_v": target.sideband_offset_v,
                         "rail_v": step.bounds.get("rail_v", 1.0 - abs(amplitude_v)),
                         "next_amplitude_v": next_amplitude,
+                        "bounds": step.bounds,
                     })
                 else:  # "narrow" -- no centring or rail escape was needed
                     next_amplitude = step.amplitude_v
@@ -3504,6 +3508,7 @@ class DeviceSession:
                     "sideband_offset_v": target.sideband_offset_v,
                     "width_shift_v": width_shift_v,
                     "shift_per_fraction_v": shift_per_fraction,
+                    "bounds": step.bounds,
                 })
                 identity.check(target, amplitude_v=amplitude_v, detector=detector, resolution_samples=resolution)
                 narrow_count += 1
@@ -3530,7 +3535,8 @@ class DeviceSession:
                     stages.append({
                         "kind": "recenter", "center_v": center_v, "amplitude_v": amplitude_v,
                         "target_voltage": target.target_voltage, "resolution_samples": resolution,
-                        "detector": "coarse", "metrics": coarse_metrics,
+                        "detector": "coarse", "sideband_offset_v": target.sideband_offset_v,
+                        "metrics": coarse_metrics,
                     })
                     identity.check(target, amplitude_v=amplitude_v, detector="coarse", resolution_samples=resolution)
 
@@ -3604,7 +3610,8 @@ class DeviceSession:
             stages.append({
                 "kind": "final_verify", "center_v": center_v, "amplitude_v": amplitude_v,
                 "target_voltage": strict_two.target_voltage, "resolution_samples": resolution,
-                "detector": "strict", "consistent": True,
+                "detector": "strict", "sideband_offset_v": strict_two.sideband_offset_v,
+                "consistent": True,
             })
             return strict_two, {
                 "attempted": True,

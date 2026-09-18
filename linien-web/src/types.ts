@@ -382,8 +382,22 @@ export type AutoLockScanResult = {
       target_voltage?: number;
       resolution_samples?: number;
       detector?: string;
+      sideband_offset_v?: number | null;
       consistent?: boolean;
       detail?: string;
+      // Present on stages that narrowed or recentred: every constraint the
+      // planner considered when it chose this stage's geometry.
+      bounds?: {
+        goal_v?: number;
+        scheduled_v?: number;
+        shift_capped_v?: number;
+        crop_floor_v?: number;
+        rail_v?: number;
+      };
+      rail_v?: number;
+      next_amplitude_v?: number;
+      width_shift_v?: number;
+      shift_per_fraction_v?: number | null;
     }>;
     restored?: boolean;
     failure?: string;
