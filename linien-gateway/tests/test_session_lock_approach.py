@@ -1932,3 +1932,66 @@ def test_a_rail_blocked_narrowing_never_cuts_below_the_safe_floor(monkeypatch):
     assert narrowed[0][0] > (1.0 - 0.8) + 1e-6, (
         "narrowed without moving the centre; the rail still pins it"
     )
+
+
+# -------------------------- the shift estimate measures the actuator, not the
+# -------------------------- disagreement between two detectors
+#
+# Field payload, centre 0.2 V amplitude 0.8 V: the initial coarse detection put
+# the feature at 0.5341 V and the first (strict) narrowing stage at 0.4312 V.
+# The walk recorded the 103 mV difference as a width-induced shift, inferred
+# 0.206 V per unit fractional width change, and from then on the predicted
+# shift consumed the entire stage allowance -- so the very next stage narrowed
+# with a centre budget of 7e-18 V. That is the "narrows without recentring"
+# the operator sees. The two numbers were measured by different detectors on
+# different crossings; their difference is not a shift.
+
+def _shift_walk(monkeypatch, *, strict_raises: bool):
+    """Narrow once from a coarse initial detection, with the feature apparently
+    103 mV away afterwards. `strict_raises` decides which detector reports it."""
+    session, _board = _make_session(monkeypatch, _no_error, approach={"enabled": False})
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+
+    def _coarse(settings, after=None):
+        return _result(0.4312, 0.032), 0.2649, 0.4, 4.55, {}
+
+    def _strict(settings, traces=None, after=None):
+        if strict_raises:
+            raise ValueError("no strict crossing")
+        return _result(0.4312, 0.032), 0.2649, 0.4, 4.55
+
+    monkeypatch.setattr(session, "_coarse_auto_lock_target", _coarse)
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _strict)
+    try:
+        _result_obj, refinement = session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            ApproachSettings.from_mapping(session.lock_approach_settings),
+            0.2, 0.8,
+            initial_target=_result(0.5341, 0.032),
+            initial_center_v=0.2,
+            initial_amplitude_v=0.8,
+            initial_resolution=2.275,
+            initial_detector="coarse", trace_length=2048,
+        )
+    except session_module.TrajectoryRefinementAborted as aborted:
+        refinement = aborted.refinement
+    narrows = [s for s in refinement["stages"] if s["kind"] == "narrow"]
+    assert narrows, "expected the walk to narrow at least once"
+    return narrows[0]
+
+
+def test_a_shift_measured_across_a_detector_change_is_not_charged_to_the_budget(
+    monkeypatch,
+):
+    # coarse -> strict across the write: nothing may be inferred about the actuator.
+    assert _shift_walk(monkeypatch, strict_raises=False)["shift_per_fraction_v"] is None
+
+
+def test_a_shift_measured_by_one_detector_twice_is_charged_to_the_budget(monkeypatch):
+    # coarse -> coarse: the same detector on both sides, so this is a measurement.
+    narrow = _shift_walk(monkeypatch, strict_raises=True)
+    assert narrow["shift_per_fraction_v"] == pytest.approx(
+        abs(0.4312 - 0.5341) / (1.0 - narrow["amplitude_v"] / 0.8), rel=0.02
+    )

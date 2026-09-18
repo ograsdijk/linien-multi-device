@@ -3433,39 +3433,25 @@ class DeviceSession:
                 if step.action == "refuse":
                     raise ValueError(step.reason)
                 if step.action == "recenter":
-                    new_center = step.center_v
-                    # The schedule's candidate amplitude, computed before this
-                    # recentre -- reused below if the recentre brings the
-                    # target inside the window, exactly as the pre-planner
-                    # code reused its own `next_amplitude` variable across the
-                    # recentre rather than rescheduling from the new geometry.
-                    next_amplitude = step.amplitude_v
-                    moved_at = self._set_sweep_geometry(new_center, amplitude_v)
+                    # The planner reaches this only when no width change is
+                    # safe yet. Move the centre alone and re-plan from what the
+                    # next detection actually finds; carrying a pre-move
+                    # amplitude across the write would size the cut from
+                    # geometry that no longer exists.
+                    moved_at = self._set_sweep_geometry(step.center_v, amplitude_v)
                     target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
                         settings, after=moved_at
                     )
+                    detector = "coarse"
                     identity.check(target, amplitude_v=amplitude_v, detector="coarse", resolution_samples=resolution)
                     stages.append({"kind": "recenter", "center_v": center_v,
                                    "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
                                    "resolution_samples": resolution, "detector": "coarse",
                                    "sideband_offset_v": target.sideband_offset_v,
                                    "metrics": coarse_metrics, "bounds": step.bounds})
-                    # One bounded step may not be enough to reach a feature
-                    # far from the centre, and narrowing anyway crops the
-                    # very feature being tracked out of the next window: a
-                    # run that recentred 0.2 -> 0.35 V with the target at
-                    # 0.771 V then narrowed to +/-0.3 V, whose window ends at
-                    # 0.65 V, and the detector duly found a different
-                    # crossing. Step again instead, and only narrow once the
-                    # target is inside.
-                    if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
-                        narrow_count += 1
-                        continue
-                    # The recentre landed it inside; narrow from where the
-                    # re-detection actually found the centre, not the planner's
-                    # pre-move value.
-                    next_center = center_v
-                elif step.action == "rail_escape":
+                    narrow_count += 1
+                    continue
+                if step.action == "rail_escape":
                     next_amplitude = step.amplitude_v
                     stages.append({
                         "kind": "rail_blocked", "center_v": center_v,
@@ -3483,6 +3469,7 @@ class DeviceSession:
                     next_center = step.center_v
                 before_v = float(target.target_voltage)
                 before_amplitude = abs(amplitude_v)
+                before_detector = detector
                 moved_at = self._set_sweep_geometry(next_center, next_amplitude)
                 try:
                     target, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
@@ -3501,7 +3488,17 @@ class DeviceSession:
                     1.0 - (abs(amplitude_v) / before_amplitude)
                     if before_amplitude > 1e-12 else 0.0
                 )
-                if width_fraction > _REFINEMENT_MIN_MEASURABLE_FRACTION:
+                # Only a same-detector pair measures the actuator. The strict
+                # detector and the coarse tracker can settle on different
+                # crossings of a multi-feature scan, and their difference --
+                # 100 mV in the field -- is not a width-induced shift. Charging
+                # it to the shift estimate spends the stage allowance on it,
+                # which is what left a narrowing stage with no centre budget at
+                # all: it took the width change and skipped the centring.
+                if (
+                    width_fraction > _REFINEMENT_MIN_MEASURABLE_FRACTION
+                    and detector == before_detector
+                ):
                     observed = width_shift_v / width_fraction
                     # Keep the worst seen: one gentle stage must not talk the
                     # walk back into a step a harsher one already showed is big.
@@ -3520,33 +3517,13 @@ class DeviceSession:
                 })
                 identity.check(target, amplitude_v=amplitude_v, detector=detector, resolution_samples=resolution)
                 narrow_count += 1
-                # Keep the feature inside the central half, but bound a centre
-                # adjustment to 25% of the present half-range.
-                offset = float(target.target_voltage) - center_v
-                inner = 0.5 * abs(amplitude_v)
-                if abs(offset) > inner:
-                    new_center = self._bounded_recenter_v(
-                        center_v,
-                        float(target.target_voltage),
-                        amplitude_v,
-                        signal_width_v=(
-                            None if target.sideband_offset_v is None
-                            else 2.0 * abs(float(target.sideband_offset_v))
-                        ),
-                        max_signal_widths=settings.max_center_step_signal_widths,
-                    )
-                    moved_at = self._set_sweep_geometry(new_center, amplitude_v)
-                    target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
-                        settings, after=moved_at
-                    )
-                    detector = "coarse"
-                    stages.append({
-                        "kind": "recenter", "center_v": center_v, "amplitude_v": amplitude_v,
-                        "target_voltage": target.target_voltage, "resolution_samples": resolution,
-                        "detector": "coarse", "sideband_offset_v": target.sideband_offset_v,
-                        "metrics": coarse_metrics,
-                    })
-                    identity.check(target, amplitude_v=amplitude_v, detector="coarse", resolution_samples=resolution)
+                # A target still outside the inner window is the next stage's
+                # business: plan_refinement_step weighs it against the crop
+                # floor, the rails and the step allowance together. Correcting
+                # it here spent a second full centre allowance inside the same
+                # stage and handed the loop back a coarse detection, which is
+                # what made the walk alternate detectors -- and the two then
+                # disagreed about where the feature was.
 
             # The coarse result only guides geometry. Demand two fresh strict
             # detections at the final unchanged geometry before any guarded move.
