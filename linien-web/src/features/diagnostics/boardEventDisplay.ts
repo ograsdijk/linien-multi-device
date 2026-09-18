@@ -12,6 +12,7 @@ const BY_KIND: Record<BoardEventKind, EventDisplay> = {
   telemetry_offline: { label: 'Telemetry lost', tone: 'amber' },
   telemetry_recovered: { label: 'Telemetry back', tone: 'green' },
   persistent_log_enabled: { label: 'Persistent logs on', tone: 'green' },
+  reset_cause_cleared: { label: 'Reset causes cleared', tone: 'dimmed' },
 };
 
 export const resolveBoardEventDisplay = (event: BoardEvent): EventDisplay =>

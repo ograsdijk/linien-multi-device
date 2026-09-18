@@ -32,6 +32,7 @@ export const useDiagnosticsController = ({
   const [bundle, setBundle] = useState<DiagnosticsBundle | null>(null);
   const [collecting, setCollecting] = useState(false);
   const [enabling, setEnabling] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Which board the visible state belongs to. A collect is a dozen SSH
   // commands, so the operator can easily close the modal and open another
@@ -69,6 +70,7 @@ export const useDiagnosticsController = ({
     setEvents([]);
     setCollecting(false);
     setEnabling(false);
+    setClearing(false);
     if (deviceKey) void loadEvents();
   }, [deviceKey, loadEvents]);
 
@@ -96,6 +98,33 @@ export const useDiagnosticsController = ({
     }
   }, [appendUiErrorLog, deviceKey]);
 
+  const clearResetCause = useCallback(async () => {
+    if (!deviceKey) return;
+    setClearing(true);
+    setError(null);
+    try {
+      const result = await api.clearResetCause(deviceKey);
+      if (currentKeyRef.current !== deviceKey) return;
+      // A board whose bits refuse to clear reports `ok: false` rather than
+      // throwing -- the write went out and was read back, it just did not
+      // take. Saying nothing would leave the operator believing the next
+      // reading starts from zero.
+      if (!result.ok) {
+        setError(result.error || 'The reset-cause bits did not clear.');
+      }
+      // Re-collect either way: the register now reads differently, and the
+      // timeline has the pre-clear reading in it.
+      await Promise.all([collect(), loadEvents()]);
+    } catch (err) {
+      const message = toErrorMessage(err, 'Could not clear the reset causes.');
+      appendUiErrorLog('board_diagnostics', 'reset_cause_clear_failed', message, deviceKey);
+      if (currentKeyRef.current !== deviceKey) return;
+      setError(message);
+    } finally {
+      if (currentKeyRef.current === deviceKey) setClearing(false);
+    }
+  }, [appendUiErrorLog, collect, deviceKey, loadEvents]);
+
   const enablePersistentLog = useCallback(async () => {
     if (!deviceKey) return;
     setEnabling(true);
@@ -122,9 +151,11 @@ export const useDiagnosticsController = ({
     bundle,
     collecting,
     enabling,
+    clearing,
     error,
     collect,
     enablePersistentLog,
+    clearResetCause,
     reloadEvents: loadEvents,
   };
 };

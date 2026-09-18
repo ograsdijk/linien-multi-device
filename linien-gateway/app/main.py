@@ -41,6 +41,7 @@ from .board_event_store import (
     KIND_DIAGNOSIS,
     KIND_DISCONNECTED,
     KIND_PERSISTENT_LOG_ENABLED,
+    KIND_RESET_CAUSE_CLEARED,
     KIND_REBOOT_REQUESTED,
     KIND_TELEMETRY_OFFLINE,
     KIND_TELEMETRY_RECOVERED,
@@ -1929,6 +1930,41 @@ def get_board_events(key: str, limit: int = BOARD_EVENT_LIMIT) -> dict:
 async def collect_board_diagnostics(key: str) -> dict:
     device = _get_device_or_404(key)
     return await _run_diagnostics_ssh(board_diagnostics.collect_diagnostics, device)
+
+
+@app.post("/api/devices/{key}/diagnostics/clear-reset-cause")
+async def clear_reset_cause(key: str) -> dict:
+    """Zero the board's recorded reset causes.
+
+    The register accumulates and carries no timestamp, so an old board reads
+    as every cause it has ever seen. Clearing after reading is what makes the
+    next reading mean "since I last looked".
+
+    Deliberately not folded into `collect`: an automatic clear on every read
+    would let a second collect erase a cause nobody had looked at yet. It is
+    also the only hardware write in the feature, so it stays an explicit
+    operator action, and the reading it destroys is recorded in the timeline
+    before it goes.
+    """
+    device = _get_device_or_404(key)
+    result = await _run_diagnostics_ssh(board_diagnostics.clear_reboot_status, device)
+    if result.get("ok"):
+        board_event_store.record(
+            key,
+            KIND_RESET_CAUSE_CLEARED,
+            detail=(
+                "Reset causes cleared. Before: "
+                + (result.get("before_description") or "unknown")
+            ),
+        )
+        _emit_log(
+            logging.INFO,
+            "board_diagnostics",
+            "reset_cause_cleared",
+            "Reset-cause register cleared on the Red Pitaya.",
+            key,
+        )
+    return result
 
 
 @app.post("/api/devices/{key}/diagnostics/enable-persistent-log")

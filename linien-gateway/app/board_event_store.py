@@ -44,6 +44,7 @@ KIND_REBOOT_REQUESTED = "reboot_requested"
 KIND_TELEMETRY_OFFLINE = "telemetry_offline"
 KIND_TELEMETRY_RECOVERED = "telemetry_recovered"
 KIND_PERSISTENT_LOG_ENABLED = "persistent_log_enabled"
+KIND_RESET_CAUSE_CLEARED = "reset_cause_cleared"
 
 DEFAULT_MAX_PER_DEVICE = 200
 DEFAULT_MAX_AGE_S = 30.0 * 24.0 * 60.0 * 60.0

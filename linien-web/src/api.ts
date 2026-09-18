@@ -298,6 +298,17 @@ export const api = {
     request<DiagnosticsBundle>(`/devices/${key}/diagnostics/collect`, {
       method: 'POST',
     }),
+  // The one hardware write in the feature, and explicit for that reason: it
+  // destroys the reading, so the reading comes back with the result.
+  clearResetCause: (key: string) =>
+    request<{
+      ok: boolean;
+      error?: string | null;
+      before?: number;
+      after?: number;
+      method?: string | null;
+      before_description?: string | null;
+    }>(`/devices/${key}/diagnostics/clear-reset-cause`, { method: 'POST' }),
   enablePersistentLog: (key: string) =>
     request<{
       ok: boolean;

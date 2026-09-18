@@ -11,6 +11,7 @@ from app.board_event_store import (
     KIND_DISCONNECTED,
     KIND_PERSISTENT_LOG_ENABLED,
     KIND_REBOOT_REQUESTED,
+    KIND_RESET_CAUSE_CLEARED,
 )
 
 
@@ -231,3 +232,52 @@ def test_the_events_limit_is_clamped_to_what_is_actually_retained(client):
 
     assert len(payload["events"]) == 5
 
+
+
+# --- clearing the reset causes -------------------------------------------
+
+
+def test_clearing_the_reset_causes_records_what_was_there(client, monkeypatch):
+    """The action destroys the reading, so the timeline has to carry it --
+    otherwise the evidence is gone the moment the operator tidies up."""
+    monkeypatch.setattr(
+        main.board_diagnostics,
+        "clear_reboot_status",
+        lambda device: {
+            "ok": True,
+            "before": 0x00410000,
+            "after": 0,
+            "method": "write-zero",
+            "before_description": "0x00410000: SWDT_RST (system watchdog timeout).",
+        },
+    )
+
+    payload = client.post("/api/devices/dev-1/diagnostics/clear-reset-cause").json()
+
+    assert payload["ok"] is True
+    events = client.get("/api/devices/dev-1/events").json()["events"]
+    assert [event["kind"] for event in events] == [KIND_RESET_CAUSE_CLEARED]
+    assert "SWDT_RST" in events[0]["detail"]
+
+
+def test_a_failed_clear_leaves_no_timeline_entry(client, monkeypatch):
+    """A board whose bits refused to clear has not been cleared, and a
+    timeline saying otherwise would be worse than none."""
+    monkeypatch.setattr(
+        main.board_diagnostics,
+        "clear_reboot_status",
+        lambda device: {"ok": False, "error": "the bits did not clear"},
+    )
+
+    payload = client.post("/api/devices/dev-1/diagnostics/clear-reset-cause").json()
+
+    assert payload["ok"] is False
+    assert client.get("/api/devices/dev-1/events").json()["events"] == []
+
+
+def test_clearing_an_unknown_device_is_a_404(client, monkeypatch):
+    monkeypatch.setattr(main.device_store, "get_device", lambda key: None)
+
+    response = client.post("/api/devices/nope/diagnostics/clear-reset-cause")
+
+    assert response.status_code == 404
