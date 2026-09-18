@@ -37,7 +37,6 @@ from .auto_lock_scan import (
     feature_resolution_samples,
     find_coarse_auto_lock_target,
     find_auto_lock_target,
-    max_lockable_amplitude_v,
     scan_too_wide_to_lock,
 )
 from .auto_relock import AutoRelockConfig, AutoRelockController
@@ -51,6 +50,16 @@ from .lock_approach import (
     classify_hysteresis,
     plan_approach,
     probe_report,
+)
+from .lock_refinement import (
+    _MAX_REFINEMENT_STAGES,
+    _REFINEMENT_MIN_MEASURABLE_FRACTION,
+    _TrackingIdentityChanged,
+    IdentityGuard,
+    bounded_recenter_v,
+    center_step_allowance_v,
+    min_safe_amplitude_v,
+    plan_refinement_step,
 )
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
 from .manual_lock_record import ADC_SCALE, build_manual_lock_row, modulation_raw_to_hz
@@ -142,51 +151,10 @@ class TrajectoryRefinementAborted(RuntimeError):
         return str(self.refinement.get("failure_kind", "other"))
 
 
-class _TrackingIdentityChanged(ValueError):
-    """The tracked candidate is no longer the feature refinement started on."""
-
-
-# Samples per calibrated feature half-width that refinement aims for when it
-# has to narrow a scan. NOT a detector requirement: find_auto_lock_target needs
-# only two points either side of the crossing (see _half_range_to_points and the
-# candidate loop in auto_lock_scan). This is a target for the narrowing walk to
-# stop at, and nothing may use it to reject a detection the detector accepted.
-_STRICT_DETECTOR_SAMPLES = 10.0
-# Scan-width reduction per refinement stage for the last approach. Gradual on
-# purpose: this actuator's apparent feature position moves with scan geometry
-# (a 9% width change was measured to move it 5.4 mV), so a large step near the
-# goal can drop the feature out of the window it was supposed to land in.
-_REFINEMENT_NARROW_FACTOR = 0.75
-# Reduction while still far from the goal. The window is many signal widths wide
-# there, so a half-step is safe and each one saved is a stage of drift avoided:
-# 0.75x alone needs ~18 stages to cross the full range, 0.5x first needs ~11.
-_REFINEMENT_COARSE_NARROW_FACTOR = 0.5
-# "Far from the goal" -- more than this multiple of the target amplitude.
-_REFINEMENT_GENTLE_APPROACH = 4.0
-# Stages before refinement gives up. Each costs several sweeps, and the walk has
-# to be able to cross the full sweep range: from 1 V to a few mV takes ~11
-# stages at the factors above, so the budget is that with headroom.
-_MAX_REFINEMENT_STAGES = 16
-# Gentlest narrowing the adaptive rule may fall back to. A stage that barely
-# changes the width measures nothing and burns the budget, so a feature whose
-# position is this sensitive to width is one the walk should give up on rather
-# than creep after.
-_REFINEMENT_MAX_NARROW_FACTOR = 0.9
-# Width changes below this fraction cannot measure the shift they cause: the
-# detector's own scatter swamps it and the ratio explodes.
-_REFINEMENT_MIN_MEASURABLE_FRACTION = 0.05
-# Share of the half-span the target may sit at and still count as "inside the
-# window" when the rails force a narrowing that has not been centred first.
-# Below 1 so the edge is not the acceptance criterion.
-_WINDOW_KEEP_FRACTION = 0.9
-# Below this, a commanded centre move is no move at all -- the rails have pinned
-# it and stepping again would spin.
-_CENTER_MOVE_EPSILON_V = 1e-6
-# Slack on the sweep-rail comparison, comfortably above double-precision noise
-# on 1.0 - amplitude and far below anything the hardware resolves.
-_RAIL_EPSILON_V = 1e-9
-# Fixed-point rounds for the safe-narrowing solve. It converges in three.
-_SAFE_NARROWING_ITERATIONS = 5
+# _TrackingIdentityChanged, and the constants governing the trajectory
+# refinement walk (narrowing factors, stage budget, rail/epsilon tolerances),
+# live in lock_refinement.py now -- see the imports above. The walk itself
+# (_trajectory_refine_auto_lock, below) is the only remaining consumer.
 
 # How long a disconnect waits for an in-flight relock action to finish before
 # going ahead anyway. A guarded center move takes seconds; abandoning one
@@ -3252,6 +3220,10 @@ class DeviceSession:
             )
             return False
 
+    # The three static helpers below used to hold this arithmetic directly.
+    # It now lives in lock_refinement.py (moved unchanged) alongside the rest
+    # of the trajectory-refinement planning; these delegates exist only so
+    # existing callers -- production and test alike -- keep working unchanged.
     @staticmethod
     def _min_safe_amplitude_v(
         amplitude_v: float,
@@ -3259,39 +3231,7 @@ class DeviceSession:
         shift_per_fraction: float | None,
         floor_v: float,
     ) -> float | None:
-        """Smallest amplitude that still leaves the target inside the window.
-
-        A FLOOR on the next amplitude, not a ceiling: narrowing below it crops
-        the target out of view. Named for what it returns, because reading it as
-        a ceiling and taking min() of the two produced exactly the cropping it
-        exists to prevent -- a 0.533 V floor cut to 0.400 V, putting a target at
-        0.6795 V outside a window ending at 0.600 V.
-
-        Used when the sweep rails block further re-centring: the centre cannot
-        exceed +/-(1 - amplitude), so a target beyond that is unreachable until
-        the amplitude comes down and takes the rail outward with it. Narrowing
-        is then the only way forward, even though the target is not yet centred.
-
-        Two effects race. A smaller window brings its own edge closer to the
-        target, and the width change moves the target as well (measured as
-        ``shift_per_fraction``). Solve for the widest amplitude where the target
-        still sits inside after the shift that reaching it causes -- widest, not
-        smallest, because a gentler cut both moves the feature less and leaves
-        more room. ``None`` when no cut is safe.
-        """
-        amplitude = abs(float(amplitude_v))
-        offset = abs(float(offset_v))
-        spf = max(0.0, float(shift_per_fraction or 0.0))
-        if amplitude <= 1e-12:
-            return None
-        candidate = max(float(floor_v), 1e-9)
-        for _ in range(_SAFE_NARROWING_ITERATIONS):
-            fraction = max(0.0, 1.0 - (candidate / amplitude))
-            needed = (offset + spf * fraction) / _WINDOW_KEEP_FRACTION
-            candidate = max(needed, float(floor_v))
-        if candidate >= amplitude:
-            return None
-        return candidate
+        return min_safe_amplitude_v(amplitude_v, offset_v, shift_per_fraction, floor_v)
 
     @staticmethod
     def _center_step_allowance_v(
@@ -3299,18 +3239,7 @@ class DeviceSession:
         amplitude_v: float,
         sideband_offset_v: float | None,
     ) -> float:
-        """How far one stage may move the apparent feature, in sweep volts.
-
-        One allowance for both ways a stage can move it -- commanding the centre
-        and changing the width -- because the risk is the same either way:
-        travelling further than the distance to a neighbouring feature in a
-        single step can leave the walk tracking the wrong one.
-        """
-        allowance = 0.25 * abs(float(amplitude_v))
-        widths = float(settings.max_center_step_signal_widths)
-        if sideband_offset_v is not None and widths > 0.0:
-            allowance = min(allowance, widths * 2.0 * abs(float(sideband_offset_v)))
-        return allowance
+        return center_step_allowance_v(settings, amplitude_v, sideband_offset_v)
 
     @staticmethod
     def _bounded_recenter_v(
@@ -3321,43 +3250,13 @@ class DeviceSession:
         signal_width_v: float | None = None,
         max_signal_widths: float = 0.0,
     ) -> float:
-        """Where to put the sweep centre for one bounded step toward the target.
-
-        Capped at a quarter of the present half-range, because a centre move
-        itself shifts this actuator's apparent feature position: small steps
-        keep that shift measurable instead of compounding into a jump onto a
-        neighbouring feature.
-
-        The FPGA sweep is bounded, but the rail clamp must never turn that small
-        step into a large one. An operator scanning at a centre the rails would
-        not permit -- 0.653 V at amplitude 0.6, which runs to 1.25 V -- had the
-        clamp yank the centre 253 mV in a single write, four times the intended
-        bound and precisely the uncontrolled move this stage exists to avoid.
-        The rails are therefore honoured only when the centre already respects
-        them, and never at the cost of exceeding the step bound.
-        """
-        amplitude = abs(float(amplitude_v))
-        bound = 0.25 * amplitude
-        # The scan width is an operator setting and says nothing about whether a
-        # step is safe. What does is the distance to the NEXT feature: a step
-        # longer than that can vault over a neighbour and land the walk on the
-        # wrong one. On a device with 32.5 mV sidebands, a quarter of a 0.6 V
-        # half-range is 150 mV -- 4.6 sideband spacings in a single write.
-        # Bound by the measured signal width where one is known; the scan-width
-        # rule remains the fallback when it is not.
-        if signal_width_v and max_signal_widths > 0.0:
-            bound = min(bound, float(max_signal_widths) * abs(float(signal_width_v)))
-        lo, hi = center_v - bound, center_v + bound
-        rail_lo, rail_hi = -1.0 + amplitude, 1.0 - amplitude
-        # Tolerant comparison: 1.0 - 0.8 is 0.19999999999999996, and a centre
-        # sitting exactly on that rail reads back as 0.2 often enough that an
-        # exact test let a 4e-17 difference decide between honouring the rails
-        # and ignoring them entirely.
-        if rail_lo <= rail_hi and (
-            rail_lo - _RAIL_EPSILON_V <= center_v <= rail_hi + _RAIL_EPSILON_V
-        ):
-            lo, hi = max(lo, rail_lo), min(hi, rail_hi)
-        return min(hi, max(lo, float(target_v)))
+        return bounded_recenter_v(
+            center_v,
+            target_v,
+            amplitude_v,
+            signal_width_v=signal_width_v,
+            max_signal_widths=max_signal_widths,
+        )
 
     def _set_sweep_geometry(self, center_v: float, amplitude_v: float) -> float:
         """Atomically command both scan axes and return the completion timestamp."""
@@ -3486,78 +3385,7 @@ class DeviceSession:
                 "target_voltage": target.target_voltage, "resolution_samples": resolution,
                 "detector": detector, "metrics": coarse_metrics,
             })
-            identity_slope = target.target_slope_rising
-            identity_sideband = target.sideband_offset_v
-            # Resolution the standing sideband identity was measured at. A
-            # spacing read off a barely-resolved trace is an estimate, not a
-            # reference the rest of the walk must match.
-            identity_resolution = resolution if identity_sideband is not None else 0.0
-
-            def _check_identity(
-                candidate: Any,
-                *,
-                detector: str = "strict",
-                resolution_samples: float = 0.0,
-                check_sideband: bool = True,
-            ) -> None:
-                nonlocal identity_sideband, identity_resolution
-                if candidate.target_slope_rising != identity_slope:
-                    raise _TrackingIdentityChanged(
-                        "Tracking candidate changed discriminator slope identity."
-                    )
-                if not check_sideband:
-                    return
-                if identity_sideband is not None and candidate.sideband_offset_v is not None:
-                    # ANY better resolved strict detection REPLACES the
-                    # identity rather than being judged against it. The measured
-                    # spacing is biased by resolution -- 16.9 mV at 6.1 samples
-                    # per half-width and 23.6 mV at 8.8 on the same feature --
-                    # so comparing across a resolution change tests the sweep
-                    # width, not the identity of the crossing. Narrowing exists
-                    # to measure better; rejecting the better measurement for
-                    # disagreeing with the worse one rejects the improvement it
-                    # was sent to get.
-                    #
-                    # This used to demand a 1.5x improvement, so that two
-                    # detections at one geometry would compare rather than adopt.
-                    # The final pair no longer checks the spacing at all, so that
-                    # margin protected nothing -- and once narrowing became
-                    # adaptive the stages got gentler, a 1.45x stage slipped
-                    # under it, and the check fired on the bias it was meant to
-                    # tolerate. Equal or worse resolution still compares, which
-                    # is what a re-centring stage does.
-                    if detector == "strict" and resolution_samples > (
-                        identity_resolution * 1.001
-                    ):
-                        identity_sideband = candidate.sideband_offset_v
-                        identity_resolution = resolution_samples
-                        return
-                    # Sideband spacing should survive geometry changes. Allow a
-                    # generous 35% while the wide trace is under-resolved.
-                    tolerance = max(
-                        0.35 * identity_sideband, 2.0 * abs(amplitude_v) / trace_length
-                    )
-                    if abs(candidate.sideband_offset_v - identity_sideband) > tolerance:
-                        raise _TrackingIdentityChanged(
-                            "Tracking candidate changed PDH sideband identity: "
-                            f"measured {candidate.sideband_offset_v * 1e3:.3f} mV by the "
-                            f"{detector} detector at {resolution_samples:.2f} samples per "
-                            f"half-width, against an identity of "
-                            f"{identity_sideband * 1e3:.3f} mV established at "
-                            f"{identity_resolution:.2f} samples "
-                            f"(tolerance {tolerance * 1e3:.3f} mV)."
-                        )
-                elif candidate.sideband_offset_v is not None and detector == "strict":
-                    # Wide scans may not resolve ±Ω. Once a later one does, make
-                    # that spacing part of the identity thereafter -- but only
-                    # from a STRICT detection. The coarse tracker measures the
-                    # spacing a different way, so letting it set the baseline
-                    # means later strict detections are compared against another
-                    # algorithm's estimate and rejected over the disagreement,
-                    # not over any real change in the feature. It is declared
-                    # tracking-only; defining the identity is not tracking.
-                    identity_sideband = candidate.sideband_offset_v
-                    identity_resolution = resolution_samples
+            identity = IdentityGuard(target, resolution, trace_length=trace_length)
 
             # Narrow in <=25% reductions until the STRICT detector accepts a
             # trace -- that, not a sample count, is the thing refinement is
@@ -3583,117 +3411,64 @@ class DeviceSession:
                         f"No lockable scan after {_MAX_REFINEMENT_STAGES} "
                         "trajectory refinement stages."
                     )
-                # Two floors, whichever is wider: the amplitude that gives the
-                # detector the samples it needs, and the one that puts the error
-                # signal over min_signal_scan_fraction of the span.
-                target_amplitude = (
-                    float(settings.half_range_sweep_v)
-                    * (trace_length - 1)
-                    / (2.0 * _STRICT_DETECTOR_SAMPLES)
+                # Ask the planner what to do next -- see plan_refinement_step's
+                # docstring for the constraint order. It makes no I/O and
+                # decides exactly one step; everything below is acting on that
+                # decision, redetecting, and recording the stage.
+                step = plan_refinement_step(
+                    settings,
+                    center_v=center_v,
+                    amplitude_v=amplitude_v,
+                    target_v=float(target.target_voltage),
+                    sideband_offset_v=target.sideband_offset_v,
+                    detector=detector,
+                    trace_length=trace_length,
+                    shift_per_fraction=shift_per_fraction,
                 )
-                width_amplitude = max_lockable_amplitude_v(
-                    settings, target.sideband_offset_v
-                )
-                if width_amplitude is not None:
-                    target_amplitude = min(target_amplitude, width_amplitude)
-                # Step size adapts to the margin. While the signal is a speck on
-                # the scan, the next window is still many signal widths wide and
-                # a half-step is safe; close to the goal, narrow gently, because
-                # a width change of a few percent visibly moves this actuator's
-                # apparent feature position and a big jump can drop it out of
-                # the new window entirely.
-                factor = (
-                    _REFINEMENT_COARSE_NARROW_FACTOR
-                    if amplitude_v > _REFINEMENT_GENTLE_APPROACH * target_amplitude
-                    else _REFINEMENT_NARROW_FACTOR
-                )
-                # Hold the width-induced shift to the same allowance a centre
-                # step gets: never move the feature further than the distance to
-                # a neighbour in one go, whichever way it is moved.
-                step_allowance = self._center_step_allowance_v(
-                    settings, amplitude_v, target.sideband_offset_v
-                )
-                if shift_per_fraction and shift_per_fraction > 1e-9:
-                    gentlest = 1.0 - (step_allowance / shift_per_fraction)
-                    factor = min(
-                        _REFINEMENT_MAX_NARROW_FACTOR, max(factor, gentlest)
-                    )
-                next_amplitude = amplitude_v * factor
-                # Stop precisely at the goal rather than overshooting past it.
-                next_amplitude = max(target_amplitude, next_amplitude)
-                next_amplitude = min(amplitude_v, next_amplitude)
-                if next_amplitude >= amplitude_v - 1e-9:
+                if step.action == "done":
                     break
-                # Do not narrow an edge feature out of the next window. Centre
-                # motion is deliberately its own bounded, freshly-redetected
-                # stage because it can itself move the apparent resonance.
-                if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
-                    new_center = self._bounded_recenter_v(
-                        center_v,
-                        float(target.target_voltage),
-                        amplitude_v,
-                        signal_width_v=(
-                            None if target.sideband_offset_v is None
-                            else 2.0 * abs(float(target.sideband_offset_v))
-                        ),
-                        max_signal_widths=settings.max_center_step_signal_widths,
+                if step.action == "refuse":
+                    raise ValueError(step.reason)
+                if step.action == "recenter":
+                    new_center = step.center_v
+                    # The schedule's candidate amplitude, computed before this
+                    # recentre -- reused below if the recentre brings the
+                    # target inside the window, exactly as the pre-planner
+                    # code reused its own `next_amplitude` variable across the
+                    # recentre rather than rescheduling from the new geometry.
+                    next_amplitude = step.amplitude_v
+                    moved_at = self._set_sweep_geometry(new_center, amplitude_v)
+                    target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
+                        settings, after=moved_at
                     )
-                    if abs(new_center - center_v) > _CENTER_MOVE_EPSILON_V:
-                        moved_at = self._set_sweep_geometry(new_center, amplitude_v)
-                        target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
-                            settings, after=moved_at
-                        )
-                        _check_identity(target, detector="coarse", resolution_samples=resolution)
-                        stages.append({"kind": "recenter", "center_v": center_v,
-                                       "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
-                                       "resolution_samples": resolution, "detector": "coarse",
-                                       "metrics": coarse_metrics})
-                        # One bounded step may not be enough to reach a feature
-                        # far from the centre, and narrowing anyway crops the
-                        # very feature being tracked out of the next window: a
-                        # run that recentred 0.2 -> 0.35 V with the target at
-                        # 0.771 V then narrowed to +/-0.3 V, whose window ends at
-                        # 0.65 V, and the detector duly found a different
-                        # crossing. Step again instead, and only narrow once the
-                        # target is inside.
-                        if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
-                            narrow_count += 1
-                            continue
-                    else:
-                        # The rails pin the centre at +/-(1 - amplitude), so the
-                        # target is unreachable at this width however many steps
-                        # are taken -- and the previous rule then refused to
-                        # narrow because it was not centred, which is a deadlock
-                        # that burned all 16 stages without one width change.
-                        # Narrowing is the way out: the rail moves outward with
-                        # the amplitude. Take the gentlest cut that keeps the
-                        # target in view and let the next stage centre on it.
-                        safe = self._min_safe_amplitude_v(
-                            amplitude_v,
-                            float(target.target_voltage) - center_v,
-                            shift_per_fraction,
-                            target_amplitude,
-                        )
-                        if safe is None:
-                            raise ValueError(
-                                "The sweep rails pin the center at "
-                                f"{center_v:+.4f} V and the target is "
-                                f"{float(target.target_voltage):+.4f} V, which no "
-                                "narrowing can bring into view without losing it. "
-                                "Move the laser closer to the feature, or start "
-                                "from a narrower scan."
-                            )
-                        # A floor: never narrow past what keeps the target in
-                        # view, even though the schedule wanted a bigger cut.
-                        next_amplitude = max(next_amplitude, safe)
-                        stages.append({
-                            "kind": "rail_blocked", "center_v": center_v,
-                            "amplitude_v": amplitude_v,
-                            "target_voltage": target.target_voltage,
-                            "resolution_samples": resolution, "detector": detector,
-                            "rail_v": 1.0 - abs(amplitude_v),
-                            "next_amplitude_v": next_amplitude,
-                        })
+                    identity.check(target, amplitude_v=amplitude_v, detector="coarse", resolution_samples=resolution)
+                    stages.append({"kind": "recenter", "center_v": center_v,
+                                   "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
+                                   "resolution_samples": resolution, "detector": "coarse",
+                                   "metrics": coarse_metrics})
+                    # One bounded step may not be enough to reach a feature
+                    # far from the centre, and narrowing anyway crops the
+                    # very feature being tracked out of the next window: a
+                    # run that recentred 0.2 -> 0.35 V with the target at
+                    # 0.771 V then narrowed to +/-0.3 V, whose window ends at
+                    # 0.65 V, and the detector duly found a different
+                    # crossing. Step again instead, and only narrow once the
+                    # target is inside.
+                    if abs(float(target.target_voltage) - center_v) > 0.5 * next_amplitude:
+                        narrow_count += 1
+                        continue
+                elif step.action == "rail_escape":
+                    next_amplitude = step.amplitude_v
+                    stages.append({
+                        "kind": "rail_blocked", "center_v": center_v,
+                        "amplitude_v": amplitude_v,
+                        "target_voltage": target.target_voltage,
+                        "resolution_samples": resolution, "detector": detector,
+                        "rail_v": step.bounds.get("rail_v", 1.0 - abs(amplitude_v)),
+                        "next_amplitude_v": next_amplitude,
+                    })
+                else:  # "narrow" -- no centring or rail escape was needed
+                    next_amplitude = step.amplitude_v
                 before_v = float(target.target_voltage)
                 before_amplitude = abs(amplitude_v)
                 moved_at = self._set_sweep_geometry(center_v, next_amplitude)
@@ -3730,7 +3505,7 @@ class DeviceSession:
                     "width_shift_v": width_shift_v,
                     "shift_per_fraction_v": shift_per_fraction,
                 })
-                _check_identity(target, detector=detector, resolution_samples=resolution)
+                identity.check(target, amplitude_v=amplitude_v, detector=detector, resolution_samples=resolution)
                 narrow_count += 1
                 # Keep the feature inside the central half, but bound a centre
                 # adjustment to 25% of the present half-range.
@@ -3757,7 +3532,7 @@ class DeviceSession:
                         "target_voltage": target.target_voltage, "resolution_samples": resolution,
                         "detector": "coarse", "metrics": coarse_metrics,
                     })
-                    _check_identity(target, detector="coarse", resolution_samples=resolution)
+                    identity.check(target, amplitude_v=amplitude_v, detector="coarse", resolution_samples=resolution)
 
             # The coarse result only guides geometry. Demand two fresh strict
             # detections at the final unchanged geometry before any guarded move.
@@ -3781,15 +3556,15 @@ class DeviceSession:
             # check below is strictly stronger: same slope and same voltage is
             # the same crossing, whatever the sideband fit did. Applying it here
             # only adds a way to fail.
-            _check_identity(
-                strict_one, resolution_samples=resolution, check_sideband=False
+            identity.check(
+                strict_one, amplitude_v=amplitude_v, resolution_samples=resolution, check_sideband=False
             )
             verify_after = time.time()
             strict_two, verify_center, verify_amplitude, _ = self._capture_auto_lock_target(
                 settings, after=verify_after
             )
-            _check_identity(
-                strict_two, resolution_samples=resolution, check_sideband=False
+            identity.check(
+                strict_two, amplitude_v=amplitude_v, resolution_samples=resolution, check_sideband=False
             )
             # One definition of "the feature moved too far", shared with the
             # guarded move, rather than a second inline literal that silently
