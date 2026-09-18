@@ -204,10 +204,14 @@ def min_safe_amplitude_v(
 
     Two effects race. A smaller window brings its own edge closer to the
     target, and the width change moves the target as well (measured as
-    ``shift_per_fraction``). Solve for the widest amplitude where the target
-    still sits inside after the shift that reaching it causes -- widest, not
-    smallest, because a gentler cut both moves the feature less and leaves
-    more room. ``None`` when no cut is safe.
+    ``shift_per_fraction``). Solve for the SMALLEST amplitude that still
+    contains the target after the shift reaching it causes -- the floor a
+    caller may narrow down to, not a ceiling it may narrow past. (This
+    docstring used to say "widest, not smallest" from before the function
+    was renamed from ``_widest_safe_narrowing_v`` -- backwards against the
+    function it described, and the same misreading that once had a caller
+    take ``min()`` of this floor against the schedule instead of ``max()``.)
+    ``None`` when no cut is safe.
     """
     amplitude = abs(float(amplitude_v))
     offset = abs(float(offset_v))
@@ -323,7 +327,21 @@ def plan_refinement_step(
             ),
             max_signal_widths=settings.max_center_step_signal_widths,
         )
-        if abs(new_center - center_v) > _CENTER_MOVE_EPSILON_V:
+        # A step this planner itself capped at the rail -- rather than at the
+        # step bound -- cannot be made to progress by taking it again: the
+        # rail will still be exactly where it was. Escaping only once the
+        # step measured EXACTLY zero (the old rule) let a centre a hair off
+        # the rail creep towards it one stage at a time, each one a step that
+        # visibly moved yet could not possibly reach the target. Checking
+        # "did this step land on the rail, short of the target" catches that
+        # on the very first rail-limited step instead of after however many
+        # a hair's width takes to close.
+        rail_lo, rail_hi = -1.0 + abs(amplitude_v), 1.0 - abs(amplitude_v)
+        rail_limited = rail_lo <= rail_hi and (
+            abs(new_center - rail_lo) <= _RAIL_EPSILON_V
+            or abs(new_center - rail_hi) <= _RAIL_EPSILON_V
+        ) and abs(target_v - new_center) > _CENTER_MOVE_EPSILON_V
+        if not rail_limited and abs(new_center - center_v) > _CENTER_MOVE_EPSILON_V:
             return RefinementStep(
                 "recenter",
                 new_center,
