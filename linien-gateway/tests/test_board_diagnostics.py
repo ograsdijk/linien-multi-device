@@ -372,23 +372,44 @@ def test_every_reader_is_tried_rather_than_only_the_first_one_present():
     ended it with an empty answer and nothing else was attempted."""
     command = next(s for s in bd._SECTIONS if s[0] == "reboot_status")[2]
 
-    # One `if` per reader, each guarded on the value still being empty, rather
-    # than a single if/elif whose first present tool decides the outcome.
+    # Every reader after the first is guarded on the value still being empty,
+    # rather than a single if/elif whose first present tool decides the
+    # outcome. Three `if`s plus the python loop's own `[ -z "$V" ] || break`.
     assert "elif" not in command
-    assert command.count('if [ -z "$V" ]') == 4
+    assert command.count('[ -z "$V" ]') == 4
 
 
-def test_the_register_can_be_read_with_nothing_installed():
-    """A field board had no devmem, no devmem2 and no monitor, and reported
-    "no way to read". `dd` and `od` are in every busybox."""
+def test_the_register_is_read_with_python_on_a_board_with_no_tools():
+    """A field board had no devmem, no devmem2, no monitor and no busybox at
+    all. python3 is the one reader a board running Linien must have: the
+    server is itself a Python process."""
     command = next(s for s in bd._SECTIONS if s[0] == "reboot_status")[2]
 
-    assert "if=/dev/mem" in command
-    # Seeking in 4-byte words, not bytes: the byte offset is 0xF8000258, which
-    # overflows 32-bit shell arithmetic on the armv7 boards.
-    assert "bs=4" in command
-    assert "skip=" + str(bd.REBOOT_STATUS_SKIP_WORDS) in command
-    assert bd.REBOOT_STATUS_SKIP_WORDS * 4 == int(bd.REBOOT_STATUS_ADDR, 16)
+    assert "python3" in command
+    assert "mmap.mmap" in command
+    assert "for PY in python3 python" in command
+
+
+def test_the_register_is_mapped_rather_than_read():
+    """`read()` on /dev/mem copies from `__va(phys)`, valid only for RAM. SLCR
+    is IO space, so a read of it fails with EFAULT ("Bad address") on any
+    kernel -- a field board returned exactly that. Only mmap reaches it, which
+    is why every devmem tool mmaps."""
+    command = next(s for s in bd._SECTIONS if s[0] == "reboot_status")[2]
+
+    assert "dd if=/dev/mem" not in command
+    assert "mmap.MAP_SHARED" in command
+
+
+def test_the_mapped_page_and_offset_land_on_the_register():
+    """mmap takes a page-aligned offset, so the address is split in two. The
+    halves are derived from it, and this is the check that they still add up."""
+    assert bd.REBOOT_STATUS_PAGE_ADDR % bd.REBOOT_STATUS_PAGE_SIZE == 0
+    assert (
+        bd.REBOOT_STATUS_PAGE_ADDR + bd.REBOOT_STATUS_PAGE_OFFSET
+        == int(bd.REBOOT_STATUS_ADDR, 16)
+    )
+    assert 0 <= bd.REBOOT_STATUS_PAGE_OFFSET < bd.REBOOT_STATUS_PAGE_SIZE
 
 
 def test_an_unreadable_register_says_what_was_tried():
@@ -396,12 +417,12 @@ def test_an_unreadable_register_says_what_was_tried():
     looking for a gateway bug rather than a missing tool on the board."""
     bundle = _reboot_bundle(
         "no way to read 0xF8000258 "
-        "(tried devmem, devmem2, monitor, busybox devmem, /dev/mem)"
+        "(tried devmem, devmem2, monitor, busybox devmem, python mmap)"
     )
 
     assert bundle["reboot_status"] is None
     section = next(s for s in bundle["sections"] if s["name"] == "reboot_status")
-    for tool in ("devmem", "devmem2", "monitor", "/dev/mem"):
+    for tool in ("devmem", "devmem2", "monitor", "python mmap"):
         assert tool in section["output"]
 
 
@@ -413,10 +434,23 @@ def test_reading_the_register_never_touches_the_fpga():
 
     import re
 
-    # The only address the command dereferences is the SLCR one. Anything in
-    # the FPGA's address space (0x4000_0000 and up on this SoC) must not appear.
-    addresses = set(re.findall(r"0x[0-9A-Fa-f]{6,}", command))
-    assert addresses == {bd.REBOOT_STATUS_ADDR}
+    # Every address the command dereferences must lie in the SLCR page. The
+    # mmap reader adds the page base to the register address, so an exact
+    # match against the one literal no longer holds -- but "inside the SLCR
+    # page" is the invariant that actually matters, and it also covers the
+    # decimal forms mmap needs.
+    slcr = bd.REBOOT_STATUS_PAGE_ADDR
+    hex_addresses = {
+        int(match, 16) for match in re.findall(r"0x[0-9A-Fa-f]{6,}", command)
+    }
+    decimal_addresses = {
+        int(match)
+        for match in re.findall(r"(?<![\w.])\d{7,}(?![\w.])", command)
+    }
+    for address in hex_addresses | decimal_addresses:
+        assert slcr <= address < slcr + bd.REBOOT_STATUS_PAGE_SIZE, hex(address)
+    # ...and the SLCR page is nowhere near the FPGA's window on this SoC.
+    assert not (0x40000000 <= slcr < 0xC0000000)
 
 
 # --- enabling persistence ------------------------------------------------

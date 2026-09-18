@@ -59,10 +59,12 @@ SECTION_MAX_CHARS = 20_000
 # the decoder can find it without re-running anything.
 REBOOT_STATUS_ADDR = "0xF8000258"
 REBOOT_STATUS_PREFIX = "REBOOT_STATUS="
-# The same address as a count of 4-byte words, for the `dd` fallback below.
-# Derived rather than written out so the two can never disagree, and kept in
-# words because `dd`'s byte offset would overflow 32-bit shell arithmetic.
-REBOOT_STATUS_SKIP_WORDS = int(REBOOT_STATUS_ADDR, 16) // 4
+# The page the register lives in, and its offset inside that page, for the
+# mmap fallback below. Derived rather than written out so they cannot disagree
+# with the address, and mmap will only accept a page-aligned offset.
+REBOOT_STATUS_PAGE_SIZE = 4096
+REBOOT_STATUS_PAGE_ADDR = int(REBOOT_STATUS_ADDR, 16) & ~(REBOOT_STATUS_PAGE_SIZE - 1)
+REBOOT_STATUS_PAGE_OFFSET = int(REBOOT_STATUS_ADDR, 16) - REBOOT_STATUS_PAGE_ADDR
 # Bit -> what caused the last reset. Bits 16-19 are as documented for the
 # Zynq-7000 (UG585 section 6.3.12); 20-22 follow the same order the TRM lists
 # the reset sources in, but I could not verify them against the manual here --
@@ -349,9 +351,19 @@ _SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
         # that existed and failed silently ended it with an empty answer and
         # the remaining tools were never tried.
         #
-        # `dd` seeks in 4-byte words rather than bytes, so the offset stays
-        # inside 32-bit shell arithmetic on armv7. Reading SLCR touches nothing
-        # in the FPGA fabric.
+        # The last one mmaps, and that is not a stylistic choice: `read()` on
+        # /dev/mem copies from `__va(phys)`, which is only valid for RAM. SLCR
+        # is IO space, so the kernel has to ioremap it and that path exists
+        # only for mmap -- a `dd` of this address fails with EFAULT ("Bad
+        # address") on any kernel, which is what the field board returned. It
+        # is why every devmem tool mmaps, and why there is no shell-only
+        # reader here.
+        #
+        # python3 is a fair assumption on a board running Linien: the server
+        # itself is a Python process. `python` is tried after it for an image
+        # that never made the version-suffixed name.
+        #
+        # Reading SLCR touches nothing in the FPGA fabric.
         'V=""; '
         "if command -v devmem >/dev/null 2>&1; then "
         'V=$(devmem ' + REBOOT_STATUS_ADDR + ' 32 2>/dev/null); fi; '
@@ -362,13 +374,22 @@ _SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
         'V=$(monitor ' + REBOOT_STATUS_ADDR + ' 2>/dev/null); fi; '
         'if [ -z "$V" ] && command -v busybox >/dev/null 2>&1; then '
         'V=$(busybox devmem ' + REBOOT_STATUS_ADDR + ' 32 2>/dev/null); fi; '
-        'if [ -z "$V" ] && [ -r /dev/mem ]; then '
-        'W=$(dd if=/dev/mem bs=4 count=1 skip=' + str(REBOOT_STATUS_SKIP_WORDS)
-        + ' 2>/dev/null | od -An -tx4 | tr -d " \\n"); '
-        '[ -n "$W" ] && V="0x$W"; fi; '
+        'for PY in python3 python; do '
+        '[ -z "$V" ] || break; '
+        'command -v $PY >/dev/null 2>&1 || continue; '
+        'V=$($PY -c "'
+        "import mmap, os, struct; "
+        "f = os.open('/dev/mem', os.O_RDONLY | getattr(os, 'O_SYNC', 0)); "
+        "m = mmap.mmap(f, " + str(REBOOT_STATUS_PAGE_SIZE) + ", mmap.MAP_SHARED, "
+        "mmap.PROT_READ, offset=" + str(REBOOT_STATUS_PAGE_ADDR) + "); "
+        "print('0x%08x' % struct.unpack('<I', m["
+        + str(REBOOT_STATUS_PAGE_OFFSET) + ":" + str(REBOOT_STATUS_PAGE_OFFSET + 4)
+        + "])[0])"
+        '" 2>/dev/null); '
+        'done; '
         'if [ -n "$V" ]; then echo "' + REBOOT_STATUS_PREFIX + '$V"; '
         'else echo "no way to read ' + REBOOT_STATUS_ADDR
-        + ' (tried devmem, devmem2, monitor, busybox devmem, /dev/mem)"; fi',
+        + ' (tried devmem, devmem2, monitor, busybox devmem, python mmap)"; fi',
         True,
     ),
     (
