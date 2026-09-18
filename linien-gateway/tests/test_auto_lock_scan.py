@@ -776,3 +776,32 @@ def test_a_crossing_inside_the_carrier_window_is_not_a_sideband():
     ) == pytest.approx(40.0)
     # Without the exclusion window that stray crossing halves the spacing.
     assert _sideband_offset_pts(noisy, anchor, True, exclusion_pts=1) is None
+
+
+def test_a_scan_too_coarse_to_resolve_the_feature_reports_no_spacing():
+    """The field's opening geometry: ±0.8 V, 2.275 samples per half-width.
+
+    The feature spans 4.5 samples against a 5-sample smoothing window, and the
+    two detectors returned 16.0 mV and 31.7 mV for the same laser -- one having
+    paired carrier-to-sideband, the other sideband-to-sideband, 41 samples
+    apart either way. Neither number was a measurement, and the walk seeded its
+    identity, its scan-width test and its centre-step allowance from one.
+    """
+    settings = _field_settings()
+    assert feature_resolution_samples(settings, 2048, 0.8) == pytest.approx(2.275)
+
+    trace = _field_pdh_trace(0.2, 0.8)
+    strict, coarse = _detect(trace, 0.2, 0.8, settings)
+    assert strict.sideband_offset_v is None
+    assert coarse.sideband_offset_v is None
+    # The feature is still found -- only the claim about its spacing is withheld.
+    assert strict.target_voltage == pytest.approx(0.4841, abs=0.01)
+
+
+def test_the_same_scan_narrowed_enough_to_resolve_it_reports_a_spacing():
+    """Same laser, ±0.4 V: 4.55 samples per half-width clears the window."""
+    settings = _field_settings()
+    trace = _field_pdh_trace(0.2649, 0.4)
+    strict, coarse = _detect(trace, 0.2649, 0.4, settings)
+    assert strict.sideband_offset_v == pytest.approx(_FIELD_SIDEBAND_V, rel=0.1)
+    assert coarse.sideband_offset_v == pytest.approx(_FIELD_SIDEBAND_V, rel=0.1)

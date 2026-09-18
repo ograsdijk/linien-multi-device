@@ -1246,7 +1246,7 @@ def _walking_session(
         session, "_capture_auto_lock_target",
         lambda settings, traces=None, after=None: next(captures),
     )
-    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a: time.time())
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a, settle_s=0.0: time.time())
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
     return session
 
@@ -1443,7 +1443,7 @@ def _identity_session(monkeypatch, coarse_sideband, strict_sideband):
         monkeypatch, _no_error, approach={"enabled": False}
     )
     session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
-    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a: time.time())
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a, settle_s=0.0: time.time())
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
     monkeypatch.setattr(
         session, "_coarse_auto_lock_target",
@@ -1498,7 +1498,7 @@ def test_a_recentring_stage_that_changes_the_spacing_is_an_identity_change(monke
         monkeypatch, _no_error, approach={"enabled": False}
     )
     session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
-    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a: time.time())
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a, settle_s=0.0: time.time())
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
     # A flipped discriminator slope: checked on every detection whatever path
     # the stage took, so it is the walk-level assertion that identity failures
@@ -1542,7 +1542,7 @@ def test_a_coarse_reading_is_not_judged_against_a_strict_baseline(monkeypatch):
         monkeypatch, _no_error, approach={"enabled": False}
     )
     session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
-    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a: time.time())
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a, settle_s=0.0: time.time())
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
     monkeypatch.setattr(
         session, "_coarse_auto_lock_target",
@@ -1629,7 +1629,7 @@ def _cropping_session(monkeypatch, coarse_targets):
     geometry: list[tuple[float, float]] = []
     monkeypatch.setattr(
         session, "_set_sweep_geometry",
-        lambda c, a: (geometry.append((c, a)), time.time())[1],
+        lambda c, a, settle_s=0.0: (geometry.append((c, a)), time.time())[1],
     )
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
     coarse = iter(coarse_targets)
@@ -1757,7 +1757,7 @@ def test_a_narrowing_that_moves_the_feature_too_far_gentles_the_next_one(monkeyp
     widths: list[float] = []
     monkeypatch.setattr(
         session, "_set_sweep_geometry",
-        lambda c, a: (widths.append(a), time.time())[1],
+        lambda c, a, settle_s=0.0: (widths.append(a), time.time())[1],
     )
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
     # Each capture reports the geometry it was asked for, and a target that has
@@ -1828,7 +1828,7 @@ def test_a_rail_pinned_walk_narrows_instead_of_stalling(monkeypatch):
     session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
     widths: list[float] = []
 
-    def _set(center, amplitude):
+    def _set(center, amplitude, settle_s=0.0):
         widths.append(float(amplitude))
         return time.time()
 
@@ -1888,7 +1888,7 @@ def test_a_rail_blocked_narrowing_never_cuts_below_the_safe_floor(monkeypatch):
     writes: list[tuple[float, float]] = []
     monkeypatch.setattr(
         session, "_set_sweep_geometry",
-        lambda c, a: (writes.append((float(c), float(a))), time.time())[1],
+        lambda c, a, settle_s=0.0: (writes.append((float(c), float(a))), time.time())[1],
     )
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
     pinned = (_result(0.6795310210063508, 0.03204689789936493), 1.0 - 0.8, 0.8, 2.275)
@@ -1951,7 +1951,7 @@ def _shift_walk(monkeypatch, *, strict_raises: bool):
     103 mV away afterwards. `strict_raises` decides which detector reports it."""
     session, _board = _make_session(monkeypatch, _no_error, approach={"enabled": False})
     session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
-    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a: time.time())
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a, settle_s=0.0: time.time())
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
 
     def _coarse(settings, after=None):
@@ -1995,3 +1995,49 @@ def test_a_shift_measured_by_one_detector_twice_is_charged_to_the_budget(monkeyp
     assert narrow["shift_per_fraction_v"] == pytest.approx(
         abs(0.4312 - 0.5341) / (1.0 - narrow["amplitude_v"] / 0.8), rel=0.02
     )
+
+
+def test_every_refinement_geometry_write_waits_for_the_calibrated_settle(monkeypatch):
+    """Both sweep axes are actuators with a settling tail.
+
+    The guarded approach has always waited `settle_ms` before believing a trace.
+    The refinement walk commands a larger move than any single approach step and
+    waited for none: it wrote both registers and began counting frames at once,
+    so the frames it counted could show the scan mid-transition. A 123-trace
+    characterization run that settles for 0.5 s before capturing has both
+    detectors agreeing to under 0.2 mV at every width; the walk's own payloads
+    had them 123 mV apart.
+    """
+    session, _board = _make_session(monkeypatch, _no_error, approach={"enabled": False})
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    session.lock_approach_settings["settle_ms"] = 250
+    settles: list[float] = []
+
+    def _set(center, amplitude, settle_s=0.0):
+        settles.append(float(settle_s))
+        return time.time()
+
+    monkeypatch.setattr(session, "_set_sweep_geometry", _set)
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (_result(0.45, 0.032), 0.3, 0.4, 4.55, {}),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (_result(0.45, 0.032), 0.3, 0.4, 4.55),
+    )
+    try:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            ApproachSettings.from_mapping(session.lock_approach_settings),
+            0.2, 0.8,
+            initial_target=_result(0.5341, 0.032),
+            initial_center_v=0.2, initial_amplitude_v=0.8,
+            initial_resolution=2.275, initial_detector="coarse", trace_length=2048,
+        )
+    except Exception:
+        pass
+
+    assert settles, "expected the walk to command at least one geometry write"
+    assert all(s == pytest.approx(0.25) for s in settles), settles

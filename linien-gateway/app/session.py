@@ -3258,12 +3258,24 @@ class DeviceSession:
             max_signal_widths=max_signal_widths,
         )
 
-    def _set_sweep_geometry(self, center_v: float, amplitude_v: float) -> float:
-        """Atomically command both scan axes and return the completion timestamp."""
+    def _set_sweep_geometry(
+        self, center_v: float, amplitude_v: float, *, settle_s: float = 0.0
+    ) -> float:
+        """Atomically command both scan axes and return the completion timestamp.
+
+        The guarded approach lets `settle_ms` decay before it believes a trace
+        (see _apply_center_plan); the refinement walk did not, and started
+        counting frames the instant the registers were written. Both axes are
+        actuators with a settling tail, so the first frames after the write show
+        the scan mid-transition. The timestamp is taken AFTER the settle so that
+        the freshness check admits only frames acquired past it.
+        """
         with self._rpyc_lock:
             self.parameters.sweep_center.value = float(center_v)
             self.parameters.sweep_amplitude.value = float(amplitude_v)
             self.control.exposed_write_registers()
+        if settle_s > 0.0:
+            time.sleep(float(settle_s))
         return time.time()
 
     def _restore_sweep_geometry(self, center_v: float, amplitude_v: float) -> bool:
@@ -3398,6 +3410,10 @@ class DeviceSession:
             # Centre moves are intentionally separate;
             # they are known to perturb this DFB's apparent feature position.
             narrow_count = 0
+            # Both sweep axes are actuators. The guarded approach already waits
+            # `settle_ms` before trusting a trace; a refinement stage commands a
+            # larger move than a single approach step and waited for none.
+            geometry_settle_s = max(0.0, float(approach.settle_ms) / 1000.0)
             # Narrowing the scan moves the feature too: changing the ramp width
             # changes the actuator's trajectory, and the apparent resonance
             # follows. Measured on this device at 73 mV for one 2x narrowing --
@@ -3438,7 +3454,9 @@ class DeviceSession:
                     # next detection actually finds; carrying a pre-move
                     # amplitude across the write would size the cut from
                     # geometry that no longer exists.
-                    moved_at = self._set_sweep_geometry(step.center_v, amplitude_v)
+                    moved_at = self._set_sweep_geometry(
+                        step.center_v, amplitude_v, settle_s=geometry_settle_s
+                    )
                     target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
                         settings, after=moved_at
                     )
@@ -3470,7 +3488,9 @@ class DeviceSession:
                 before_v = float(target.target_voltage)
                 before_amplitude = abs(amplitude_v)
                 before_detector = detector
-                moved_at = self._set_sweep_geometry(next_center, next_amplitude)
+                moved_at = self._set_sweep_geometry(
+                    next_center, next_amplitude, settle_s=geometry_settle_s
+                )
                 try:
                     target, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
                         settings, after=moved_at

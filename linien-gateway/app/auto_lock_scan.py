@@ -107,6 +107,34 @@ class AutoLockScanSettings:
         return cls(**values)
 
 
+
+def _spacing_is_measurable(
+    settings: "AutoLockScanSettings", n_points: int, sweep_amplitude_v: float
+) -> bool:
+    """Can a sideband spacing be measured on a scan this coarse at all?
+
+    Both detectors smooth with a boxcar `smooth_window_pts` wide before looking
+    for crossings. A feature narrower than that window does not survive it, and
+    the crossings whose separation is the spacing are then placed by the
+    smoother rather than by the signal. On a field scan at +/-0.8 V the
+    calibrated feature was 2.3 samples per half-width -- 4.5 samples end to end,
+    against a 5-sample window -- and the two detectors duly returned spacings a
+    factor of two apart, one having paired carrier-to-sideband and the other
+    sideband-to-sideband. Neither was a measurement.
+
+    Reporting None is the honest answer and a safe one: the spacing gates only
+    the scan-width test, the refinement centre-step allowance and the tracking
+    identity, and every one of them already handles an unresolved spacing. The
+    refinement goal is driven by feature resolution, so the walk still narrows
+    -- and once it has narrowed enough to resolve the feature, the spacing
+    becomes measurable on its own merits.
+    """
+    feature_pts = 2.0 * _half_range_to_points(
+        settings.half_range_sweep_v, n_points, sweep_amplitude_v
+    )
+    return feature_pts >= max(1, int(settings.smooth_window_pts))
+
+
 def feature_resolution_samples(
     settings: AutoLockScanSettings, n_points: int, sweep_amplitude_v: float
 ) -> float:
@@ -404,7 +432,9 @@ def find_coarse_auto_lock_target(
     ) = max(options, key=lambda item: item[0])
     sideband_offset_v: float | None = None
     hz_per_v: float | None = None
-    if str(settings.signal_type) == "pdh":
+    if str(settings.signal_type) == "pdh" and _spacing_is_measurable(
+        settings, n, sweep_amplitude_v
+    ):
         if sideband_pts is not None:
             sideband_offset_v = float(sideband_pts) * (2.0 * abs(float(sweep_amplitude_v)) / (n - 1))
         if modulation_frequency_hz and sideband_offset_v is not None and sideband_offset_v > 1e-12:
@@ -856,7 +886,11 @@ def find_auto_lock_target(
     sideband_offset_v: float | None = None
     hz_per_v: float | None = None
     discriminator_slope_v_per_mhz: float | None = None
-    if str(settings.signal_type) == "pdh" and modulation_frequency_hz:
+    if (
+        str(settings.signal_type) == "pdh"
+        and modulation_frequency_hz
+        and _spacing_is_measurable(settings, n_points, sweep_amplitude_v)
+    ):
         off_pts = _sideband_offset_pts(
             error,
             best.index,
