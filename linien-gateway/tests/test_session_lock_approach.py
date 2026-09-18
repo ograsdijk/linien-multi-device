@@ -2083,3 +2083,95 @@ def test_a_narrowing_that_does_not_take_is_reported_not_repeated(monkeypatch):
     assert "not following the commanded value" in message
     # One stage, not the full budget.
     assert len(excinfo.value.refinement["stages"]) <= 3
+
+
+# ------------------------------- the final gate measures a rate, not a distance
+#
+# Field payloads, both after the walk had converged cleanly from +/-0.8 V to
+# +/-0.11 V at 16 samples per half-width: the two final detections came back
+# 2.058 mV and 3.326 mV apart and were refused against a 0.889 mV capture
+# window. Verifying a detection costs two fresh sweeps, so those readings are
+# seconds apart, while the window is half a feature half-width -- on a laser
+# whose own characterization run measured 1-3 mV/s of drift, no honest pair of
+# verifications can pass. What the lock actually needs is that the feature still
+# be inside the capture window when the handover happens, which is `settle_ms`
+# after the last detection, not seconds.
+
+def _drift_session(monkeypatch, *, drift_mv: float, interval_s: float,
+                   settle_ms: int = 300):
+    """Two final detections `drift_mv` apart, `interval_s` apart in time."""
+    session, _board = _make_session(
+        monkeypatch, _no_error,
+        approach={"capture_fraction": 0.5, "max_correction_span": 4.0,
+                  "settle_ms": settle_ms},
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(session_module.time, "time", lambda: clock["t"])
+
+    target = 0.5091693630289127          # the field's converged target
+    captures = iter([
+        (_result(target, 0.0341), 0.438, 0.1346, 13.5),                  # narrow
+        (_result(target, 0.0341), 0.438, 0.1346, 13.5),                  # strict_one
+        (_result(target + drift_mv / 1e3, 0.0341), 0.438, 0.1346, 13.5),  # strict_two
+    ])
+
+    def _capture(settings, traces=None, after=None):
+        item = next(captures)
+        clock["t"] += interval_s      # each verification costs real time
+        return item
+
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _capture)
+    monkeypatch.setattr(session, "_set_sweep_geometry",
+                        lambda c, a, settle_s=0.0: clock["t"])
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    return session
+
+
+def _drift_walk(session):
+    return session._trajectory_refine_auto_lock(
+        AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+        ApproachSettings.from_mapping(session.lock_approach_settings),
+        0.438, 0.2,
+        initial_target=_result(0.5091693630289127, 0.0341),
+        initial_center_v=0.438, initial_amplitude_v=0.2,
+        initial_resolution=9.1, initial_detector="coarse", trace_length=2048,
+    )
+
+
+def test_a_slow_drift_measured_over_seconds_still_locks(monkeypatch):
+    """3.326 mV over 1.5 s is 2.2 mV/s: 0.67 mV during a 300 ms handover."""
+    session = _drift_session(monkeypatch, drift_mv=3.326, interval_s=1.5)
+    result, refinement = _drift_walk(session)
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+    assert result.target_voltage == pytest.approx(0.5091693630289127 + 3.326e-3)
+
+
+def test_the_same_displacement_over_a_short_interval_does_not(monkeypatch):
+    """Identical 3.326 mV, but measured 0.1 s apart -- 33 mV/s, and the feature
+    leaves the capture window before the lock can engage."""
+    session = _drift_session(monkeypatch, drift_mv=3.326, interval_s=0.1)
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        _drift_walk(session)
+    failure = excinfo.value.refinement["failure"]
+    assert "drifting at 33.26 mV/s" in failure
+    assert "during the 300 ms handover" in failure
+    assert excinfo.value.failure_kind == "position"
+
+
+def test_a_shorter_handover_rescues_a_faster_drift(monkeypatch):
+    """The knob the message names actually works: 33.26 mV/s needs the handover
+    under 27 ms to keep the feature inside a 0.889 mV window."""
+    session = _drift_session(monkeypatch, drift_mv=3.326, interval_s=0.1,
+                             settle_ms=20)
+    _result_obj, refinement = _drift_walk(session)
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+
+
+def test_two_detections_past_the_neighbour_bound_are_a_different_crossing(monkeypatch):
+    """No interval makes a jump to the next feature acceptable."""
+    session = _drift_session(monkeypatch, drift_mv=9.0, interval_s=10.0)
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        _drift_walk(session)
+    assert "not the same crossing" in excinfo.value.refinement["failure"]
+    assert excinfo.value.failure_kind == "identity"

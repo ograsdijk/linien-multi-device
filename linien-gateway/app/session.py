@@ -3591,9 +3591,11 @@ class DeviceSession:
                 strict_one, amplitude_v=amplitude_v, resolution_samples=resolution, check_sideband=False
             )
             verify_after = time.time()
+            one_at = time.time()
             strict_two, verify_center, verify_amplitude, _ = self._capture_auto_lock_target(
                 settings, after=verify_after
             )
+            two_at = time.time()
             identity.check(
                 strict_two, amplitude_v=amplitude_v, resolution_samples=resolution, check_sideband=False
             )
@@ -3624,13 +3626,60 @@ class DeviceSession:
                     "The two final detections disagreed on the discriminator slope."
                 )
             drift_v = abs(strict_one.target_voltage - strict_two.target_voltage)
-            if drift_v > tolerance:
+            # Two questions, not one. They were conflated into a single
+            # displacement test that a drifting laser cannot pass: verifying a
+            # detection costs two fresh sweeps, so the two readings are seconds
+            # apart, while the capture window is half a feature half-width. On
+            # the characterization device -- 1-3 mV/s of drift against a 0.889 mV
+            # window -- any honest pair of verifications is 2-3 mV apart and was
+            # refused, however well the walk had converged.
+            #
+            # 1. Are these the same crossing? The scale for that is the distance
+            #    to the next feature, which is what the neighbour guard already
+            #    derives; the capture window says nothing about it.
+            # rejection_bound_v is already defined as the offset beyond which a
+            # re-detection is a different crossing rather than a moved one, so
+            # it is the threshold -- not half of it. On the field device that
+            # bound is 7.1 mV and an honest pair of verifications is 2-3 mV
+            # apart; halving it would leave 7% of headroom.
+            neighbour_bound = window.bound_v
+            if neighbour_bound is not None and drift_v > neighbour_bound:
+                raise _TrackingIdentityChanged(
+                    f"The two final detections were {drift_v * 1e3:.3f} mV apart, "
+                    f"past the {neighbour_bound * 1e3:.3f} mV neighbour bound: "
+                    "they are not the same crossing."
+                )
+            # 2. Is it slow enough to hand over? What matters is not how far the
+            #    feature moved while being verified, but how far it will move
+            #    between the last detection and the lock engaging -- the settle
+            #    the approach already waits. Comparing a multi-second drift
+            #    against a capture window the handover never spans is what made
+            #    this unsatisfiable.
+            interval_s = max(0.0, two_at - one_at)
+            handover_s = max(0.0, float(approach.settle_ms) / 1000.0)
+            if interval_s > 1e-3:
+                drift_rate_v_s = drift_v / interval_s
+                predicted_v = drift_rate_v_s * handover_s
+                if predicted_v > tolerance:
+                    raise ValueError(
+                        f"The feature is drifting at {drift_rate_v_s * 1e3:.2f} mV/s "
+                        f"({drift_v * 1e3:.3f} mV between two detections "
+                        f"{interval_s:.2f} s apart), so it moves "
+                        f"{predicted_v * 1e3:.3f} mV during the {handover_s * 1e3:.0f} ms "
+                        f"handover -- outside the {tolerance * 1e3:.3f} mV capture "
+                        f"window (capture_fraction {float(approach.capture_fraction):g} "
+                        f"x feature half-width "
+                        f"{float(settings.half_range_sweep_v) * 1e3:.3f} mV). "
+                        "Shorten settle_ms, or stabilise the laser."
+                    )
+            elif drift_v > tolerance:
+                # No usable interval to derive a rate from: fall back to the
+                # displacement, which is all that can be said.
                 raise ValueError(
                     f"The two final detections were {drift_v * 1e3:.3f} mV apart, "
                     f"outside the {tolerance * 1e3:.3f} mV acceptance window "
                     f"(capture_fraction {float(approach.capture_fraction):g} x feature "
-                    f"half-width {float(settings.half_range_sweep_v) * 1e3:.3f} mV). "
-                    "The feature is moving faster than the scan can be verified."
+                    f"half-width {float(settings.half_range_sweep_v) * 1e3:.3f} mV)."
                 )
             stages.append({
                 "kind": "final_verify", "center_v": center_v, "amplitude_v": amplitude_v,
