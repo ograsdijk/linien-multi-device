@@ -1,10 +1,13 @@
-import { useMemo, useState, type CSSProperties } from 'react';
+import { useMemo, useRef, useState, type CSSProperties } from 'react';
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
+import { useHotkeys } from '@mantine/hooks';
 import {
   ActionIcon,
   Button,
   Card,
+  Chip,
+  Collapse,
   Group,
   Menu,
   Modal,
@@ -16,20 +19,32 @@ import {
 import {
   IconChevronDown,
   IconChevronLeft,
+  IconChevronRight,
   IconDevices,
+  IconLayoutSidebarRightExpand,
   IconPencil,
+  IconSearch,
   IconTemperature,
   IconTrash,
+  IconX,
 } from '@tabler/icons-react';
 import type {
   AutoRelockStatus,
   Device,
   DeviceStatus,
   LockIndicatorSnapshot,
+  StreamMessage,
 } from '../types';
 import { toDeviceListDragId } from '../features/devices/dragIds';
 import { resolveConnectionDisplay } from '../features/connection/connectionState';
 import { resolveLockDisplay, resolveRelockTag } from '../features/locks/lockState';
+import {
+  DEVICE_FILTER_TAGS,
+  filterDevices,
+  resolveFilterAlias,
+  type DeviceFilterTag,
+} from '../features/devices/deviceFilter';
+import { DeviceDetailModal } from './DeviceDetailModal';
 import { RpTemperatureLine } from './RpTemperatureLine';
 
 // Operator actions on the Red Pitaya telemetry service. `install` also enables
@@ -79,10 +94,11 @@ type DeviceListProps = {
   onInstallTelemetryAll: (keys: string[]) => Promise<void>;
   onStartTelemetryAll: (keys: string[]) => Promise<void>;
   onRequestDiagnostics: (device: Device) => void;
+  onStateUpdate?: (deviceKey: string, message: StreamMessage) => void;
   telemetryBusyKeys?: Record<string, boolean>;
 };
 
-type SortableDeviceCardProps = {
+type DeviceRowProps = {
   device: Device;
   status?: DeviceStatus;
   indicator?: LockIndicatorSnapshot;
@@ -91,6 +107,9 @@ type SortableDeviceCardProps = {
   inActiveGroup: boolean;
   canAddToGroup: boolean;
   sortable: boolean;
+  expanded: boolean;
+  onToggleExpanded: (key: string) => void;
+  onOpenDetail: (device: Device) => void;
   onEdit: (device: Device) => void;
   onDelete: (key: string) => Promise<void>;
   onAddToGroup: (key: string) => void;
@@ -105,7 +124,10 @@ type SortableDeviceCardProps = {
   telemetryBusy: boolean;
 };
 
-function SortableDeviceCard({
+// One line per device when collapsed. Everything the old card showed below the
+// title is behind the expander: at fleet size the panel was one device tall,
+// which made finding a board a scrolling exercise.
+function DeviceRow({
   device,
   status,
   indicator,
@@ -114,6 +136,9 @@ function SortableDeviceCard({
   inActiveGroup,
   canAddToGroup,
   sortable,
+  expanded,
+  onToggleExpanded,
+  onOpenDetail,
   onEdit,
   onDelete,
   onAddToGroup,
@@ -126,7 +151,7 @@ function SortableDeviceCard({
   onRequestDiagnostics,
   onTelemetryCommand,
   telemetryBusy,
-}: SortableDeviceCardProps) {
+}: DeviceRowProps) {
   const {
     attributes,
     listeners,
@@ -181,6 +206,22 @@ function SortableDeviceCard({
     : recovery?.phase === 'failed'
       ? `Reboot failed: ${recovery.error ?? 'unknown error'}`
       : null;
+  // dnd-kit's 6px activation constraint lets a click and a drag share the same
+  // element, but it does not swallow the click that follows a drop -- without
+  // this the row would toggle open every time it was reordered.
+  const pressOriginRef = useRef<{ x: number; y: number } | null>(null);
+  const handleHeadPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    pressOriginRef.current = { x: event.clientX, y: event.clientY };
+  };
+  const handleHeadClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    const origin = pressOriginRef.current;
+    pressOriginRef.current = null;
+    if (origin) {
+      const moved = Math.hypot(event.clientX - origin.x, event.clientY - origin.y);
+      if (moved > 6) return;
+    }
+    onToggleExpanded(device.key);
+  };
   const wrapperStyle: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -198,205 +239,251 @@ function SortableDeviceCard({
       data-dragging={isDragging ? 'true' : undefined}
     >
       <Card
-        padding="sm"
+        padding={6}
         radius="md"
         withBorder
         style={cardStyle}
-        className="device-card-sortable"
+        className="device-card-sortable device-row"
         data-dragging={isDragging ? 'true' : undefined}
         data-sortable={sortable ? 'true' : 'false'}
-        {...(sortable ? attributes : {})}
-        {...(sortable ? listeners : {})}
+        data-expanded={expanded ? 'true' : undefined}
       >
-        <Group justify="space-between" align="center">
-          <div>
-            <Group gap={4} align="center" wrap="nowrap">
-              <Text fw={600}>{device.name || 'Unnamed device'}</Text>
-              <ActionIcon
-                size="xs"
-                variant="subtle"
-                color="orange"
-                aria-label={`Edit ${device.name || 'device'}`}
-                onClick={() => onEdit(device)}
-                disabled={recoveryActive}
-              >
-                <IconPencil size={12} />
-              </ActionIcon>
-            </Group>
-            <Text size="xs" c="dimmed">
+        {/* Drag listeners live on the collapsed header only, so the buttons
+            revealed below never compete with the sortable sensor. */}
+        <Group
+          gap={6}
+          wrap="nowrap"
+          align="center"
+          className="device-row-head"
+          onPointerDownCapture={handleHeadPointerDown}
+          onClick={handleHeadClick}
+          {...(sortable ? attributes : {})}
+          {...(sortable ? listeners : {})}
+        >
+          <ActionIcon
+            size="xs"
+            variant="subtle"
+            color="gray"
+            aria-label={expanded ? `Collapse ${device.name || 'device'}` : `Expand ${device.name || 'device'}`}
+          >
+            {expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+          </ActionIcon>
+          <div className="device-row-title">
+            <Text fw={600} size="sm" truncate>
+              {device.name || 'Unnamed device'}
+            </Text>
+            <Text size="xs" c="dimmed" truncate>
               {device.host}:{device.port}
             </Text>
-            <RpTemperatureLine
-              status={status}
-              deviceKey={device.key}
-              busy={telemetryBusy}
-              onAction={(action) => {
-                // 'update' is an install of the newer bundled binary.
-                void onTelemetryCommand(device.key, action === 'update' ? 'install' : action);
-              }}
-            />
-            {connectionDisplay.show ? (
-              <Text size="xs" c="dimmed">{connectionDisplay.tooltip}</Text>
-            ) : status?.last_error ? (
-              <Text size="xs" c="red">{status.last_error}</Text>
-            ) : null}
-            {recoveryLabel ? (
-              <Text size="xs" c={recovery?.phase === 'failed' ? 'red' : 'orange'}>
-                {recoveryLabel}
-              </Text>
-            ) : null}
           </div>
-          <Group gap={6} align="center">
-            <div className={`device-tag status-${state}`}>{tagLabel}</div>
-            {connectionDisplay.show ? (
-              <div
-                className={`device-tag diag-${connectionDisplay.color}`}
-                title={connectionDisplay.tooltip}
-              >
-                {connectionDisplay.label}
-              </div>
-            ) : null}
-            <div className={`device-tag status-lock-${lockDisplay.uiState}`}>
-              {lockDisplay.label}
-            </div>
-            <button
-              type="button"
-              className={`device-tag device-tag-button status-lock-${autoRelockDisplay.uiState}`}
-              onClick={() => onToggleAutoRelock(device.key, !autoRelockDisplay.enabled)}
-              disabled={autoRelockBusy}
-              style={{
-                cursor: autoRelockBusy ? 'default' : 'pointer',
-                opacity: autoRelockBusy ? 0.6 : 1,
-              }}
-              title="Toggle auto relock"
-            >
-              {autoRelockDisplay.label}
-            </button>
-            <Menu shadow="md" position="bottom-end" withinPortal>
-              <Menu.Target>
-                <ActionIcon
-                  size="sm"
-                  variant="subtle"
-                  color="gray"
-                  loading={telemetryBusy}
-                  aria-label={`Telemetry actions for ${device.name || 'device'}`}
-                  title="Red Pitaya telemetry"
-                >
-                  <IconTemperature size={14} />
-                </ActionIcon>
-              </Menu.Target>
-              <Menu.Dropdown>
-                <Menu.Label>Red Pitaya telemetry</Menu.Label>
-                <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'install')}>
-                  {telemetryInstalled ? 'Update / reinstall' : 'Install'}
-                </Menu.Item>
-                <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'start')}>
-                  Start
-                </Menu.Item>
-                <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'stop')}>
-                  Stop
-                </Menu.Item>
-                <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'restart')}>
-                  Restart
-                </Menu.Item>
-                <Menu.Divider />
-                <Menu.Item
-                  color="red"
-                  onClick={() => void onTelemetryCommand(device.key, 'uninstall')}
-                >
-                  Uninstall
-                </Menu.Item>
-              </Menu.Dropdown>
-            </Menu>
-          </Group>
-        </Group>
-        <Group mt="sm" gap="xs" style={{ paddingRight: 34 }}>
-          <Button
-            size="xs"
-            variant="light"
-            onClick={() => onAddToGroup(device.key)}
-            disabled={!canAddToGroup || inActiveGroup}
-          >
-            {inActiveGroup ? 'In group' : 'Add to group'}
-          </Button>
-          <Button
-            size="xs"
-            variant="light"
-            color="blue"
-            onClick={() => {
-              void onStartServer(device.key);
-            }}
-            disabled={Boolean(connected) || Boolean(connecting) || recoveryActive}
-          >
-            Start server
-          </Button>
-          {connected ? (
-            <>
-              <Button
-                size="xs"
-                color="red"
-                variant="light"
-                onClick={() => {
-                  void onDisconnect(device.key);
-                }}
-              >
-                Disconnect
-              </Button>
-              <Button
-                size="xs"
-                color="red"
-                variant="subtle"
-                onClick={() => onRequestShutdown(device)}
-                disabled={!connected || recoveryActive}
-              >
-                Shutdown
-              </Button>
-            </>
-          ) : (
-            <Button
-              size="xs"
-              color="green"
-              variant="light"
-              onClick={() => {
-                void onConnect(device.key);
-              }}
-              disabled={Boolean(connecting) || recoveryActive}
-            >
-              Connect
-            </Button>
-          )}
-          <Button
-            size="xs"
-            color="red"
-            variant="outline"
-            onClick={() => onRequestReboot(device)}
-            disabled={Boolean(connecting) || recoveryActive}
-          >
-            {recoveryActive ? 'Rebooting' : 'Reboot board'}
-          </Button>
-          <Button
-            size="xs"
-            variant="light"
+          <div className={`device-tag status-${state}`}>{tagLabel}</div>
+          <div className={`device-tag status-lock-${lockDisplay.uiState}`}>
+            {lockDisplay.label}
+          </div>
+          <ActionIcon
+            size="sm"
+            variant="subtle"
             color="gray"
-            onClick={() => onRequestDiagnostics(device)}
-            title="Why did this board reset, or why did linien-server stop?"
+            aria-label={`Details for ${device.name || 'device'}`}
+            title="Device overview"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenDetail(device);
+            }}
           >
-            Diagnostics
-          </Button>
+            <IconLayoutSidebarRightExpand size={14} />
+          </ActionIcon>
         </Group>
-        <ActionIcon
-          size="sm"
-          color="red"
-          variant="subtle"
-          aria-label={`Remove ${device.name || 'device'}`}
-          onClick={() => {
-            void onDelete(device.key);
-          }}
-          disabled={recoveryActive}
-          style={{ position: 'absolute', right: 8, bottom: 8 }}
-        >
-          <IconTrash size={14} />
-        </ActionIcon>
+
+        <Collapse in={expanded}>
+          <div className="device-row-body">
+            <Group justify="space-between" align="flex-start" wrap="nowrap">
+              <div style={{ minWidth: 0 }}>
+                <Group gap={4} align="center" wrap="nowrap">
+                  <ActionIcon
+                    size="xs"
+                    variant="subtle"
+                    color="orange"
+                    aria-label={`Edit ${device.name || 'device'}`}
+                    onClick={() => onEdit(device)}
+                    disabled={recoveryActive}
+                  >
+                    <IconPencil size={12} />
+                  </ActionIcon>
+                  <Text size="xs" c="dimmed">
+                    Edit device
+                  </Text>
+                </Group>
+                <RpTemperatureLine
+                  status={status}
+                  deviceKey={device.key}
+                  busy={telemetryBusy}
+                  onAction={(action) => {
+                    // 'update' is an install of the newer bundled binary.
+                    void onTelemetryCommand(device.key, action === 'update' ? 'install' : action);
+                  }}
+                />
+                {connectionDisplay.show ? (
+                  <Text size="xs" c="dimmed">{connectionDisplay.tooltip}</Text>
+                ) : status?.last_error ? (
+                  <Text size="xs" c="red">{status.last_error}</Text>
+                ) : null}
+                {recoveryLabel ? (
+                  <Text size="xs" c={recovery?.phase === 'failed' ? 'red' : 'orange'}>
+                    {recoveryLabel}
+                  </Text>
+                ) : null}
+              </div>
+              <Group gap={6} align="center" wrap="nowrap">
+                {connectionDisplay.show ? (
+                  <div
+                    className={`device-tag diag-${connectionDisplay.color}`}
+                    title={connectionDisplay.tooltip}
+                  >
+                    {connectionDisplay.label}
+                  </div>
+                ) : null}
+                <button
+                  type="button"
+                  className={`device-tag device-tag-button status-lock-${autoRelockDisplay.uiState}`}
+                  onClick={() => onToggleAutoRelock(device.key, !autoRelockDisplay.enabled)}
+                  disabled={autoRelockBusy}
+                  style={{
+                    cursor: autoRelockBusy ? 'default' : 'pointer',
+                    opacity: autoRelockBusy ? 0.6 : 1,
+                  }}
+                  title="Toggle auto relock"
+                >
+                  {autoRelockDisplay.label}
+                </button>
+                <Menu shadow="md" position="bottom-end" withinPortal>
+                  <Menu.Target>
+                    <ActionIcon
+                      size="sm"
+                      variant="subtle"
+                      color="gray"
+                      loading={telemetryBusy}
+                      aria-label={`Telemetry actions for ${device.name || 'device'}`}
+                      title="Red Pitaya telemetry"
+                    >
+                      <IconTemperature size={14} />
+                    </ActionIcon>
+                  </Menu.Target>
+                  <Menu.Dropdown>
+                    <Menu.Label>Red Pitaya telemetry</Menu.Label>
+                    <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'install')}>
+                      {telemetryInstalled ? 'Update / reinstall' : 'Install'}
+                    </Menu.Item>
+                    <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'start')}>
+                      Start
+                    </Menu.Item>
+                    <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'stop')}>
+                      Stop
+                    </Menu.Item>
+                    <Menu.Item onClick={() => void onTelemetryCommand(device.key, 'restart')}>
+                      Restart
+                    </Menu.Item>
+                    <Menu.Divider />
+                    <Menu.Item
+                      color="red"
+                      onClick={() => void onTelemetryCommand(device.key, 'uninstall')}
+                    >
+                      Uninstall
+                    </Menu.Item>
+                  </Menu.Dropdown>
+                </Menu>
+              </Group>
+            </Group>
+            <Group mt="xs" gap="xs" style={{ paddingRight: 34 }}>
+              <Button
+                size="xs"
+                variant="light"
+                onClick={() => onAddToGroup(device.key)}
+                disabled={!canAddToGroup || inActiveGroup}
+              >
+                {inActiveGroup ? 'In group' : 'Add to group'}
+              </Button>
+              <Button
+                size="xs"
+                variant="light"
+                color="blue"
+                onClick={() => {
+                  void onStartServer(device.key);
+                }}
+                disabled={Boolean(connected) || Boolean(connecting) || recoveryActive}
+              >
+                Start server
+              </Button>
+              {connected ? (
+                <>
+                  <Button
+                    size="xs"
+                    color="red"
+                    variant="light"
+                    onClick={() => {
+                      void onDisconnect(device.key);
+                    }}
+                  >
+                    Disconnect
+                  </Button>
+                  <Button
+                    size="xs"
+                    color="red"
+                    variant="subtle"
+                    onClick={() => onRequestShutdown(device)}
+                    disabled={!connected || recoveryActive}
+                  >
+                    Shutdown
+                  </Button>
+                </>
+              ) : (
+                <Button
+                  size="xs"
+                  color="green"
+                  variant="light"
+                  onClick={() => {
+                    void onConnect(device.key);
+                  }}
+                  disabled={Boolean(connecting) || recoveryActive}
+                >
+                  Connect
+                </Button>
+              )}
+              <Button
+                size="xs"
+                color="red"
+                variant="outline"
+                onClick={() => onRequestReboot(device)}
+                disabled={Boolean(connecting) || recoveryActive}
+              >
+                {recoveryActive ? 'Rebooting' : 'Reboot board'}
+              </Button>
+              <Button
+                size="xs"
+                variant="light"
+                color="gray"
+                onClick={() => onRequestDiagnostics(device)}
+                title="Why did this board reset, or why did linien-server stop?"
+              >
+                Diagnostics
+              </Button>
+            </Group>
+            <ActionIcon
+              size="sm"
+              color="red"
+              variant="subtle"
+              aria-label={`Remove ${device.name || 'device'}`}
+              onClick={() => {
+                void onDelete(device.key);
+              }}
+              disabled={recoveryActive}
+              style={{ position: 'absolute', right: 8, bottom: 8 }}
+            >
+              <IconTrash size={14} />
+            </ActionIcon>
+          </div>
+        </Collapse>
       </Card>
     </div>
   );
@@ -427,6 +514,7 @@ export function DeviceList({
   onInstallTelemetryAll,
   onStartTelemetryAll,
   onRequestDiagnostics,
+  onStateUpdate,
   telemetryBusyKeys,
 }: DeviceListProps) {
   const [opened, setOpened] = useState(false);
@@ -439,8 +527,67 @@ export function DeviceList({
   const [telemetryAllBusy, setTelemetryAllBusy] = useState(false);
   const [telemetryStartAllBusy, setTelemetryStartAllBusy] = useState(false);
   const [telemetryAllOpen, setTelemetryAllOpen] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const [filterTags, setFilterTags] = useState<DeviceFilterTag[]>([]);
+  // One row open at a time: letting them all expand would restore the very
+  // scrolling this panel was collapsed to avoid.
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [detailKey, setDetailKey] = useState<string | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
   const activeSet = useMemo(() => new Set(activeKeys), [activeKeys]);
-  const sortable = sortMode === 'manual';
+  const filterActive = searchText.trim().length > 0 || filterTags.length > 0;
+  // Dropping a card into a filtered subset would persist an order derived from
+  // rows that are not on screen, so manual reordering waits for a clear list.
+  const sortable = sortMode === 'manual' && !filterActive;
+  const visibleDevices = useMemo(
+    () =>
+      filterDevices(devices, searchText, filterTags, {
+        statuses,
+        lockIndicators,
+        autoRelockStates,
+      }),
+    [autoRelockStates, devices, filterTags, lockIndicators, searchText, statuses]
+  );
+  const detailDevice = useMemo(
+    () => (detailKey ? devices.find((device) => device.key === detailKey) ?? null : null),
+    [detailKey, devices]
+  );
+
+  useHotkeys([['mod+K', () => searchRef.current?.focus()]]);
+
+  const addFilterTag = (tag: DeviceFilterTag) => {
+    setFilterTags((prev) => (prev.includes(tag) ? prev : [...prev, tag]));
+  };
+
+  const clearFilters = () => {
+    setSearchText('');
+    setFilterTags([]);
+  };
+
+  // A typed status word becomes a chip rather than staying loose text, so the
+  // chip row is always the full truth about what is being filtered.
+  const handleSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      clearFilters();
+      event.currentTarget.blur();
+      return;
+    }
+    if (event.key === 'Enter' || event.key === ' ') {
+      const tag = resolveFilterAlias(searchText);
+      if (tag) {
+        event.preventDefault();
+        addFilterTag(tag);
+        setSearchText('');
+      }
+      return;
+    }
+    if (event.key === 'Backspace' && searchText === '' && filterTags.length > 0) {
+      event.preventDefault();
+      setFilterTags((prev) => prev.slice(0, -1));
+    }
+  };
+
   const connectableDevices = useMemo(
     () => devices.filter((device) => {
       const status = statuses[device.key];
@@ -629,22 +776,74 @@ export function DeviceList({
           </ActionIcon>
         </Group>
       </Group>
-      <Select
+
+      <TextInput
+        ref={searchRef}
         size="xs"
-        label="Sort"
-        value={sortMode}
-        data={DEVICE_SORT_OPTIONS}
-        onChange={(value) => {
-          if (value) onSortModeChange(value as DeviceSortMode);
-        }}
+        placeholder="Search devices…"
+        aria-label="Search devices"
+        value={searchText}
+        onChange={(event) => setSearchText(event.currentTarget.value)}
+        onKeyDown={handleSearchKeyDown}
+        leftSection={<IconSearch size={14} />}
+        rightSection={
+          filterActive ? (
+            <ActionIcon
+              size="xs"
+              variant="subtle"
+              color="gray"
+              aria-label="Clear filters"
+              onClick={clearFilters}
+            >
+              <IconX size={12} />
+            </ActionIcon>
+          ) : (
+            <Text size="xs" c="dimmed" pr={4}>
+              ⌘K
+            </Text>
+          )
+        }
       />
+      <Chip.Group
+        multiple
+        value={filterTags}
+        onChange={(value) => setFilterTags(value as DeviceFilterTag[])}
+      >
+        <Group gap={4}>
+          {DEVICE_FILTER_TAGS.map(({ tag, label }) => (
+            <Chip key={tag} value={tag} size="xs" variant="outline">
+              {label}
+            </Chip>
+          ))}
+        </Group>
+      </Chip.Group>
+
+      <Group justify="space-between" align="flex-end" gap="xs" wrap="nowrap">
+        <Select
+          size="xs"
+          label="Sort"
+          value={sortMode}
+          data={DEVICE_SORT_OPTIONS}
+          onChange={(value) => {
+            if (value) onSortModeChange(value as DeviceSortMode);
+          }}
+          style={{ flex: '0 0 130px' }}
+        />
+        {filterActive ? (
+          <Text size="xs" c="dimmed" ta="right">
+            {visibleDevices.length} of {devices.length} shown
+            {sortMode === 'manual' ? ' · clear filters to reorder' : ''}
+          </Text>
+        ) : null}
+      </Group>
+
       <Stack gap="xs" className="device-list-scroll">
         <SortableContext
-          items={devices.map((device) => toDeviceListDragId(device.key))}
+          items={visibleDevices.map((device) => toDeviceListDragId(device.key))}
           strategy={verticalListSortingStrategy}
         >
-          {devices.map((device) => (
-            <SortableDeviceCard
+          {visibleDevices.map((device) => (
+            <DeviceRow
               key={device.key}
               device={device}
               status={statuses[device.key]}
@@ -654,6 +853,11 @@ export function DeviceList({
               inActiveGroup={activeSet.has(device.key)}
               canAddToGroup={canAddToGroup}
               sortable={sortable}
+              expanded={expandedKey === device.key}
+              onToggleExpanded={(key) =>
+                setExpandedKey((prev) => (prev === key ? null : key))
+              }
+              onOpenDetail={(target) => setDetailKey(target.key)}
               onEdit={openEdit}
               onDelete={onDelete}
               onAddToGroup={onAddToGroup}
@@ -668,10 +872,52 @@ export function DeviceList({
               telemetryBusy={Boolean(telemetryBusyKeys?.[device.key])}
             />
           ))}
+          {visibleDevices.length === 0 ? (
+            <Text size="xs" c="dimmed" ta="center" py="sm">
+              {devices.length === 0
+                ? 'No devices configured.'
+                : 'No devices match the current filters.'}
+            </Text>
+          ) : null}
         </SortableContext>
       </Stack>
 
-      <Modal opened={opened} onClose={() => setOpened(false)} title={editingKey ? 'Edit device' : 'Add device'}>
+      {detailDevice ? (
+        <DeviceDetailModal
+          device={detailDevice}
+          status={statuses[detailDevice.key]}
+          indicator={lockIndicators[detailDevice.key]}
+          autoRelock={
+            autoRelockStates[detailDevice.key] ??
+            statuses[detailDevice.key]?.auto_relock ??
+            undefined
+          }
+          autoRelockBusy={Boolean(autoRelockBusyKeys?.[detailDevice.key])}
+          telemetryBusy={Boolean(telemetryBusyKeys?.[detailDevice.key])}
+          inActiveGroup={activeSet.has(detailDevice.key)}
+          canAddToGroup={canAddToGroup}
+          onClose={() => setDetailKey(null)}
+          onEdit={openEdit}
+          onDelete={onDelete}
+          onAddToGroup={onAddToGroup}
+          onToggleAutoRelock={onToggleAutoRelock}
+          onStartServer={onStartServer}
+          onConnect={onConnect}
+          onDisconnect={onDisconnect}
+          onRequestShutdown={setShutdownDevice}
+          onRequestReboot={setRebootDevice}
+          // Diagnostics is its own full-width modal; close this one first so the
+          // two never stack.
+          onRequestDiagnostics={(target) => {
+            setDetailKey(null);
+            onRequestDiagnostics(target);
+          }}
+          onTelemetryCommand={onTelemetryCommand}
+          onStateUpdate={onStateUpdate}
+        />
+      ) : null}
+
+      <Modal opened={opened} onClose={() => setOpened(false)} title={editingKey ? 'Edit device' : 'Add device'} zIndex={440}>
         <Stack>
           <TextInput
             label="Name"
@@ -760,11 +1006,14 @@ export function DeviceList({
           </Group>
         </Stack>
       </Modal>
+      {/* Above the detail modal (400): a destructive confirmation raised from
+          inside it must stay readable and on top. */}
       <Modal
         opened={rebootDevice !== null}
         onClose={closeRebootModal}
         title="Reboot Red Pitaya?"
         centered
+        zIndex={440}
       >
         <Stack>
           <Text size="sm">
@@ -800,6 +1049,7 @@ export function DeviceList({
         onClose={() => setShutdownDevice(null)}
         title="Shutdown server?"
         centered
+        zIndex={440}
       >
         <Stack>
           <Text size="sm">

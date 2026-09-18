@@ -726,6 +726,7 @@ export function App() {
             onInstallTelemetryAll={installTelemetryAll}
             onStartTelemetryAll={startTelemetryAll}
             onRequestDiagnostics={setDiagnosticsDevice}
+            onStateUpdate={updateState}
             telemetryBusyKeys={telemetryBusyKeys}
           />
         </AppShell.Navbar>

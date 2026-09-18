@@ -105,6 +105,35 @@ body {
   opacity: 0.22;
 }
 
+.device-row {
+  cursor: default;
+}
+
+.device-row-head {
+  cursor: grab;
+  padding: 2px;
+}
+
+.device-row[data-sortable='false'] .device-row-head {
+  cursor: pointer;
+}
+
+.device-row-head:active {
+  cursor: grabbing;
+}
+
+/* Name and host have to give way inside a 320px navbar; without a zero
+   min-width the flex item refuses to shrink and the tags fall off the row. */
+.device-row-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.device-row-body {
+  position: relative;
+  padding: 6px 2px 28px;
+}
+
 .device-card-drag-overlay {
   pointer-events: none;
   box-shadow: 0 18px 38px rgba(39, 28, 18, 0.22);
