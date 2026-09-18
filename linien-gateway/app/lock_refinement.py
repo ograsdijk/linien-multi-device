@@ -69,8 +69,6 @@ _CENTER_MOVE_EPSILON_V = 1e-6
 # Slack on the sweep-rail comparison, comfortably above double-precision noise
 # on 1.0 - amplitude and far below anything the hardware resolves.
 _RAIL_EPSILON_V = 1e-9
-# Fixed-point rounds for the safe-narrowing solve. It converges in three.
-_SAFE_NARROWING_ITERATIONS = 5
 # Below this, the narrowing SCHEDULE has computed no meaningful cut -- the walk
 # is done, not stalled. Distinct from _CENTER_MOVE_EPSILON_V: this compares
 # amplitudes, not sweep-centre voltages.
@@ -234,11 +232,34 @@ def min_safe_amplitude_v(
     spf = max(0.0, float(shift_per_fraction or 0.0))
     if amplitude <= 1e-12:
         return None
-    candidate = max(float(floor_v), 1e-9)
-    for _ in range(_SAFE_NARROWING_ITERATIONS):
-        fraction = max(0.0, 1.0 - (candidate / amplitude))
-        needed = (offset + spf * fraction) / _WINDOW_KEEP_FRACTION
-        candidate = max(needed, float(floor_v))
+    # Solved, not iterated. The requirement is
+    #
+    #     c >= (offset + spf * (1 - c / amplitude)) / _WINDOW_KEEP_FRACTION
+    #
+    # whose right side falls as c rises, so the smallest admissible c is the
+    # single crossing point -- available in closed form:
+    #
+    #     c* = (offset + spf) / (_WINDOW_KEEP_FRACTION + spf / amplitude)
+    #
+    # This was a five-round fixed-point iteration, which is a contraction only
+    # while spf < _WINDOW_KEEP_FRACTION * amplitude. On an actuator whose
+    # apparent feature position is more sensitive to width than that -- the
+    # field case was spf 0.289 V per unit fraction at amplitude 0.212 V, a
+    # contraction factor of 1.5 -- the iteration does not converge. It settles
+    # into a two-cycle (0.1556 <-> 0.2411 V), and round five happened to land
+    # on the high branch, which reads as "above the current amplitude" and so
+    # as "no cut is safe". The walk refused at a stage where 0.1896 V was a
+    # perfectly legal narrowing, and the refusal was decided by the parity of
+    # the iteration count.
+    #
+    # Past the crossing the shift term is gone and the requirement is the flat
+    # c >= offset / _WINDOW_KEEP_FRACTION, so when that alone exceeds the
+    # current amplitude nothing narrower can hold the target either.
+    if offset >= _WINDOW_KEEP_FRACTION * amplitude:
+        return None
+    candidate = max(
+        float(floor_v), (offset + spf) / (_WINDOW_KEEP_FRACTION + spf / amplitude)
+    )
     if candidate >= amplitude:
         return None
     return candidate
@@ -382,9 +403,23 @@ def plan_refinement_step(
             # Nothing this stage can do keeps the feature in view: the centre is
             # as close as one bounded step and the rails allow, and no width
             # that still narrows leaves the target inside.
+            # Name the bound that actually bit. The message used to blame the
+            # rails unconditionally; in the field it did so at a centre of
+            # +0.4048 V with the rail at 0.7880 V, 383 mV away, which sent the
+            # diagnosis in the wrong direction for a whole round of testing.
+            rail_v = 1.0 - abs(next_amplitude)
+            if abs(combined_center) >= rail_v - _RAIL_EPSILON_V:
+                held_by = f"the sweep rails hold the center at {combined_center:+.4f} V"
+            elif abs(combined_center - center_v) >= centre_budget - _CENTER_MOVE_EPSILON_V:
+                held_by = (
+                    f"one stage may move the center only {centre_budget * 1e3:.1f} mV "
+                    f"(from {center_v:+.4f} V to {combined_center:+.4f} V)"
+                )
+            else:
+                held_by = f"the center reached {combined_center:+.4f} V"
             reason = (
-                f"The sweep rails hold the center at {combined_center:+.4f} V "
-                f"and the target is {target_v:+.4f} V, which no narrowing can "
+                f"{held_by} and the target is {target_v:+.4f} V, "
+                f"{abs(residual_offset) * 1e3:.1f} mV away, which no narrowing can "
                 "bring into view without losing it. Move the laser closer to "
                 "the feature, or start from a narrower scan."
             )

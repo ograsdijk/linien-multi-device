@@ -3488,6 +3488,7 @@ class DeviceSession:
                     next_center = step.center_v
                 before_v = float(target.target_voltage)
                 before_amplitude = abs(amplitude_v)
+                before_center = float(center_v)
                 before_detector = detector
                 moved_at = self._set_sweep_geometry(
                     next_center, next_amplitude, settle_s=geometry_settle_s
@@ -3516,9 +3517,26 @@ class DeviceSession:
                 # it to the shift estimate spends the stage allowance on it,
                 # which is what left a narrowing stage with no centre budget at
                 # all: it took the width change and skipped the centring.
+                # A narrowing stage moves the centre in the same register
+                # write, and both changes move the apparent feature. Dividing
+                # the WHOLE observed move by the width fraction alone charges
+                # the centre's share to the width, and the smaller the cut the
+                # larger the bogus coefficient: the field case cut 22.6 mV of
+                # half-range while commanding the centre 40.3 mV, and the
+                # resulting 27.8 mV move over a 0.096 fraction read as 0.289 V
+                # per unit fraction -- double the 0.144 the same walk had
+                # measured on stages where the width did dominate. The max()
+                # below then made that permanent, and it throttled every
+                # subsequent cut and centre step until the walk gave up.
+                # So only a stage whose width change outweighs its centre
+                # change is allowed to speak for the width. Both are sweep
+                # volts, so the comparison carries no scale of its own.
+                width_delta_v = max(0.0, before_amplitude - abs(amplitude_v))
+                center_delta_v = abs(float(center_v) - before_center)
                 if (
                     width_fraction > _REFINEMENT_MIN_MEASURABLE_FRACTION
                     and detector == before_detector
+                    and width_delta_v >= center_delta_v
                 ):
                     observed = width_shift_v / width_fraction
                     # Keep the worst seen: one gentle stage must not talk the
@@ -3533,6 +3551,7 @@ class DeviceSession:
                     "detector": detector, "metrics": coarse_metrics if detector == "coarse" else None,
                     "sideband_offset_v": target.sideband_offset_v,
                     "width_shift_v": width_shift_v,
+                    "center_shift_v": center_delta_v,
                     "shift_per_fraction_v": shift_per_fraction,
                     "bounds": step.bounds,
                 })

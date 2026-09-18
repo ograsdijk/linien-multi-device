@@ -397,6 +397,7 @@ export type AutoLockScanResult = {
       rail_v?: number;
       next_amplitude_v?: number;
       width_shift_v?: number;
+      center_shift_v?: number;
       shift_per_fraction_v?: number | null;
     }>;
     restored?: boolean;

@@ -327,3 +327,86 @@ def test_a_coarse_reading_is_never_judged_against_a_strict_baseline():
             _target(0.20), amplitude_v=0.4477, detector="strict",
             resolution_samples=4.07,
         )
+
+
+# ------------------------------------------------------------ field case 5
+# "The sweep rails hold the center at +0.4048 V" -- with the rail at 0.7880 V,
+# 383 mV away. The real stop was inside min_safe_amplitude_v, whose five-round
+# fixed point diverges once the actuator's shift coefficient exceeds
+# _WINDOW_KEEP_FRACTION x the current amplitude. The field stage had
+# spf 0.2890 V per unit fraction at amplitude 0.2120 V: a contraction factor
+# of 1.5, a two-cycle between 0.1556 V and 0.2411 V, and round five on the high
+# branch -- which reads as "no cut is safe" purely by the parity of the loop.
+
+_DIVERGENT_AMPLITUDE_V = 0.21203012978894104
+_DIVERGENT_SHIFT_PER_FRACTION = 0.2890252242537811
+_DIVERGENT_OFFSET_V = 0.140
+_DIVERGENT_FLOOR_V = 0.10820284981490627
+
+
+def test_a_shift_coefficient_past_the_contraction_limit_still_has_a_safe_cut():
+    # Well past the limit: the old iteration cannot be trusted here at all.
+    limit = 0.9 * _DIVERGENT_AMPLITUDE_V
+    assert _DIVERGENT_SHIFT_PER_FRACTION > limit
+
+    safe = min_safe_amplitude_v(
+        _DIVERGENT_AMPLITUDE_V,
+        _DIVERGENT_OFFSET_V,
+        _DIVERGENT_SHIFT_PER_FRACTION,
+        _DIVERGENT_FLOOR_V,
+    )
+
+    assert safe is not None, "a legal narrowing was reported as impossible"
+    assert safe == pytest.approx(0.1896, abs=5e-4)
+    # It is a narrowing, and it holds the target after the shift it causes.
+    assert _DIVERGENT_FLOOR_V <= safe < _DIVERGENT_AMPLITUDE_V
+    shifted = _DIVERGENT_OFFSET_V + _DIVERGENT_SHIFT_PER_FRACTION * (
+        1.0 - safe / _DIVERGENT_AMPLITUDE_V
+    )
+    assert shifted <= 0.9 * safe + 1e-9
+
+
+def test_a_shift_coefficient_past_the_contraction_limit__fails_when_iterated():
+    """The pre-fix arithmetic, verbatim, on the same numbers."""
+    candidate = max(_DIVERGENT_FLOOR_V, 1e-9)
+    for _ in range(5):
+        fraction = max(0.0, 1.0 - (candidate / _DIVERGENT_AMPLITUDE_V))
+        candidate = max(
+            (_DIVERGENT_OFFSET_V + _DIVERGENT_SHIFT_PER_FRACTION * fraction) / 0.9,
+            _DIVERGENT_FLOOR_V,
+        )
+    assert candidate >= _DIVERGENT_AMPLITUDE_V, "iteration would have returned a cut"
+    # ... and one more round flips the answer, which is the whole objection.
+    fraction = max(0.0, 1.0 - (candidate / _DIVERGENT_AMPLITUDE_V))
+    candidate = max(
+        (_DIVERGENT_OFFSET_V + _DIVERGENT_SHIFT_PER_FRACTION * fraction) / 0.9,
+        _DIVERGENT_FLOOR_V,
+    )
+    assert candidate < _DIVERGENT_AMPLITUDE_V
+
+
+def test_an_offset_past_the_keep_fraction_of_the_span_has_no_safe_cut():
+    """The flat branch: no shift at all, but the target is simply too far out."""
+    assert min_safe_amplitude_v(0.2, 0.19, 0.0, 0.01) is None
+    assert min_safe_amplitude_v(0.2, 0.15, 0.0, 0.01) == pytest.approx(0.15 / 0.9)
+
+
+def test_a_refusal_names_the_step_allowance_when_the_rails_are_far_away():
+    settings = _settings(half_range_sweep_v=0.001524, max_center_step_signal_widths=1.0)
+    step = plan_refinement_step(
+        settings,
+        center_v=0.4047675963415047,
+        amplitude_v=_DIVERGENT_AMPLITUDE_V,
+        target_v=0.5780148514918598,
+        sideband_offset_v=0.030142045807807445,
+        detector="strict",
+        trace_length=2048,
+        shift_per_fraction=_DIVERGENT_SHIFT_PER_FRACTION,
+    )
+    if step.action == "refuse":
+        assert "sweep rails" not in step.reason, step.reason
+        assert "may move the center only" in step.reason
+    else:
+        # The closed-form solve is expected to keep this stage moving instead.
+        assert step.action in {"narrow", "recenter"}
+        assert step.amplitude_v <= _DIVERGENT_AMPLITUDE_V
