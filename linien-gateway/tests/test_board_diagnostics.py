@@ -1,3 +1,7 @@
+import builtins
+import struct
+from types import SimpleNamespace
+
 import pytest
 
 from app import board_diagnostics as bd
@@ -308,20 +312,47 @@ def _reboot_bundle(stdout):
     return bd.collect_diagnostics(Device(), connection_factory=factory_for(conn))
 
 
-def test_an_empty_reset_register_reads_as_lost_power():
+def test_an_empty_reset_register_is_not_read_as_lost_power():
+    """It used to be. A field board reading 0x00410000 -- a watchdog timeout
+    and a power-on standing together -- shows the bits accumulate, so a power
+    loss leaves bit 22 SET and an empty register means only that something
+    cleared it."""
     bundle = _reboot_bundle("REBOOT_STATUS=0x00000000")
 
     status = bundle["reboot_status"]
     assert status["value"] == 0
-    assert status["power_on_reset"] is True
-    assert "lost power" in status["description"]
+    assert status["causes"] == []
+    assert status["power_on"] is False
+    assert "lost power" not in status["description"]
+    assert "nothing has been recorded" in status["description"]
 
 
-def test_a_software_reboot_is_not_reported_as_lost_power():
+def test_a_power_on_is_the_bit_being_set_not_the_register_being_empty():
+    bundle = _reboot_bundle("REBOOT_STATUS=0x00400000")
+
+    status = bundle["reboot_status"]
+    assert status["power_on"] is True
+    assert status["watchdog"] is False
+
+
+def test_a_watchdog_and_a_power_on_can_stand_together():
+    """The field reading that settled how the register behaves."""
+    bundle = _reboot_bundle("REBOOT_STATUS=0x00410000")
+
+    status = bundle["reboot_status"]
+    assert status["causes"] == ["SWDT_RST", "POR"]
+    assert status["watchdog"] is True
+    assert status["power_on"] is True
+    assert status["software_reboot"] is False
+    assert "accumulate" in status["description"]
+
+
+def test_a_software_reboot_is_reported_as_one():
     bundle = _reboot_bundle("REBOOT_STATUS=0x00080000")
 
     status = bundle["reboot_status"]
-    assert status["power_on_reset"] is False
+    assert status["software_reboot"] is True
+    assert status["watchdog"] is False
     assert "SLC_RST" in status["description"]
 
 
@@ -332,10 +363,13 @@ def test_a_watchdog_reset_names_the_watchdog():
 
 
 def test_the_unverified_bits_say_so():
-    """16-19 are documented; the rest follow the TRM's ordering and have not
-    been confirmed here, so a decode resting on them must not read as fact."""
-    assert "unverified" in bd.describe_reboot_status(1 << 22)
+    """16-19 are documented and 22 was confirmed in the field; 20 and 21 still
+    follow only the TRM's ordering, so a decode resting on them must not read
+    as fact."""
+    assert "unverified" in bd.describe_reboot_status(1 << 20)
+    assert "unverified" in bd.describe_reboot_status(1 << 21)
     assert "unverified" not in bd.describe_reboot_status(1 << 19)
+    assert "unverified" not in bd.describe_reboot_status(1 << 22)
 
 
 def test_the_bootloader_scratch_byte_is_not_a_reset_cause():
@@ -451,6 +485,173 @@ def test_reading_the_register_never_touches_the_fpga():
         assert slcr <= address < slcr + bd.REBOOT_STATUS_PAGE_SIZE, hex(address)
     # ...and the SLCR page is nowhere near the FPGA's window on this SoC.
     assert not (0x40000000 <= slcr < 0xC0000000)
+
+
+# --- clearing the reset register -----------------------------------------
+#
+# The bits accumulate and carry no timestamp, so without a clear a board that
+# has run for months reads as every cause it has ever seen. A field board came
+# back 0x00410000 -- a watchdog timeout and a power-on standing together --
+# which is what established the accumulation in the first place.
+
+
+class FakeSlcrPage:
+    """A stand-in for the mapped SLCR page.
+
+    Models the write protection, and can behave as either write-one-to-clear
+    or plain read/write, because the manual does not settle which these bits
+    are and the script has to work on both.
+    """
+
+    def __init__(self, initial, write_one_to_clear):
+        self.buf = bytearray(bd.REBOOT_STATUS_PAGE_SIZE)
+        self.write_one_to_clear = write_one_to_clear
+        self.unlocked = False
+        self.wrote_while_locked = False
+        reg = bd.REBOOT_STATUS_PAGE_OFFSET
+        self.buf[reg : reg + 4] = struct.pack("<I", initial)
+
+    def __setitem__(self, where, data):
+        offset = where.start
+        value = struct.unpack("<I", data)[0]
+        if offset == bd.SLCR_UNLOCK_ADDR - bd.REBOOT_STATUS_PAGE_ADDR:
+            self.unlocked = value == bd.SLCR_UNLOCK_KEY
+            return
+        if offset == bd.SLCR_LOCK_ADDR - bd.REBOOT_STATUS_PAGE_ADDR:
+            self.unlocked = False
+            return
+        if not self.unlocked:
+            self.wrote_while_locked = True
+        if self.write_one_to_clear:
+            current = struct.unpack("<I", bytes(self.buf[offset : offset + 4]))[0]
+            value = current & ~value & 0xFFFFFFFF
+        self.buf[offset : offset + 4] = struct.pack("<I", value)
+
+    def __getitem__(self, where):
+        return bytes(self.buf[where.start : where.stop])
+
+
+def _run_clear_script(page):
+    """Execute the generated script against `page`, returning what it printed.
+
+    The fakes are supplied through `__import__` rather than as globals: the
+    script imports mmap and os itself, which rebinds anything put in the
+    globals dict under those names.
+    """
+    printed = []
+    fake_mmap = SimpleNamespace(
+        mmap=lambda *a, **k: page, MAP_SHARED=1, PROT_READ=1, PROT_WRITE=2
+    )
+    fake_os = SimpleNamespace(open=lambda *a, **k: 3, O_RDWR=2, O_SYNC=0)
+    fakes = {"mmap": fake_mmap, "os": fake_os}
+
+    def fake_import(name, *args, **kwargs):
+        if name in fakes:
+            return fakes[name]
+        return builtins.__import__(name, *args, **kwargs)
+
+    exec(  # noqa: S102 - running the very text we ship is the point
+        compile(bd._clear_reboot_status_script(), "<clear>", "exec"),
+        {
+            "__builtins__": {**vars(builtins), "__import__": fake_import},
+            "print": lambda *a: printed.append(" ".join(str(x) for x in a)),
+        },
+    )
+    return printed
+
+
+@pytest.mark.parametrize("write_one_to_clear", [True, False])
+def test_the_clear_works_whichever_way_the_bits_behave(write_one_to_clear):
+    """UG585 does not say whether 22:16 are write-one-to-clear or plain
+    read/write, so the script tries the first and falls back to the second."""
+    page = FakeSlcrPage(0x00410000, write_one_to_clear)
+
+    printed = _run_clear_script(page)
+
+    assert "BEFORE=0x00410000" in printed
+    assert "AFTER=0x00000000" in printed
+    assert page.wrote_while_locked is False
+
+
+def test_the_clear_says_which_way_worked():
+    """Reported rather than assumed: the operator is never told "cleared" on
+    the strength of a guess about the silicon."""
+    w1c = _run_clear_script(FakeSlcrPage(0x00410000, True))
+    plain = _run_clear_script(FakeSlcrPage(0x00410000, False))
+
+    assert "METHOD=write-one-to-clear" in w1c
+    assert "METHOD=write-zero" in plain
+
+
+def test_the_clear_leaves_the_bootloader_scratch_byte_alone():
+    """Bits 31:24 are the BootROM's and u-boot's, not a reset cause."""
+    page = FakeSlcrPage(0xA5410000, False)
+
+    printed = _run_clear_script(page)
+
+    assert "AFTER=0xa5000000" in printed
+
+
+def test_the_clear_relocks_slcr_even_when_the_write_fails():
+    """Leaving SLCR unlocked would outlive the diagnostic and is the one
+    lasting harm this action could do."""
+    page = FakeSlcrPage(0x00410000, False)
+    original = FakeSlcrPage.__setitem__
+
+    def explode(self, where, data):
+        if where.start == bd.REBOOT_STATUS_PAGE_OFFSET:
+            raise OSError("bus error")
+        original(self, where, data)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(FakeSlcrPage, "__setitem__", explode)
+        with pytest.raises(OSError):
+            _run_clear_script(page)
+
+    assert page.unlocked is False
+
+
+def test_a_board_that_prints_no_reading_is_not_reported_as_cleared():
+    conn = FakeConnection(rules={"/dev/mem": FakeResult(stdout="", stderr="no python")})
+
+    result = bd.clear_reboot_status(Device(), connection_factory=factory_for(conn))
+
+    assert result["ok"] is False
+    assert "no python" in result["error"]
+
+
+def test_a_successful_clear_reports_what_was_there_before():
+    """The reading is destroyed by the action, so the action has to carry it."""
+    conn = FakeConnection(
+        rules={
+            "/dev/mem": FakeResult(
+                stdout="BEFORE=0x00410000\nAFTER=0x00000000\nMETHOD=write-zero\n"
+            )
+        }
+    )
+
+    result = bd.clear_reboot_status(Device(), connection_factory=factory_for(conn))
+
+    assert result["ok"] is True
+    assert result["before"] == 0x00410000
+    assert result["after"] == 0
+    assert result["method"] == "write-zero"
+    assert "SWDT_RST" in result["before_description"]
+
+
+def test_bits_that_refuse_to_clear_are_not_reported_as_success():
+    conn = FakeConnection(
+        rules={
+            "/dev/mem": FakeResult(
+                stdout="BEFORE=0x00410000\nAFTER=0x00410000\nMETHOD=none\n"
+            )
+        }
+    )
+
+    result = bd.clear_reboot_status(Device(), connection_factory=factory_for(conn))
+
+    assert result["ok"] is False
+    assert "did not clear" in result["error"]
 
 
 # --- enabling persistence ------------------------------------------------

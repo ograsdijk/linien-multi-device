@@ -65,14 +65,19 @@ REBOOT_STATUS_PREFIX = "REBOOT_STATUS="
 REBOOT_STATUS_PAGE_SIZE = 4096
 REBOOT_STATUS_PAGE_ADDR = int(REBOOT_STATUS_ADDR, 16) & ~(REBOOT_STATUS_PAGE_SIZE - 1)
 REBOOT_STATUS_PAGE_OFFSET = int(REBOOT_STATUS_ADDR, 16) - REBOOT_STATUS_PAGE_ADDR
-# Bit -> what caused the last reset. Bits 16-19 are as documented for the
-# Zynq-7000 (UG585 section 6.3.12); 20-22 follow the same order the TRM lists
-# the reset sources in, but I could not verify them against the manual here --
-# hence `unverified`, and hence the raw value stays in the section output.
+# Bit -> a reset cause the register has recorded. Bits 16-19 are as documented
+# for the Zynq-7000 (UG585 section 6.3.12); 20 and 21 follow the same order the
+# TRM lists the reset sources in and are not confirmed here -- hence
+# `unverified`, and hence the raw value stays in the section output.
 #
-# Confirm per image before trusting a decode: `reboot` the board and read it,
-# then pull the power and read it again. A power cycle must come back with
-# nothing set (power-on reset clears the register); a warm reboot must not.
+# Bit 22 was confirmed in the field: a board came back 0x00410000, i.e. 22 and
+# 16 set together. Which also settles how the register behaves, and it is not
+# how this code originally assumed. The bits ACCUMULATE. Were each reset to
+# clear the register and set one bit, a power-on and a later watchdog timeout
+# could never both be standing. So a reading is every cause since the register
+# was last cleared, not the last reset -- and an empty register means only
+# that something cleared it (some bootloaders do), never "the board lost
+# power". Bit 22 being set is what a power-on leaves behind.
 REBOOT_STATUS_BITS: tuple[tuple[int, str, str, bool], ...] = (
     (16, "SWDT_RST", "system watchdog timeout", False),
     (17, "AWDT0_RST", "CPU0 watchdog timeout", False),
@@ -80,8 +85,14 @@ REBOOT_STATUS_BITS: tuple[tuple[int, str, str, bool], ...] = (
     (19, "SLC_RST", "software reboot (SLCR), e.g. `reboot`", False),
     (20, "DBG_RST", "debug reset over JTAG", True),
     (21, "SRST_B", "external reset pin asserted", True),
-    (22, "POR", "power-on reset", True),
+    (22, "POR", "power-on reset", False),
 )
+
+# The causes worth a dedicated flag on the summary, because they are what an
+# operator is actually asking about: did it hang, or did someone restart it.
+REBOOT_STATUS_WATCHDOG_BITS = (16, 17, 18)
+REBOOT_STATUS_SOFTWARE_BIT = 19
+REBOOT_STATUS_POWER_ON_BIT = 22
 
 JOURNALD_DROPIN_DIR = "/etc/systemd/journald.conf.d"
 # `99-` so it wins: systemd applies drop-ins in lexical order, and a `00-`
@@ -470,7 +481,12 @@ def collect_diagnostics(
 
 
 def _reboot_status_summary(sections: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Decoded reset cause for the bundle header, or None if unavailable."""
+    """Decoded reset causes for the bundle header, or None if unavailable.
+
+    `power_on` is the POR bit, not the absence of every other bit. The earlier
+    reading -- no bit set means the board lost power -- was exactly backwards,
+    and the field value that showed it stood at 0x00410000.
+    """
     for section in sections:
         if section.get("name") != "reboot_status":
             continue
@@ -480,9 +496,16 @@ def _reboot_status_summary(sections: list[dict[str, Any]]) -> dict[str, Any] | N
             return None
         return {
             "value": value,
-            "power_on_reset": not any(
-                value & (1 << bit) for bit, _n, _m, _u in REBOOT_STATUS_BITS
+            "causes": [
+                name
+                for bit, name, _meaning, _unverified in REBOOT_STATUS_BITS
+                if value & (1 << bit)
+            ],
+            "watchdog": any(
+                value & (1 << bit) for bit in REBOOT_STATUS_WATCHDOG_BITS
             ),
+            "software_reboot": bool(value & (1 << REBOOT_STATUS_SOFTWARE_BIT)),
+            "power_on": bool(value & (1 << REBOOT_STATUS_POWER_ON_BIT)),
             "description": description,
         }
     return None
@@ -544,10 +567,13 @@ def parse_reboot_status(output: str) -> int | None:
 def describe_reboot_status(value: int | None) -> str | None:
     """Plain-language reading of REBOOT_STATUS, or None if there is nothing.
 
-    Deliberately hedged. An empty register is the interesting case -- it means
-    the last reset was a power-on reset, i.e. the board lost power rather than
-    rebooting itself -- but only the watchdog and software bits are verified
-    here, so anything resting on the others says so.
+    Every cause SINCE THE REGISTER WAS LAST CLEARED, not the last reset: the
+    bits accumulate (see REBOOT_STATUS_BITS). So this deliberately says
+    "recorded" rather than "caused", and an empty register is reported as
+    nothing recorded rather than as a power loss.
+
+    Bits 20 and 21 remain unverified against the manual, so a decode resting
+    on them still says so.
     """
     if value is None:
         return None
@@ -561,16 +587,21 @@ def describe_reboot_status(value: int | None) -> str | None:
     tail = f" (boot state 0x{state:02x})" if state else ""
     if not causes:
         return (
-            f"0x{value:08x}: no reset-cause bit set, which is what a power-on "
-            "reset leaves behind -- the board lost power rather than resetting "
-            "itself. Confirm the register behaves that way on this image "
-            "before relying on it." + tail
+            f"0x{value:08x}: no reset-cause bit set, so nothing has been "
+            "recorded since the register was last cleared. Some bootloaders "
+            "clear it at every boot; this is not evidence of a power loss."
+            + tail
         )
     listed = "; ".join(
         f"{name} ({meaning}{', bit position unverified' if unverified else ''})"
         for name, meaning, unverified in causes
     )
-    return f"0x{value:08x}: {listed}." + tail
+    return (
+        f"0x{value:08x}: {listed}. These accumulate, so they are every cause "
+        "recorded since the register was last cleared, in no particular order "
+        "and with no timestamp -- the board timeline dates the restart."
+        + tail
+    )
 
 
 def _persistent_journal(sections: list[dict[str, Any]]) -> bool | None:
@@ -595,6 +626,143 @@ def _persistent_journal(sections: list[dict[str, Any]]) -> bool | None:
         # False here would nag about a board we could not read, and True would
         # promise logs that may not survive.
         return None
+    return None
+
+
+# Clearing the register needs SLCR's write protection lifted and put back.
+# These two magic words are fixed by the silicon (UG585 section 4.1.2); they
+# are not configuration.
+SLCR_UNLOCK_ADDR = 0xF8000008
+SLCR_UNLOCK_KEY = 0xDF0D
+SLCR_LOCK_ADDR = 0xF8000004
+SLCR_LOCK_KEY = 0x767B
+
+# Markers the clear script prints its readings behind, so the result is parsed
+# rather than pattern-matched out of prose.
+REBOOT_CLEAR_BEFORE_PREFIX = "BEFORE="
+REBOOT_CLEAR_AFTER_PREFIX = "AFTER="
+REBOOT_CLEAR_METHOD_PREFIX = "METHOD="
+
+
+def _clear_reboot_status_script() -> str:
+    """Python that clears SLCR REBOOT_STATUS and proves whether it worked.
+
+    Two ways to clear it, because the manual does not settle which these bits
+    are. Write the value back first, which clears them if they are write-one-
+    to-clear and is a no-op if they are plain read/write; re-read; and only if
+    they are still standing write zeros instead. Whichever worked is reported,
+    along with the readings before and after, so the operator is never told
+    "cleared" on the strength of an assumption.
+
+    The bootloader scratch byte in 31:24 is preserved either way -- it is not
+    a reset cause and something else owns it.
+    """
+    page = REBOOT_STATUS_PAGE_ADDR
+    size = REBOOT_STATUS_PAGE_SIZE
+    reg = REBOOT_STATUS_PAGE_OFFSET
+    unlock = SLCR_UNLOCK_ADDR - page
+    lock = SLCR_LOCK_ADDR - page
+    causes = sum(1 << bit for bit, _n, _m, _u in REBOOT_STATUS_BITS)
+    return (
+        "import mmap, os, struct\n"
+        "f = os.open('/dev/mem', os.O_RDWR | getattr(os, 'O_SYNC', 0))\n"
+        f"m = mmap.mmap(f, {size}, mmap.MAP_SHARED, "
+        "mmap.PROT_READ | mmap.PROT_WRITE, "
+        f"offset={page})\n"
+        "def rd(off):\n"
+        "    return struct.unpack('<I', m[off:off + 4])[0]\n"
+        "def wr(off, value):\n"
+        "    m[off:off + 4] = struct.pack('<I', value)\n"
+        f"before = rd({reg})\n"
+        f"print('{REBOOT_CLEAR_BEFORE_PREFIX}0x%08x' % before)\n"
+        f"wr({unlock}, {SLCR_UNLOCK_KEY})\n"
+        "try:\n"
+        f"    wr({reg}, before & {causes})\n"
+        f"    after = rd({reg})\n"
+        "    method = 'write-one-to-clear'\n"
+        f"    if after & {causes}:\n"
+        # `& 0xFFFFFFFF` because Python's ~ is signed and struct would refuse
+        # the negative that falls out of it.
+        f"        wr({reg}, before & ~{causes} & 0xFFFFFFFF)\n"
+        f"        after = rd({reg})\n"
+        "        method = 'write-zero'\n"
+        f"    if after & {causes}:\n"
+        "        method = 'none (the bits did not clear)'\n"
+        "finally:\n"
+        f"    wr({lock}, {SLCR_LOCK_KEY})\n"
+        f"print('{REBOOT_CLEAR_AFTER_PREFIX}0x%08x' % after)\n"
+        f"print('{REBOOT_CLEAR_METHOD_PREFIX}%s' % method)\n"
+    )
+
+
+def clear_reboot_status(
+    device: Any, *, connection_factory: Callable[..., Any] | None = None
+) -> dict[str, Any]:
+    """Zero the recorded reset causes so the next incident stands alone.
+
+    The bits accumulate and carry no timestamp, so a board that has been
+    running for months reads as every cause it has ever seen. Clearing after
+    reading is what makes the next reading mean "since I last looked".
+
+    This is the only hardware write in the diagnostics feature, and it is
+    deliberately an explicit operator action rather than something `collect`
+    does: an automatic clear on every read would let a second collect erase a
+    cause nobody had looked at yet.
+    """
+    script = _clear_reboot_status_script()
+    # Written to a file and run, not passed with -c: the script is multi-line
+    # and crossing SSH as one quoted argument is how quoting bugs get in.
+    remote = "/tmp/linien-clear-reset-cause.py"
+    command = (
+        "printf %s " + shell_single_quote(script) + " > " + remote + " && "
+        "{ python3 " + remote + " || python " + remote + "; }; "
+        "rm -f " + remote
+    )
+    try:
+        with _open(device, connection_factory) as conn:
+            exited, stdout, stderr = run_remote(
+                conn, device, command, timeout=SECTION_TIMEOUT_S + 5.0
+            )
+    except Exception as exc:  # noqa: BLE001 - reported, never raised at the API
+        logger.debug("clearing the reset register failed", exc_info=True)
+        return {"ok": False, "error": str(exc)}
+
+    before = _prefixed_value(stdout, REBOOT_CLEAR_BEFORE_PREFIX)
+    after = _prefixed_value(stdout, REBOOT_CLEAR_AFTER_PREFIX)
+    method = _prefixed_text(stdout, REBOOT_CLEAR_METHOD_PREFIX)
+    causes = sum(1 << bit for bit, _n, _m, _u in REBOOT_STATUS_BITS)
+    cleared = after is not None and not (after & causes)
+    if before is None or after is None:
+        detail = (stderr or stdout or "").strip()[:300]
+        return {
+            "ok": False,
+            "error": detail or f"the board printed no reading (exited {exited})",
+        }
+    return {
+        "ok": cleared,
+        "error": None if cleared else "the bits did not clear",
+        "before": before,
+        "after": after,
+        "method": method,
+        "before_description": describe_reboot_status(before),
+    }
+
+
+def _prefixed_value(output: str, prefix: str) -> int | None:
+    text = _prefixed_text(output, prefix)
+    if text is None:
+        return None
+    try:
+        return int(text, 16) if text.lower().startswith("0x") else int(text, 10)
+    except ValueError:
+        return None
+
+
+def _prefixed_text(output: str, prefix: str) -> str | None:
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip()
     return None
 
 

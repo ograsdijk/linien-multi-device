@@ -332,7 +332,49 @@ wrongly declared the lock lost.
 - its journal for this boot **and the previous one**;
 - the kernel ring buffer, with watchdog/reset/OOM/panic lines pre-extracted;
 - `pstore` crash remnants, memory, disk, load, and FPGA manager state;
-- the `rp-telemetry` journal.
+- the `rp-telemetry` journal;
+- the Zynq reset-cause register.
+
+### Reset cause
+
+`journalctl` cannot tell you why a board reset, because a board that lost power
+wrote nothing before it went. SLCR `REBOOT_STATUS` can: a watchdog timeout, a
+software `reboot`, an external reset and a power-on each leave a different bit.
+
+Reading it needed five attempts before one worked on a real board. Field images
+turned out to carry no `devmem`, no `devmem2`, no Red Pitaya `monitor` and no
+busybox at all; and `dd` on `/dev/mem` fails with `EFAULT` no matter the image,
+because `read()` copies from `__va(phys)`, which is valid only for RAM — SLCR
+is IO space and the kernel reaches it only through `ioremap`, i.e. `mmap`. So
+the reader that works is a python3 `mmap` of the SLCR page, and python3 is a
+fair assumption on a board whose Linien server is itself a Python process. Each
+reader is tried whenever the previous produced nothing, rather than whenever its
+tool is absent: one that exists and fails silently used to end the chain.
+
+**The bits accumulate.** A field board read `0x00410000` — a system watchdog
+timeout and a power-on standing together, which is impossible if each reset
+cleared the register first. So a reading is every cause recorded *since the
+register was last cleared*, in no order and with no timestamp; the board
+timeline is what dates the restart. This corrected an earlier reading in this
+codebase that was exactly backwards: an empty register was reported as "the
+board lost power", when in fact a power-on **sets** bit 22 and an empty register
+means only that something cleared it.
+
+Because they accumulate, `POST /api/devices/{key}/diagnostics/clear-reset-cause`
+zeroes them, so the next incident stands alone. It is the only hardware write in
+the feature and stays an explicit operator action rather than something
+`collect` does — an automatic clear on every read would let a second collect
+erase a cause nobody had looked at yet. The pre-clear reading goes into the
+timeline before it is destroyed. SLCR's write protection is lifted and put back
+in a `finally`, and since the manual does not settle whether these bits are
+write-one-to-clear or plain read/write, the script tries the first, reads back,
+falls back to the second, and reports which one worked rather than assuming.
+Bits 31:24 are the bootloader's scratch space and are preserved.
+
+Bits 16–19 are as documented in UG585; bit 22 was confirmed in the field. Bits
+20 and 21 follow the order the TRM lists the reset sources in and are unverified
+— a decode resting on them says so, and the raw value stays in the section
+output either way.
 
 Every command is `timeout`-bounded and every section fails independently —
 these images vary, and a missing tool is a finding, not a reason to lose the

@@ -51,9 +51,11 @@ export function DiagnosticsModal({
     bundle,
     collecting,
     enabling,
+    clearing,
     error,
     collect,
     enablePersistentLog,
+    clearResetCause,
   } = useDiagnosticsController({ deviceKey: device?.key ?? null, appendUiErrorLog });
 
   const connectionDisplay = resolveConnectionDisplay(status);
@@ -117,16 +119,35 @@ export function DiagnosticsModal({
         </Group>
 
         {bundle?.reboot_status ? (
+          // "Recorded", not "last reset": the bits accumulate and carry no
+          // timestamp. A watchdog timeout is the one worth colouring, because
+          // it means the software stopped answering rather than someone
+          // restarting the board.
           <Alert
-            color={bundle.reboot_status.power_on_reset ? 'orange' : 'blue'}
+            color={bundle.reboot_status.watchdog ? 'red' : 'blue'}
             variant="light"
             title={
-              bundle.reboot_status.power_on_reset
-                ? 'Last reset: the board lost power'
-                : 'Last reset: the board reset itself'
+              bundle.reboot_status.watchdog
+                ? 'A watchdog timeout is recorded'
+                : bundle.reboot_status.causes.length === 0
+                  ? 'No reset cause recorded'
+                  : 'Reset causes recorded'
             }
           >
-            {bundle.reboot_status.description}
+            <Stack gap="xs" align="flex-start">
+              <Text size="sm">{bundle.reboot_status.description}</Text>
+              {bundle.reboot_status.causes.length > 0 ? (
+                <Button
+                  size="xs"
+                  variant="light"
+                  color="gray"
+                  loading={clearing}
+                  onClick={() => void clearResetCause()}
+                >
+                  Clear recorded causes
+                </Button>
+              ) : null}
+            </Stack>
           </Alert>
         ) : null}
 
