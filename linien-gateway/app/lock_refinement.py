@@ -394,15 +394,36 @@ class IdentityGuard:
     """
 
     def __init__(
-        self, target: Any, resolution_samples: float, *, trace_length: int
+        self,
+        target: Any,
+        resolution_samples: float,
+        *,
+        trace_length: int,
+        detector: str = "strict",
     ) -> None:
         self._slope = target.target_slope_rising
-        self._sideband: float | None = target.sideband_offset_v
-        # Resolution the standing sideband identity was measured at. A
-        # spacing read off a barely-resolved trace is an estimate, not a
-        # reference the rest of the walk must match.
-        self._resolution = resolution_samples if self._sideband is not None else 0.0
+        # One baseline PER DETECTOR: {detector: (sideband_v, resolution)}.
+        #
+        # The two detectors do not measure the same number. Over eight field
+        # runs the coarse tracker reported 32.22 mV mean with 1.86 mV of spread
+        # across scan amplitudes from 0.8 down to 0.45 V, while the strict
+        # detector reported 18.44 mV mean with 7.76 mV of spread, converging
+        # upward as resolution improved (15.8 -> 16.9 -> 17.5 -> 23.6). They sit
+        # a systematic ~1.75x apart, so comparing one against the other tests
+        # which algorithm ran, not whether the crossing changed -- a walk was
+        # aborted for "measuring 32.369 mV against an identity of 17.497 mV"
+        # when both readings were of the same untroubled feature.
+        #
+        # Keeping the baselines apart is the same principle already applied to
+        # resolution: only compare like with like, and let a better measurement
+        # from the SAME estimator supersede a worse one.
+        self._baselines: dict[str, tuple[float, float]] = {}
         self._trace_length = trace_length
+        if target.sideband_offset_v is not None:
+            self._baselines[str(detector)] = (
+                target.sideband_offset_v,
+                resolution_samples,
+            )
 
     def check(
         self,
@@ -419,53 +440,48 @@ class IdentityGuard:
             )
         if not check_sideband:
             return
-        if self._sideband is not None and candidate.sideband_offset_v is not None:
-            # ANY better resolved strict detection REPLACES the identity
-            # rather than being judged against it. The measured spacing is
-            # biased by resolution -- 16.9 mV at 6.1 samples per half-width
-            # and 23.6 mV at 8.8 on the same feature -- so comparing across a
-            # resolution change tests the sweep width, not the identity of
-            # the crossing. Narrowing exists to measure better; rejecting the
-            # better measurement for disagreeing with the worse one rejects
-            # the improvement it was sent to get.
-            #
-            # This used to demand a 1.5x improvement, so that two detections
-            # at one geometry would compare rather than adopt. The final pair
-            # no longer checks the spacing at all, so that margin protected
-            # nothing -- and once narrowing became adaptive the stages got
-            # gentler, a 1.45x stage slipped under it, and the check fired on
-            # the bias it was meant to tolerate. Equal or worse resolution
-            # still compares, which is what a re-centring stage does.
-            if detector == "strict" and resolution_samples > (
-                self._resolution * _SIDEBAND_ADOPTION_MARGIN
-            ):
-                self._sideband = candidate.sideband_offset_v
-                self._resolution = resolution_samples
-                return
-            # Sideband spacing should survive geometry changes. Allow a
-            # generous 35% while the wide trace is under-resolved.
-            tolerance = max(
-                _SIDEBAND_IDENTITY_TOLERANCE_FRACTION * self._sideband,
-                2.0 * abs(amplitude_v) / self._trace_length,
+        if candidate.sideband_offset_v is None:
+            return
+        baseline = self._baselines.get(str(detector))
+        if baseline is None:
+            # First reading from this estimator: it becomes that estimator's
+            # own reference. It is never compared against another's.
+            self._baselines[str(detector)] = (
+                candidate.sideband_offset_v,
+                resolution_samples,
             )
-            if abs(candidate.sideband_offset_v - self._sideband) > tolerance:
-                raise _TrackingIdentityChanged(
-                    "Tracking candidate changed PDH sideband identity: "
-                    f"measured {candidate.sideband_offset_v * 1e3:.3f} mV by the "
-                    f"{detector} detector at {resolution_samples:.2f} samples per "
-                    f"half-width, against an identity of "
-                    f"{self._sideband * 1e3:.3f} mV established at "
-                    f"{self._resolution:.2f} samples "
-                    f"(tolerance {tolerance * 1e3:.3f} mV)."
-                )
-        elif candidate.sideband_offset_v is not None and detector == "strict":
-            # Wide scans may not resolve ±Ω. Once a later one does, make that
-            # spacing part of the identity thereafter -- but only from a
-            # STRICT detection. The coarse tracker measures the spacing a
-            # different way, so letting it set the baseline means later
-            # strict detections are compared against another algorithm's
-            # estimate and rejected over the disagreement, not over any real
-            # change in the feature. It is declared tracking-only; defining
-            # the identity is not tracking.
-            self._sideband = candidate.sideband_offset_v
-            self._resolution = resolution_samples
+            return
+        known_sideband, known_resolution = baseline
+
+        # A better resolved reading REPLACES its estimator's baseline rather
+        # than being judged against it. The spacing is biased by resolution --
+        # this estimator read 16.9 mV at 6.1 samples per half-width and 23.6 mV
+        # at 8.8 on the same feature -- so comparing across a resolution change
+        # tests the sweep width, not the identity of the crossing. Narrowing
+        # exists to measure better; rejecting the better measurement for
+        # disagreeing with the worse one rejects the improvement it was sent
+        # to get. Equal or worse resolution still compares, which is what a
+        # re-centring stage does.
+        if resolution_samples > known_resolution * _SIDEBAND_ADOPTION_MARGIN:
+            self._baselines[str(detector)] = (
+                candidate.sideband_offset_v,
+                resolution_samples,
+            )
+            return
+
+        # Sideband spacing should survive geometry changes. Allow a generous
+        # 35% while the wide trace is under-resolved.
+        tolerance = max(
+            _SIDEBAND_IDENTITY_TOLERANCE_FRACTION * known_sideband,
+            2.0 * abs(amplitude_v) / self._trace_length,
+        )
+        if abs(candidate.sideband_offset_v - known_sideband) > tolerance:
+            raise _TrackingIdentityChanged(
+                "Tracking candidate changed PDH sideband identity: "
+                f"measured {candidate.sideband_offset_v * 1e3:.3f} mV by the "
+                f"{detector} detector at {resolution_samples:.2f} samples per "
+                f"half-width, against an identity of "
+                f"{known_sideband * 1e3:.3f} mV established at "
+                f"{known_resolution:.2f} samples "
+                f"(tolerance {tolerance * 1e3:.3f} mV)."
+            )

@@ -3386,7 +3386,9 @@ class DeviceSession:
                 "detector": detector, "sideband_offset_v": target.sideband_offset_v,
                 "metrics": coarse_metrics,
             })
-            identity = IdentityGuard(target, resolution, trace_length=trace_length)
+            identity = IdentityGuard(
+                target, resolution, trace_length=trace_length, detector=detector
+            )
 
             # Narrow in <=25% reductions until the STRICT detector accepts a
             # trace -- that, not a sample count, is the thing refinement is

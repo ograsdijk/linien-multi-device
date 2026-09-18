@@ -1485,8 +1485,8 @@ def test_a_coarse_sideband_estimate_does_not_become_the_identity(monkeypatch):
 def test_a_recentring_stage_that_changes_the_spacing_is_an_identity_change(monkeypatch):
     """Where the check still protects. A re-centring stage commands the biggest
     moves and does NOT improve resolution, so its spacing is comparable to the
-    standing identity and a disagreement means the walk has been carried onto a
-    different crossing."""
+    baseline THAT SAME detector set, and a disagreement means the walk has been
+    carried onto a different crossing."""
     session, _board = _make_session(
         monkeypatch, _no_error, approach={"enabled": False}
     )
@@ -1495,7 +1495,7 @@ def test_a_recentring_stage_that_changes_the_spacing_is_an_identity_change(monke
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
     monkeypatch.setattr(
         session, "_coarse_auto_lock_target",
-        # Same resolution as the identity, four times the spacing.
+        # Same detector, same resolution as the baseline, four times the spacing.
         lambda settings, after=None: (_result(0.9, 0.20), 0.4, 0.6, 20.0, {}),
     )
 
@@ -1509,12 +1509,50 @@ def test_a_recentring_stage_that_changes_the_spacing_is_an_identity_change(monke
             # re-centres rather than taking the rail-blocked path.
             initial_center_v=0.0, initial_amplitude_v=0.6,
             initial_resolution=20.0,
-            initial_detector="strict", trace_length=2048,
+            initial_detector="coarse", trace_length=2048,
         )
     assert excinfo.value.failure_kind == "identity"
     # The numbers that decided it, which the message used to omit entirely.
     failure = excinfo.value.refinement["failure"]
     assert "200.000 mV" in failure and "50.000 mV" in failure
+
+
+def test_a_coarse_reading_is_not_judged_against_a_strict_baseline(monkeypatch):
+    """The field regression. The strict detector established 17.497 mV and the
+    coarse tracker then read 32.369 mV of the same untroubled feature, 1.85x
+    apart, and the walk aborted. Across eight runs the two estimators sit a
+    systematic ~1.75x apart (coarse 32.22 mV mean, spread 1.86; strict 18.44 mV
+    mean, spread 7.76), so comparing one against the other tests which
+    algorithm ran, not whether the crossing changed."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (
+            _result(0.9, 0.032369), 0.4, 0.6, 20.0, {}
+        ),
+    )
+
+    # Strict baseline at the field value; the coarse stage reads 1.85x that.
+    # It must be taken as this estimator's own first reading, not a violation.
+    try:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            ApproachSettings.from_mapping(session.lock_approach_settings),
+            0.0, 0.6,
+            initial_target=_result(0.9, 0.017497),
+            initial_center_v=0.0, initial_amplitude_v=0.6,
+            initial_resolution=20.0,
+            initial_detector="strict", trace_length=2048,
+        )
+    except session_module.TrajectoryRefinementAborted as exc:
+        assert exc.failure_kind != "identity", (
+            f"aborted on a cross-detector spacing comparison: {exc}"
+        )
 
 
 def test_a_better_resolved_spacing_is_adopted_however_small_the_gain(monkeypatch):
