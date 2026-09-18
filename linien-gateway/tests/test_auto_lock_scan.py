@@ -522,8 +522,8 @@ def _settings(**kw):
 
 def test_a_signal_filling_a_quarter_of_the_scan_is_lockable():
     # sideband +/-0.05 V -> 0.1 V wide signal; exactly a quarter of a 0.4 V span.
-    assert not scan_too_wide_to_lock(_settings(), sweep_amplitude_v=0.2,
-                                     sideband_offset_v=0.05)
+    assert not scan_too_wide_to_lock(_settings(min_signal_scan_fraction=0.25),
+                                     sweep_amplitude_v=0.2, sideband_offset_v=0.05)
 
 
 def test_a_signal_that_is_a_speck_on_the_scan_is_not():
@@ -553,7 +553,9 @@ def test_an_unmeasured_sideband_spacing_does_not_force_narrowing():
 
 
 def test_the_goal_amplitude_is_the_widest_scan_that_passes():
-    settings = _settings()
+    # The fraction is pinned rather than inherited: this asserts the goal is the
+    # widest scan the test admits, for whatever fraction is configured.
+    settings = _settings(min_signal_scan_fraction=0.25)
     amp = max_lockable_amplitude_v(settings, 0.05)
     assert amp == pytest.approx(0.2)
     assert not scan_too_wide_to_lock(settings, sweep_amplitude_v=amp,
@@ -864,3 +866,29 @@ def test_a_scan_too_coarse_to_measure_a_spacing_counts_as_too_wide():
     # An uncalibrated device belongs at the "calibrate first" refusal, not here.
     blank = dataclasses.replace(settings, half_range_sweep_v=0.0)
     assert scan_too_wide_to_lock(blank, wide, None, trace_points=2048) is False
+
+
+def test_the_default_lock_width_is_three_signal_widths_of_centre_travel():
+    """The default is a relationship, not a width.
+
+    `min_signal_scan_fraction` is the reciprocal of twice the longest centre
+    move it permits: the target can sit a half-span out, so a signal filling
+    fraction f of the span is at most 1/(2f) signal widths away. At the old 1/4
+    that was two widths, which made the characterization laser -- error signal
+    33.90 +/- 0.42 mV sideband to sideband, measured over 98 recorded scans --
+    narrow to +/-0.136 V before it would lock, well inside the +/-0.2 V an
+    operator locks it at by hand.
+    """
+    settings = AutoLockScanSettings(signal_type="pdh")
+    assert 1.0 / (2.0 * settings.min_signal_scan_fraction) == pytest.approx(3.0)
+
+    measured_sideband_v = 0.0339
+    goal = max_lockable_amplitude_v(settings, measured_sideband_v)
+    assert goal == pytest.approx(0.203, abs=0.005)
+    assert not scan_too_wide_to_lock(settings, 0.2, measured_sideband_v,
+                                     trace_points=2048)
+
+    # A laser with a signal half this wide gets half the width, not 0.2 V.
+    assert max_lockable_amplitude_v(settings, measured_sideband_v / 2) == pytest.approx(
+        goal / 2
+    )

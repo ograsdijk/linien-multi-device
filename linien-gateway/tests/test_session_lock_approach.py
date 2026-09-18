@@ -1754,6 +1754,9 @@ def test_a_narrowing_that_moves_the_feature_too_far_gentles_the_next_one(monkeyp
         monkeypatch, _no_error, approach={"enabled": False}
     )
     session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    # Pinned, not inherited: this test is about how one cut sizes the next, so
+    # the goal must not move when the default lock width is retuned.
+    session.auto_lock_scan_settings["min_signal_scan_fraction"] = 0.25
     widths: list[float] = []
     monkeypatch.setattr(
         session, "_set_sweep_geometry",

@@ -132,12 +132,13 @@ class AutoLockScanSettings(BaseModel):
         description="Min weaker/stronger lobe ratio (dimensionless).",
     )
     min_signal_scan_fraction: float = Field(
-        default=0.25, ge=0.0, le=1.0,
+        default=1.0 / 6.0, ge=0.0, le=1.0,
         description=(
             "Smallest share of the scan span the whole PDH error signal "
             "(sideband to sideband) may occupy before the scan is treated as "
             "too wide to lock from and is narrowed around the target first. "
-            "0 disables the test."
+            "Its reciprocal over two is the longest centre move this allows, in "
+            "signal widths: 1/6 means three. 0 disables the test."
         ),
     )
     max_center_step_signal_widths: float = Field(

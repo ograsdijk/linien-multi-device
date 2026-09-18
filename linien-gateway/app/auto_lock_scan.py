@@ -86,7 +86,16 @@ class AutoLockScanSettings:
     # jump, and its error grows with its length, so a feature that is a speck
     # on a wide scan is reached by a leap that lands on the wrong one. Narrowing
     # around it first turns that leap into a staircase. 0 disables the test.
-    min_signal_scan_fraction: float = 0.25
+    #
+    # The value is the reciprocal of twice the worst-case move: the target can
+    # sit a half-span from the centre, so a signal occupying fraction f of the
+    # span is at most 1/(2f) signal widths away. 1/6 therefore means "never
+    # command a move longer than three signal widths", and each individual step
+    # is separately bounded to max_center_step_signal_widths, so that distance is
+    # covered in at least three bounded steps rather than one leap. The earlier
+    # 1/4 (two widths) made a laser with a 68 mV error signal narrow to +/-0.136 V
+    # before it would lock, well past the +/-0.2 V an operator locks it by hand.
+    min_signal_scan_fraction: float = 1.0 / 6.0
     # Largest centre step a refinement stage may take, in whole error-signal
     # widths (sideband to sideband). The scan width is an operator setting and
     # says nothing about whether a step is safe; what matters is the distance to
@@ -1240,7 +1249,7 @@ def calibrate_auto_lock_settings(
     # volts: the narrowest meaningful feature is the two samples `half_width_pts`
     # is already floored at, and the widest is the half-trace `_peak_offsets`
     # searched. A fixed millivolt floor would silently widen the calibration of
-    # any laser whose feature is finer than it -- this one's is 1.8 mV.
+    # any laser whose feature is finer than it -- the characterization device calibrates to 1.5 mV.
     half_range_sweep_v = (
         _clamp(
             factors.half_range_margin * feature_half_width_v,
