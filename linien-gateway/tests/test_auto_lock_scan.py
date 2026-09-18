@@ -9,6 +9,7 @@ from app.auto_lock_scan import (
     feature_resolution_samples,
     find_coarse_auto_lock_target,
     find_auto_lock_target,
+    _sideband_offset_pts,
     max_lockable_amplitude_v,
     scan_too_wide_to_lock,
 )
@@ -632,3 +633,146 @@ def test_the_coarse_tracker_reports_the_monitor_level_it_used():
         _two_identical_features(), _monitor_peak_at(0.4), use_monitor=True
     )
     assert candidate.result.monitor_level is not None
+
+
+# --- Sideband spacing must be a measurement, not an assertion ----------------
+#
+# Field payloads from a DFB whose scan carries several features had the strict
+# detector reporting 16-20 mV spacings against the coarse tracker's 32 mV at the
+# same geometry. The spacing is set by the modulation frequency and the laser's
+# tuning coefficient, so the two cannot honestly differ; the strict path was
+# pairing the carrier with a neighbouring feature's crossing. A wrong spacing is
+# worse than none, because it rescales scan_too_wide_to_lock, the refinement
+# centre-step allowance and the tracking identity all at once.
+
+_FIELD_HALF_RANGE_V = 2.275 * 2 * 0.8 / 2047  # 1.778 mV, from resolution 2.275 at ±0.8 V
+_FIELD_SIDEBAND_V = 0.032
+
+
+def _field_settings(**overrides):
+    base = dict(
+        signal_type="pdh",
+        half_range_sweep_v=_FIELD_HALF_RANGE_V,
+        error_min=0.0005,
+        single_error_min=0.0005,
+        min_amplitude=0.0005,
+    )
+    base.update(overrides)
+    return AutoLockScanSettings(**base)
+
+
+def _field_pdh_trace(center_v, amplitude_v, neighbour_dv=None, n=2048, carrier_v=0.4841):
+    """A PDH triplet at the field's feature width, optionally with a neighbour."""
+    v = np.linspace(center_v - amplitude_v, center_v + amplitude_v, n)
+
+    def lobe(v0, strength):
+        u = (v - v0) / _FIELD_HALF_RANGE_V
+        return strength * u / (1.0 + u * u)
+
+    def triplet(v0, strength):
+        return (
+            lobe(v0, strength)
+            + lobe(v0 - _FIELD_SIDEBAND_V, -0.5 * strength)
+            + lobe(v0 + _FIELD_SIDEBAND_V, -0.5 * strength)
+        )
+
+    signal = triplet(carrier_v, 1.0)
+    if neighbour_dv is not None:
+        signal = signal + triplet(carrier_v + neighbour_dv, 0.6)
+    return signal * 0.0022 / np.max(np.abs(signal))
+
+
+def _detect(trace, center_v, amplitude_v, settings):
+    strict = find_auto_lock_target(
+        error_trace_v=trace,
+        monitor_trace_v=None,
+        sweep_center_v=center_v,
+        sweep_amplitude_v=amplitude_v,
+        settings=settings,
+        preferred_slope_rising=True,
+        modulation_frequency_hz=25e6,
+    )
+    coarse = find_coarse_auto_lock_target(
+        error_trace_v=trace,
+        monitor_trace_v=None,
+        sweep_center_v=center_v,
+        sweep_amplitude_v=amplitude_v,
+        settings=settings,
+        preferred_slope_rising=True,
+        modulation_frequency_hz=25e6,
+    )
+    return strict, coarse.result
+
+
+@pytest.mark.parametrize("neighbour_dv", [-0.045, 0.045])
+def test_a_neighbouring_feature_never_yields_a_spacing_below_the_true_one(neighbour_dv):
+    """The crossing of an adjacent feature is nearer than the real sideband."""
+    settings = _field_settings()
+    trace = _field_pdh_trace(0.2649, 0.4, neighbour_dv=neighbour_dv)
+    strict, coarse = _detect(trace, 0.2649, 0.4, settings)
+
+    # Both detectors still place the carrier correctly; only the spacing was at risk.
+    assert strict.target_voltage == pytest.approx(0.4841, abs=3 * _FIELD_HALF_RANGE_V)
+
+    # Either it measures the true spacing or it declines -- never a smaller number.
+    if strict.sideband_offset_v is not None:
+        assert strict.sideband_offset_v == pytest.approx(_FIELD_SIDEBAND_V, rel=0.15)
+    # And it may not contradict the coarse tracker looking at the same trace.
+    if strict.sideband_offset_v is not None and coarse.sideband_offset_v is not None:
+        assert strict.sideband_offset_v == pytest.approx(
+            coarse.sideband_offset_v, rel=0.2
+        )
+
+
+def test_a_spacing_is_never_asserted_from_one_side_alone():
+    """With the upper sideband off the end of the scan there is no pair to average.
+
+    The old code averaged whatever offsets it had, so a single side was returned
+    as if it were the mean of two -- indistinguishable, to every caller, from a
+    measurement that had actually been checked.
+    """
+    settings = _field_settings()
+    # Carrier one sideband's width inside the top rail: +Omega falls outside.
+    center_v, amplitude_v = 0.0, 0.5
+    carrier_v = amplitude_v - 0.5 * _FIELD_SIDEBAND_V
+    trace = _field_pdh_trace(center_v, amplitude_v, carrier_v=carrier_v)
+    strict, _ = _detect(trace, center_v, amplitude_v, settings)
+
+    assert strict.sideband_offset_v is None
+
+
+def test_a_crossing_inside_the_carrier_window_is_not_a_sideband():
+    """A crossing within the calibrated feature width belongs to the carrier.
+
+    Tested on the offset helper directly: a trace crafted to survive the
+    detector's smoother would be testing the smoother, not the exclusion rule.
+    """
+    n = 400
+    anchor = 200
+    error = np.zeros(n)
+    # Carrier: rising through zero at `anchor`.
+    error[:anchor] = -1.0
+    error[anchor:] = 1.0
+    # True -Omega and +Omega falling crossings, 40 samples out on both sides.
+    error[anchor - 40 :] = np.where(
+        np.arange(anchor - 40, n) < anchor, 1.0, error[anchor - 40 :]
+    )
+    error = np.concatenate([
+        np.full(anchor - 40, 1.0),   # above zero
+        np.full(40, -1.0),           # -Omega falling crossing at anchor-40
+        np.full(40, 1.0),            # carrier rising crossing at anchor
+        np.full(n - anchor - 40, -1.0),  # +Omega falling crossing at anchor+40
+    ])
+    assert _sideband_offset_pts(
+        error, anchor, True, exclusion_pts=3
+    ) == pytest.approx(40.0)
+
+    # A crossing 10 samples out, inside a 24-sample carrier window, is not a
+    # sideband: the true pair at ±40 must still be the measurement.
+    noisy = error.copy()
+    noisy[anchor + 10 : anchor + 14] = -1.0
+    assert _sideband_offset_pts(
+        noisy, anchor, True, exclusion_pts=24
+    ) == pytest.approx(40.0)
+    # Without the exclusion window that stray crossing halves the spacing.
+    assert _sideband_offset_pts(noisy, anchor, True, exclusion_pts=1) is None

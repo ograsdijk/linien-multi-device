@@ -32,6 +32,37 @@ import numpy as np
 # crossings that already pass the gates). Internal; not a user setting.
 _MONITOR_SCORE_WEIGHT = 0.5
 
+# A real +/-Omega pair straddles the carrier symmetrically: both offsets are the
+# same physical modulation frequency seen through the same tuning coefficient.
+# Anything measurably lopsided is not a sideband pair -- it is the carrier paired
+# with a neighbouring feature's crossing, which reports a spacing that is simply
+# wrong rather than absent. Internal; not a user setting.
+_SIDEBAND_SYMMETRY_TOLERANCE = 0.35
+
+
+def _symmetric_sideband_offset(
+    left_offset: float | None, right_offset: float | None
+) -> float | None:
+    """Mean of a candidate +/-Omega pair, or None if it is not a pair.
+
+    Both detectors measure the same physical quantity and must apply the same
+    test: a spacing asserted from one side alone cannot be checked, and a
+    lopsided pair means one of the two crossings belongs to something else.
+    Returning None is safe everywhere -- every consumer of `sideband_offset_v`
+    already handles an unresolved spacing, and an unresolved spacing is far
+    less damaging than a confident wrong one, which silently rescales the scan
+    width test, the centre-step allowance and the tracking identity.
+    """
+    if left_offset is None or right_offset is None:
+        return None
+    if left_offset <= 0.0 or right_offset <= 0.0:
+        return None
+    widest = max(left_offset, right_offset)
+    if abs(left_offset - right_offset) > _SIDEBAND_SYMMETRY_TOLERANCE * widest:
+        return None
+    return (left_offset + right_offset) / 2.0
+
+
 
 @dataclass
 class AutoLockScanSettings:
@@ -269,11 +300,10 @@ def find_coarse_auto_lock_target(
         right_pos = int(np.searchsorted(opposite, crossing + exclusion, side="left"))
         if left_pos < 0 or right_pos >= len(opposite):
             return None
-        left_offset = crossing - int(opposite[left_pos])
-        right_offset = int(opposite[right_pos]) - crossing
-        if abs(left_offset - right_offset) > 0.35 * max(left_offset, right_offset):
-            return None
-        return (left_offset + right_offset) / 2.0
+        return _symmetric_sideband_offset(
+            float(crossing - int(opposite[left_pos])),
+            float(int(opposite[right_pos]) - crossing),
+        )
 
     for width in (1, 3, 5):
         signal = _moving_average(raw, width)
@@ -587,16 +617,26 @@ def _crossing_slope_v_per_v(
 
 
 def _sideband_offset_pts(
-    error: np.ndarray, anchor: int, carrier_rising: bool
+    error: np.ndarray, anchor: int, carrier_rising: bool, *, exclusion_pts: int
 ) -> float | None:
-    """Mean distance (in samples) from the carrier crossing to the nearest
-    opposite-slope (sideband) crossings on each side.
+    """Mean distance (in samples) from the carrier crossing to its ±Ω crossings.
 
-    In PDH the ±Ω sideband error features cross zero exactly Ω from the carrier and
-    with the opposite slope, so this distance is the sample-equivalent of Ω."""
+    In PDH the ±Ω sideband error features cross zero exactly Ω from the carrier
+    and with the opposite slope, so this distance is the sample-equivalent of Ω.
+
+    Two crossings of the right slope are not on their own a sideband pair. A
+    crossing within the carrier's own measurement window is part of the carrier
+    (or its noise), and a pair that does not straddle the carrier symmetrically
+    belongs to a neighbouring feature -- both are screened out here, by the same
+    test the coarse tracker applies. Without them a scan carrying more than one
+    feature yields a confident spacing well below the true one, which is worse
+    than no spacing at all: it rescales the scan-width test, the centre-step
+    allowance and the tracking identity, all of which then disagree with the
+    coarse tracker measuring the same laser."""
     n = len(error)
     left_idx: int | None = None
     right_idx: int | None = None
+    exclusion = max(1, int(exclusion_pts))
     for i in range(n - 1):
         a = float(error[i])
         b = float(error[i + 1])
@@ -607,6 +647,8 @@ def _sideband_offset_pts(
         if rising == carrier_rising:
             continue  # same slope as carrier -> not a sideband
         idx = i if abs(a) <= abs(b) else i + 1
+        if abs(idx - anchor) < exclusion:
+            continue  # inside the carrier's own window -> not a sideband
         if idx < anchor:
             if left_idx is None or idx > left_idx:
                 left_idx = idx  # nearest on the left
@@ -614,14 +656,10 @@ def _sideband_offset_pts(
             if right_idx is None or idx < right_idx:
                 right_idx = idx  # nearest on the right
 
-    offsets = []
-    if left_idx is not None and (anchor - left_idx) > 0:
-        offsets.append(anchor - left_idx)
-    if right_idx is not None and (right_idx - anchor) > 0:
-        offsets.append(right_idx - anchor)
-    if not offsets:
-        return None
-    return float(sum(offsets)) / float(len(offsets))
+    return _symmetric_sideband_offset(
+        None if left_idx is None else float(anchor - left_idx),
+        None if right_idx is None else float(right_idx - anchor),
+    )
 
 
 def find_auto_lock_target(
@@ -819,7 +857,12 @@ def find_auto_lock_target(
     hz_per_v: float | None = None
     discriminator_slope_v_per_mhz: float | None = None
     if str(settings.signal_type) == "pdh" and modulation_frequency_hz:
-        off_pts = _sideband_offset_pts(error, best.index, best.target_slope_rising)
+        off_pts = _sideband_offset_pts(
+            error,
+            best.index,
+            best.target_slope_rising,
+            exclusion_pts=max(3, half_range_pts),
+        )
         if off_pts and off_pts > 0 and n_points > 1:
             sideband_offset_v = float(off_pts) * (
                 2.0 * abs(float(sweep_amplitude_v)) / (n_points - 1)
