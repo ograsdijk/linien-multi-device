@@ -23,23 +23,12 @@ LOCK_RESULT_POSTGRES_CONFIG_PATH = USER_DATA_PATH / "manual_lock_postgres.json"
 SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
 logger = logging.getLogger(__name__)
 PostgresEventCallback = Callable[[int, str, str, str, dict[str, Any]], None]
-# The guarded-move columns, declared once and rendered into the CREATE, the
+# The sweep-geometry columns, declared once and rendered into the CREATE, the
 # migration and the INSERT below. Two hand-maintained copies of the same list
 # had nothing keeping them in step.
-APPROACH_COLUMNS: tuple[tuple[str, str], ...] = (
+SWEEP_COLUMNS: tuple[tuple[str, str], ...] = (
     ("sweep_center_v", "DOUBLE PRECISION"),
     ("sweep_amplitude_v", "DOUBLE PRECISION"),
-    ("target_voltage_v", "DOUBLE PRECISION"),
-    ("sweep_center_start_v", "DOUBLE PRECISION"),
-    ("center_move_v", "DOUBLE PRECISION"),
-    ("center_correction_v", "DOUBLE PRECISION"),
-    ("center_offset_v", "DOUBLE PRECISION"),
-    ("capture_tolerance_v", "DOUBLE PRECISION"),
-    ("approach_enabled", "BOOLEAN"),
-    ("approach_direct", "BOOLEAN"),
-    ("approach_from_below", "BOOLEAN"),
-    ("approach_attempts", "INTEGER"),
-    ("approach_detail", "JSONB"),
 )
 
 # psycopg sends a Python str as PostgreSQL ``text`` (StrDumper.oid = 25), and
@@ -50,22 +39,22 @@ _PARAM_CASTS = {"JSONB": "::jsonb"}
 
 
 def _column_definitions() -> str:
-    return "".join(f",\n    {name} {sql}" for name, sql in APPROACH_COLUMNS)
+    return "".join(f",\n    {name} {sql}" for name, sql in SWEEP_COLUMNS)
 
 
 def _add_column_clauses() -> str:
     return ",\n".join(
-        f"    ADD COLUMN IF NOT EXISTS {name} {sql}" for name, sql in APPROACH_COLUMNS
+        f"    ADD COLUMN IF NOT EXISTS {name} {sql}" for name, sql in SWEEP_COLUMNS
     )
 
 
 def _insert_names() -> str:
-    return ",\n".join(f"    {name}" for name, _sql in APPROACH_COLUMNS)
+    return ",\n".join(f"    {name}" for name, _sql in SWEEP_COLUMNS)
 
 
 def _insert_values() -> str:
     return ",\n".join(
-        f"    %({name})s{_PARAM_CASTS.get(sql, '')}" for name, sql in APPROACH_COLUMNS
+        f"    %({name})s{_PARAM_CASTS.get(sql, '')}" for name, sql in SWEEP_COLUMNS
     )
 
 
@@ -95,12 +84,10 @@ ALTER_TABLE_ADD_LOCK_SOURCE_SQL = """
 ALTER TABLE pdh_lock_results
     ADD COLUMN IF NOT EXISTS lock_source TEXT NOT NULL DEFAULT 'manual_lock';
 """
-# The approach columns landed after the table did, so existing deployments pick
-# them up on the next startup rather than needing a hand-run migration. Same
-# idempotent ADD COLUMN IF NOT EXISTS pattern as lock_source above.
-# Existing deployments pick the approach columns up on the next startup rather
-# than needing a hand-run migration, the same idempotent pattern lock_source uses.
-ALTER_TABLE_ADD_APPROACH_SQL = """
+# The sweep columns landed after the table did, so existing deployments pick
+# them up on the next startup rather than needing a hand-run migration, the same
+# idempotent ADD COLUMN IF NOT EXISTS pattern lock_source uses.
+ALTER_TABLE_ADD_SWEEP_SQL = """
 ALTER TABLE pdh_lock_results
 """ + _add_column_clauses() + """;
 """
@@ -347,7 +334,7 @@ class LockResultPostgresService:
         """Create the table and bring an older one up to date. Idempotent."""
         cur.execute(CREATE_TABLE_SQL)
         cur.execute(ALTER_TABLE_ADD_LOCK_SOURCE_SQL)
-        cur.execute(ALTER_TABLE_ADD_APPROACH_SQL)
+        cur.execute(ALTER_TABLE_ADD_SWEEP_SQL)
         cur.execute(CREATE_INDEX_CREATED_SQL)
         cur.execute(CREATE_INDEX_LASER_SQL)
 

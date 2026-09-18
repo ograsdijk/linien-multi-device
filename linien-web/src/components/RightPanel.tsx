@@ -8,7 +8,7 @@ import type {
   AutoLockScanSettings,
   LockIndicatorConfig,
   LockIndicatorSnapshot,
-  LockApproachSettings,
+  LockAcceptanceSettings,
 } from '../types';
 import { useStablePick } from '../hooks/useStablePick';
 import { AutoRelockPanel } from './AutoRelockPanel';
@@ -75,7 +75,7 @@ type RightPanelProps = {
   ) => Promise<AutoLockCalibrationResult>;
   autoLockSettings?: AutoLockScanSettings | null;
   onAutoLockSettingsChange?: (settings: AutoLockScanSettings) => void;
-  lockApproachSettings?: LockApproachSettings | null;
+  lockAcceptanceSettings?: LockAcceptanceSettings | null;
   onStartOptimizationSelection: () => void;
   onAbortOptimizationSelection: () => void;
   onStopTask: (useNew: boolean) => void;
@@ -164,7 +164,7 @@ export function RightPanel(props: RightPanelProps) {
               onCalibrateAutoLock={props.onCalibrateAutoLock}
               autoLockSettingsConfig={props.autoLockSettings}
               onAutoLockSettingsChange={props.onAutoLockSettingsChange}
-              lockApproachSettings={props.lockApproachSettings}
+              lockAcceptanceSettings={props.lockAcceptanceSettings}
               onStopLock={props.onStopLock}
               lockMode={props.lockMode}
               onLockModeChange={props.onLockModeChange}

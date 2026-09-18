@@ -295,67 +295,14 @@ export type AutoLockScanSettings = {
   monitor_threshold: number;
 };
 
-export type LockApproachSettings = {
-  // Guarded sweep-center move. Voltages are sweep volts (x-axis). The acceptance
-  // window is NOT a voltage here: it is capture_fraction x the calibrated feature
-  // half-width (auto-lock half_range_sweep_v), because a lock succeeds whenever the
-  // DC point lands between the two lobe extrema.
-  enabled: boolean;
+export type LockAcceptanceSettings = {
+  // How close the refinement walk must land, and how long it waits. The
+  // acceptance window is NOT a voltage here: it is capture_fraction x the
+  // calibrated feature half-width (auto-lock half_range_sweep_v), because a lock
+  // succeeds whenever the DC point lands between the two lobe extrema.
   capture_fraction: number;
   max_correction_span: number;
-  max_direct_jump_v: number;
-  approach_offset_v: number;
-  ramp_step_v: number;
-  ramp_step_delay_ms: number;
   settle_ms: number;
-  approach_from_below: boolean;
-  max_approach_iterations: number;
-};
-
-export type LockApproachAttempt = {
-  attempt: number;
-  from_below: boolean;
-  direct: boolean;
-  set_points: number;
-  commanded_voltage: number;
-  detected_voltage?: number | null;
-  offset_v?: number | null;
-  accepted: boolean;
-  detail: string;
-};
-
-export type LockApproachReport = {
-  enabled: boolean;
-  accepted: boolean;
-  target_voltage: number;
-  commanded_voltage: number;
-  start_voltage: number;
-  // How far the center actually travelled, and how much of that was hysteresis
-  // correction rather than the detected target (0 = target used untouched).
-  center_move_v: number;
-  center_correction_v: number;
-  center_offset_v?: number | null;
-  capture_tolerance_v: number;
-  // Null when no usable neighbour guard could be derived for this signal.
-  rejection_bound_v?: number | null;
-  attempts: LockApproachAttempt[];
-};
-
-export type LockApproachSample = {
-  from_below: boolean;
-  settle_ms: number;
-  offset_v?: number | null;
-  detected_voltage?: number | null;
-  detail: string;
-};
-
-export type LockApproachProbeResult = {
-  target_voltage: number;
-  start_voltage: number;
-  capture_tolerance_v: number;
-  samples: LockApproachSample[];
-  verdict: 'backlash' | 'creep' | 'drift_or_creep' | 'negligible' | 'inconclusive';
-  detail: string;
 };
 
 export type AutoLockScanResult = {
@@ -371,7 +318,6 @@ export type AutoLockScanResult = {
   hz_per_v?: number | null;
   sideband_offset_v?: number | null;
   detail?: string | null;
-  approach?: LockApproachReport | null;
   refinement?: {
     attempted: boolean;
     trigger?: string;
@@ -439,7 +385,7 @@ export type ConfigUpdateName =
   | 'auto_lock_scan_settings'
   | 'lock_indicator_config'
   | 'auto_relock_config'
-  | 'lock_approach_settings';
+  | 'lock_acceptance_settings';
 
 export type ConfigUpdateMessage = {
   type: 'config_update';
@@ -448,7 +394,7 @@ export type ConfigUpdateMessage = {
     | AutoLockScanSettings
     | LockIndicatorConfig
     | AutoRelockConfig
-    | LockApproachSettings;
+    | LockAcceptanceSettings;
 };
 
 export type StreamMessage =

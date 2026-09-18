@@ -23,7 +23,7 @@ import pytest
 
 import app.session as session_module
 from app.auto_lock_scan import AutoLockScanResult, AutoLockScanSettings
-from app.lock_approach import ApproachSettings
+from app.lock_acceptance import AcceptanceSettings
 from app.session import DeviceSession
 
 FEATURE_V = 0.20
@@ -155,7 +155,7 @@ def _make_session(
         "max_approach_iterations": 2,
     }
     settings.update(approach or {})
-    session.update_lock_approach_settings(settings)
+    session.update_lock_acceptance_settings(settings)
 
     def fake_find(**kwargs):
         board.detections += 1
@@ -214,172 +214,24 @@ def _unrepeatable(width: float) -> Callable[[list[float]], float]:
 # --------------------------------------------------------------------- tests
 
 
-def test_a_clean_board_locks_on_the_direct_probe_with_no_correction(monkeypatch):
-    session, board = _make_session(monkeypatch, _no_error)
-
-    payload = session.auto_lock_from_scan(None)
-
-    approach = payload["approach"]
-    assert approach["accepted"] is True
-    assert approach["attempts"][0]["direct"] is True
-    assert len(approach["attempts"]) == 1
-    assert approach["center_correction_v"] == pytest.approx(0.0)
-    assert approach["center_move_v"] == pytest.approx(FEATURE_V - START_CENTER_V)
-    assert board.lock_started is True
 
 
-def test_backlash_is_corrected_and_the_lock_starts(monkeypatch):
-    session, board = _make_session(monkeypatch, _backlash(0.03))
-
-    payload = session.auto_lock_from_scan(None)
-
-    approach = payload["approach"]
-    assert approach["accepted"] is True
-    # First attempt measured the displacement, second landed on it.
-    assert len(approach["attempts"]) == 2
-    assert approach["attempts"][0]["offset_v"] == pytest.approx(0.03)
-    assert approach["attempts"][0]["accepted"] is False
-    assert approach["attempts"][1]["accepted"] is True
-    assert approach["center_correction_v"] == pytest.approx(0.03)
-    assert approach["commanded_voltage"] == pytest.approx(FEATURE_V + 0.03)
-    assert board.lock_started is True
 
 
-def test_creep_is_corrected_the_same_way_backlash_is(monkeypatch):
-    # The whole point of correcting rather than only flipping direction: a
-    # displacement that does NOT flip sign would defeat a direction-only retry.
-    session, board = _make_session(monkeypatch, _creep(0.025))
-
-    payload = session.auto_lock_from_scan(None)
-
-    approach = payload["approach"]
-    assert approach["accepted"] is True
-    assert approach["center_correction_v"] == pytest.approx(0.025)
-    assert board.lock_started is True
 
 
-def test_the_retry_flips_the_approach_direction(monkeypatch):
-    """Exhausting the corrections on one side must re-approach from the other.
-
-    Driven through _approach_and_verify directly, because the report is what
-    records the direction and auto_lock_from_scan only raises a message.
-    """
-    session, board = _make_session(
-        monkeypatch, _unrepeatable(0.03), approach={"max_approach_iterations": 1}
-    )
-    # Stand in for the initial scan, which auto_lock_from_scan would have run.
-    board.detections = 1
-    scan_settings = AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings)
-    approach = ApproachSettings.from_mapping(session.lock_approach_settings)
-
-    report, failure = session._approach_and_verify(
-        target_v=FEATURE_V,
-        start_center_v=START_CENTER_V,
-        approach=approach,
-        scan_settings=scan_settings,
-        sideband_offset_v=None,
-    )
-
-    assert failure is not None
-    assert report["accepted"] is False
-    # The direct probe sits outside the correction budget, so one correction
-    # per direction means probe, one from below, one from above.
-    attempts = report["attempts"]
-    assert [item["direct"] for item in attempts] == [True, False, False]
-    assert [item["from_below"] for item in attempts] == [True, True, False]
 
 
-def test_both_directions_get_the_same_correction_budget(monkeypatch):
-    """The direct probe must not eat one direction's attempts."""
-    session, board = _make_session(
-        monkeypatch, _unrepeatable(0.03), approach={"max_approach_iterations": 2}
-    )
-    board.detections = 1
-    scan_settings = AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings)
-    approach = ApproachSettings.from_mapping(session.lock_approach_settings)
-
-    report, _failure = session._approach_and_verify(
-        target_v=FEATURE_V,
-        start_center_v=START_CENTER_V,
-        approach=approach,
-        scan_settings=scan_settings,
-        sideband_offset_v=None,
-    )
-
-    corrections = [item for item in report["attempts"] if not item["direct"]]
-    assert sum(1 for item in corrections if item["from_below"]) == 2
-    assert sum(1 for item in corrections if not item["from_below"]) == 2
 
 
-def test_an_unconvergeable_board_aborts_without_locking(monkeypatch):
-    session, board = _make_session(monkeypatch, _unrepeatable(0.03))
-
-    with pytest.raises(RuntimeError) as excinfo:
-        session.auto_lock_from_scan(None)
-
-    assert board.lock_started is False
-    message = str(excinfo.value)
-    assert "Auto-lock aborted" in message
-    assert "from below" in message and "from above" in message
-    assert "never confirmed the target" in message
 
 
-def test_an_aborted_approach_puts_the_sweep_center_back(monkeypatch):
-    session, board = _make_session(monkeypatch, _unrepeatable(0.03))
-
-    with pytest.raises(RuntimeError) as excinfo:
-        session.auto_lock_from_scan(None)
-
-    assert session.parameters.sweep_center.value == pytest.approx(START_CENTER_V)
-    assert board.centers[-1] == pytest.approx(START_CENTER_V)
-    assert "restored" in str(excinfo.value)
 
 
-def test_a_neighbouring_crossing_is_rejected_not_chased(monkeypatch):
-    """Correcting towards a feature 0.5 V away would walk the lock onto the
-    wrong crossing -- exactly the failure this path exists to prevent."""
-    session, board = _make_session(monkeypatch, _creep(0.5))
-
-    with pytest.raises(RuntimeError) as excinfo:
-        session.auto_lock_from_scan(None)
-
-    assert board.lock_started is False
-    assert "different feature" in str(excinfo.value)
-    # It stopped on the first measurement rather than trying the other direction.
-    assert board.centers[-1] == pytest.approx(START_CENTER_V)
 
 
-def test_a_known_sideband_offset_tightens_the_neighbour_guard(monkeypatch):
-    # Sidebands 0.1 V out put the guard at 0.04 V, so a 0.05 V displacement is
-    # a sideband -- even though the feature-width fallback would have allowed it.
-    session, _board = _make_session(
-        monkeypatch, _creep(0.05), sideband_offset_v=0.1
-    )
-    # This is a test of the guarded move's neighbour guard, not of the walk.
-    # At amplitude 1.0 a 0.2 V signal is under a quarter of the span, so the
-    # scan counts as too wide and refinement would run first -- and once it
-    # recentres onto the crept feature there is no displacement left for the
-    # guard to reject. Disable the width rule so the guard is what is measured.
-    session.auto_lock_scan_settings["min_signal_scan_fraction"] = 0.0
-
-    with pytest.raises(RuntimeError) as excinfo:
-        session.auto_lock_from_scan(None)
-
-    assert "different feature" in str(excinfo.value)
 
 
-def test_a_large_jump_ramps_in_from_below_rather_than_stepping(monkeypatch):
-    session, board = _make_session(
-        monkeypatch, _backlash(0.03), approach={"max_direct_jump_v": 0.1}
-    )
-
-    session.auto_lock_from_scan(None)
-
-    # The jump from -0.30 to 0.20 exceeds the shortcut, so the very first move
-    # overshoots below the target and ramps up onto it.
-    assert board.centers[0] == pytest.approx(FEATURE_V - 0.05)
-    ramp = board.centers[: board.centers.index(pytest.approx(FEATURE_V)) + 1]
-    assert all(b > a for a, b in zip(ramp, ramp[1:]))
 
 
 def test_the_approach_is_skipped_entirely_when_disabled(monkeypatch):
@@ -394,107 +246,20 @@ def test_the_approach_is_skipped_entirely_when_disabled(monkeypatch):
     assert board.lock_started is True
 
 
-def test_a_verification_sweep_that_detects_nothing_is_not_a_correction(monkeypatch):
-    def blind(_centers: list[float]) -> float:
-        raise ValueError("No signal detected on the current trace.")
-
-    session, board = _make_session(monkeypatch, blind)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        session.auto_lock_from_scan(None)
-
-    assert board.lock_started is False
-    assert "no detection" in str(excinfo.value)
 
 
-def test_a_sweep_that_stopped_is_reported_as_such_rather_than_locked_blind(monkeypatch):
-    session, board = _make_session(monkeypatch, _no_error)
-    session.plot_state.flowing = False
-    monkeypatch.setattr(session, "_unlocked_trace_timeout_s", lambda: 0.1)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        session.auto_lock_from_scan(None)
-
-    assert board.lock_started is False
-    assert "no fresh sweep" in str(excinfo.value)
 
 
-def test_the_diagnostic_identifies_backlash_from_the_sign_flip(monkeypatch):
-    session, board = _make_session(monkeypatch, _backlash(0.03))
-
-    report = session.measure_lock_approach([0, 10])
-
-    assert report["verdict"] == "backlash"
-    assert len(report["samples"]) == 4
-    below = [s["offset_v"] for s in report["samples"] if s["from_below"]]
-    above = [s["offset_v"] for s in report["samples"] if not s["from_below"]]
-    assert all(value > 0 for value in below)
-    assert all(value < 0 for value in above)
-    assert board.lock_started is False
 
 
-def test_the_diagnostic_identifies_creep_when_the_sign_does_not_flip(monkeypatch):
-    session, _board = _make_session(monkeypatch, _creep(0.03))
-
-    report = session.measure_lock_approach([0, 10])
-
-    # Same offset either way and it does not shrink over these settle times.
-    assert report["verdict"] == "drift_or_creep"
-    assert "does not depend on direction" in report["detail"]
 
 
-def test_the_diagnostic_puts_the_sweep_center_back(monkeypatch):
-    session, board = _make_session(monkeypatch, _backlash(0.03))
-
-    session.measure_lock_approach([0])
-
-    assert session.parameters.sweep_center.value == pytest.approx(START_CENTER_V)
-    assert board.centers[-1] == pytest.approx(START_CENTER_V)
 
 
-def test_the_diagnostic_restores_the_center_even_when_it_fails(monkeypatch):
-    def blind(_centers: list[float]) -> float:
-        raise ValueError("No signal detected on the current trace.")
-
-    session, board = _make_session(monkeypatch, blind)
-
-    report = session.measure_lock_approach([0])
-
-    assert report["verdict"] == "inconclusive"
-    assert board.centers[-1] == pytest.approx(START_CENTER_V)
 
 
-def test_measuring_without_an_overshoot_is_refused_not_guessed(monkeypatch):
-    """With approach_offset_v = 0 both directions issue the same set-point, so
-    any verdict would compare a measurement against itself."""
-    session, board = _make_session(
-        monkeypatch, _backlash(0.03), approach={"approach_offset_v": 0.0}
-    )
-
-    with pytest.raises(ValueError) as excinfo:
-        session.measure_lock_approach([0])
-
-    assert "approach_offset_v" in str(excinfo.value)
-    assert board.centers == []
 
 
-def test_a_target_against_the_rail_is_reported_as_a_gap_not_a_reading(monkeypatch):
-    """One side has no room to overshoot, so that sample must not silently
-    carry a reading taken from the other direction."""
-    session, _board = _make_session(
-        monkeypatch, _no_error, approach={"approach_offset_v": 0.05}
-    )
-    # Every plan comes back direct, as it does for a target pinned to a rail.
-    monkeypatch.setattr(
-        session_module,
-        "plan_approach",
-        lambda *_args, **kwargs: _rail_plan(kwargs.get("from_below", True)),
-    )
-
-    report = session.measure_lock_approach([0])
-
-    assert report["verdict"] == "inconclusive"
-    assert any(sample["offset_v"] is None for sample in report["samples"])
 
 
 def _rail_plan(from_below: bool):
@@ -508,112 +273,18 @@ def _rail_plan(from_below: bool):
     )
 
 
-def test_an_uncalibrated_device_is_told_to_calibrate_not_blamed_on_the_signal(monkeypatch):
-    """With no calibrated feature width there is no capture region to derive,
-    and a zero window would reject every landing as a neighbouring crossing."""
-    session, board = _make_session(monkeypatch, _no_error)
-    session.auto_lock_scan_settings["half_range_sweep_v"] = 0.0
-
-    # A configuration problem, not a failed lock attempt: ValueError maps to 422.
-    with pytest.raises(ValueError) as excinfo:
-        session.auto_lock_from_scan(None)
-
-    assert "Calibrate" in str(excinfo.value)
-    assert board.lock_started is False
-    # It refuses before touching the device at all -- no move, and so no
-    # restore write either.
-    assert board.centers == []
-    assert session.parameters.sweep_center.value == pytest.approx(START_CENTER_V)
 
 
-def test_a_disabled_neighbour_guard_lets_the_correction_loop_run(monkeypatch):
-    """max_correction_span = 0 used to reject every nonzero offset, making the
-    device unlockable through one innocuous-looking setting."""
-    session, board = _make_session(
-        monkeypatch, _creep(0.025), approach={"max_correction_span": 0.0}
-    )
-
-    payload = session.auto_lock_from_scan(None)
-
-    assert payload["approach"]["accepted"] is True
-    assert payload["approach"]["rejection_bound_v"] is None
-    assert board.lock_started is True
 
 
-def test_a_failed_approach_keeps_its_last_measured_offset(monkeypatch):
-    """These rows carry the largest offsets, so blanking the column would empty
-    the very field the failure rows exist to fill."""
-    session, board = _make_session(monkeypatch, _unrepeatable(0.03))
-    board.detections = 1
-    scan_settings = AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings)
-    approach = ApproachSettings.from_mapping(session.lock_approach_settings)
-
-    report, failure = session._approach_and_verify(
-        target_v=FEATURE_V,
-        start_center_v=START_CENTER_V,
-        approach=approach,
-        scan_settings=scan_settings,
-        sideband_offset_v=None,
-    )
-
-    assert failure is not None
-    assert report["accepted"] is False
-    assert report["center_offset_v"] is not None
-    assert report["center_offset_v"] == report["attempts"][-1]["offset_v"]
 
 
-def test_the_diagnostic_judges_by_the_window_the_lock_actually_applies(monkeypatch):
-    """A tightly spaced signal narrows the lock's window; the diagnostic must not
-    call an offset negligible that the lock would then reject."""
-    session, _board = _make_session(
-        monkeypatch, _creep(0.005), sideband_offset_v=0.015
-    )
-
-    report = session.measure_lock_approach([0])
-
-    # 0.4 x 0.015 = 0.006 bound -> 0.003 window, so a 0.005 V offset is NOT
-    # negligible, even though capture_fraction x half_range alone would allow it.
-    assert report["capture_tolerance_v"] == pytest.approx(0.003)
-    assert report["verdict"] != "negligible"
 
 
-def test_the_diagnostic_refuses_an_uncalibrated_device_too(monkeypatch):
-    session, board = _make_session(monkeypatch, _no_error)
-    session.auto_lock_scan_settings["half_range_sweep_v"] = 0.0
-
-    with pytest.raises(ValueError) as excinfo:
-        session.measure_lock_approach([0])
-
-    assert "Calibrate" in str(excinfo.value)
-    assert board.centers == []
 
 
-def test_a_second_center_move_is_refused_rather_than_interleaved(monkeypatch):
-    """Two paths drive the actuator for seconds. Interleaved, each would measure
-    offsets the other caused."""
-    session, board = _make_session(monkeypatch, _no_error)
-    assert session._center_move_lock.acquire(blocking=False)
-    try:
-        with pytest.raises(RuntimeError) as excinfo:
-            session.auto_lock_from_scan(None)
-        assert "already running" in str(excinfo.value)
-        assert board.lock_started is False
-
-        with pytest.raises(RuntimeError) as measure_error:
-            session.measure_lock_approach([0])
-        assert "already running" in str(measure_error.value)
-    finally:
-        session._center_move_lock.release()
 
 
-def test_the_lock_is_released_after_a_failed_move(monkeypatch):
-    session, _board = _make_session(monkeypatch, _unrepeatable(0.03))
-
-    with pytest.raises(RuntimeError):
-        session.auto_lock_from_scan(None)
-
-    assert session._center_move_lock.acquire(blocking=False)
-    session._center_move_lock.release()
 
 
 def test_the_guard_covers_the_plain_direct_path_too(monkeypatch):
@@ -785,41 +456,8 @@ def test_disconnect_gives_up_on_a_stuck_relock_rather_than_hanging(monkeypatch):
     release.set()
 
 
-def test_an_auto_relock_row_carries_the_guarded_move_it_actually_ran(monkeypatch):
-    """Auto-relock runs unattended and repeatedly, so it is the richest source
-    of the offsets these columns exist to trend. Recording approach_enabled as
-    false there is not just missing data -- it is a wrong value in a column you
-    would filter on."""
-    session, _board = _make_session(monkeypatch, _creep(0.025))
-    rows: list[dict] = []
-    session._lock_result_postgres = SimpleNamespace(
-        enqueue_lock_result=lambda row: rows.append(row) or True
-    )
-
-    payload = session.auto_lock_from_scan(None)
-    session._write_lock_result_to_postgres(
-        lock_source="auto_relock",
-        event_source="auto_relock",
-        approach=payload["approach"],
-    )
-
-    assert rows and rows[0]["approach_enabled"] is True
-    assert rows[0]["center_correction_v"] == pytest.approx(0.025)
 
 
-def test_a_lock_without_a_guarded_move_still_records_it_as_disabled(monkeypatch):
-    session, _board = _make_session(monkeypatch, _no_error, approach={"enabled": False})
-    rows: list[dict] = []
-    session._lock_result_postgres = SimpleNamespace(
-        enqueue_lock_result=lambda row: rows.append(row) or True
-    )
-
-    session.auto_lock_from_scan(None)
-    session._write_lock_result_to_postgres(
-        lock_source="auto_relock", event_source="auto_relock"
-    )
-
-    assert rows and rows[0]["approach_enabled"] is False
 
 
 class SteppedPlotState:
@@ -887,76 +525,12 @@ def test_the_wait_budget_is_per_frame(monkeypatch):
     assert (time.time() - started) >= 0.4
 
 
-def test_the_timeout_message_reports_the_wait_that_actually_happened(monkeypatch):
-    """The budget is per frame, so quoting the per-frame figure would tell an
-    operator three seconds after waiting six."""
-    session, _board = _make_session(monkeypatch, _no_error)
-    session.plot_state = SteppedPlotState()  # no frames will be delivered
-    monkeypatch.setattr(session, "_unlocked_trace_timeout_s", lambda: 0.1)
-    scan_settings = AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings)
-
-    started = time.time()
-    _center, _detected, offset_v, detail = session._redetect_after_move(
-        scan_settings, time.time()
-    )
-    elapsed = time.time() - started
-
-    assert offset_v is None
-    assert "0.2 s" in detail  # 0.1 s per frame, two frames
-    assert elapsed >= 0.2
 
 
-def test_the_diagnostic_is_recorded_not_just_returned(monkeypatch):
-    """Both directions at several settle times is the most direct hysteresis
-    data there is; returning it only in the HTTP response would mean running it
-    on ten lasers and keeping none of it."""
-    session, _board = _make_session(monkeypatch, _backlash(0.03))
-    rows: list[dict] = []
-    session._lock_result_postgres = SimpleNamespace(
-        enqueue_lock_result=lambda row: rows.append(row) or True
-    )
-
-    report = session.measure_lock_approach([0, 10])
-
-    assert rows and rows[0]["lock_source"] == "lock_approach_probe"
-    assert rows[0]["success"] is True
-    assert rows[0]["approach_enabled"] is True
-    # The probe restores the center, so no net move -- but the excursion stands.
-    assert rows[0]["center_move_v"] == pytest.approx(0.0)
-    assert abs(rows[0]["center_offset_v"]) == pytest.approx(0.03)
-    assert rows[0]["capture_tolerance_v"] == pytest.approx(report["capture_tolerance_v"])
 
 
-def test_an_inconclusive_measurement_is_recorded_as_unsuccessful(monkeypatch):
-    def blind(_centers: list[float]) -> float:
-        raise ValueError("No signal detected on the current trace.")
-
-    session, _board = _make_session(monkeypatch, blind)
-    rows: list[dict] = []
-    session._lock_result_postgres = SimpleNamespace(
-        enqueue_lock_result=lambda row: rows.append(row) or True
-    )
-
-    session.measure_lock_approach([0])
-
-    assert rows and rows[0]["success"] is False
-    assert rows[0]["center_offset_v"] is None
 
 
-def test_the_stored_samples_survive_as_json(monkeypatch):
-    import json
-
-    session, _board = _make_session(monkeypatch, _backlash(0.03))
-    rows: list[dict] = []
-    session._lock_result_postgres = SimpleNamespace(
-        enqueue_lock_result=lambda row: rows.append(row) or True
-    )
-
-    session.measure_lock_approach([0, 10])
-
-    stored = json.loads(rows[0]["approach_detail"])
-    assert len(stored) == 4
-    assert {item["from_below"] for item in stored} == {True, False}
 
 
 # ------------------------------------------------ refined-lock geometry restore
@@ -1090,19 +664,6 @@ def test_a_relock_that_moved_nothing_writes_no_failure_row(monkeypatch):
     assert rows == []
 
 
-def test_a_relock_whose_guarded_move_aborted_writes_a_failure_row(monkeypatch):
-    session, board = _make_session(monkeypatch, _unrepeatable(0.03))
-    rows = _recorded_rows(monkeypatch, session)
-
-    with pytest.raises(RuntimeError, match="Auto-lock aborted"):
-        session._start_auto_relock()
-
-    assert board.lock_started is False
-    assert len(rows) == 1
-    assert rows[0]["success"] is False
-    assert rows[0]["lock_source"] == "auto_relock"
-    assert isinstance(rows[0]["approach"], dict)
-    assert rows[0]["approach"]["attempts"]
 
 
 def test_a_successful_relock_writes_its_row(monkeypatch):
@@ -1254,7 +815,7 @@ def _walking_session(
 def _run_walk(session):
     return session._trajectory_refine_auto_lock(
         AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-        ApproachSettings.from_mapping(session.lock_approach_settings),
+        AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
         0.54,
         0.2,
         initial_target=_result(FIELD_TARGET_V),
@@ -1463,7 +1024,7 @@ def _identity_session(monkeypatch, coarse_sideband, strict_sideband):
 def _walk_from_coarse(session):
     return session._trajectory_refine_auto_lock(
         AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-        ApproachSettings.from_mapping(session.lock_approach_settings),
+        AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
         0.653, 0.6,
         initial_target=_result(0.4758, None),  # wide scan resolved no sideband
         initial_center_v=0.653,
@@ -1520,7 +1081,7 @@ def test_a_recentring_stage_that_changes_the_spacing_is_an_identity_change(monke
     with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
         session._trajectory_refine_auto_lock(
             AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-            ApproachSettings.from_mapping(session.lock_approach_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
             0.0, 0.6,
             initial_target=_result(0.5, 0.05),  # far out -> forces a geometry step
             initial_center_v=0.0, initial_amplitude_v=0.6,
@@ -1556,7 +1117,7 @@ def test_a_coarse_reading_is_not_judged_against_a_strict_baseline(monkeypatch):
     try:
         session._trajectory_refine_auto_lock(
             AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-            ApproachSettings.from_mapping(session.lock_approach_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
             0.0, 0.6,
             initial_target=_result(0.9, 0.017497),
             initial_center_v=0.0, initial_amplitude_v=0.6,
@@ -1660,7 +1221,7 @@ def test_narrowing_waits_until_the_target_is_inside_the_next_window(monkeypatch)
 
     session._trajectory_refine_auto_lock(
         AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-        ApproachSettings.from_mapping(session.lock_approach_settings),
+        AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
         0.2, 0.6,
         initial_target=_result(0.622991283778572, 0.0325),
         initial_center_v=0.2, initial_amplitude_v=0.6,
@@ -1685,7 +1246,7 @@ def test_a_better_resolved_detection_replaces_the_identity(monkeypatch):
 
     result, refinement = session._trajectory_refine_auto_lock(
         AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-        ApproachSettings.from_mapping(session.lock_approach_settings),
+        AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
         0.35, 0.6,
         initial_target=_result(0.48, 0.0325),  # poorly resolved estimate
         initial_center_v=0.35, initial_amplitude_v=0.6,
@@ -1777,7 +1338,7 @@ def test_a_narrowing_that_moves_the_feature_too_far_gentles_the_next_one(monkeyp
     try:
         session._trajectory_refine_auto_lock(
             AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-            ApproachSettings.from_mapping(session.lock_approach_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
             0.4, 0.6,
             initial_target=_result(0.5457, 0.0325),
             initial_center_v=0.4, initial_amplitude_v=0.6,
@@ -1854,7 +1415,7 @@ def test_a_rail_pinned_walk_narrows_instead_of_stalling(monkeypatch):
     try:
         session._trajectory_refine_auto_lock(
             AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-            ApproachSettings.from_mapping(session.lock_approach_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
             0.0, 0.8,
             initial_target=_result(0.59, 0.0320),
             initial_center_v=1.0 - 0.8, initial_amplitude_v=0.8,
@@ -1907,7 +1468,7 @@ def test_a_rail_blocked_narrowing_never_cuts_below_the_safe_floor(monkeypatch):
     try:
         session._trajectory_refine_auto_lock(
             AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-            ApproachSettings.from_mapping(session.lock_approach_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
             0.0, 0.8,
             initial_target=_result(0.6795310210063508, 0.03204689789936493),
             initial_center_v=1.0 - 0.8, initial_amplitude_v=0.8,
@@ -1970,7 +1531,7 @@ def _shift_walk(monkeypatch, *, strict_raises: bool):
     try:
         _result_obj, refinement = session._trajectory_refine_auto_lock(
             AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-            ApproachSettings.from_mapping(session.lock_approach_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
             0.2, 0.8,
             initial_target=_result(0.5341, 0.032),
             initial_center_v=0.2,
@@ -2013,7 +1574,7 @@ def test_every_refinement_geometry_write_waits_for_the_calibrated_settle(monkeyp
     """
     session, _board = _make_session(monkeypatch, _no_error, approach={"enabled": False})
     session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
-    session.lock_approach_settings["settle_ms"] = 250
+    session.lock_acceptance_settings["settle_ms"] = 250
     settles: list[float] = []
 
     def _set(center, amplitude, settle_s=0.0):
@@ -2033,7 +1594,7 @@ def test_every_refinement_geometry_write_waits_for_the_calibrated_settle(monkeyp
     try:
         session._trajectory_refine_auto_lock(
             AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-            ApproachSettings.from_mapping(session.lock_approach_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
             0.2, 0.8,
             initial_target=_result(0.5341, 0.032),
             initial_center_v=0.2, initial_amplitude_v=0.8,
@@ -2071,7 +1632,7 @@ def test_a_narrowing_that_does_not_take_is_reported_not_repeated(monkeypatch):
     with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
         session._trajectory_refine_auto_lock(
             AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-            ApproachSettings.from_mapping(session.lock_approach_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
             0.2, 0.8,
             initial_target=_result(0.5341, 0.032),
             initial_center_v=0.2, initial_amplitude_v=0.8,
@@ -2131,7 +1692,7 @@ def _drift_session(monkeypatch, *, drift_mv: float, interval_s: float,
 def _drift_walk(session):
     return session._trajectory_refine_auto_lock(
         AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-        ApproachSettings.from_mapping(session.lock_approach_settings),
+        AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
         0.438, 0.2,
         initial_target=_result(0.5091693630289127, 0.0341),
         initial_center_v=0.438, initial_amplitude_v=0.2,

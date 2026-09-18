@@ -5,8 +5,7 @@ import type {
   AutoLockCalibrationResult,
   AutoLockScanResult,
   AutoLockScanSettings,
-  LockApproachProbeResult,
-  LockApproachSettings,
+  LockAcceptanceSettings,
   BoardEvent,
   Device,
   DeviceStatus,
@@ -175,23 +174,13 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(payload),
     }),
-  getLockApproachSettings: (key: string) =>
-    request<LockApproachSettings>(`/devices/${key}/lock-approach-settings`),
-  updateLockApproachSettings: (key: string, payload: LockApproachSettings) =>
-    request<LockApproachSettings>(`/devices/${key}/lock-approach-settings`, {
+  getLockAcceptanceSettings: (key: string) =>
+    request<LockAcceptanceSettings>(`/devices/${key}/lock-acceptance-settings`),
+  updateLockAcceptanceSettings: (key: string, payload: LockAcceptanceSettings) =>
+    request<LockAcceptanceSettings>(`/devices/${key}/lock-acceptance-settings`, {
       method: 'PUT',
       body: JSON.stringify(payload),
     }),
-  measureLockApproach: (key: string, settleMsOptions?: number[]) =>
-    request<LockApproachProbeResult>(
-      `/devices/${key}/control/lock_approach/measure`,
-      {
-        method: 'POST',
-        body: JSON.stringify(
-          settleMsOptions ? { settle_ms_options: settleMsOptions } : {}
-        ),
-      }
-    ),
   getAutoRelockState: (key: string) =>
     request<AutoRelockState>(`/devices/${key}/auto-relock`),
   updateAutoRelockConfig: (key: string, payload: AutoRelockConfig) =>

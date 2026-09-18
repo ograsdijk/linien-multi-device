@@ -31,7 +31,7 @@ from .config import (
 from .device_config_store import (
     CONFIG_AUTO_LOCK_SCAN,
     CONFIG_AUTO_RELOCK,
-    CONFIG_LOCK_APPROACH,
+    CONFIG_LOCK_ACCEPTANCE,
     CONFIG_LOCK_INDICATOR,
     DeviceConfigStore,
 )
@@ -59,9 +59,7 @@ from .schemas import (
     AutoLockCalibrationResult,
     AutoLockScanResult,
     AutoLockScanSettings,
-    LockApproachProbeRequest,
-    LockApproachProbeResult,
-    LockApproachSettings,
+    LockAcceptanceSettings,
     AutoRelockConfig,
     AutoRelockEnabledUpdate,
     AutoRelockState,
@@ -550,7 +548,7 @@ def _seed_config_store_from_device(device: Device) -> None:
         CONFIG_AUTO_LOCK_SCAN,
         CONFIG_LOCK_INDICATOR,
         CONFIG_AUTO_RELOCK,
-        CONFIG_LOCK_APPROACH,
+        CONFIG_LOCK_ACCEPTANCE,
     ):
         if config_name in existing:
             continue
@@ -575,8 +573,8 @@ def _normalize_config_payload(config_name: str, value: dict) -> dict:
         return AutoLockScanSettings.model_validate(value).model_dump()
     if config_name == CONFIG_AUTO_RELOCK:
         return AutoRelockConfig.model_validate(value).model_dump()
-    if config_name == CONFIG_LOCK_APPROACH:
-        return LockApproachSettings.model_validate(value).model_dump()
+    if config_name == CONFIG_LOCK_ACCEPTANCE:
+        return LockAcceptanceSettings.model_validate(value).model_dump()
     raise HTTPException(status_code=422, detail=f"Unknown config name: {config_name}")
 
 
@@ -1154,23 +1152,7 @@ def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:
             "refinement_final_center_v": refinement.get("final_center_v"),
             "refinement_final_amplitude_v": refinement.get("final_amplitude_v"),
         })
-    details.update(_approach_event_details(result.get("approach")))
     return details
-
-
-def _approach_event_details(approach: Any) -> dict[str, Any]:
-    """The guarded-move numbers, for either a started or an aborted auto-lock."""
-    if not isinstance(approach, dict):
-        return {}
-    attempts = approach.get("attempts") or []
-    return {
-        "center_move_v": approach.get("center_move_v"),
-        "center_correction_v": approach.get("center_correction_v"),
-        "center_offset_v": approach.get("center_offset_v"),
-        "capture_tolerance_v": approach.get("capture_tolerance_v"),
-        "approach_attempts": len(attempts),
-        "approach_from_below": attempts[-1].get("from_below") if attempts else None,
-    }
 
 
 @app.post(
@@ -1199,8 +1181,7 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
         if isinstance(refinement, dict):
             details["refinement"] = refinement
         if isinstance(report, dict):
-            details.update(_approach_event_details(report))
-            _enqueue_auto_lock_row(session, key, success=False, approach=report)
+            _enqueue_auto_lock_row(session, key, success=False)
         _emit_log(
             level=logging.ERROR,
             source="auto_lock_scan",
@@ -1242,7 +1223,7 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
         device_key=key,
         details=_auto_lock_event_details(result),
     )
-    _enqueue_auto_lock_row(session, key, success=True, approach=result.get("approach"))
+    _enqueue_auto_lock_row(session, key, success=True)
     return result
 
 
@@ -1251,7 +1232,6 @@ def _enqueue_auto_lock_row(
     key: str,
     *,
     success: bool,
-    approach: Any = None,
 ) -> None:
     """Record an auto-lock attempt in postgres, successful or not.
 
@@ -1267,7 +1247,6 @@ def _enqueue_auto_lock_row(
             device_key=key,
             lock_source="auto_lock_scan",
             success=success,
-            approach=approach if isinstance(approach, dict) else None,
         )
         enqueued = lock_result_postgres.enqueue_lock_result(row)
         if not enqueued:
@@ -1396,55 +1375,23 @@ def update_auto_lock_scan_settings(key: str, payload: AutoLockScanSettings) -> d
 
 
 @app.get(
-    "/api/devices/{key}/lock-approach-settings", response_model=LockApproachSettings
+    "/api/devices/{key}/lock-acceptance-settings", response_model=LockAcceptanceSettings
 )
-def get_lock_approach_settings(key: str) -> dict:
+def get_lock_acceptance_settings(key: str) -> dict:
     session = _get_session(key)
-    return session.get_lock_approach_settings()
+    return session.get_lock_acceptance_settings()
 
 
 @app.put(
-    "/api/devices/{key}/lock-approach-settings", response_model=LockApproachSettings
+    "/api/devices/{key}/lock-acceptance-settings", response_model=LockAcceptanceSettings
 )
-def update_lock_approach_settings(key: str, payload: LockApproachSettings) -> dict:
+def update_lock_acceptance_settings(key: str, payload: LockAcceptanceSettings) -> dict:
     device = _get_device_or_404(key)
     session = _session_for_device(device)
-    settings_payload = session.update_lock_approach_settings(payload.model_dump())
-    _persist_config_block(device, CONFIG_LOCK_APPROACH, settings_payload)
-    _publish_config_update(device.key, CONFIG_LOCK_APPROACH, settings_payload)
+    settings_payload = session.update_lock_acceptance_settings(payload.model_dump())
+    _persist_config_block(device, CONFIG_LOCK_ACCEPTANCE, settings_payload)
+    _publish_config_update(device.key, CONFIG_LOCK_ACCEPTANCE, settings_payload)
     return settings_payload
-
-
-@app.post(
-    "/api/devices/{key}/control/lock_approach/measure",
-    response_model=LockApproachProbeResult,
-)
-def measure_lock_approach(key: str, payload: LockApproachProbeRequest) -> dict:
-    """Measure the actuator displacement from each direction, without locking.
-
-    This is how approach_offset_v and settle_ms get set from data: the verdict
-    says whether the board shows backlash, creep, or neither.
-    """
-    session = _get_session(key)
-    try:
-        result = session.measure_lock_approach(payload.settle_ms_options)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    _emit_log(
-        level=logging.INFO,
-        source="auto_lock_scan",
-        code="lock_approach_measured",
-        message="Lock approach measured.",
-        device_key=key,
-        details={
-            "verdict": result.get("verdict"),
-            "detail": result.get("detail"),
-            "capture_tolerance_v": result.get("capture_tolerance_v"),
-        },
-    )
-    return result
 
 
 @app.get("/api/devices/{key}/auto-relock", response_model=AutoRelockState)

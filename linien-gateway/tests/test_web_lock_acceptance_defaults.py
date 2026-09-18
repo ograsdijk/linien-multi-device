@@ -1,4 +1,4 @@
-"""The web panel hand-writes the approach defaults; keep them honest.
+"""The web panel hand-writes the acceptance defaults; keep them honest.
 
 They are the fallbacks the numeric inputs use when a field is cleared, so drift
 would silently commit a different value than the gateway would have chosen. The
@@ -14,20 +14,20 @@ from pathlib import Path
 
 import pytest
 
-from app.lock_approach import ApproachSettings
+from app.lock_acceptance import AcceptanceSettings
 
 PANEL = (
     Path(__file__).resolve().parents[2]
     / "linien-web"
     / "src"
     / "components"
-    / "LockApproachPanel.tsx"
+    / "LockAcceptancePanel.tsx"
 )
 
 
 def _parse_web_defaults(source: str) -> dict[str, object]:
     match = re.search(
-        r"const DEFAULTS: LockApproachSettings = \{(.*?)\n\};", source, re.DOTALL
+        r"const DEFAULTS: LockAcceptanceSettings = \{(.*?)\n\};", source, re.DOTALL
     )
     assert match, "DEFAULTS block not found — did the panel get restructured?"
     values: dict[str, object] = {}
@@ -43,7 +43,7 @@ def test_web_defaults_match_the_engine():
     web = _parse_web_defaults(PANEL.read_text(encoding="utf-8"))
     engine = {
         name: field.default
-        for name, field in ApproachSettings.__dataclass_fields__.items()
+        for name, field in AcceptanceSettings.__dataclass_fields__.items()
     }
 
     assert web.keys() == engine.keys()

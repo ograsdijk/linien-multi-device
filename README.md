@@ -187,86 +187,6 @@ python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   (`AUTOMATION_TEMP_DISABLED`); their endpoints and UI still exist but raise an error.
   See [Known limitations](#known-limitations).
 
-## Guarded center move (autolock hysteresis safety)
-
-On hysteretic piezo/cavity systems, commanding `sweep_center = V` does not put the
-actuator at `V`. The detector picks the right crossing, but on the next sweep the
-feature appears at `V + delta` — and the lock engages somewhere it should not.
-
-That `delta` is measurable on the very next sweep, so the gateway measures it rather
-than only guarding against it. **Disabled by default**; enable per device under the
-`Autolock` tab.
-
-What happens on `auto_lock_scan` when it is enabled:
-
-1. **Direct probe.** Set the center to the detected target, exactly as before, then
-   wait for a sweep acquired after the move and re-detect. If the crossing landed within
-   the acceptance window, start the lock. This is the common path, and it costs a couple
-   of sweeps of latency. (Two frames are required, not one: the freshness stamp records
-   when the gateway *processed* a frame, not when the board *acquired* it, so a single
-   frame can be one captured mid-ramp or before the settle finished.)
-2. **Correct.** Otherwise the center is moved to where the feature actually appeared,
-   via an anti-backlash move: overshoot by `approach_offset_v`, then ramp back onto the
-   target in `ramp_step_v` steps so the final approach always travels the same way, and
-   wait `settle_ms`. Re-verify, up to `max_approach_iterations` times.
-3. **Flip direction.** If corrections on one side are spent, the whole thing repeats
-   from the opposite direction.
-4. **Abort.** Otherwise no lock is started, the sweep center is restored, and the
-   reason is surfaced in the UI.
-
-The acceptance window is **not** configured as a voltage. A lock succeeds whenever the
-DC point lands between the two lobe extrema, and calibration already measures that
-width into `half_range_sweep_v`, so the window is `capture_fraction` x that width and
-is shown in volts next to the setting.
-
-A re-detection further out than the neighbour guard **aborts instead of being
-corrected** — that is a different crossing, and chasing it would walk the lock onto the
-wrong feature. In PDH mode the bound comes from the scan's measured `sideband_offset_v`;
-otherwise it falls back to `max_correction_span` feature widths.
-
-On a closely spaced signal the configured window can reach more than halfway to the next
-feature. Rather than widen the guard (which would leave no room to correct at all, and
-report every miss as a neighbouring crossing), the **acceptance window is tightened** to
-half the guard, and the abort message says so. The window shown in volts beside
-`capture_fraction` is the configured one; the applied window is reported per-lock as
-`capture_tolerance_v`, and the diagnostic judges by the same applied window so it cannot
-call an offset negligible that the lock would then reject. Once a measurement has run,
-the settings panel shows the applied window alongside the configured one whenever the
-two differ.
-
-Setting `max_correction_span = 0` **disables** the neighbour guard rather than rejecting
-everything. A device with no calibrated `half_range_sweep_v` has no capture region to
-derive at all, so the guarded move refuses with a prompt to calibrate instead of failing
-every landing and blaming the signal.
-
-### Setting the two physical tunables
-
-`approach_offset_v` and `settle_ms` are properties of your actuator, so measure them
-rather than guessing: **Measure hysteresis** (`POST
-/api/devices/{key}/control/lock_approach/measure`) approaches the current target from
-both directions at several settle times, without locking, and reports a verdict:
-
-| verdict | what it means | what to change |
-| --- | --- | --- |
-| `backlash` | the offset flips sign with the approach direction | raise `approach_offset_v` above the measured width |
-| `creep` | same offset either way, and it shrinks the longer you wait | raise `settle_ms` |
-| `drift_or_creep` | same offset either way, and it does not shrink | try longer settles, or look for laser/cavity drift |
-| `negligible` | both directions land inside the window | leave the guarded move off |
-| `inconclusive` | too few measurements succeeded | check the sweep is running |
-
-A single direction cannot distinguish backlash from creep, which is why the
-diagnostic always measures both.
-
-Each measurement is also written to `pdh_lock_results` with
-`lock_source = "lock_approach_probe"`, so probes and locks trend together in one query.
-`center_move_v` is 0 for a probe (it restores the center it found), `center_offset_v`
-carries the largest excursion measured, and `approach_detail` holds every sample.
-
-> **Not yet validated on hardware.** The control logic is tested against a simulated
-> hysteretic actuator (backlash, creep, non-repeatable displacement, neighbouring
-> crossings, a stopped sweep). The physical defaults are placeholders until the
-> diagnostic has been run on a real board.
-
 ## Auto-relock
 
 A per-device controller that re-establishes a lost lock. It is configured with
@@ -465,11 +385,8 @@ Configure in the UI:
 Logging behavior:
 
 - Best effort, non-blocking for lock actions.
-- Writes include `lock_source` — one of `manual_lock`, `auto_lock_scan`, `auto_relock`,
-  or `lock_approach_probe` — plus error/monitor traces, and the guarded-move columns when
-  one ran.
-  Auto-relock rows carry them too, so the unattended path that runs most often is the
-  one that populates the hysteresis trend.
+- Writes include `lock_source` — one of `manual_lock`, `auto_lock_scan` or
+  `auto_relock` — plus error/monitor traces and the sweep geometry.
 
 Expected Postgres schema (`pdh_lock_results`):
 
@@ -495,19 +412,7 @@ CREATE TABLE IF NOT EXISTS pdh_lock_results (
     monitor_trace_y_units TEXT NOT NULL DEFAULT 'V',
     -- The sweep itself, previously only recoverable by inverting trace_x:
     sweep_center_v DOUBLE PRECISION,
-    sweep_amplitude_v DOUBLE PRECISION,
-    -- Guarded center move (see "Guarded center move" above):
-    target_voltage_v DOUBLE PRECISION,      -- crossing the detector picked
-    sweep_center_start_v DOUBLE PRECISION,  -- center before anything moved
-    center_move_v DOUBLE PRECISION,         -- how far the center travelled, signed
-    center_correction_v DOUBLE PRECISION,   -- hysteresis correction; 0 = target untouched
-    center_offset_v DOUBLE PRECISION,       -- residual at acceptance
-    capture_tolerance_v DOUBLE PRECISION,   -- the window that was applied
-    approach_enabled BOOLEAN,
-    approach_direct BOOLEAN,
-    approach_from_below BOOLEAN,
-    approach_attempts INTEGER,
-    approach_detail JSONB                   -- per-attempt breakdown
+    sweep_amplitude_v DOUBLE PRECISION
 );
 ```
 

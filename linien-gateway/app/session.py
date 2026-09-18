@@ -41,15 +41,10 @@ from .auto_lock_scan import (
 )
 from .auto_relock import AutoRelockConfig, AutoRelockController
 from .device_recovery import RecoveryCancelled, reboot_device
-from .lock_approach import (
-    ApproachAborted,
-    ApproachPlan,
-    ApproachSettings,
+from .lock_acceptance import (
+    AcceptanceSettings,
     acceptance_window_v,
     capture_tolerance_v,
-    classify_hysteresis,
-    plan_approach,
-    probe_report,
 )
 from .lock_refinement import (
     _MAX_REFINEMENT_STAGES,
@@ -291,7 +286,7 @@ class DeviceSession:
         self._param_metadata_cache: List[Dict[str, Any]] | None = None
         self.plot_state = PlotState()
         self.auto_lock_scan_settings = self._initial_auto_lock_scan_settings()
-        self.lock_approach_settings = self._initial_lock_approach_settings()
+        self.lock_acceptance_settings = self._initial_lock_acceptance_settings()
         self.lock_indicator = LockIndicatorEvaluator(
             self._initial_lock_indicator_config()
         )
@@ -963,7 +958,6 @@ class DeviceSession:
         *,
         lock_source: str,
         event_source: str,
-        approach: dict[str, Any] | None = None,
         success: bool = True,
     ) -> None:
         if self._lock_result_postgres is None:
@@ -988,7 +982,6 @@ class DeviceSession:
                 device_key=self.device.key,
                 lock_source=lock_source,
                 success=success,
-                approach=approach,
             )
             enqueued = service.enqueue_lock_result(row)
             get_state = getattr(service, "get_state", None)
@@ -1096,10 +1089,10 @@ class DeviceSession:
         payload = parameters.get("auto_relock_config")
         return payload if isinstance(payload, dict) else {}
 
-    def _initial_lock_approach_settings(self) -> dict[str, Any]:
+    def _initial_lock_acceptance_settings(self) -> dict[str, Any]:
         parameters = getattr(self.device, "parameters", None)
         payload = (
-            parameters.get("lock_approach_settings")
+            parameters.get("lock_acceptance_settings")
             if isinstance(parameters, dict)
             else None
         )
@@ -1109,19 +1102,19 @@ class DeviceSession:
         # off) rather than feeding out-of-range motion settings to the hardware.
         if isinstance(payload, dict):
             try:
-                payload = schemas.LockApproachSettings.model_validate(
+                payload = schemas.LockAcceptanceSettings.model_validate(
                     payload
                 ).model_dump()
             except ValidationError as exc:
                 logger.warning(
-                    "Ignoring invalid stored lock_approach_settings for device %s: %s",
+                    "Ignoring invalid stored lock_acceptance_settings for device %s: %s",
                     getattr(self.device, "key", "?"),
                     exc,
                 )
                 payload = None
         else:
             payload = None
-        return ApproachSettings.from_mapping(payload).__dict__.copy()
+        return AcceptanceSettings.from_mapping(payload).__dict__.copy()
 
     def _normalize_influx_logging_state(self, payload: Any) -> dict[str, Any]:
         interval = DEFAULT_INFLUX_LOGGING_INTERVAL_S
@@ -1165,11 +1158,11 @@ class DeviceSession:
             if next_auto_lock_scan_settings != self.auto_lock_scan_settings:
                 self.auto_lock_scan_settings = next_auto_lock_scan_settings
 
-    def sync_lock_approach_settings_from_device(self) -> None:
+    def sync_lock_acceptance_settings_from_device(self) -> None:
         with self._state_lock:
-            next_lock_approach_settings = self._initial_lock_approach_settings()
-            if next_lock_approach_settings != self.lock_approach_settings:
-                self.lock_approach_settings = next_lock_approach_settings
+            next_lock_acceptance_settings = self._initial_lock_acceptance_settings()
+            if next_lock_acceptance_settings != self.lock_acceptance_settings:
+                self.lock_acceptance_settings = next_lock_acceptance_settings
 
     def sync_lock_indicator_settings_from_device(self) -> None:
         with self._state_lock:
@@ -1197,7 +1190,7 @@ class DeviceSession:
 
     def sync_configs_from_device(self) -> None:
         self.sync_auto_lock_scan_settings_from_device()
-        self.sync_lock_approach_settings_from_device()
+        self.sync_lock_acceptance_settings_from_device()
         self.sync_lock_indicator_settings_from_device()
         self.sync_auto_relock_config_from_device()
         self.sync_influx_logging_state_from_device()
@@ -1224,15 +1217,15 @@ class DeviceSession:
             self.auto_lock_scan_settings = settings.__dict__.copy()
             return dict(self.auto_lock_scan_settings)
 
-    def get_lock_approach_settings(self) -> dict[str, Any]:
+    def get_lock_acceptance_settings(self) -> dict[str, Any]:
         with self._state_lock:
-            return dict(self.lock_approach_settings)
+            return dict(self.lock_acceptance_settings)
 
-    def update_lock_approach_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def update_lock_acceptance_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._state_lock:
-            settings = ApproachSettings.from_mapping(payload)
-            self.lock_approach_settings = settings.__dict__.copy()
-            return dict(self.lock_approach_settings)
+            settings = AcceptanceSettings.from_mapping(payload)
+            self.lock_acceptance_settings = settings.__dict__.copy()
+            return dict(self.lock_acceptance_settings)
 
     def _unlocked_trace_timeout_s(self) -> float:
         """How stale an unlocked trace may be before callers must refuse it.
@@ -2202,24 +2195,16 @@ class DeviceSession:
                 code="auto_relock_action_start",
                 message="Auto-relock action started.",
             )
-            relock_payload = self.auto_lock_from_scan(None)
+            self.auto_lock_from_scan(None)
             self._emit_log_event(
                 level=logging.INFO,
                 source="auto_relock",
                 code="auto_relock_action_success",
                 message="Auto-relock action completed.",
             )
-            # Without this the row would record approach_enabled = False
-            # for a lock a guarded move actually established. Auto-relock is
-            # the path that runs unattended and repeatedly, so it is the
-            # richest source of the offsets these columns exist to trend.
-            approach_report = relock_payload.get("approach")
             self._write_lock_result_to_postgres(
                 lock_source="auto_relock",
                 event_source="auto_relock",
-                approach=(
-                    approach_report if isinstance(approach_report, dict) else None
-                ),
             )
         except Exception as exc:
             self._emit_log_event(
@@ -2229,22 +2214,6 @@ class DeviceSession:
                 message="Auto-relock action failed.",
                 details={"error": str(exc)},
             )
-            # An aborted guarded move carries the largest measured
-            # offsets of any attempt, so a failure here is the most
-            # informative hysteresis sample there is -- see the success
-            # path above for why leaving it out would be the wrong call.
-            # Only such a failure is recorded, as on the API path: one
-            # where nothing moved ("already locked", no target found)
-            # would add an approach-less row per relock tick and skew the
-            # failure statistics.
-            failure_report = getattr(exc, "report", None)
-            if isinstance(failure_report, dict):
-                self._write_lock_result_to_postgres(
-                    lock_source="auto_relock",
-                    event_source="auto_relock",
-                    success=False,
-                    approach=failure_report,
-                )
             raise
 
     def _on_to_plot(self, value: Any) -> None:
@@ -2567,179 +2536,6 @@ class DeviceSession:
         )
         return result.to_dict()
 
-    def measure_lock_approach(
-        self, settle_ms_options: list[int] | None = None
-    ) -> dict[str, Any]:
-        """Measure the actuator's displacement from each direction, and say why.
-
-        Approaches the current target from below and from above at a few settle
-        times, recording where the crossing then appears relative to the
-        commanded center. That is the experiment that separates backlash (the
-        offset flips sign with direction) from creep (it does not, but shrinks
-        with settling), and it is how ``approach_offset_v`` and ``settle_ms``
-        get set from data rather than guessed.
-
-        Does not lock, and puts the sweep center back when it is done.
-        """
-        if self.control is None or self.parameters is None:
-            raise RuntimeError("Device not connected")
-
-        with self._state_lock:
-            scan_settings = AutoLockScanSettings.from_mapping(
-                self.auto_lock_scan_settings
-            )
-            approach = ApproachSettings.from_mapping(self.lock_approach_settings)
-        settles = sorted({max(0, int(value)) for value in (settle_ms_options or [50, 500])})
-        if not settles:
-            settles = [50, 500]
-        if float(approach.approach_offset_v) <= 0.0:
-            # Without an overshoot both "directions" issue the same set-point,
-            # so the measurement cannot separate them and any verdict would be
-            # two readings of the same thing compared against each other.
-            raise ValueError(
-                "Set approach_offset_v above 0 before measuring: with no "
-                "overshoot, approaching from below and from above are the same "
-                "move, so the result cannot tell backlash from creep."
-            )
-
-        error_trace, monitor_trace = self._snapshot_auto_lock_traces()
-        (
-            start_center_v,
-            sweep_amplitude,
-            preferred_slope_rising,
-            modulation_frequency_hz,
-        ) = self._snapshot_sweep_params(require_unlocked=True)
-        target = find_auto_lock_target(
-            error_trace_v=error_trace,
-            monitor_trace_v=monitor_trace,
-            sweep_center_v=start_center_v,
-            sweep_amplitude_v=sweep_amplitude,
-            settings=scan_settings,
-            preferred_slope_rising=preferred_slope_rising,
-            modulation_frequency_hz=modulation_frequency_hz,
-        )
-        target_v = float(target.target_voltage)
-        # The same window the lock path applies, so the diagnostic cannot report
-        # "negligible" for offsets the lock would go on to reject.
-        tolerance_v = self._require_capture_window(
-            approach, scan_settings, target.sideband_offset_v
-        ).tolerance_v
-
-        samples: list[dict[str, Any]] = []
-        with self._exclusive_center_move("the hysteresis measurement"):
-            # Inside the lock, so the reference center cannot have moved between
-            # reading it and using it as the restore point.
-            current_center = self._current_sweep_center()
-            if current_center is not None:
-                start_center_v = current_center
-            samples = self._run_hysteresis_probes(
-                approach, scan_settings, settles, start_center_v, target_v
-            )
-
-        verdict, detail = classify_hysteresis(samples, tolerance_v)
-        result = {
-            "target_voltage": target_v,
-            "start_voltage": start_center_v,
-            "capture_tolerance_v": tolerance_v,
-            "samples": samples,
-            "verdict": verdict,
-            "detail": detail,
-        }
-        # Keep the measurement. It is the most direct hysteresis data available,
-        # and returning it only in the HTTP response would mean running it on
-        # ten lasers and retaining none of it.
-        self._write_lock_result_to_postgres(
-            lock_source="lock_approach_probe",
-            event_source="auto_lock_scan",
-            success=bool(verdict not in (None, "inconclusive")),
-            approach=probe_report(result),
-        )
-        return result
-
-    def _run_hysteresis_probes(
-        self,
-        approach: ApproachSettings,
-        scan_settings: AutoLockScanSettings,
-        settles: list[int],
-        start_center_v: float,
-        target_v: float,
-    ) -> list[dict[str, Any]]:
-        samples: list[dict[str, Any]] = []
-        try:
-            for settle_ms in settles:
-                probe = dataclasses.replace(approach, enabled=True, settle_ms=settle_ms)
-                for from_below in (True, False):
-                    # Each measurement must start from somewhere other than the
-                    # target, or there would be no move to measure the effect of.
-                    plan = plan_approach(
-                        start_center_v,
-                        target_v,
-                        probe,
-                        from_below=from_below,
-                        force_anti_backlash=True,
-                    )
-                    if plan.direct or plan.from_below != from_below:
-                        # The target is pinned against a sweep rail, so there is
-                        # no room to come at it from this side. `plan_approach`
-                        # silently substitutes the other direction rather than
-                        # failing outright (`plan.direct` is only set when
-                        # *both* sides are pinned) -- catch that swap here too,
-                        # or this probe would record a reading that silently
-                        # used the other direction under this side's label.
-                        samples.append(
-                            {
-                                "from_below": from_below,
-                                "settle_ms": settle_ms,
-                                "offset_v": None,
-                                "detected_voltage": None,
-                                "detail": (
-                                    "no room to overshoot on this side — the "
-                                    "target sits against a sweep rail"
-                                ),
-                            }
-                        )
-                        continue
-                    moved_at = self._apply_center_plan(plan)
-                    _center, detected_v, offset_v, detail = self._redetect_after_move(
-                        scan_settings, moved_at
-                    )
-                    samples.append(
-                        {
-                            "from_below": plan.from_below,
-                            "settle_ms": settle_ms,
-                            "offset_v": offset_v,
-                            "detected_voltage": detected_v,
-                            "detail": detail,
-                        }
-                    )
-        finally:
-            self._restore_sweep_center(start_center_v)
-        return samples
-
-    def _apply_center_plan(self, plan: ApproachPlan) -> float:
-        """Walk an approach plan's set-points on the device.
-
-        Returns the time the move finished. Verification must only accept a
-        sweep acquired after that instant: a trace that landed part-way through
-        the ramp would show the feature at a center the actuator has already
-        left.
-
-        ``_rpyc_lock`` is taken per set-point rather than across the whole ramp:
-        a long ramp would otherwise stall the plot poll and every API handler
-        for its full duration. The sweep keeps running throughout -- only its
-        center moves.
-        """
-        if self.control is None or self.parameters is None:
-            raise RuntimeError("Device not connected")
-        for step in plan.steps:
-            with self._rpyc_lock:
-                self.parameters.sweep_center.value = float(step.voltage)
-                self.control.exposed_write_registers()
-            if step.delay_s > 0.0:
-                time.sleep(step.delay_s)
-        if plan.settle_s > 0.0:
-            time.sleep(plan.settle_s)
-        return time.time()
 
     def _wait_for_fresh_unlocked_trace(
         self, after: float, timeout_s: float, frames: int = VERIFY_TRACE_FRAMES
@@ -2778,54 +2574,6 @@ class DeviceSession:
                 return False
             time.sleep(0.05)
 
-    def _redetect_after_move(
-        self,
-        scan_settings: AutoLockScanSettings,
-        moved_at: float,
-    ) -> tuple[float | None, float | None, float | None, str]:
-        """Re-run detection on the first sweep that finished after a center move.
-
-        Returns ``(center_v, detected_v, offset_v, detail)``. ``offset_v`` is how
-        far the crossing sits from the center actually commanded -- the hysteresis
-        excursion this whole path exists to measure. ``detected_v`` is None when
-        no fresh sweep arrived or nothing in it met the detection criteria, and
-        ``detail`` then says which.
-        """
-        timeout_s = self._unlocked_trace_timeout_s()
-        if not self._wait_for_fresh_unlocked_trace(moved_at, timeout_s):
-            # The budget is per frame, so report what was actually waited out
-            # rather than the per-frame figure.
-            waited_s = timeout_s * VERIFY_TRACE_FRAMES
-            return (
-                None,
-                None,
-                None,
-                f"no fresh sweep within {waited_s:.1f} s — is the sweep running?",
-            )
-        try:
-            error_trace, monitor_trace = self._snapshot_auto_lock_traces()
-            (
-                center_v,
-                sweep_amplitude,
-                preferred_slope_rising,
-                modulation_frequency_hz,
-            ) = self._snapshot_sweep_params(require_unlocked=True)
-            verify = find_auto_lock_target(
-                error_trace_v=error_trace,
-                monitor_trace_v=monitor_trace,
-                sweep_center_v=center_v,
-                sweep_amplitude_v=sweep_amplitude,
-                settings=scan_settings,
-                preferred_slope_rising=preferred_slope_rising,
-                modulation_frequency_hz=modulation_frequency_hz,
-            )
-        except Exception as exc:  # noqa: BLE001 - a failed re-detect is a result
-            return None, None, None, str(exc)
-        # Measure against the center read back from the device, not the value we
-        # believe we wrote, so an out-of-band change cannot be mistaken for
-        # actuator hysteresis.
-        detected_v = float(verify.target_voltage)
-        return center_v, detected_v, detected_v - float(center_v), ""
 
     def _maybe_dispatch_relock_action(self, run: Callable[[], None]) -> bool:
         """Claim the relock action and start it, or drop it if one is in flight.
@@ -2914,311 +2662,21 @@ class DeviceSession:
     def _move_and_lock(
         self,
         result: Any,
-        settings: AutoLockScanSettings,
-        approach: ApproachSettings,
         sweep_center: float,
-    ) -> dict[str, Any] | None:
+    ) -> None:
         """Put the center on the detected target and start the lock.
 
         Split out of auto_lock_from_scan so the whole move-and-handover runs
-        under the center-move lock. The reference center is re-read here rather
-        than taken from the caller's earlier snapshot: it is what an abort
-        restores to, and it has to reflect the device as of inside the lock.
+        under the center-move lock.
         """
         current_center = self._current_sweep_center()
         if current_center is not None:
             sweep_center = current_center
-        if not approach.enabled:
-            with self._rpyc_lock:
-                self.parameters.sweep_center.value = float(result.target_voltage)
-                self.control.exposed_write_registers()
-                self.control.exposed_start_lock()
-            return None
-
-        # Refuse an unusable configuration up front: nothing has moved yet, so
-        # this must not go through the restore-and-report path below.
-        self._require_capture_window(approach, settings, result.sideband_offset_v)
-        # Move onto the target under guard and confirm, on a real sweep, that
-        # the feature actually ended up inside the capture region before
-        # committing the lock.
-        try:
-            approach_report, failure = self._approach_and_verify(
-                target_v=float(result.target_voltage),
-                start_center_v=sweep_center,
-                approach=approach,
-                scan_settings=settings,
-                sideband_offset_v=result.sideband_offset_v,
-            )
-        except Exception:
-            # A ramp interrupted part-way (a disconnect, say) would otherwise
-            # leave the center parked on an arbitrary intermediate set-point.
-            # The deliberate abort path below already restores it; an unexpected
-            # failure has to as well.
-            self._restore_sweep_center(sweep_center)
-            raise
-        if failure is not None:
-            restored = self._restore_sweep_center(sweep_center)
-            raise ApproachAborted(
-                self._approach_failure_message(approach_report, failure, restored),
-                approach_report,
-            )
-        # The approach loop already wrote the confirmed center.
         with self._rpyc_lock:
+            self.parameters.sweep_center.value = float(result.target_voltage)
+            self.control.exposed_write_registers()
             self.control.exposed_start_lock()
-        return approach_report
 
-    @staticmethod
-    def _require_capture_window(
-        approach: ApproachSettings,
-        scan_settings: AutoLockScanSettings,
-        sideband_offset_v: float | None,
-    ):
-        """The acceptance window, or a refusal if none can be derived.
-
-        The window comes from the calibrated feature width, so a zero width
-        means there is nothing to derive it from. Raised as a ValueError -- this
-        is a configuration problem (422), not a failed lock attempt (409), and
-        it must surface before anything moves, so there is neither a center to
-        restore nor an empty measurement row to write.
-        """
-        window = acceptance_window_v(
-            approach, scan_settings.half_range_sweep_v, sideband_offset_v
-        )
-        if window.tolerance_v <= 0.0:
-            raise ValueError(
-                "No capture region could be derived for this device. Calibrate the "
-                "auto-lock scan settings (half_range_sweep_v) or raise "
-                "capture_fraction above 0 before enabling the guarded center move."
-            )
-        return window
-
-    def _approach_and_verify(
-        self,
-        target_v: float,
-        start_center_v: float,
-        approach: ApproachSettings,
-        scan_settings: AutoLockScanSettings,
-        sideband_offset_v: float | None,
-    ) -> tuple[dict[str, Any], str | None]:
-        """Move the sweep center onto ``target_v`` and confirm it landed there.
-
-        Commanding ``sweep_center = target_v`` does not put a hysteretic actuator
-        at ``target_v``: the feature reappears displaced by some delta. That
-        delta is measurable on the very next sweep, so rather than only guarding
-        against it, each attempt measures it and re-centers on where the feature
-        actually is.
-
-        One cheap direct probe first, then ``max_approach_iterations``
-        anti-backlash corrections from the configured direction, then the same
-        budget again from the opposite one -- which is what separates backlash,
-        where delta flips sign with direction, from creep, where it does not.
-
-        Returns ``(report, failure)``; ``failure`` is None when the center was
-        confirmed inside the capture region and the lock may be started.
-        """
-        window = self._require_capture_window(
-            approach, scan_settings, sideband_offset_v
-        )
-        tolerance_v, bound_v = window.tolerance_v, window.bound_v
-
-        state = {
-            "commanded_v": float(target_v),
-            "current_v": float(start_center_v),
-        }
-        attempts: list[dict[str, Any]] = []
-        accepted_offset: float | None = None
-
-        def _attempt(from_below: bool, *, force: bool) -> str:
-            """Move, verify, and record. Returns the verdict for the caller."""
-            nonlocal accepted_offset
-            plan = plan_approach(
-                state["current_v"],
-                state["commanded_v"],
-                approach,
-                from_below=from_below,
-                force_anti_backlash=force,
-            )
-            moved_at = self._apply_center_plan(plan)
-            center_v, detected_v, offset_v, detail = self._redetect_after_move(
-                scan_settings, moved_at
-            )
-            state["current_v"] = (
-                float(center_v) if center_v is not None else plan.target_voltage
-            )
-            record: dict[str, Any] = {
-                "attempt": len(attempts) + 1,
-                "from_below": plan.from_below,
-                "direct": plan.direct,
-                "set_points": len(plan.steps),
-                "commanded_voltage": state["current_v"],
-                "detected_voltage": detected_v,
-                "offset_v": offset_v,
-                "accepted": False,
-                "detail": detail,
-            }
-            attempts.append(record)
-
-            if offset_v is None:
-                record["detail"] = detail or "no crossing met the detection criteria"
-                return "no_detection"
-
-            if abs(offset_v) <= tolerance_v:
-                record["accepted"] = True
-                record["detail"] = (
-                    f"within capture region: off by {offset_v:+.4f} V "
-                    f"(tolerance {tolerance_v:.4f} V)"
-                )
-                accepted_offset = offset_v
-                return "accepted"
-
-            if bound_v is not None and abs(offset_v) > bound_v:
-                # Not a displaced feature -- a different one. Correcting towards
-                # it would walk the lock onto the wrong crossing, which is the
-                # failure this path exists to prevent, so stop rather than
-                # trying the other direction.
-                record["detail"] = (
-                    f"re-detected a crossing {offset_v:+.4f} V away, past the "
-                    f"{bound_v:.4f} V neighbour guard — that is a different "
-                    f"feature, not a displaced one"
-                )
-                return "neighbour"
-
-            # Move the center TO the feature's apparent position, not away from
-            # it: the crossing showed up at center + offset, so that is where the
-            # center has to go. Under a repeatable displacement this is a
-            # fixed-point iteration that converges in one step.
-            next_commanded = state["commanded_v"] + offset_v
-            if bound_v is not None and abs(next_commanded - target_v) > bound_v:
-                # Each individual offset stayed inside the neighbour guard, but
-                # several same-direction corrections have now walked the
-                # commanded center past a neighbouring feature -- the same
-                # failure the single-attempt guard above exists to prevent.
-                record["detail"] = (
-                    f"corrections drifted {abs(next_commanded - target_v):+.4f} V "
-                    f"from the original target, past the {bound_v:.4f} V "
-                    f"neighbour guard — stopping rather than risk the wrong crossing"
-                )
-                return "neighbour"
-
-            record["detail"] = (
-                f"off by {offset_v:+.4f} V (tolerance {tolerance_v:.4f} V); "
-                f"re-centering on where the feature actually is"
-            )
-            state["commanded_v"] = next_commanded
-            return "correct"
-
-        def _report(accepted: bool, failure: str | None) -> tuple[dict[str, Any], str | None]:
-            if accepted:
-                offset_v = accepted_offset
-            else:
-                # Report the last offset actually measured. A failed approach is
-                # the most informative hysteresis sample there is, and blanking
-                # it would empty the very column it was added to fill.
-                measured = [
-                    item["offset_v"] for item in attempts if item["offset_v"] is not None
-                ]
-                offset_v = measured[-1] if measured else None
-            return (
-                self._approach_report(
-                    enabled=True,
-                    accepted=accepted,
-                    target_v=target_v,
-                    commanded_v=state["current_v"],
-                    start_center_v=start_center_v,
-                    offset_v=offset_v,
-                    tolerance_v=tolerance_v,
-                    bound_v=bound_v,
-                    attempts=attempts,
-                ),
-                failure,
-            )
-
-        from_below = bool(approach.approach_from_below)
-        iterations = max(1, int(approach.max_approach_iterations))
-
-        # The cheap direct probe, outside the correction budget so that both
-        # directions get the same number of real correction attempts.
-        verdict = _attempt(from_below, force=False)
-        if verdict == "accepted":
-            return _report(True, None)
-        if verdict == "neighbour":
-            return _report(False, attempts[-1]["detail"])
-
-        for direction_index in range(2):
-            if direction_index == 1:
-                from_below = not from_below
-            for _iteration in range(iterations):
-                verdict = _attempt(from_below, force=True)
-                if verdict == "accepted":
-                    return _report(True, None)
-                if verdict == "neighbour":
-                    return _report(False, attempts[-1]["detail"])
-                if verdict == "no_detection":
-                    break  # nothing to correct by; try the other direction
-
-        if all(item["offset_v"] is None for item in attempts):
-            # Nothing was ever measured, so this is not a hysteresis failure at
-            # all -- most often the sweep is not running. Say that instead of
-            # reporting a tolerance the board never got near.
-            failure = str(attempts[-1].get("detail") or "no crossing was detected")
-        else:
-            failure = (
-                "the pre-lock verification sweep never confirmed the target within "
-                f"{tolerance_v:.4f} V"
-            )
-            if window.tightened:
-                failure += (
-                    f" (narrowed from {capture_tolerance_v(approach, scan_settings.half_range_sweep_v):.4f} V "
-                    "because the neighbouring feature is close — this signal is more "
-                    "tightly spaced than the settings assume)"
-                )
-        return _report(False, failure)
-
-    @staticmethod
-    def _approach_report(
-        *,
-        enabled: bool,
-        accepted: bool,
-        target_v: float,
-        commanded_v: float,
-        start_center_v: float,
-        offset_v: float | None,
-        tolerance_v: float,
-        bound_v: float | None,
-        attempts: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        return {
-            "enabled": enabled,
-            "accepted": accepted,
-            "target_voltage": float(target_v),
-            "commanded_voltage": float(commanded_v),
-            "start_voltage": float(start_center_v),
-            "center_move_v": float(commanded_v) - float(start_center_v),
-            "center_correction_v": float(commanded_v) - float(target_v),
-            "center_offset_v": offset_v,
-            "capture_tolerance_v": float(tolerance_v),
-            "rejection_bound_v": None if bound_v is None else float(bound_v),
-            "attempts": attempts,
-        }
-
-    def _restore_sweep_center(self, center_v: float) -> bool:
-        """Put the sweep center back after an abandoned approach, best effort.
-
-        A failed auto-lock should leave the device as it found it rather than
-        parked on a target that was never confirmed.
-        """
-        try:
-            with self._rpyc_lock:
-                self.parameters.sweep_center.value = float(center_v)
-                self.control.exposed_write_registers()
-            return True
-        except Exception:  # noqa: BLE001 - never mask the original failure
-            logger.warning(
-                "Failed restoring sweep center to %.4f V after an aborted approach",
-                float(center_v),
-                exc_info=True,
-            )
-            return False
 
     # The three static helpers below used to hold this arithmetic directly.
     # It now lives in lock_refinement.py (moved unchanged) alongside the rest
@@ -3263,7 +2721,7 @@ class DeviceSession:
     ) -> float:
         """Atomically command both scan axes and return the completion timestamp.
 
-        The guarded approach lets `settle_ms` decay before it believes a trace
+        The refinement walk lets `settle_ms` decay before it believes a trace
         (see _apply_center_plan); the refinement walk did not, and started
         counting frames the instant the registers were written. Both axes are
         actuators with a settling tail, so the first frames after the write show
@@ -3362,7 +2820,7 @@ class DeviceSession:
     def _trajectory_refine_auto_lock(
         self,
         settings: AutoLockScanSettings,
-        approach: ApproachSettings,
+        acceptance: AcceptanceSettings,
         start_center_v: float,
         start_amplitude_v: float,
         *,
@@ -3410,10 +2868,10 @@ class DeviceSession:
             # Centre moves are intentionally separate;
             # they are known to perturb this DFB's apparent feature position.
             narrow_count = 0
-            # Both sweep axes are actuators. The guarded approach already waits
+            # Both sweep axes are actuators, so a geometry write needs the same
             # `settle_ms` before trusting a trace; a refinement stage commands a
-            # larger move than a single approach step and waited for none.
-            geometry_settle_s = max(0.0, float(approach.settle_ms) / 1000.0)
+            # settle a centre move needs before the trace can be believed.
+            geometry_settle_s = max(0.0, float(acceptance.settle_ms) / 1000.0)
             # Narrowing the scan moves the feature too: changing the ramp width
             # changes the actuator's trajectory, and the apparent resonance
             # follows. Measured on this device at 73 mV for one 2x narrowing --
@@ -3623,7 +3081,7 @@ class DeviceSession:
             # diverges from capture_fraction the moment anyone changes it.
             # Floored at one sample: nothing can be resolved finer than that.
             window = acceptance_window_v(
-                approach, settings.half_range_sweep_v, strict_two.sideband_offset_v
+                acceptance, settings.half_range_sweep_v, strict_two.sideband_offset_v
             )
             tolerance = max(
                 window.tolerance_v, 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
@@ -3671,11 +3129,11 @@ class DeviceSession:
             # 2. Is it slow enough to hand over? What matters is not how far the
             #    feature moved while being verified, but how far it will move
             #    between the last detection and the lock engaging -- the settle
-            #    the approach already waits. Comparing a multi-second drift
+            #    the handover already waits. Comparing a multi-second drift
             #    against a capture window the handover never spans is what made
             #    this unsatisfiable.
             interval_s = max(0.0, two_at - one_at)
-            handover_s = max(0.0, float(approach.settle_ms) / 1000.0)
+            handover_s = max(0.0, float(acceptance.settle_ms) / 1000.0)
             if interval_s > 1e-3:
                 drift_rate_v_s = drift_v / interval_s
                 predicted_v = drift_rate_v_s * handover_s
@@ -3686,7 +3144,7 @@ class DeviceSession:
                         f"{interval_s:.2f} s apart), so it moves "
                         f"{predicted_v * 1e3:.3f} mV during the {handover_s * 1e3:.0f} ms "
                         f"handover -- outside the {tolerance * 1e3:.3f} mV capture "
-                        f"window (capture_fraction {float(approach.capture_fraction):g} "
+                        f"window (capture_fraction {float(acceptance.capture_fraction):g} "
                         f"x feature half-width "
                         f"{float(settings.half_range_sweep_v) * 1e3:.3f} mV). "
                         "Shorten settle_ms, or stabilise the laser."
@@ -3697,7 +3155,7 @@ class DeviceSession:
                 raise ValueError(
                     f"The two final detections were {drift_v * 1e3:.3f} mV apart, "
                     f"outside the {tolerance * 1e3:.3f} mV acceptance window "
-                    f"(capture_fraction {float(approach.capture_fraction):g} x feature "
+                    f"(capture_fraction {float(acceptance.capture_fraction):g} x feature "
                     f"half-width {float(settings.half_range_sweep_v) * 1e3:.3f} mV)."
                 )
             stages.append({
@@ -3741,33 +3199,6 @@ class DeviceSession:
                 diagnostics,
             ) from exc
 
-    @staticmethod
-    def _approach_failure_message(
-        report: dict[str, Any], reason: str | None, restored: bool
-    ) -> str:
-        """Why the lock was not started, in terms an operator can act on.
-
-        Leads with the specific reason -- a neighbouring crossing and a target
-        that simply would not settle need different responses -- then lists what
-        each attempt measured.
-        """
-        parts = []
-        for attempt in report.get("attempts", []):
-            direction = "from below" if attempt.get("from_below") else "from above"
-            offset = attempt.get("offset_v")
-            measured = "no detection" if offset is None else f"off by {offset:+.4f} V"
-            parts.append(f"#{attempt.get('attempt')} {direction}: {measured}")
-        summary = "; ".join(parts) if parts else "no attempts were made"
-        headline = reason or (
-            "the pre-lock verification sweep never confirmed the target within "
-            f"{report.get('capture_tolerance_v', 0.0):.4f} V"
-        )
-        tail = (
-            f" Sweep center restored to {report.get('start_voltage', 0.0):.4f} V."
-            if restored
-            else " The sweep center could NOT be restored — check the device."
-        )
-        return f"Auto-lock aborted: {headline}. Attempts: {summary}.{tail}"
 
     def auto_lock_from_scan(
         self, settings_payload: dict[str, Any] | None
@@ -3784,9 +3215,8 @@ class DeviceSession:
                 settings = AutoLockScanSettings.from_mapping(settings_payload)
                 self.auto_lock_scan_settings = settings.__dict__.copy()
         with self._state_lock:
-            approach = ApproachSettings.from_mapping(self.lock_approach_settings)
+            acceptance = AcceptanceSettings.from_mapping(self.lock_acceptance_settings)
 
-        approach_report: dict[str, Any] | None = None
         refinement: dict[str, Any] | None = None
         # A walk that aborted has already put the operator's geometry back, so
         # there is nothing left to defer.
@@ -3824,7 +3254,7 @@ class DeviceSession:
                 try:
                     result, refinement = self._trajectory_refine_auto_lock(
                         settings,
-                        approach,
+                        acceptance,
                         sweep_center,
                         sweep_amplitude,
                         initial_target=coarse,
@@ -3853,7 +3283,7 @@ class DeviceSession:
                     try:
                         result, refinement = self._trajectory_refine_auto_lock(
                             settings,
-                            approach,
+                            acceptance,
                             sweep_center,
                             sweep_amplitude,
                             initial_target=direct,
@@ -3882,17 +3312,15 @@ class DeviceSession:
                         result = direct
                         refinement_failed = True
             try:
-                # The refinement final verification leaves geometry untouched;
-                # guarded handover therefore starts from the exact verified scan.
-                approach_report = self._move_and_lock(
-                    result, settings, approach, sweep_center
-                )
+                # The refinement final verification leaves geometry untouched,
+                # so the handover starts from the exact verified scan.
+                self._move_and_lock(result, sweep_center)
             except Exception as exc:
                 if refinement is not None:
                     self._restore_sweep_geometry(sweep_center, sweep_amplitude)
-                    # ApproachAborted only carries `.report`. The refinement
-                    # stage history that got us here is otherwise lost, and it
-                    # is the most informative diagnostic for this failure.
+                    # The refinement stage history that got us here is otherwise
+                    # lost, and it is the most informative diagnostic for this
+                    # failure.
                     if not hasattr(exc, "refinement"):
                         exc.refinement = refinement
                 raise
@@ -3923,14 +3351,6 @@ class DeviceSession:
         if refinement is not None:
             payload["refinement"] = refinement
         payload["detail"] = "Auto-lock started from scan."
-        if approach_report is not None:
-            payload["approach"] = approach_report
-            payload["detail"] = (
-                "Auto-lock started from scan after a guarded center move of "
-                f"{approach_report['center_move_v']:+.4f} V "
-                f"(correction {approach_report['center_correction_v']:+.4f} V, "
-                f"{len(approach_report['attempts'])} attempt(s))."
-            )
         return payload
 
     def build_manual_lock_row(
@@ -3940,7 +3360,6 @@ class DeviceSession:
         device_key: str,
         lock_source: str = "manual_lock",
         success: bool = True,
-        approach: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         param_names = (
             "modulation_frequency",
@@ -3967,7 +3386,6 @@ class DeviceSession:
             params=params,
             trace_y=trace_values,
             monitor_trace_y=monitor_trace_values,
-            approach=approach,
         )
 
     def _collect_manual_lock_params(self, names: tuple[str, ...]) -> dict[str, Any]:

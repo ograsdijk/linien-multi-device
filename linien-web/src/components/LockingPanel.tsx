@@ -16,12 +16,12 @@ import type {
   AutoLockCalibrationResult,
   AutoLockScanResult,
   AutoLockScanSettings,
-  LockApproachSettings,
+  LockAcceptanceSettings,
 } from '../types';
 import { ApiError } from '../api';
 import { toClampedNumberOr, toFiniteNumberOr, toRoundedIntOr } from '../utils/numberInput';
 import { DeferredNumberInput } from './DeferredNumberInput';
-import { LockApproachPanel } from './LockApproachPanel';
+import { LockAcceptancePanel } from './LockAcceptancePanel';
 
 const DEFAULT_AUTO_LOCK_SETTINGS: AutoLockScanSettings = {
   signal_type: 'pdh',
@@ -37,8 +37,6 @@ const DEFAULT_AUTO_LOCK_SETTINGS: AutoLockScanSettings = {
   monitor_threshold: 0.1,
 };
 
-const formatSigned = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(4)}`;
-
 type LockingPanelProps = {
   deviceKey?: string;
   params: Record<string, any>;
@@ -53,7 +51,7 @@ type LockingPanelProps = {
     options: AutoLockCalibrateRequest
   ) => Promise<AutoLockCalibrationResult>;
   autoLockSettingsConfig?: AutoLockScanSettings | null;
-  lockApproachSettings?: LockApproachSettings | null;
+  lockAcceptanceSettings?: LockAcceptanceSettings | null;
   onAutoLockSettingsChange?: (settings: AutoLockScanSettings) => void;
   onStopLock: () => void;
   lockMode?: 'manual' | 'autolock_scan' | 'autolock';
@@ -74,7 +72,7 @@ export const LockingPanel = memo(function LockingPanel({
   onAutoLockFromScan,
   onCalibrateAutoLock,
   autoLockSettingsConfig,
-  lockApproachSettings,
+  lockAcceptanceSettings,
   onAutoLockSettingsChange,
   onStopLock,
   lockMode,
@@ -432,11 +430,11 @@ export const LockingPanel = memo(function LockingPanel({
               </Group>
             ) : null}
             {deviceKey ? (
-              <LockApproachPanel
+              <LockAcceptancePanel
                 deviceKey={deviceKey}
                 halfRangeSweepV={autoLockSettings.half_range_sweep_v}
                 active={mode === 'autolock_scan'}
-                settingsFromStream={lockApproachSettings}
+                settingsFromStream={lockAcceptanceSettings}
               />
             ) : null}
             <Button
@@ -456,24 +454,6 @@ export const LockingPanel = memo(function LockingPanel({
                 {autoLockResult.pair_excursion.toFixed(3)}
                 {autoLockResult.hz_per_v != null
                   ? ` | ${(autoLockResult.hz_per_v / 1e6).toFixed(3)} MHz/V`
-                  : ''}
-              </Text>
-            ) : null}
-            {autoLockResult?.approach?.enabled ? (
-              <Text size="xs" c="dimmed">
-                moved {formatSigned(autoLockResult.approach.center_move_v)} V ·
-                {' '}corrected {formatSigned(autoLockResult.approach.center_correction_v)} V ·
-                {' '}{autoLockResult.approach.attempts.length} attempt
-                {autoLockResult.approach.attempts.length === 1 ? '' : 's'}
-                {' '}({autoLockResult.approach.attempts[
-                  autoLockResult.approach.attempts.length - 1
-                ]?.from_below
-                  ? 'from below'
-                  : 'from above'})
-                {autoLockResult.approach.center_offset_v != null
-                  ? ` · residual ${formatSigned(
-                      autoLockResult.approach.center_offset_v
-                    )} V of ${autoLockResult.approach.capture_tolerance_v.toFixed(4)} V`
                   : ''}
               </Text>
             ) : null}

@@ -18,18 +18,7 @@ CREATE TABLE IF NOT EXISTS pdh_lock_results (
     trace_y_units TEXT NOT NULL DEFAULT 'V',
     monitor_trace_y_units TEXT NOT NULL DEFAULT 'V',
     sweep_center_v DOUBLE PRECISION,
-    sweep_amplitude_v DOUBLE PRECISION,
-    target_voltage_v DOUBLE PRECISION,
-    sweep_center_start_v DOUBLE PRECISION,
-    center_move_v DOUBLE PRECISION,
-    center_correction_v DOUBLE PRECISION,
-    center_offset_v DOUBLE PRECISION,
-    capture_tolerance_v DOUBLE PRECISION,
-    approach_enabled BOOLEAN,
-    approach_direct BOOLEAN,
-    approach_from_below BOOLEAN,
-    approach_attempts INTEGER,
-    approach_detail JSONB
+    sweep_amplitude_v DOUBLE PRECISION
 );
 
 ALTER TABLE pdh_lock_results

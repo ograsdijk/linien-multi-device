@@ -14,30 +14,6 @@ const result: AutoLockScanResult = {
   right_excursion: 0.13,
   pair_excursion: 0.25,
   symmetry: 0.92,
-  approach: {
-    enabled: true,
-    accepted: true,
-    target_voltage: 0.412,
-    commanded_voltage: 0.43,
-    start_voltage: 0.0,
-    center_move_v: 0.43,
-    center_correction_v: 0.018,
-    center_offset_v: 0.0004,
-    capture_tolerance_v: 0.01,
-    rejection_bound_v: 0.08,
-    attempts: [
-      {
-        attempt: 1,
-        from_below: true,
-        direct: true,
-        set_points: 1,
-        commanded_voltage: 0.412,
-        offset_v: 0.018,
-        accepted: false,
-        detail: '',
-      },
-    ],
-  },
 };
 
 const renderPanel = (onAutoLockFromScan: () => Promise<AutoLockScanResult>) =>
@@ -67,13 +43,13 @@ describe('LockingPanel auto-lock summary', () => {
     renderPanel(run);
 
     fireEvent.click(screen.getByRole('button', { name: /Auto-lock from scan/i }));
-    await waitFor(() => expect(screen.getByText(/moved \+0.4300 V/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/score=0.870/)).toBeTruthy());
 
-    // A failed attempt restores the center, so the move it describes no longer
+    // A failed attempt restores the geometry, so the run it describes no longer
     // stands -- leaving it up contradicts the failure toast beside it.
     succeed = false;
     fireEvent.click(screen.getByRole('button', { name: /Auto-lock from scan/i }));
 
-    await waitFor(() => expect(screen.queryByText(/moved \+0.4300 V/)).toBeNull());
+    await waitFor(() => expect(screen.queryByText(/score=0.870/)).toBeNull());
   });
 });

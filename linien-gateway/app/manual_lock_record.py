@@ -74,47 +74,6 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _approach_columns(approach: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Flatten a guarded-move report into the pdh_lock_results columns.
-
-    These are stored as scalars rather than buried in the JSON blob because the
-    interesting questions are trends per laser -- is this piezo's backlash
-    growing? -- which want plain SQL. ``approach_detail`` keeps the per-attempt
-    breakdown for when one device needs a closer look.
-    """
-    if not isinstance(approach, Mapping):
-        return {
-            "target_voltage_v": None,
-            "sweep_center_start_v": None,
-            "center_move_v": None,
-            "center_correction_v": None,
-            "center_offset_v": None,
-            "capture_tolerance_v": None,
-            "approach_enabled": False,
-            "approach_direct": None,
-            "approach_from_below": None,
-            "approach_attempts": None,
-            "approach_detail": None,
-        }
-    attempts = list(approach.get("attempts") or [])
-    last = attempts[-1] if attempts else {}
-    return {
-        "target_voltage_v": _to_float(approach.get("target_voltage")),
-        "sweep_center_start_v": _to_float(approach.get("start_voltage")),
-        "center_move_v": _to_float(approach.get("center_move_v")),
-        "center_correction_v": _to_float(approach.get("center_correction_v")),
-        "center_offset_v": _to_float(approach.get("center_offset_v")),
-        "capture_tolerance_v": _to_float(approach.get("capture_tolerance_v")),
-        "approach_enabled": bool(approach.get("enabled", False)),
-        "approach_direct": last.get("direct"),
-        "approach_from_below": last.get("from_below"),
-        "approach_attempts": len(attempts),
-        "approach_detail": (
-            json.dumps(_json_safe(attempts), allow_nan=False) if attempts else None
-        ),
-    }
-
-
 def build_manual_lock_row(
     *,
     device_name: str | None,
@@ -124,7 +83,6 @@ def build_manual_lock_row(
     params: Mapping[str, Any],
     trace_y: Sequence[Any] | np.ndarray | None,
     monitor_trace_y: Sequence[Any] | np.ndarray | None,
-    approach: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     laser_name = (device_name or "").strip() or device_key
     control_channel_raw = _to_float(params.get("control_channel"))
@@ -182,5 +140,4 @@ def build_manual_lock_row(
         "monitor_trace_y_units": "V",
         "sweep_center_v": sweep_center,
         "sweep_amplitude_v": sweep_amplitude,
-        **_approach_columns(approach),
     }
