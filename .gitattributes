@@ -1,2 +1,16 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# The cross-compiled Red Pitaya telemetry helper is a deployable executable:
+# never let line-ending normalization near it.
+linien-gateway/app/assets/rp-telemetry-armv7 binary
+
+# Scripts that are *executed* rather than read must keep LF endings. With
+# `text=auto` and core.autocrlf=true (the Windows default), these would be
+# checked out CRLF and then fail at the first line: bash reports
+# `$'\r': command not found` on `set -euo pipefail`, and make sees the CR as
+# part of each recipe command. rp-telemetry/build-arm.sh is documented in the
+# README as the way to build the ARM binary, from Git Bash included.
+*.sh text eol=lf
+Makefile text eol=lf
+**/Makefile text eol=lf

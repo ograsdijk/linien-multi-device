@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 import app.main as main
 from app.auto_lock_scan import AutoLockCalibration, AutoLockScanSettings
+from app.session import TrajectoryRefinementAborted
 
 
 class DummyAutoLockSession:
@@ -57,6 +58,8 @@ def test_auto_lock_scan_endpoint_passes_payload(monkeypatch):
         "min_amplitude": 0.02,
         "smooth_window_pts": 7,
         "monitor_threshold": 0.1,
+        "min_signal_scan_fraction": 0.25,
+        "max_center_step_signal_widths": 1.0,
     }
     response = client.post("/api/devices/test-device/control/auto_lock_scan", json=payload)
     assert response.status_code == 200
@@ -106,6 +109,26 @@ def test_auto_lock_scan_endpoint_maps_runtime_error(monkeypatch):
     response = client.post("/api/devices/test-device/control/auto_lock_scan", json={})
     assert response.status_code == 409
     assert "not connected" in response.text
+
+
+def test_auto_lock_scan_returns_structured_trajectory_failure(monkeypatch):
+    class ErrorSession(DummyAutoLockSession):
+        def auto_lock_from_scan(self, _payload):
+            raise TrajectoryRefinementAborted(
+                "tracking failed", {"attempted": True, "stages": [], "restored": True}
+            )
+
+    device = type("Device", (), {"key": "dev", "parameters": {}})()
+    monkeypatch.setattr(main.device_store, "get_device", lambda _key: device)
+    monkeypatch.setattr(main.device_store, "save_device", lambda _device: None)
+    monkeypatch.setattr(main.device_config_store, "set_config", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(main, "_session_for_device", lambda _device: ErrorSession())
+    response = TestClient(main.app).post("/api/devices/dev/control/auto_lock_scan", json={})
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "message": "tracking failed",
+        "refinement": {"attempted": True, "stages": [], "restored": True},
+    }
 
 
 def test_auto_lock_scan_endpoint_maps_validation_error(monkeypatch):
@@ -276,3 +299,58 @@ def test_calibrate_endpoint_maps_runtime_error(monkeypatch):
     )
     assert response.status_code == 409
     assert "No unlocked trace available" in response.text
+
+
+def test_the_real_engine_payload_passes_response_validation(monkeypatch):
+    """Guard the response_model against the engine's actual dict.
+
+    The other tests in this module hand-write the response body, so a key the
+    engine emits but the schema does not declare slips through them -- and
+    extra='forbid' turns that into a 500 *after* the lock has been started.
+    """
+    from app.auto_lock_scan import AutoLockScanResult as EngineResult
+
+    engine_result = EngineResult(
+        target_index=1024,
+        target_voltage=0.2,
+        target_slope_rising=True,
+        score=0.9,
+        left_excursion=0.15,
+        right_excursion=0.16,
+        pair_excursion=0.31,
+        symmetry=0.91,
+        monitor_level=None,
+        hz_per_v=2.0e6,
+        sideband_offset_v=0.1,
+        discriminator_slope_v_per_mhz=0.5,
+    )
+
+    class EngineSession(DummyAutoLockSession):
+        def auto_lock_from_scan(self, payload):
+            self.last_payload = payload
+            body = engine_result.to_dict()
+            body["detail"] = "Auto-lock started from scan."
+            return body
+
+    session = EngineSession()
+    device = type(
+        "Device", (), {"key": "test-device", "name": "test-device", "parameters": {}}
+    )()
+    monkeypatch.setattr(main.device_store, "get_device", lambda _key: device)
+    monkeypatch.setattr(main.device_store, "save_device", lambda _device: None)
+    monkeypatch.setattr(main.device_config_store, "set_config", lambda *_a, **_k: {})
+    monkeypatch.setattr(main, "_session_for_device", lambda _device: session)
+    monkeypatch.setattr(
+        main.lock_result_postgres, "enqueue_lock_result", lambda _row: True
+    )
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/devices/test-device/control/auto_lock_scan",
+        json=main.AutoLockScanSettings().model_dump(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["discriminator_slope_v_per_mhz"] == 0.5
+
+

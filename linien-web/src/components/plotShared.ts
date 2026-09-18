@@ -7,6 +7,27 @@
 export const N_POINTS = 2048;
 export const DECIMATION = 8;
 export const ADC_SAMPLE_RATE = 125e6;
+export const SWEEP_VOLTAGE_MIN = -1;
+export const SWEEP_VOLTAGE_MAX = 1;
+
+// Convert a trace index to the voltage actually available at the sweep output.
+// sweep_center and sweep_amplitude are independently valid parameters, so their
+// sum can describe (for example) 0.4 .. 1.2 V even though the hardware output
+// is limited to -1 .. +1 V. Keep the index spacing from the commanded sweep and
+// clamp only the resulting voltage: rescaling the entire trace into the valid
+// interval would incorrectly move every point before the clipped edge.
+export const sweepIndexToVoltage = (
+  index: number,
+  pointCount: number,
+  center: number,
+  amplitude: number
+): number => {
+  const count = Math.max(pointCount, 2);
+  const minimum = center - amplitude;
+  const spacing = (2 * amplitude) / (count - 1);
+  const voltage = minimum + index * spacing;
+  return Math.min(SWEEP_VOLTAGE_MAX, Math.max(SWEEP_VOLTAGE_MIN, voltage));
+};
 
 // uPlot accepts typed arrays as well as plain arrays. We use Float64Array
 // for both x and series data so we can reuse pre-allocated buffers

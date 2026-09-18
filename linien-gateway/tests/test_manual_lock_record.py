@@ -5,6 +5,19 @@ from app.manual_lock_record import (
     build_manual_lock_row,
 )
 
+PARAMS = {
+    "control_channel": 0,
+    "modulation_frequency": 2 * MOD_HZ_UNIT,
+    "modulation_amplitude": 0.5 * MOD_AMP_SCALE,
+    "demodulation_phase_a": 10,
+    "offset_a": 100,
+    "p": 1.1,
+    "i": 2.2,
+    "d": 3.3,
+    "sweep_center": 0.1,
+    "sweep_amplitude": 0.8,
+}
+
 
 def test_build_manual_lock_row_uses_control_channel_b_and_conversions():
     params = {
@@ -63,3 +76,45 @@ def test_build_manual_lock_row_falls_back_to_device_key_and_index_trace_x():
     assert row["trace_x"] == [0.0, 1.0, 2.0]
     assert len(row["trace_y"]) == 3
     assert len(row["monitor_trace_y"]) == 3
+
+
+def _approach_report():
+    return {
+        "enabled": True,
+        "accepted": True,
+        "target_voltage": 0.2,
+        "commanded_voltage": 0.23,
+        "start_voltage": -0.3,
+        "center_move_v": 0.53,
+        "center_correction_v": 0.03,
+        "center_offset_v": 0.002,
+        "capture_tolerance_v": 0.01,
+        "rejection_bound_v": 0.08,
+        "attempts": [
+            {"attempt": 1, "from_below": True, "direct": True, "offset_v": 0.03},
+            {"attempt": 2, "from_below": True, "direct": False, "offset_v": 0.002},
+        ],
+    }
+
+
+
+
+
+
+def test_the_sweep_is_recorded_as_columns_not_only_inside_trace_x():
+    row = build_manual_lock_row(
+        device_name="laser-1",
+        device_key="dev-1",
+        params=PARAMS,
+        trace_y=[0.0, 1.0],
+        monitor_trace_y=None,
+    )
+
+    assert row["sweep_center_v"] == PARAMS["sweep_center"]
+    assert row["sweep_amplitude_v"] == PARAMS["sweep_amplitude"]
+
+
+
+
+
+

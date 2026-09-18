@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import pickle
@@ -7,6 +8,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import asdict
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -32,10 +34,28 @@ from .auto_lock_scan import (
     AutoLockCalibration,
     AutoLockScanSettings,
     calibrate_auto_lock_settings,
+    feature_resolution_samples,
+    find_coarse_auto_lock_target,
     find_auto_lock_target,
+    scan_too_wide_to_lock,
 )
 from .auto_relock import AutoRelockConfig, AutoRelockController
 from .device_recovery import RecoveryCancelled, reboot_device
+from .lock_acceptance import (
+    AcceptanceSettings,
+    acceptance_window_v,
+    capture_tolerance_v,
+)
+from .lock_refinement import (
+    _MAX_REFINEMENT_STAGES,
+    _REFINEMENT_MIN_MEASURABLE_FRACTION,
+    _TrackingIdentityChanged,
+    IdentityGuard,
+    bounded_recenter_v,
+    center_step_allowance_v,
+    min_safe_amplitude_v,
+    plan_refinement_step,
+)
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
 from .manual_lock_record import ADC_SCALE, build_manual_lock_row, modulation_raw_to_hz
 from .plot_processing import PlotState, V, build_plot_frame
@@ -81,6 +101,14 @@ NORMALIZED_PARAMS_ON_CONNECT = (
 PERSISTENT_SETTINGS_SNAPSHOT_KEY = "linien_settings_snapshot"
 PERSISTENT_SETTINGS_SNAPSHOT_VERSION = 1
 RECOVERY_STATE_KEY = "gateway_recovery"
+# When we last had a working connection to this board, and which kernel boot it
+# was in. Persisted because both halves are evidence about the *board*, and a
+# gateway restart is not a board event: held only in memory, every device looked
+# like one we had never connected to after a restart, the exact reboot test
+# (`uptime < our absence`) could not run, and a board that had rebooted two
+# hours ago was classified from a 600 s uptime threshold as "server crashed,
+# FPGA still running".
+LAST_HEALTHY_KEY = "gateway_last_healthy"
 EXTRA_PERSISTENT_SETTINGS = {
     # Upstream linien-server 2.1.0 does not mark this as restorable, but it is a
     # user setting that controls the sign of the PID gains written to the FPGA.
@@ -95,6 +123,43 @@ AUTOMATION_TEMP_DISABLED_REASON = (
 )
 DEFAULT_INFLUX_LOGGING_INTERVAL_S = 1.0
 logger = logging.getLogger(__name__)
+
+
+class TrajectoryRefinementAborted(RuntimeError):
+    """A failed staged scan with machine-readable diagnostics for the API."""
+
+    def __init__(self, message: str, refinement: dict[str, Any]):
+        super().__init__(message)
+        self.refinement = refinement
+
+    @property
+    def failure_kind(self) -> str:
+        """Which kind of failure ended the walk, for callers and operators.
+
+        ``"identity"`` means a changed slope or sideband spacing -- the walk
+        lost the feature and was tracking a different crossing, which is the
+        failure this machinery exists to catch. ``"position"`` means the same
+        feature simply would not hold still long enough to be verified, which
+        points at drift or settle time, not at the detector. ``"other"`` is
+        anything else (no fresh sweep, a lost connection).
+        """
+        return str(self.refinement.get("failure_kind", "other"))
+
+
+# _TrackingIdentityChanged, and the constants governing the trajectory
+# refinement walk (narrowing factors, stage budget, rail/epsilon tolerances),
+# live in lock_refinement.py now -- see the imports above. The walk itself
+# (_trajectory_refine_auto_lock, below) is the only remaining consumer.
+
+# How long a disconnect waits for an in-flight relock action to finish before
+# going ahead anyway. A guarded center move takes seconds; abandoning one
+# mid-ramp leaves the sweep center on an arbitrary set-point.
+RELOCK_ACTION_DRAIN_TIMEOUT_S = 5.0
+
+# Frames a verification sweep must observe before it trusts what it sees. One is
+# not enough: the freshness stamp records when a frame was PROCESSED, not when
+# the board acquired it. See _wait_for_fresh_unlocked_trace.
+VERIFY_TRACE_FRAMES = 2
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -206,11 +271,22 @@ class DeviceSession:
         self._rpyc_lock = threading.RLock()
         self._state_lock = threading.RLock()
         self._relock_action_lock = threading.Lock()
+        # Serialises everything that drives the sweep center over time. A
+        # guarded move and a hysteresis measurement both walk the actuator for
+        # seconds; interleaved they would each measure offsets the other caused.
+        self._center_move_lock = threading.Lock()
+        # (center_v, amplitude_v) to put back when the sweep next starts, after
+        # a refined auto-lock narrowed it. Deferred rather than written at lock
+        # time: while locked, sweep_center is the lock's operating point, and
+        # writing the old center then would drag the laser off the feature.
+        # Guarded by _rpyc_lock.
+        self._deferred_sweep_geometry: tuple[float, float] | None = None
         self.param_cache: Dict[str, Any] = {}
         self.param_cache_serialized: Dict[str, Any] = {}
         self._param_metadata_cache: List[Dict[str, Any]] | None = None
         self.plot_state = PlotState()
         self.auto_lock_scan_settings = self._initial_auto_lock_scan_settings()
+        self.lock_acceptance_settings = self._initial_lock_acceptance_settings()
         self.lock_indicator = LockIndicatorEvaluator(
             self._initial_lock_indicator_config()
         )
@@ -241,6 +317,8 @@ class DeviceSession:
         # disconnected). `_wants_diagnosis` gates re-probing so intentionally
         # disconnected devices are not probed forever.
         self._last_connected_at: float | None = None
+        self._last_healthy_boot_id: str | None = None
+        self._restore_last_healthy()
         self._diagnosis_cache: dict[str, Any] | None = None
         self._last_diagnosis_category: str | None = None
         self._wants_diagnosis: bool = False
@@ -264,6 +342,10 @@ class DeviceSession:
         self._recovery_cancel = threading.Event()
         self._recovery_thread: threading.Thread | None = None
         self._removed = False
+        # Supplies the cached Red Pitaya telemetry fields (die temperature +
+        # service state) to status(). A pure in-memory dict read owned by
+        # RpTelemetryManager -- status() must stay free of remote calls.
+        self._telemetry_provider: Callable[[str], dict[str, Any]] | None = None
 
     @staticmethod
     def _utc_now_iso() -> str:
@@ -465,6 +547,73 @@ class DeviceSession:
     ) -> None:
         self._diagnosis_request_callback = callback
 
+    def set_telemetry_provider(
+        self, provider: Callable[[str], dict[str, Any]] | None
+    ) -> None:
+        self._telemetry_provider = provider
+
+    def _restore_last_healthy(self) -> None:
+        stored = self._device_parameters().get(LAST_HEALTHY_KEY)
+        if not isinstance(stored, dict):
+            return
+        at = stored.get("at")
+        if isinstance(at, (int, float)) and at > 0:
+            # A stored time from the future means the clock moved, and treating
+            # it as an absence would make every board look freshly rebooted.
+            self._last_connected_at = min(float(at), time.time())
+        boot_id = stored.get("boot_id")
+        if isinstance(boot_id, str) and boot_id:
+            self._last_healthy_boot_id = boot_id
+
+    def _persist_last_healthy(self) -> None:
+        if self._removed:
+            return
+        self._device_parameters()[LAST_HEALTHY_KEY] = {
+            "at": self._last_connected_at,
+            "boot_id": self._last_healthy_boot_id,
+        }
+        device_store.save_device(self.device)
+
+    def last_healthy_boot_id(self) -> str | None:
+        """The board's boot id from the last time the server was up, if known.
+
+        Read by the diagnosis probe. It is only ever written while connected --
+        an id read from an already-dead board would be the post-reboot one and
+        would hide the very reboot it was meant to detect.
+        """
+        with self._state_lock:
+            return self._last_healthy_boot_id
+
+    def _record_healthy_boot_id(self) -> None:
+        """Read and store the boot id of the board we just connected to.
+
+        Off the connect path in its own thread: an SSH handshake is ~1 s and
+        nothing about connecting should wait for it. A device with no usable
+        SSH credentials simply never gets an id, and the uptime tests carry on
+        as before.
+        """
+        device = self.device
+
+        def worker() -> None:
+            from .diagnosis import read_boot_id
+
+            boot_id = read_boot_id(device)
+            if not boot_id:
+                return
+            with self._state_lock:
+                if not self.connected:
+                    # Dropped again while we were asking. Storing the id now
+                    # would date it to a connection that no longer exists.
+                    return
+                if boot_id == self._last_healthy_boot_id:
+                    return
+                self._last_healthy_boot_id = boot_id
+            self._persist_last_healthy()
+
+        threading.Thread(
+            target=worker, name=f"boot-id-{self.device.key}", daemon=True
+        ).start()
+
     def seconds_since_last_connected(self) -> float | None:
         with self._state_lock:
             ts = self._last_connected_at
@@ -556,6 +705,26 @@ class DeviceSession:
             self._persist_recovery_locked()
         self._publish_status()
         return True
+
+    def _clear_finished_recovery_locked(self) -> None:
+        """Drop a finished recovery record. Caller must hold ``_state_lock``.
+
+        `failed`/`completed`/`cancelled` are terminal phases, and the record is
+        persisted to devices.json, so nothing ever retracted it: a reboot that
+        timed out at REBOOT_TIMEOUT_S on a board that came back a little later
+        left "Reboot failed: Timed out waiting for the Red Pitaya to reboot" on
+        the card forever, across gateway restarts. A successful connection is
+        proof the board is back, which is the only thing that record reports.
+        The failure itself stays in the log timeline (`device_reboot_failed`).
+        """
+        recovery = self._recovery
+        if recovery is None:
+            return
+        if recovery.get("phase") not in {"completed", "failed", "cancelled"}:
+            # A run still in progress owns the record; never clear it here.
+            return
+        self._recovery = None
+        self._persist_recovery_locked()
 
     def _persist_recovery_locked(self) -> None:
         if self._removed:
@@ -789,6 +958,7 @@ class DeviceSession:
         *,
         lock_source: str,
         event_source: str,
+        success: bool = True,
     ) -> None:
         if self._lock_result_postgres is None:
             self._emit_log_event(
@@ -811,6 +981,7 @@ class DeviceSession:
                 device_name=device_name,
                 device_key=self.device.key,
                 lock_source=lock_source,
+                success=success,
             )
             enqueued = service.enqueue_lock_result(row)
             get_state = getattr(service, "get_state", None)
@@ -918,6 +1089,33 @@ class DeviceSession:
         payload = parameters.get("auto_relock_config")
         return payload if isinstance(payload, dict) else {}
 
+    def _initial_lock_acceptance_settings(self) -> dict[str, Any]:
+        parameters = getattr(self.device, "parameters", None)
+        payload = (
+            parameters.get("lock_acceptance_settings")
+            if isinstance(parameters, dict)
+            else None
+        )
+        # Validated through the same Pydantic model the HTTP boundary uses, for
+        # the reasons given in _initial_auto_lock_scan_settings: a stored block
+        # that fails validation falls back to defaults (i.e. the guarded move
+        # off) rather than feeding out-of-range motion settings to the hardware.
+        if isinstance(payload, dict):
+            try:
+                payload = schemas.LockAcceptanceSettings.model_validate(
+                    payload
+                ).model_dump()
+            except ValidationError as exc:
+                logger.warning(
+                    "Ignoring invalid stored lock_acceptance_settings for device %s: %s",
+                    getattr(self.device, "key", "?"),
+                    exc,
+                )
+                payload = None
+        else:
+            payload = None
+        return AcceptanceSettings.from_mapping(payload).__dict__.copy()
+
     def _normalize_influx_logging_state(self, payload: Any) -> dict[str, Any]:
         interval = DEFAULT_INFLUX_LOGGING_INTERVAL_S
         enabled = False
@@ -960,6 +1158,12 @@ class DeviceSession:
             if next_auto_lock_scan_settings != self.auto_lock_scan_settings:
                 self.auto_lock_scan_settings = next_auto_lock_scan_settings
 
+    def sync_lock_acceptance_settings_from_device(self) -> None:
+        with self._state_lock:
+            next_lock_acceptance_settings = self._initial_lock_acceptance_settings()
+            if next_lock_acceptance_settings != self.lock_acceptance_settings:
+                self.lock_acceptance_settings = next_lock_acceptance_settings
+
     def sync_lock_indicator_settings_from_device(self) -> None:
         with self._state_lock:
             next_lock_indicator_config = LockIndicatorConfig.from_mapping(
@@ -986,6 +1190,7 @@ class DeviceSession:
 
     def sync_configs_from_device(self) -> None:
         self.sync_auto_lock_scan_settings_from_device()
+        self.sync_lock_acceptance_settings_from_device()
         self.sync_lock_indicator_settings_from_device()
         self.sync_auto_relock_config_from_device()
         self.sync_influx_logging_state_from_device()
@@ -1012,6 +1217,32 @@ class DeviceSession:
             self.auto_lock_scan_settings = settings.__dict__.copy()
             return dict(self.auto_lock_scan_settings)
 
+    def get_lock_acceptance_settings(self) -> dict[str, Any]:
+        with self._state_lock:
+            return dict(self.lock_acceptance_settings)
+
+    def update_lock_acceptance_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._state_lock:
+            settings = AcceptanceSettings.from_mapping(payload)
+            self.lock_acceptance_settings = settings.__dict__.copy()
+            return dict(self.lock_acceptance_settings)
+
+    def _unlocked_trace_timeout_s(self) -> float:
+        """How stale an unlocked trace may be before callers must refuse it.
+
+        Reuses the freshness definition the auto-relock subsystem already
+        applies to this same trace rather than inventing a second one, with a
+        little slack over the plot-poll cadence so a fresh sweep is never
+        spuriously rejected between frames.
+        """
+        try:
+            configured = float(
+                self.auto_relock.get_config().get("unlocked_trace_timeout_s", 2.0)
+            )
+        except Exception:  # noqa: BLE001 - fall back to the schema default
+            configured = 2.0
+        return max(configured, 3.0)
+
     def calibrate_auto_lock_settings(
         self,
         *,
@@ -1029,18 +1260,8 @@ class DeviceSession:
         error_trace, monitor_trace = self._snapshot_auto_lock_traces()
 
         # The unlocked trace (last_plot_data) is only refreshed while sweeping;
-        # refuse to calibrate from a stale/locked trace. Reuse the same freshness
-        # definition the auto-relock subsystem applies to this trace, rather than
-        # inventing a separate timeout.
-        try:
-            trace_timeout_s = float(
-                self.auto_relock.get_config().get("unlocked_trace_timeout_s", 2.0)
-            )
-        except Exception:  # noqa: BLE001 - fall back to the schema default
-            trace_timeout_s = 2.0
-        # Allow a little slack over the plot-poll cadence so a fresh sweep is
-        # never spuriously rejected between frames.
-        trace_timeout_s = max(trace_timeout_s, 3.0)
+        # refuse to calibrate from a stale/locked trace.
+        trace_timeout_s = self._unlocked_trace_timeout_s()
         with self._state_lock:
             last_unlocked_at = self.plot_state.last_unlocked_trace_at
         if last_unlocked_at is None or (time.time() - last_unlocked_at) > trace_timeout_s:
@@ -1215,6 +1436,7 @@ class DeviceSession:
             self._param_metadata_cache = None
             self._logging_active_cache = None
             self._discriminator_slope_v_per_mhz = None
+            self._deferred_sweep_geometry = None
             thread_to_join = self._poll_thread
             self._poll_thread = None
         self._disconnect_client_safely(client_to_close)
@@ -1367,6 +1589,14 @@ class DeviceSession:
                     self._diagnosis_cache = None
                     self._last_diagnosis_category = None
                     self._wants_diagnosis = False
+                    # The board answered, so a finished reboot record has
+                    # nothing left to report -- including a `failed` one whose
+                    # board came back after the wait gave up.
+                    self._clear_finished_recovery_locked()
+                # Persist the moment, then go find out which boot it was. Both
+                # are facts about the board that must outlive this process.
+                self._persist_last_healthy()
+                self._record_healthy_boot_id()
                 self._register_callbacks()
                 self._stop_event.clear()
                 self._poll_thread = threading.Thread(
@@ -1394,7 +1624,41 @@ class DeviceSession:
     def disconnect(self) -> None:
         if self._recovery_active():
             raise RuntimeError("Cannot disconnect while device recovery is running")
+        self._await_relock_action()
         self._reset_connection_state(last_error=self.last_error)
+
+    def await_relock_action(
+        self, timeout_s: float = RELOCK_ACTION_DRAIN_TIMEOUT_S
+    ) -> None:
+        """Public drain, for callers that want to wait BEFORE taking a lock.
+
+        disconnect() drains too, but it runs under the registry's per-key lock,
+        which would serialise every other request for that device behind the
+        wait. Draining first leaves that join returning immediately.
+        """
+        self._await_relock_action(timeout_s)
+
+    def _await_relock_action(self, timeout_s: float = RELOCK_ACTION_DRAIN_TIMEOUT_S) -> None:
+        """Give an in-flight relock a moment to stop driving the sweep center.
+
+        A guarded move takes seconds, so tearing the connection down underneath
+        one can strand the center part-way along a ramp. Bounded: a stuck action
+        must not block a disconnect indefinitely.
+
+        Waits on `_relock_action_lock` rather than a thread handle: the lock is
+        claimed synchronously before the worker thread even exists, so a
+        thread-handle check has a narrow window where a relock has just been
+        claimed but not yet published for this method to see.
+        """
+        if self._relock_action_lock.acquire(timeout=timeout_s):
+            self._relock_action_lock.release()
+            return
+        logger.warning(
+            "Relock action still running after %.1fs; disconnecting anyway "
+            "(device=%s)",
+            timeout_s,
+            getattr(self.device, "key", "?"),
+        )
 
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -1922,6 +2186,36 @@ class DeviceSession:
         params["lock"] = lock_value
         return lock_value, params
 
+    def _start_auto_relock(self) -> None:
+        # The caller holds _relock_action_lock for the whole of this.
+        try:
+            self._emit_log_event(
+                level=logging.INFO,
+                source="auto_relock",
+                code="auto_relock_action_start",
+                message="Auto-relock action started.",
+            )
+            self.auto_lock_from_scan(None)
+            self._emit_log_event(
+                level=logging.INFO,
+                source="auto_relock",
+                code="auto_relock_action_success",
+                message="Auto-relock action completed.",
+            )
+            self._write_lock_result_to_postgres(
+                lock_source="auto_relock",
+                event_source="auto_relock",
+            )
+        except Exception as exc:
+            self._emit_log_event(
+                level=logging.ERROR,
+                source="auto_relock",
+                code="auto_relock_action_failed",
+                message="Auto-relock action failed.",
+                details={"error": str(exc)},
+            )
+            raise
+
     def _on_to_plot(self, value: Any) -> None:
         if self.parameters is None:
             return
@@ -1934,40 +2228,6 @@ class DeviceSession:
             return
 
         lock_value, params = self._derive_lock_and_plot_params(to_plot)
-
-        def _start_auto_relock() -> None:
-            acquired = self._relock_action_lock.acquire(blocking=False)
-            if not acquired:
-                raise RuntimeError("relock_action_in_progress")
-            try:
-                self._emit_log_event(
-                    level=logging.INFO,
-                    source="auto_relock",
-                    code="auto_relock_action_start",
-                    message="Auto-relock action started.",
-                )
-                self.auto_lock_from_scan(None)
-                self._emit_log_event(
-                    level=logging.INFO,
-                    source="auto_relock",
-                    code="auto_relock_action_success",
-                    message="Auto-relock action completed.",
-                )
-                self._write_lock_result_to_postgres(
-                    lock_source="auto_relock",
-                    event_source="auto_relock",
-                )
-            except Exception as exc:
-                self._emit_log_event(
-                    level=logging.ERROR,
-                    source="auto_relock",
-                    code="auto_relock_action_failed",
-                    message="Auto-relock action failed.",
-                    details={"error": str(exc)},
-                )
-                raise
-            finally:
-                self._relock_action_lock.release()
 
         # Decide what detail level to build at. When every connected
         # websocket subscriber only needs a summary frame (the common case
@@ -2066,14 +2326,22 @@ class DeviceSession:
         # Perform the auto-relock device I/O OUTSIDE _state_lock so status()
         # and snapshot reads don't stall during a (possibly multi-second)
         # relock sweep/scan. complete_action() applies the result. (#26)
-        if relock_action is not None:
+        if relock_action == "relock":
+            # Off the poll thread, not just outside _state_lock. A guarded
+            # center move waits for a fresh unlocked trace, and this callback IS
+            # the thread that produces them -- run inline, it would block
+            # waiting for output it is itself preventing, time out on every
+            # attempt, and stall the plot pipeline meanwhile. Note that tick()
+            # keeps handing out "relock" every frame until complete_action
+            # lands, so the dispatch has to drop duplicates itself; see
+            # _maybe_dispatch_relock_action.
+            self._maybe_dispatch_relock_action(self._start_auto_relock)
+        elif relock_action is not None:
             action_ok = True
             action_error: str | None = None
             try:
                 if relock_action == "sweep":
                     self.stop_lock()
-                elif relock_action == "relock":
-                    _start_auto_relock()
             except Exception as exc:  # noqa: BLE001 - recorded as a relock failure
                 action_ok = False
                 action_error = str(exc)
@@ -2150,6 +2418,18 @@ class DeviceSession:
             and stream_age_s is not None
             and stream_age_s > AUTO_RELOCK_STREAM_STALL_S
         )
+        telemetry_fields: Dict[str, Any] = {}
+        provider = self._telemetry_provider
+        if provider is not None:
+            try:
+                telemetry_fields = provider(self.device.key) or {}
+            except Exception:  # noqa: BLE001 - telemetry must not break status
+                logger.debug(
+                    "Telemetry status lookup failed for device=%s",
+                    self.device.key,
+                    exc_info=True,
+                )
+                telemetry_fields = {}
         return {
             "connected": self.connected,
             "connecting": self.connecting,
@@ -2182,6 +2462,9 @@ class DeviceSession:
             "stalled": stalled,
             "diagnosis": diagnosis,
             "recovery": recovery,
+            # Red Pitaya (Zynq die) temperature and telemetry-service state.
+            # Cache-only; see app/rp_telemetry.py.
+            **telemetry_fields,
         }
 
     def set_param(self, name: str, value: Any, write_registers: bool) -> None:
@@ -2190,6 +2473,9 @@ class DeviceSession:
         with self._rpyc_lock:
             param = getattr(self.parameters, name)
             normalized_value = self._normalize_param_value(name, value)
+            if name in ("sweep_center", "sweep_amplitude"):
+                # The operator's own geometry wins over a pending restore.
+                self._deferred_sweep_geometry = None
             if name in self._persistent_param_names:
                 self._pending_gateway_param_writes[name] = normalized_value
             try:
@@ -2250,12 +2536,675 @@ class DeviceSession:
         )
         return result.to_dict()
 
+
+    def _wait_for_fresh_unlocked_trace(
+        self, after: float, timeout_s: float, frames: int = VERIFY_TRACE_FRAMES
+    ) -> bool:
+        """Block until a sweep *acquired* after ``after`` has landed.
+
+        Traces arrive on the plot poll thread; there is no way to demand one, so
+        the verification step waits for the next sweep to come round rather than
+        re-reading whatever was already in hand (which still shows the feature
+        at its pre-move position).
+
+        Two frames, not one. ``last_unlocked_trace_at`` records when a frame was
+        PROCESSED, not when the board acquired it, and the poll loop reads
+        ``to_plot`` under the same ``_rpyc_lock`` the ramp is using -- so an
+        array pulled off the device mid-ramp, or before the settle finished, can
+        be processed after ``after`` and would pass a single-frame check. That
+        is precisely the un-settled state ``settle_ms`` exists to let decay. The
+        second frame cannot have been acquired before the first was processed,
+        so it post-dates the move for real.
+
+        The budget is per frame, since each wait is independent.
+        """
+        wanted = max(1, int(frames))
+        deadline = time.time() + max(0.0, float(timeout_s)) * wanted
+        threshold = float(after)
+        seen = 0
+        while True:
+            with self._state_lock:
+                stamp = self.plot_state.last_unlocked_trace_at
+            if stamp is not None and float(stamp) > threshold:
+                seen += 1
+                threshold = float(stamp)
+                if seen >= wanted:
+                    return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
+    def _maybe_dispatch_relock_action(self, run: Callable[[], None]) -> bool:
+        """Claim the relock action and start it, or drop it if one is in flight.
+
+        tick() hands out "relock" on every frame until complete_action lands,
+        which was harmless only while the caller ran the action synchronously.
+        A duplicate has to be dropped outright: completing it would record a
+        spurious failure against the attempt already running and then discard
+        that attempt's real result as stale.
+        """
+        if not self._relock_action_lock.acquire(blocking=False):
+            logger.debug(
+                "Skipping duplicate relock action for device %s; one is in flight",
+                getattr(self.device, "key", "?"),
+            )
+            return False
+        self._dispatch_relock_action(run)
+        return True
+
+    def _dispatch_relock_action(self, run: Callable[[], None]) -> None:
+        """Run a relock action on its own thread and report it back when done.
+
+        The caller must already hold ``_relock_action_lock``; the worker
+        releases it once the result has been applied.
+        """
+
+        def _worker() -> None:
+            action_ok = True
+            action_error: str | None = None
+            try:
+                run()
+            except Exception as exc:  # noqa: BLE001 - recorded as a relock failure
+                action_ok = False
+                action_error = str(exc)
+            try:
+                with self._state_lock:
+                    self.auto_relock.complete_action(
+                        "relock", action_ok, action_error
+                    )
+            except Exception:  # noqa: BLE001 - never kill the worker thread
+                logger.warning(
+                    "Failed recording the auto-relock action result", exc_info=True
+                )
+            finally:
+                # Released only after the result is applied: releasing first
+                # would let the next frame dispatch again while the controller
+                # still reports the action as pending.
+                self._relock_action_lock.release()
+
+        thread = threading.Thread(
+            target=_worker, name="auto-relock-action", daemon=True
+        )
+        try:
+            thread.start()
+        except Exception:
+            # The worker's own release never runs if it never started.
+            # Leaking the lock here would silently disable every future
+            # relock for the life of the process.
+            self._relock_action_lock.release()
+            raise
+
+    def _current_sweep_center(self) -> float | None:
+        """The center as the device currently reports it, or None if unreadable."""
+        try:
+            with self._rpyc_lock:
+                return float(self.parameters.sweep_center.value)
+        except Exception:  # noqa: BLE001 - callers fall back to their snapshot
+            return None
+
+    @contextmanager
+    def _exclusive_center_move(self, what: str):
+        """Hold the center-move lock, or refuse rather than interleave.
+
+        Non-blocking on purpose: a second request should be told the actuator is
+        busy, not silently queued behind a move that takes seconds.
+        """
+        if not self._center_move_lock.acquire(blocking=False):
+            raise RuntimeError(
+                f"Another sweep-center move is already running; {what} was not started."
+            )
+        try:
+            yield
+        finally:
+            self._center_move_lock.release()
+
+    def _move_and_lock(
+        self,
+        result: Any,
+        sweep_center: float,
+    ) -> None:
+        """Put the center on the detected target and start the lock.
+
+        Split out of auto_lock_from_scan so the whole move-and-handover runs
+        under the center-move lock.
+        """
+        current_center = self._current_sweep_center()
+        if current_center is not None:
+            sweep_center = current_center
+        with self._rpyc_lock:
+            self.parameters.sweep_center.value = float(result.target_voltage)
+            self.control.exposed_write_registers()
+            self.control.exposed_start_lock()
+
+
+    # The three static helpers below used to hold this arithmetic directly.
+    # It now lives in lock_refinement.py (moved unchanged) alongside the rest
+    # of the trajectory-refinement planning; these delegates exist only so
+    # existing callers -- production and test alike -- keep working unchanged.
+    @staticmethod
+    def _min_safe_amplitude_v(
+        amplitude_v: float,
+        offset_v: float,
+        shift_per_fraction: float | None,
+        floor_v: float,
+    ) -> float | None:
+        return min_safe_amplitude_v(amplitude_v, offset_v, shift_per_fraction, floor_v)
+
+    @staticmethod
+    def _center_step_allowance_v(
+        settings: AutoLockScanSettings,
+        amplitude_v: float,
+        sideband_offset_v: float | None,
+    ) -> float:
+        return center_step_allowance_v(settings, amplitude_v, sideband_offset_v)
+
+    @staticmethod
+    def _bounded_recenter_v(
+        center_v: float,
+        target_v: float,
+        amplitude_v: float,
+        *,
+        signal_width_v: float | None = None,
+        max_signal_widths: float = 0.0,
+    ) -> float:
+        return bounded_recenter_v(
+            center_v,
+            target_v,
+            amplitude_v,
+            signal_width_v=signal_width_v,
+            max_signal_widths=max_signal_widths,
+        )
+
+    def _set_sweep_geometry(
+        self, center_v: float, amplitude_v: float, *, settle_s: float = 0.0
+    ) -> float:
+        """Atomically command both scan axes and return the completion timestamp.
+
+        The refinement walk lets `settle_ms` decay before it believes a trace
+        (see _apply_center_plan); the refinement walk did not, and started
+        counting frames the instant the registers were written. Both axes are
+        actuators with a settling tail, so the first frames after the write show
+        the scan mid-transition. The timestamp is taken AFTER the settle so that
+        the freshness check admits only frames acquired past it.
+        """
+        with self._rpyc_lock:
+            self.parameters.sweep_center.value = float(center_v)
+            self.parameters.sweep_amplitude.value = float(amplitude_v)
+            self.control.exposed_write_registers()
+        if settle_s > 0.0:
+            time.sleep(float(settle_s))
+        return time.time()
+
+    def _restore_sweep_geometry(self, center_v: float, amplitude_v: float) -> bool:
+        """Best-effort restoration after a trajectory refinement failure."""
+        try:
+            self._set_sweep_geometry(center_v, amplitude_v)
+            return True
+        except Exception:  # noqa: BLE001 - do not mask the detector failure
+            logger.warning(
+                "Failed restoring sweep geometry to center %.4f V, amplitude %.4f V",
+                center_v,
+                amplitude_v,
+                exc_info=True,
+            )
+            return False
+
+    def _capture_auto_lock_target(
+        self,
+        settings: AutoLockScanSettings,
+        *,
+        after: float | None = None,
+        traces: tuple[Any, Any] | None = None,
+    ) -> tuple[Any, float, float, float]:
+        """Capture one fresh trace and detect it against its read-back geometry.
+
+        Waiting after every geometry write makes the trace/detection pair atomic
+        from the caller's perspective: no target from a previous scan window is
+        ever carried into the next stage. Pass `traces` to reuse a trace the
+        caller already fetched instead of taking a second snapshot.
+        """
+        if after is not None:
+            timeout_s = self._unlocked_trace_timeout_s()
+            if not self._wait_for_fresh_unlocked_trace(after, timeout_s):
+                raise RuntimeError("No fresh sweep arrived after changing scan geometry.")
+        if traces is not None:
+            error_trace, monitor_trace = traces
+        else:
+            error_trace, monitor_trace = self._snapshot_auto_lock_traces()
+        center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
+            require_unlocked=True
+        )
+        result = find_auto_lock_target(
+            error_trace_v=error_trace,
+            monitor_trace_v=monitor_trace,
+            sweep_center_v=center_v,
+            sweep_amplitude_v=amplitude_v,
+            settings=settings,
+            preferred_slope_rising=rising,
+            modulation_frequency_hz=mod_hz,
+        )
+        return result, center_v, amplitude_v, feature_resolution_samples(
+            settings, len(error_trace), amplitude_v
+        )
+
+    def _coarse_auto_lock_target(
+        self, settings: AutoLockScanSettings, *, after: float | None = None
+    ) -> tuple[Any, float, float, float, dict[str, Any]]:
+        """A permissive detector used only to track a feature into a fresh scan.
+
+        It can never start a lock. The final two detections always use the
+        calibrated strict settings.
+        """
+        if after is not None:
+            timeout_s = self._unlocked_trace_timeout_s()
+            if not self._wait_for_fresh_unlocked_trace(after, timeout_s):
+                raise RuntimeError("No fresh sweep arrived after changing scan geometry.")
+        error_trace, monitor_trace = self._snapshot_auto_lock_traces()
+        center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
+            require_unlocked=True
+        )
+        candidate = find_coarse_auto_lock_target(
+            error_trace_v=error_trace,
+            monitor_trace_v=monitor_trace,
+            sweep_center_v=center_v,
+            sweep_amplitude_v=amplitude_v,
+            settings=settings,
+            preferred_slope_rising=rising,
+            modulation_frequency_hz=mod_hz,
+        )
+        return candidate.result, center_v, amplitude_v, feature_resolution_samples(
+            settings, len(error_trace), amplitude_v
+        ), candidate.metrics
+
+    def _trajectory_refine_auto_lock(
+        self,
+        settings: AutoLockScanSettings,
+        acceptance: AcceptanceSettings,
+        start_center_v: float,
+        start_amplitude_v: float,
+        *,
+        initial_target: Any,
+        initial_center_v: float,
+        initial_amplitude_v: float,
+        initial_resolution: float,
+        initial_detector: str = "coarse",
+        trace_length: int,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Track an under-resolved feature through gradual scan changes.
+
+        The actuator's apparent carrier position may change with scan trajectory,
+        so each stage throws away its predecessor's voltage and redetects on a
+        newly acquired trace. A failed tracking run restores both axes.
+
+        Reached only when the strict detector REJECTED the live trace, so the
+        seed is normally a coarse candidate (``initial_detector="coarse"``) and
+        the loop narrows until strict agrees. Refinement exists to rescue a scan
+        that cannot be locked as it stands; it must never be handed a strict
+        detection that already succeeded, because it can only discard it.
+        """
+        stages: list[dict[str, Any]] = []
+        target, center_v, amplitude_v, resolution = (
+            initial_target, initial_center_v, initial_amplitude_v, initial_resolution
+        )
+        detector = str(initial_detector)
+        coarse_metrics: dict[str, Any] | None = None
+        try:
+            stages.append({
+                "kind": "initial", "center_v": center_v, "amplitude_v": amplitude_v,
+                "target_voltage": target.target_voltage, "resolution_samples": resolution,
+                "detector": detector, "sideband_offset_v": target.sideband_offset_v,
+                "metrics": coarse_metrics,
+            })
+            identity = IdentityGuard(
+                target, resolution, trace_length=trace_length, detector=detector
+            )
+
+            # Narrow in <=25% reductions until the STRICT detector accepts a
+            # trace -- that, not a sample count, is the thing refinement is
+            # trying to obtain, and it is the only exit that can start a lock.
+            # Narrowing further once strict agrees would spend sweeps (and,
+            # on a feature that moves with geometry, accuracy) for nothing.
+            # Centre moves are intentionally separate;
+            # they are known to perturb this DFB's apparent feature position.
+            narrow_count = 0
+            # Both sweep axes are actuators, so a geometry write needs the same
+            # `settle_ms` before trusting a trace; a refinement stage commands a
+            # settle a centre move needs before the trace can be believed.
+            geometry_settle_s = max(0.0, float(acceptance.settle_ms) / 1000.0)
+            # Narrowing the scan moves the feature too: changing the ramp width
+            # changes the actuator's trajectory, and the apparent resonance
+            # follows. Measured on this device at 73 mV for one 2x narrowing --
+            # larger than the 65 mV signal width the centre steps are bounded
+            # by, so an unbounded width change is the bigger move of the two.
+            # Each stage measures it (shift per unit fractional width change)
+            # and the next stage is sized from what was actually observed.
+            shift_per_fraction: float | None = None
+            while detector == "coarse" or scan_too_wide_to_lock(
+                settings, amplitude_v, target.sideband_offset_v,
+                trace_points=trace_length,
+            ):
+                if narrow_count >= _MAX_REFINEMENT_STAGES:
+                    raise ValueError(
+                        f"No lockable scan after {_MAX_REFINEMENT_STAGES} "
+                        "trajectory refinement stages."
+                    )
+                # Ask the planner what to do next -- see plan_refinement_step's
+                # docstring for the constraint order. It makes no I/O and
+                # decides exactly one step; everything below is acting on that
+                # decision, redetecting, and recording the stage.
+                step = plan_refinement_step(
+                    settings,
+                    center_v=center_v,
+                    amplitude_v=amplitude_v,
+                    target_v=float(target.target_voltage),
+                    sideband_offset_v=target.sideband_offset_v,
+                    detector=detector,
+                    trace_length=trace_length,
+                    shift_per_fraction=shift_per_fraction,
+                )
+                if step.action == "done":
+                    break
+                if step.action == "refuse":
+                    raise ValueError(step.reason)
+                if step.action == "recenter":
+                    # The planner reaches this only when no width change is
+                    # safe yet. Move the centre alone and re-plan from what the
+                    # next detection actually finds; carrying a pre-move
+                    # amplitude across the write would size the cut from
+                    # geometry that no longer exists.
+                    moved_at = self._set_sweep_geometry(
+                        step.center_v, amplitude_v, settle_s=geometry_settle_s
+                    )
+                    target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
+                        settings, after=moved_at
+                    )
+                    detector = "coarse"
+                    identity.check(target, amplitude_v=amplitude_v, detector="coarse", resolution_samples=resolution)
+                    stages.append({"kind": "recenter", "center_v": center_v,
+                                   "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
+                                   "resolution_samples": resolution, "detector": "coarse",
+                                   "sideband_offset_v": target.sideband_offset_v,
+                                   "metrics": coarse_metrics, "bounds": step.bounds})
+                    narrow_count += 1
+                    continue
+                if step.action == "rail_escape":
+                    next_amplitude = step.amplitude_v
+                    stages.append({
+                        "kind": "rail_blocked", "center_v": center_v,
+                        "amplitude_v": amplitude_v,
+                        "target_voltage": target.target_voltage,
+                        "resolution_samples": resolution, "detector": detector,
+                        "sideband_offset_v": target.sideband_offset_v,
+                        "rail_v": step.bounds.get("rail_v", 1.0 - abs(amplitude_v)),
+                        "next_amplitude_v": next_amplitude,
+                        "bounds": step.bounds,
+                    })
+                    next_center = center_v
+                else:  # "narrow" -- narrows and recentres in one write
+                    next_amplitude = step.amplitude_v
+                    next_center = step.center_v
+                before_v = float(target.target_voltage)
+                before_amplitude = abs(amplitude_v)
+                before_center = float(center_v)
+                before_detector = detector
+                moved_at = self._set_sweep_geometry(
+                    next_center, next_amplitude, settle_s=geometry_settle_s
+                )
+                try:
+                    target, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
+                        settings, after=moved_at
+                    )
+                    detector = "strict"
+                    coarse_metrics = None
+                except ValueError:
+                    target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
+                        settings, after=moved_at
+                    )
+                    detector = "coarse"
+                # What the width change actually did to the apparent position.
+                width_shift_v = abs(float(target.target_voltage) - before_v)
+                width_fraction = (
+                    1.0 - (abs(amplitude_v) / before_amplitude)
+                    if before_amplitude > 1e-12 else 0.0
+                )
+                # Only a same-detector pair measures the actuator. The strict
+                # detector and the coarse tracker can settle on different
+                # crossings of a multi-feature scan, and their difference --
+                # 100 mV in the field -- is not a width-induced shift. Charging
+                # it to the shift estimate spends the stage allowance on it,
+                # which is what left a narrowing stage with no centre budget at
+                # all: it took the width change and skipped the centring.
+                # A narrowing stage moves the centre in the same register
+                # write, and both changes move the apparent feature. Dividing
+                # the WHOLE observed move by the width fraction alone charges
+                # the centre's share to the width, and the smaller the cut the
+                # larger the bogus coefficient: the field case cut 22.6 mV of
+                # half-range while commanding the centre 40.3 mV, and the
+                # resulting 27.8 mV move over a 0.096 fraction read as 0.289 V
+                # per unit fraction -- double the 0.144 the same walk had
+                # measured on stages where the width did dominate. The max()
+                # below then made that permanent, and it throttled every
+                # subsequent cut and centre step until the walk gave up.
+                # So only a stage whose width change outweighs its centre
+                # change is allowed to speak for the width. Both are sweep
+                # volts, so the comparison carries no scale of its own.
+                width_delta_v = max(0.0, before_amplitude - abs(amplitude_v))
+                center_delta_v = abs(float(center_v) - before_center)
+                if (
+                    width_fraction > _REFINEMENT_MIN_MEASURABLE_FRACTION
+                    and detector == before_detector
+                    and width_delta_v >= center_delta_v
+                ):
+                    observed = width_shift_v / width_fraction
+                    # Keep the worst seen: one gentle stage must not talk the
+                    # walk back into a step a harsher one already showed is big.
+                    shift_per_fraction = (
+                        observed if shift_per_fraction is None
+                        else max(shift_per_fraction, observed)
+                    )
+                stages.append({
+                    "kind": "narrow", "center_v": center_v, "amplitude_v": amplitude_v,
+                    "target_voltage": target.target_voltage, "resolution_samples": resolution,
+                    "detector": detector, "metrics": coarse_metrics if detector == "coarse" else None,
+                    "sideband_offset_v": target.sideband_offset_v,
+                    "width_shift_v": width_shift_v,
+                    "center_shift_v": center_delta_v,
+                    "shift_per_fraction_v": shift_per_fraction,
+                    "bounds": step.bounds,
+                })
+                identity.check(target, amplitude_v=amplitude_v, detector=detector, resolution_samples=resolution)
+                # Checked after the identity guard: if the walk has lost the
+                # feature, that is the more specific diagnosis. A narrowing that
+                # did not narrow would otherwise be re-planned identically next
+                # stage, and the walk would spend its whole budget asking for
+                # the same width before reporting only that it ran out of
+                # stages. The realized amplitude is read back from the device,
+                # so a register that quantizes or clamps the request surfaces on
+                # the first stage rather than the sixteenth.
+                if (
+                    step.action == "narrow"
+                    and step.amplitude_v < before_amplitude
+                    and abs(amplitude_v) >= before_amplitude
+                ):
+                    raise ValueError(
+                        f"The scan width did not change: {before_amplitude:.4f} V "
+                        f"was asked to narrow to {step.amplitude_v:.4f} V and read "
+                        f"back {abs(amplitude_v):.4f} V. The sweep amplitude is not "
+                        "following the commanded value."
+                    )
+                narrow_count += 1
+                # A target still outside the inner window is the next stage's
+                # business: plan_refinement_step weighs it against the crop
+                # floor, the rails and the step allowance together. Correcting
+                # it here spent a second full centre allowance inside the same
+                # stage and handed the loop back a coarse detection, which is
+                # what made the walk alternate detectors -- and the two then
+                # disagreed about where the feature was.
+
+            # The coarse result only guides geometry. Demand two fresh strict
+            # detections at the final unchanged geometry before any guarded move.
+            try:
+                strict_one, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
+                    settings, after=time.time()
+                )
+            except (ValueError, RuntimeError) as first_final_error:
+                # A geometry transition can have a short thermal/piezo tail.
+                # Retry once after a real settle interval before declaring the
+                # feature lost; never reuse the rejected frame.
+                time.sleep(0.3)
+                stages.append({"kind": "settle_retry", "detail": str(first_final_error)})
+                strict_one, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
+                    settings, after=time.time()
+                )
+            # Sideband spacing is a derived quantity with its own measurement
+            # noise. It earns its keep ACROSS geometry changes, where the target
+            # voltage legitimately moves and another invariant is needed. These
+            # two detections are at one unchanged geometry, where the position
+            # check below is strictly stronger: same slope and same voltage is
+            # the same crossing, whatever the sideband fit did. Applying it here
+            # only adds a way to fail.
+            identity.check(
+                strict_one, amplitude_v=amplitude_v, resolution_samples=resolution, check_sideband=False
+            )
+            verify_after = time.time()
+            one_at = time.time()
+            strict_two, verify_center, verify_amplitude, _ = self._capture_auto_lock_target(
+                settings, after=verify_after
+            )
+            two_at = time.time()
+            identity.check(
+                strict_two, amplitude_v=amplitude_v, resolution_samples=resolution, check_sideband=False
+            )
+            # One definition of "the feature moved too far", shared with the
+            # guarded move, rather than a second inline literal that silently
+            # diverges from capture_fraction the moment anyone changes it.
+            # Floored at one sample: nothing can be resolved finer than that.
+            window = acceptance_window_v(
+                acceptance, settings.half_range_sweep_v, strict_two.sideband_offset_v
+            )
+            tolerance = max(
+                window.tolerance_v, 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
+            )
+            # Four distinct failures. They used to share one message with no
+            # numbers in it, which says nothing about which one fired.
+            if abs(verify_center - center_v) > 1e-6:
+                raise ValueError(
+                    f"Sweep center moved between the two final detections: "
+                    f"{center_v:.6f} V then {verify_center:.6f} V."
+                )
+            if abs(verify_amplitude - amplitude_v) > 1e-6:
+                raise ValueError(
+                    f"Sweep amplitude moved between the two final detections: "
+                    f"{amplitude_v:.6f} V then {verify_amplitude:.6f} V."
+                )
+            if strict_one.target_slope_rising != strict_two.target_slope_rising:
+                raise _TrackingIdentityChanged(
+                    "The two final detections disagreed on the discriminator slope."
+                )
+            drift_v = abs(strict_one.target_voltage - strict_two.target_voltage)
+            # Two questions, not one. They were conflated into a single
+            # displacement test that a drifting laser cannot pass: verifying a
+            # detection costs two fresh sweeps, so the two readings are seconds
+            # apart, while the capture window is half a feature half-width. On
+            # the characterization device -- 1-3 mV/s of drift against a 0.889 mV
+            # window -- any honest pair of verifications is 2-3 mV apart and was
+            # refused, however well the walk had converged.
+            #
+            # 1. Are these the same crossing? The scale for that is the distance
+            #    to the next feature, which is what the neighbour guard already
+            #    derives; the capture window says nothing about it.
+            # rejection_bound_v is already defined as the offset beyond which a
+            # re-detection is a different crossing rather than a moved one, so
+            # it is the threshold -- not half of it. On the field device that
+            # bound is 7.1 mV and an honest pair of verifications is 2-3 mV
+            # apart; halving it would leave 7% of headroom.
+            neighbour_bound = window.bound_v
+            if neighbour_bound is not None and drift_v > neighbour_bound:
+                raise _TrackingIdentityChanged(
+                    f"The two final detections were {drift_v * 1e3:.3f} mV apart, "
+                    f"past the {neighbour_bound * 1e3:.3f} mV neighbour bound: "
+                    "they are not the same crossing."
+                )
+            # 2. Is it slow enough to hand over? What matters is not how far the
+            #    feature moved while being verified, but how far it will move
+            #    between the last detection and the lock engaging -- the settle
+            #    the handover already waits. Comparing a multi-second drift
+            #    against a capture window the handover never spans is what made
+            #    this unsatisfiable.
+            interval_s = max(0.0, two_at - one_at)
+            handover_s = max(0.0, float(acceptance.settle_ms) / 1000.0)
+            if interval_s > 1e-3:
+                drift_rate_v_s = drift_v / interval_s
+                predicted_v = drift_rate_v_s * handover_s
+                if predicted_v > tolerance:
+                    raise ValueError(
+                        f"The feature is drifting at {drift_rate_v_s * 1e3:.2f} mV/s "
+                        f"({drift_v * 1e3:.3f} mV between two detections "
+                        f"{interval_s:.2f} s apart), so it moves "
+                        f"{predicted_v * 1e3:.3f} mV during the {handover_s * 1e3:.0f} ms "
+                        f"handover -- outside the {tolerance * 1e3:.3f} mV capture "
+                        f"window (capture_fraction {float(acceptance.capture_fraction):g} "
+                        f"x feature half-width "
+                        f"{float(settings.half_range_sweep_v) * 1e3:.3f} mV). "
+                        "Shorten settle_ms, or stabilise the laser."
+                    )
+            elif drift_v > tolerance:
+                # No usable interval to derive a rate from: fall back to the
+                # displacement, which is all that can be said.
+                raise ValueError(
+                    f"The two final detections were {drift_v * 1e3:.3f} mV apart, "
+                    f"outside the {tolerance * 1e3:.3f} mV acceptance window "
+                    f"(capture_fraction {float(acceptance.capture_fraction):g} x feature "
+                    f"half-width {float(settings.half_range_sweep_v) * 1e3:.3f} mV)."
+                )
+            stages.append({
+                "kind": "final_verify", "center_v": center_v, "amplitude_v": amplitude_v,
+                "target_voltage": strict_two.target_voltage, "resolution_samples": resolution,
+                "detector": "strict", "sideband_offset_v": strict_two.sideband_offset_v,
+                "consistent": True,
+            })
+            return strict_two, {
+                "attempted": True,
+                "trigger": "under_resolved",
+                "original_center_v": start_center_v,
+                "original_amplitude_v": start_amplitude_v,
+                "final_center_v": center_v,
+                "final_amplitude_v": amplitude_v,
+                "initial_resolution_samples": initial_resolution,
+                "stages": stages,
+                "restored": False,
+            }
+        except Exception as exc:
+            restored = self._restore_sweep_geometry(start_center_v, start_amplitude_v)
+            diagnostics = {
+                "attempted": True,
+                "original_center_v": start_center_v,
+                "original_amplitude_v": start_amplitude_v,
+                "initial_resolution_samples": initial_resolution,
+                "stages": stages,
+                "restored": restored,
+                "failure": str(exc),
+                "failure_kind": (
+                    "identity"
+                    if isinstance(exc, _TrackingIdentityChanged)
+                    else "position"
+                    if isinstance(exc, ValueError)
+                    else "other"
+                ),
+            }
+            raise TrajectoryRefinementAborted(
+                f"Trajectory-aware auto-lock refinement failed: {exc} "
+                f"(scan geometry {'restored' if restored else 'could not be restored'}).",
+                diagnostics,
+            ) from exc
+
+
     def auto_lock_from_scan(
         self, settings_payload: dict[str, Any] | None
     ) -> dict[str, Any]:
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
-        error_trace, monitor_trace = self._snapshot_auto_lock_traces()
 
         with self._state_lock:
             if settings_payload is None:
@@ -2265,26 +3214,129 @@ class DeviceSession:
             else:
                 settings = AutoLockScanSettings.from_mapping(settings_payload)
                 self.auto_lock_scan_settings = settings.__dict__.copy()
-        sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz = (
-            self._snapshot_sweep_params(require_unlocked=True)
-        )
+        with self._state_lock:
+            acceptance = AcceptanceSettings.from_mapping(self.lock_acceptance_settings)
 
-        # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
-        result = find_auto_lock_target(
-            error_trace_v=error_trace,
-            monitor_trace_v=monitor_trace,
-            sweep_center_v=sweep_center,
-            sweep_amplitude_v=sweep_amplitude,
-            settings=settings,
-            preferred_slope_rising=preferred_slope_rising,
-            modulation_frequency_hz=modulation_frequency_hz,
-        )
-
-        with self._rpyc_lock:
-            self.parameters.sweep_center.value = float(result.target_voltage)
-            self.control.exposed_write_registers()
-            self.control.exposed_start_lock()
-
+        refinement: dict[str, Any] | None = None
+        # A walk that aborted has already put the operator's geometry back, so
+        # there is nothing left to defer.
+        refinement_failed = False
+        with self._exclusive_center_move("auto-lock from scan"):
+            # Snapshot the restore-to geometry inside the lock: _move_and_lock
+            # re-reads the center for the same reason (see its docstring) --
+            # an unserialized set_param between an earlier snapshot and here
+            # could otherwise make a later restore overwrite the operator's
+            # own change with a stale value.
+            sweep_center, sweep_amplitude, _preferred_slope_rising, _modulation_frequency_hz = (
+                self._snapshot_sweep_params(require_unlocked=True)
+            )
+            # A strict detection is authoritative: if the calibrated detector
+            # accepts this trace, lock on it. Refinement used to run whenever
+            # the sample count was below a hardcoded 10, which meant it could
+            # only ever discard a target the detector had just accepted -- and
+            # on a feature that moves with scan geometry, its own verification
+            # then refused the lock outright.
+            error_trace, monitor_trace = self._snapshot_auto_lock_traces()
+            try:
+                direct, direct_center, direct_amplitude, direct_resolution = (
+                    self._capture_auto_lock_target(
+                        settings, traces=(error_trace, monitor_trace)
+                    )
+                )
+            except ValueError as strict_error:
+                # The detector REJECTED this trace -- the case refinement was
+                # written for. Seed the walk with a coarse candidate and narrow
+                # until strict agrees. A RuntimeError (no trace, already locked)
+                # is not a detection problem and still propagates.
+                coarse, coarse_center, coarse_amplitude, coarse_resolution, _metrics = (
+                    self._coarse_auto_lock_target(settings)
+                )
+                try:
+                    result, refinement = self._trajectory_refine_auto_lock(
+                        settings,
+                        acceptance,
+                        sweep_center,
+                        sweep_amplitude,
+                        initial_target=coarse,
+                        initial_center_v=coarse_center,
+                        initial_amplitude_v=coarse_amplitude,
+                        initial_resolution=coarse_resolution,
+                        initial_detector="coarse",
+                        trace_length=len(error_trace),
+                    )
+                except TrajectoryRefinementAborted as refine_error:
+                    # Nothing to fall back to: the strict detector never
+                    # accepted anything. Report the original rejection, which is
+                    # what the operator has to act on, with the walk's history.
+                    refine_error.refinement["strict_rejection"] = str(strict_error)
+                    raise
+            else:
+                result = direct
+                # The detector is happy, but on a scan this wide the centre move
+                # that follows is one long hysteretic jump and lands on the
+                # wrong feature. Narrow around the target first so the centre
+                # walks there in bounded steps instead.
+                if scan_too_wide_to_lock(
+                    settings, direct_amplitude, direct.sideband_offset_v,
+                    trace_points=len(error_trace),
+                ):
+                    try:
+                        result, refinement = self._trajectory_refine_auto_lock(
+                            settings,
+                            acceptance,
+                            sweep_center,
+                            sweep_amplitude,
+                            initial_target=direct,
+                            initial_center_v=direct_center,
+                            initial_amplitude_v=direct_amplitude,
+                            initial_resolution=direct_resolution,
+                            initial_detector="strict",
+                            trace_length=len(error_trace),
+                        )
+                    except TrajectoryRefinementAborted as refine_error:
+                        # Unlike the rejection path there IS something to fall
+                        # back to. Narrowing is an improvement on a detection
+                        # that already passed, so failing to narrow must not
+                        # cost the lock -- except when the walk lost the feature
+                        # itself, which is the one failure that means the target
+                        # can no longer be trusted.
+                        if refine_error.failure_kind == "identity":
+                            raise
+                        logger.warning(
+                            "Auto-lock narrowing failed (%s); locking on the "
+                            "direct detection at the original scan instead.",
+                            refine_error,
+                        )
+                        refinement = dict(refine_error.refinement)
+                        refinement["fell_back_to_direct"] = True
+                        result = direct
+                        refinement_failed = True
+            try:
+                # The refinement final verification leaves geometry untouched,
+                # so the handover starts from the exact verified scan.
+                self._move_and_lock(result, sweep_center)
+            except Exception as exc:
+                if refinement is not None:
+                    self._restore_sweep_geometry(sweep_center, sweep_amplitude)
+                    # The refinement stage history that got us here is otherwise
+                    # lost, and it is the most informative diagnostic for this
+                    # failure.
+                    if not hasattr(exc, "refinement"):
+                        exc.refinement = refinement
+                raise
+            else:
+                if refinement is not None and not refinement_failed:
+                    # Do NOT restore now: while locked, sweep_center is the
+                    # lock's operating point (_move_and_lock set it to the
+                    # target just before start_lock), so writing the old center
+                    # would pull the laser off the feature. Put the operator's
+                    # geometry back when the sweep next starts instead, so the
+                    # free-running scan is not left narrowed.
+                    with self._rpyc_lock:
+                        self._deferred_sweep_geometry = (
+                            float(sweep_center),
+                            float(sweep_amplitude),
+                        )
         # Cache the discriminator slope measured on this scan so status()/plot
         # frames can report the in-loop lock error in MHz. Only overwrite when the
         # scan resolved one (PDH + known modulation frequency); keep the previous
@@ -2296,6 +3348,8 @@ class DeviceSession:
                 )
 
         payload = result.to_dict()
+        if refinement is not None:
+            payload["refinement"] = refinement
         payload["detail"] = "Auto-lock started from scan."
         return payload
 
@@ -2305,6 +3359,7 @@ class DeviceSession:
         device_name: str | None = None,
         device_key: str,
         lock_source: str = "manual_lock",
+        success: bool = True,
     ) -> dict[str, Any]:
         param_names = (
             "modulation_frequency",
@@ -2327,6 +3382,7 @@ class DeviceSession:
             device_name=device_name,
             device_key=device_key,
             lock_source=lock_source,
+            success=success,
             params=params,
             trace_y=trace_values,
             monitor_trace_y=monitor_trace_values,
@@ -2401,6 +3457,17 @@ class DeviceSession:
             raise RuntimeError("Device not connected")
         with self._rpyc_lock:
             self.control.exposed_start_sweep()
+            self._apply_deferred_sweep_geometry()
+
+    def _apply_deferred_sweep_geometry(self) -> None:
+        """Restore the pre-refinement scan once the lock is off. Caller holds
+        _rpyc_lock and has just started the sweep, so the write can no longer
+        move a lock's operating point."""
+        pending = self._deferred_sweep_geometry
+        if pending is None:
+            return
+        self._deferred_sweep_geometry = None
+        self._restore_sweep_geometry(*pending)
 
     def set_csr_direct(self, key: str, value: int) -> None:
         """Directly write a single FPGA CSR (bypasses the write_registers diff cache).
@@ -2626,6 +3693,7 @@ class DeviceSession:
                         task.exposed_stop(False)
                 self.parameters.task.value = None
             self.control.exposed_start_sweep()
+            self._apply_deferred_sweep_geometry()
 
     def stop_task(self, use_new_parameters: bool = False) -> None:
         if self.parameters is None:

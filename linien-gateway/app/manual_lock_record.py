@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from typing import Any, Mapping, Sequence
 
@@ -57,11 +58,28 @@ def _build_trace_x(
     return [minimum + step * idx for idx in range(count)]
 
 
+def _json_safe(value: Any) -> Any:
+    """Strip non-finite floats, which json.dumps writes as bare NaN/Infinity.
+
+    That is not valid JSON, so Postgres rejects it when parsing the jsonb column
+    -- and the write error is swallowed by the best-effort writer, losing the
+    row silently.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def build_manual_lock_row(
     *,
     device_name: str | None,
     device_key: str,
     lock_source: str = "manual_lock",
+    success: bool = True,
     params: Mapping[str, Any],
     trace_y: Sequence[Any] | np.ndarray | None,
     monitor_trace_y: Sequence[Any] | np.ndarray | None,
@@ -106,7 +124,7 @@ def build_manual_lock_row(
     return {
         "laser_name": laser_name,
         "lock_source": (lock_source or "").strip() or "manual_lock",
-        "success": True,
+        "success": bool(success),
         "modulation_frequency_hz": modulation_hz,
         "demod_phase_deg": demod_phase,
         "signal_offset_volts": offset_volts,
@@ -120,4 +138,6 @@ def build_manual_lock_row(
         "trace_x_units": "V",
         "trace_y_units": "V",
         "monitor_trace_y_units": "V",
+        "sweep_center_v": sweep_center,
+        "sweep_amplitude_v": sweep_amplitude,
     }

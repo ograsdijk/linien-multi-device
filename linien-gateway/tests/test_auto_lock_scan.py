@@ -6,7 +6,12 @@ import pytest
 from app.auto_lock_scan import (
     AutoLockScanSettings,
     calibrate_auto_lock_settings,
+    feature_resolution_samples,
+    find_coarse_auto_lock_target,
     find_auto_lock_target,
+    _sideband_offset_pts,
+    max_lockable_amplitude_v,
+    scan_too_wide_to_lock,
 )
 from app.schemas import AutoLockScanSettings as SchemaAutoLockScanSettings
 
@@ -29,6 +34,33 @@ def _pdh_triplet(n=2048, carrier=0.4, sideband=0.15, width=0.03, sb_off=0.3):
         + _dispersive(n, amplitude=-sideband, width=width, center=-sb_off)
         + _dispersive(n, amplitude=-sideband, width=width, center=+sb_off)
     )
+
+
+def test_feature_resolution_is_calibrated_width_per_sample_not_scan_threshold():
+    settings = AutoLockScanSettings(half_range_sweep_v=0.04)
+    # Same physical scan amplitude, doubled samples -> doubled resolution.
+    assert feature_resolution_samples(settings, 2048, 1.0) == pytest.approx(40.94)
+    assert feature_resolution_samples(settings, 1024, 1.0) == pytest.approx(20.46)
+    # Same ADC depth, halving scan amplitude also doubles the feature samples.
+    assert feature_resolution_samples(settings, 2048, 0.5) == pytest.approx(81.88)
+
+
+def test_coarse_tracker_requires_pdh_sidebands_and_reports_snr_metrics():
+    error = _pdh_triplet(n=2048, width=0.012, sb_off=0.25)
+    coarse = find_coarse_auto_lock_target(
+        error_trace_v=error,
+        monitor_trace_v=None,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=AutoLockScanSettings(signal_type="pdh", half_range_sweep_v=0.01),
+        preferred_slope_rising=True,
+        modulation_frequency_hz=20e6,
+    )
+    assert abs(coarse.result.target_voltage) < 0.03
+    assert coarse.result.sideband_offset_v is not None
+    assert coarse.metrics["method"] == "multiscale_extrema_pair"
+    assert coarse.metrics["snr"] > 6
+
 
 
 def test_finds_rising_crossing_near_center():
@@ -480,3 +512,383 @@ def test_calibrate_monitor_aware_anchor():
         include_monitor=True,
     )
     assert calib.target_voltage > 0.2
+
+
+# ------------------------------------------------- scan too wide to lock from
+
+def _settings(**kw):
+    return AutoLockScanSettings.from_mapping({"signal_type": "pdh", **kw})
+
+
+def test_a_signal_filling_a_quarter_of_the_scan_is_lockable():
+    # sideband +/-0.05 V -> 0.1 V wide signal; exactly a quarter of a 0.4 V span.
+    assert not scan_too_wide_to_lock(_settings(min_signal_scan_fraction=0.25),
+                                     sweep_amplitude_v=0.2, sideband_offset_v=0.05)
+
+
+def test_a_signal_that_is_a_speck_on_the_scan_is_not():
+    """The failure this exists for: the centre move to a target that far away
+    is one long hysteretic jump, and it lands on a different feature."""
+    assert scan_too_wide_to_lock(_settings(), sweep_amplitude_v=1.0,
+                                 sideband_offset_v=0.05)
+
+
+def test_the_fraction_is_configurable():
+    wide = dict(sweep_amplitude_v=1.0, sideband_offset_v=0.05)
+    assert scan_too_wide_to_lock(_settings(), **wide)
+    assert not scan_too_wide_to_lock(_settings(min_signal_scan_fraction=0.05), **wide)
+    assert not scan_too_wide_to_lock(_settings(min_signal_scan_fraction=0.0), **wide)
+
+
+def test_an_unmeasured_sideband_spacing_does_not_force_narrowing():
+    """None means "could not measure", not "too wide". Reading it as too wide
+    narrows every dispersive device and every scan that did not resolve the
+    sidebands -- including ones that lock perfectly well."""
+    assert not scan_too_wide_to_lock(_settings(), sweep_amplitude_v=1.0,
+                                     sideband_offset_v=None)
+    assert not scan_too_wide_to_lock(
+        _settings(signal_type="dispersive"), sweep_amplitude_v=1.0,
+        sideband_offset_v=0.001,
+    )
+
+
+def test_the_goal_amplitude_is_the_widest_scan_that_passes():
+    # The fraction is pinned rather than inherited: this asserts the goal is the
+    # widest scan the test admits, for whatever fraction is configured.
+    settings = _settings(min_signal_scan_fraction=0.25)
+    amp = max_lockable_amplitude_v(settings, 0.05)
+    assert amp == pytest.approx(0.2)
+    assert not scan_too_wide_to_lock(settings, sweep_amplitude_v=amp,
+                                     sideband_offset_v=0.05)
+    assert scan_too_wide_to_lock(settings, sweep_amplitude_v=amp * 1.01,
+                                 sideband_offset_v=0.05)
+
+
+# ------------------------------------- the coarse tracker honours the monitor
+#
+# The coarse detector steers the narrowing walk. It used to accept
+# monitor_trace_v and ignore it, so on a device where the monitor is the only
+# thing telling two crossings apart, the walk could track onto the wrong one and
+# burn its whole stage budget before the strict detections at the end noticed.
+
+
+def _two_identical_features(n=2048):
+    """Two crossings the error signal cannot tell apart, at -0.4 and +0.4."""
+    return (
+        _dispersive(n, amplitude=0.4, width=0.03, center=-0.4)
+        + _dispersive(n, amplitude=0.4, width=0.03, center=+0.4)
+    )
+
+
+def _monitor_peak_at(center, n=2048, height=0.8):
+    """A transmission peak marking one of them as the real feature."""
+    x = np.linspace(-1.0, 1.0, n)
+    return height * np.exp(-0.5 * ((x - center) / 0.03) ** 2)
+
+
+def _coarse(error, monitor, **kw):
+    settings = AutoLockScanSettings.from_mapping(
+        {"signal_type": "dispersive", "half_range_sweep_v": 0.06, **kw}
+    )
+    return find_coarse_auto_lock_target(
+        error_trace_v=error,
+        monitor_trace_v=monitor,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=settings,
+        preferred_slope_rising=True,
+    )
+
+
+def test_the_coarse_tracker_picks_the_crossing_the_monitor_marks():
+    error = _two_identical_features()
+    for marked in (-0.4, 0.4):
+        candidate = _coarse(error, _monitor_peak_at(marked), use_monitor=True)
+        assert candidate.result.target_voltage == pytest.approx(marked, abs=0.05)
+
+
+def test_the_coarse_tracker_ignores_the_monitor_when_it_is_not_calibrated_in():
+    """use_monitor is set by calibration; an uncalibrated monitor must not
+    start gating candidates."""
+    error = _two_identical_features()
+    a = _coarse(error, _monitor_peak_at(-0.4), use_monitor=False)
+    b = _coarse(error, _monitor_peak_at(0.4), use_monitor=False)
+    assert a.result.target_voltage == pytest.approx(b.result.target_voltage)
+
+
+def test_a_monitor_that_rejects_everything_says_so():
+    """'no signal-to-noise' would send the operator after the wrong problem."""
+    error = _two_identical_features()
+    # A monitor that DIPS at both crossings, on a device configured for peaks:
+    # every candidate sits below the baseline the rest of the trace sets.
+    monitor = (
+        1.0
+        - _monitor_peak_at(-0.4, height=1.0)
+        - _monitor_peak_at(0.4, height=1.0)
+    )
+    with pytest.raises(ValueError, match="rejected by the monitor"):
+        _coarse(error, monitor, use_monitor=True)
+
+
+def test_the_coarse_tracker_reports_the_monitor_level_it_used():
+    candidate = _coarse(
+        _two_identical_features(), _monitor_peak_at(0.4), use_monitor=True
+    )
+    assert candidate.result.monitor_level is not None
+
+
+# --- Sideband spacing must be a measurement, not an assertion ----------------
+#
+# Field payloads from a DFB whose scan carries several features had the strict
+# detector reporting 16-20 mV spacings against the coarse tracker's 32 mV at the
+# same geometry. The spacing is set by the modulation frequency and the laser's
+# tuning coefficient, so the two cannot honestly differ; the strict path was
+# pairing the carrier with a neighbouring feature's crossing. A wrong spacing is
+# worse than none, because it rescales scan_too_wide_to_lock, the refinement
+# centre-step allowance and the tracking identity all at once.
+
+_FIELD_HALF_RANGE_V = 2.275 * 2 * 0.8 / 2047  # 1.778 mV, from resolution 2.275 at ±0.8 V
+_FIELD_SIDEBAND_V = 0.032
+
+
+def _field_settings(**overrides):
+    base = dict(
+        signal_type="pdh",
+        half_range_sweep_v=_FIELD_HALF_RANGE_V,
+        error_min=0.0005,
+        single_error_min=0.0005,
+        min_amplitude=0.0005,
+    )
+    base.update(overrides)
+    return AutoLockScanSettings(**base)
+
+
+def _field_pdh_trace(center_v, amplitude_v, neighbour_dv=None, n=2048, carrier_v=0.4841):
+    """A PDH triplet at the field's feature width, optionally with a neighbour."""
+    v = np.linspace(center_v - amplitude_v, center_v + amplitude_v, n)
+
+    def lobe(v0, strength):
+        u = (v - v0) / _FIELD_HALF_RANGE_V
+        return strength * u / (1.0 + u * u)
+
+    def triplet(v0, strength):
+        return (
+            lobe(v0, strength)
+            + lobe(v0 - _FIELD_SIDEBAND_V, -0.5 * strength)
+            + lobe(v0 + _FIELD_SIDEBAND_V, -0.5 * strength)
+        )
+
+    signal = triplet(carrier_v, 1.0)
+    if neighbour_dv is not None:
+        signal = signal + triplet(carrier_v + neighbour_dv, 0.6)
+    return signal * 0.0022 / np.max(np.abs(signal))
+
+
+def _detect(trace, center_v, amplitude_v, settings):
+    strict = find_auto_lock_target(
+        error_trace_v=trace,
+        monitor_trace_v=None,
+        sweep_center_v=center_v,
+        sweep_amplitude_v=amplitude_v,
+        settings=settings,
+        preferred_slope_rising=True,
+        modulation_frequency_hz=25e6,
+    )
+    coarse = find_coarse_auto_lock_target(
+        error_trace_v=trace,
+        monitor_trace_v=None,
+        sweep_center_v=center_v,
+        sweep_amplitude_v=amplitude_v,
+        settings=settings,
+        preferred_slope_rising=True,
+        modulation_frequency_hz=25e6,
+    )
+    return strict, coarse.result
+
+
+@pytest.mark.parametrize("neighbour_dv", [-0.045, 0.045])
+def test_a_neighbouring_feature_never_yields_a_spacing_below_the_true_one(neighbour_dv):
+    """The crossing of an adjacent feature is nearer than the real sideband."""
+    settings = _field_settings()
+    trace = _field_pdh_trace(0.2649, 0.4, neighbour_dv=neighbour_dv)
+    strict, coarse = _detect(trace, 0.2649, 0.4, settings)
+
+    # Both detectors still place the carrier correctly; only the spacing was at risk.
+    assert strict.target_voltage == pytest.approx(0.4841, abs=3 * _FIELD_HALF_RANGE_V)
+
+    # Either it measures the true spacing or it declines -- never a smaller number.
+    if strict.sideband_offset_v is not None:
+        assert strict.sideband_offset_v == pytest.approx(_FIELD_SIDEBAND_V, rel=0.15)
+    # And it may not contradict the coarse tracker looking at the same trace.
+    if strict.sideband_offset_v is not None and coarse.sideband_offset_v is not None:
+        assert strict.sideband_offset_v == pytest.approx(
+            coarse.sideband_offset_v, rel=0.2
+        )
+
+
+def test_a_spacing_is_never_asserted_from_one_side_alone():
+    """With the upper sideband off the end of the scan there is no pair to average.
+
+    The old code averaged whatever offsets it had, so a single side was returned
+    as if it were the mean of two -- indistinguishable, to every caller, from a
+    measurement that had actually been checked.
+    """
+    settings = _field_settings()
+    # Carrier one sideband's width inside the top rail: +Omega falls outside.
+    center_v, amplitude_v = 0.0, 0.5
+    carrier_v = amplitude_v - 0.5 * _FIELD_SIDEBAND_V
+    trace = _field_pdh_trace(center_v, amplitude_v, carrier_v=carrier_v)
+    strict, _ = _detect(trace, center_v, amplitude_v, settings)
+
+    assert strict.sideband_offset_v is None
+
+
+def test_a_crossing_inside_the_carrier_window_is_not_a_sideband():
+    """A crossing within the calibrated feature width belongs to the carrier.
+
+    Tested on the offset helper directly: a trace crafted to survive the
+    detector's smoother would be testing the smoother, not the exclusion rule.
+    """
+    n = 400
+    anchor = 200
+    error = np.zeros(n)
+    # Carrier: rising through zero at `anchor`.
+    error[:anchor] = -1.0
+    error[anchor:] = 1.0
+    # True -Omega and +Omega falling crossings, 40 samples out on both sides.
+    error[anchor - 40 :] = np.where(
+        np.arange(anchor - 40, n) < anchor, 1.0, error[anchor - 40 :]
+    )
+    error = np.concatenate([
+        np.full(anchor - 40, 1.0),   # above zero
+        np.full(40, -1.0),           # -Omega falling crossing at anchor-40
+        np.full(40, 1.0),            # carrier rising crossing at anchor
+        np.full(n - anchor - 40, -1.0),  # +Omega falling crossing at anchor+40
+    ])
+    assert _sideband_offset_pts(
+        error, anchor, True, exclusion_pts=3
+    ) == pytest.approx(40.0)
+
+    # A crossing 10 samples out, inside a 24-sample carrier window, is not a
+    # sideband: the true pair at ±40 must still be the measurement.
+    noisy = error.copy()
+    noisy[anchor + 10 : anchor + 14] = -1.0
+    assert _sideband_offset_pts(
+        noisy, anchor, True, exclusion_pts=24
+    ) == pytest.approx(40.0)
+    # Without the exclusion window that stray crossing halves the spacing.
+    assert _sideband_offset_pts(noisy, anchor, True, exclusion_pts=1) is None
+
+
+def test_a_scan_too_coarse_to_resolve_the_feature_reports_no_spacing():
+    """The field's opening geometry: ±0.8 V, 2.275 samples per half-width.
+
+    The feature spans 4.5 samples against a 5-sample smoothing window, and the
+    two detectors returned 16.0 mV and 31.7 mV for the same laser -- one having
+    paired carrier-to-sideband, the other sideband-to-sideband, 41 samples
+    apart either way. Neither number was a measurement, and the walk seeded its
+    identity, its scan-width test and its centre-step allowance from one.
+    """
+    settings = _field_settings()
+    assert feature_resolution_samples(settings, 2048, 0.8) == pytest.approx(2.275)
+
+    trace = _field_pdh_trace(0.2, 0.8)
+    strict, coarse = _detect(trace, 0.2, 0.8, settings)
+    assert strict.sideband_offset_v is None
+    assert coarse.sideband_offset_v is None
+    # The feature is still found -- only the claim about its spacing is withheld.
+    assert strict.target_voltage == pytest.approx(0.4841, abs=0.01)
+
+
+def test_the_same_scan_narrowed_enough_to_resolve_it_reports_a_spacing():
+    """Same laser, ±0.4 V: 4.55 samples per half-width clears the window."""
+    settings = _field_settings()
+    trace = _field_pdh_trace(0.2649, 0.4)
+    strict, coarse = _detect(trace, 0.2649, 0.4, settings)
+    assert strict.sideband_offset_v == pytest.approx(_FIELD_SIDEBAND_V, rel=0.1)
+    assert coarse.sideband_offset_v == pytest.approx(_FIELD_SIDEBAND_V, rel=0.1)
+
+
+# --- Nothing may be scaled in absolute volts ---------------------------------
+#
+# Every threshold has to be expressed against something the device measures --
+# the calibrated feature width, the sample pitch, the scan span -- so that a
+# laser with narrower features or a gentler actuator is not silently mis-served
+# by a constant chosen on one device.
+
+def test_a_feature_finer_than_a_millivolt_calibrates_to_its_real_width():
+    """A 1 mV floor would have widened this laser's calibration by 3x.
+
+    The characterization device calibrates to 1.5 mV, which cleared the old
+    floor by less than a factor of two; a tighter cavity or a finer scan would
+    not have. The floor's real job -- keeping the width above a couple of
+    samples -- is already done in sample units.
+    """
+    n, amplitude = 2048, 0.1
+    pts_to_v = 2.0 * amplitude / (n - 1)          # 97.7 uV per sample
+    half_width_v = 4.0 * pts_to_v                 # 0.39 mV: well under a millivolt
+    x = np.linspace(-amplitude, amplitude, n)
+    u = x / half_width_v
+    error = 0.3 * u / (1.0 + u * u)
+
+    cal = calibrate_auto_lock_settings(
+        error_trace_v=error, monitor_trace_v=None,
+        sweep_center_v=0.0, sweep_amplitude_v=amplitude,
+        base=AutoLockScanSettings(signal_type="dispersive"),
+        preferred_slope_rising=True,
+    )
+    settings = cal.settings if hasattr(cal, "settings") else cal
+    assert settings.half_range_sweep_v < 0.001          # the old floor
+    assert settings.half_range_sweep_v >= 2.0 * pts_to_v  # but not below two samples
+
+
+def test_a_scan_too_coarse_to_measure_a_spacing_counts_as_too_wide():
+    """Two different silences, and only one of them means "go ahead".
+
+    Withholding the spacing on an unresolvable scan (as the detectors now do)
+    made `scan_too_wide_to_lock` fall through to False, so a walk whose strict
+    detector happened to succeed at ±0.625 V would have stopped and locked from
+    a scan carrying five samples of feature. Measured on the 119-scan run: the
+    strict detector succeeds on 8 of 10 scans at that width.
+    """
+    # The width calibrate_auto_lock_settings derives from the run's own
+    # narrowest scan, not an assumed one: 1.524 mV.
+    settings = _field_settings(half_range_sweep_v=0.001524)
+    wide = 0.625
+    assert feature_resolution_samples(settings, 2048, wide) == pytest.approx(2.5, abs=0.05)
+
+    # Unmeasurable because the scan cannot resolve the feature -> too wide.
+    assert scan_too_wide_to_lock(settings, wide, None, trace_points=2048) is True
+    # Resolvable scan that simply reported no sideband -> no opinion, as before.
+    assert scan_too_wide_to_lock(settings, 0.1, None, trace_points=2048) is False
+    # Callers that cannot say how long the trace was keep the old behaviour.
+    assert scan_too_wide_to_lock(settings, wide, None) is False
+    # An uncalibrated device belongs at the "calibrate first" refusal, not here.
+    blank = dataclasses.replace(settings, half_range_sweep_v=0.0)
+    assert scan_too_wide_to_lock(blank, wide, None, trace_points=2048) is False
+
+
+def test_the_default_lock_width_is_three_signal_widths_of_centre_travel():
+    """The default is a relationship, not a width.
+
+    `min_signal_scan_fraction` is the reciprocal of twice the longest centre
+    move it permits: the target can sit a half-span out, so a signal filling
+    fraction f of the span is at most 1/(2f) signal widths away. At the old 1/4
+    that was two widths, which made the characterization laser -- error signal
+    33.90 +/- 0.42 mV sideband to sideband, measured over 98 recorded scans --
+    narrow to +/-0.136 V before it would lock, well inside the +/-0.2 V an
+    operator locks it at by hand.
+    """
+    settings = AutoLockScanSettings(signal_type="pdh")
+    assert 1.0 / (2.0 * settings.min_signal_scan_fraction) == pytest.approx(3.0)
+
+    measured_sideband_v = 0.0339
+    goal = max_lockable_amplitude_v(settings, measured_sideband_v)
+    assert goal == pytest.approx(0.203, abs=0.005)
+    assert not scan_too_wide_to_lock(settings, 0.2, measured_sideband_v,
+                                     trace_points=2048)
+
+    # A laser with a signal half this wide gets half the width, not 0.2 V.
+    assert max_lockable_amplitude_v(settings, measured_sideband_v / 2) == pytest.approx(
+        goal / 2
+    )

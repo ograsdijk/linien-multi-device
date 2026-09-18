@@ -17,6 +17,9 @@ dependencies = [
 
 [project.scripts]
 linien-sim = "linien_sim.main:main"
+# Host-side stand-in for the Red Pitaya rp-telemetry daemon, so the gateway's
+# temperature polling can be developed without hardware.
+linien-rp-telemetry-sim = "linien_sim.rp_telemetry_sim:main"
 
 [tool.setuptools.packages.find]
 namespaces = false

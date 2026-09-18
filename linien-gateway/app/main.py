@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -29,19 +31,35 @@ from .config import (
 from .device_config_store import (
     CONFIG_AUTO_LOCK_SCAN,
     CONFIG_AUTO_RELOCK,
+    CONFIG_LOCK_ACCEPTANCE,
     CONFIG_LOCK_INDICATOR,
     DeviceConfigStore,
 )
+from . import board_diagnostics
+from .board_event_store import (
+    DEFAULT_MAX_PER_DEVICE as BOARD_EVENT_LIMIT,
+    KIND_DIAGNOSIS,
+    KIND_DISCONNECTED,
+    KIND_PERSISTENT_LOG_ENABLED,
+    KIND_RESET_CAUSE_CLEARED,
+    KIND_REBOOT_REQUESTED,
+    KIND_TELEMETRY_OFFLINE,
+    KIND_TELEMETRY_RECOVERED,
+    BoardEventStore,
+)
 from .diagnosis import DiagnosisProbe
+from .influx_writer import InfluxLineWriter
 from .log_store import LogStore
 from .manual_lock_postgres import LockResultPostgresService
-from .path_utils import find_repo_root
+from .path_utils import find_repo_root, resolve_repo_path
 from .psd_store import PsdStore
+from .rp_telemetry import RpTelemetryManager
 from .schemas import (
     AutoLockCalibrateRequest,
     AutoLockCalibrationResult,
     AutoLockScanResult,
     AutoLockScanSettings,
+    LockAcceptanceSettings,
     AutoRelockConfig,
     AutoRelockEnabledUpdate,
     AutoRelockState,
@@ -84,8 +102,136 @@ log_store = LogStore(max_entries=10_000, max_age_s=24.0 * 60.0 * 60.0)
 psd_store = PsdStore(max_entries=500, max_age_s=24.0 * 60.0 * 60.0)
 device_config_store = DeviceConfigStore()
 session_registry = SessionRegistry()
-diagnosis_probe = DiagnosisProbe(session_registry)
+# Durable per-device timeline. Lives beside devices.json so a gateway
+# restart -- which is itself often part of the incident -- does not erase
+# the history of what the boards were doing.
+board_event_store = BoardEventStore(
+    resolve_repo_path("board_events.json", Path.cwd().resolve())
+)
+diagnosis_probe = DiagnosisProbe(session_registry, event_store=board_event_store)
 logger = logging.getLogger(__name__)
+
+
+def _publish_telemetry_status(device_key: str) -> None:
+    """Push a fresh status frame after a telemetry state change.
+
+    Only called when the telemetry cache actually moved (see
+    RpTelemetryManager._material_signature), so a settled board does not
+    generate a websocket message every poll.
+    """
+    session = session_registry.get(device_key)
+    if session is None:
+        return
+    _publish_status_update(device_key, session)
+
+
+def _fetch_influx_credentials(device_key: str):
+    """Best-effort one-off credential lookup for the telemetry Influx write.
+
+    Normally the credentials are cached when the operator opens or saves them
+    in the UI. This covers the case where the gateway restarted since: it is
+    rate-limited by the manager (INFLUX_CREDENTIAL_RETRY_S) and only runs for
+    a connected device, so it is never part of the 30 s telemetry path.
+    """
+    session = session_registry.get(device_key)
+    if session is None or not getattr(session, "connected", False):
+        return None
+    try:
+        return session.logging_get_credentials()
+    except Exception:  # noqa: BLE001 - credentials are optional here
+        logger.debug(
+            "Influx credential lookup failed for device=%s", device_key, exc_info=True
+        )
+        return None
+
+
+# Every telemetry management action is long, blocking SSH work: an install is
+# ~8 commands at up to SSH_COMMAND_TIMEOUT_S each plus the verify retries. They
+# all share one bounded pool of their own, so no amount of telemetry work --
+# a bulk install, or an operator clicking Install on a dozen boards in turn --
+# can occupy the loop's default executor, which serves /api/devices/statuses,
+# the PSD start/stop fan-outs, and every other asyncio.to_thread() caller.
+TELEMETRY_SSH_CONCURRENCY = 4
+_telemetry_ssh_executor: ThreadPoolExecutor | None = None
+_telemetry_ssh_executor_lock = threading.Lock()
+
+
+def _get_telemetry_ssh_executor() -> ThreadPoolExecutor:
+    """The telemetry SSH pool, created on first use.
+
+    Created lazily rather than at import so that a shutdown (which disposes of
+    it) can be followed by another startup in the same process -- several
+    TestClient instances in one test session do exactly that, and so does a
+    uvicorn reload.
+    """
+    global _telemetry_ssh_executor
+    with _telemetry_ssh_executor_lock:
+        if _telemetry_ssh_executor is None:
+            _telemetry_ssh_executor = ThreadPoolExecutor(
+                max_workers=TELEMETRY_SSH_CONCURRENCY,
+                thread_name_prefix="rp-telemetry-ssh",
+            )
+        return _telemetry_ssh_executor
+
+
+async def _run_telemetry_ssh(action, *args):
+    """Run one blocking telemetry SSH action off the loop's default executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_get_telemetry_ssh_executor(), action, *args)
+
+
+# Diagnostics get their own pool rather than sharing the telemetry one: a
+# fleet-wide collect is a dozen SSH sessions of up to a dozen commands each,
+# and it must not leave an operator's Install or Start queued behind it.
+DIAGNOSTICS_SSH_CONCURRENCY = 3
+_diagnostics_ssh_executor: ThreadPoolExecutor | None = None
+_diagnostics_ssh_executor_lock = threading.Lock()
+
+
+def _get_diagnostics_ssh_executor() -> ThreadPoolExecutor:
+    global _diagnostics_ssh_executor
+    with _diagnostics_ssh_executor_lock:
+        if _diagnostics_ssh_executor is None:
+            _diagnostics_ssh_executor = ThreadPoolExecutor(
+                max_workers=DIAGNOSTICS_SSH_CONCURRENCY,
+                thread_name_prefix="board-diagnostics-ssh",
+            )
+        return _diagnostics_ssh_executor
+
+
+async def _run_diagnostics_ssh(action, *args):
+    """Run one blocking diagnostics SSH action off the loop's default executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_get_diagnostics_ssh_executor(), action, *args)
+
+
+def _shutdown_diagnostics_ssh_executor() -> None:
+    global _diagnostics_ssh_executor
+    with _diagnostics_ssh_executor_lock:
+        executor = _diagnostics_ssh_executor
+        _diagnostics_ssh_executor = None
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+
+def _shutdown_telemetry_ssh_executor() -> None:
+    global _telemetry_ssh_executor
+    with _telemetry_ssh_executor_lock:
+        executor = _telemetry_ssh_executor
+        _telemetry_ssh_executor = None
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+influx_line_writer = InfluxLineWriter()
+telemetry_manager = RpTelemetryManager(
+    device_provider=device_store.list_devices,
+    save_device=device_store.save_device,
+    status_publisher=_publish_telemetry_status,
+    log_callback=lambda **kwargs: _emit_log(**kwargs),
+    credentials_fetcher=_fetch_influx_credentials,
+    reload_device=device_store.get_device,
+    influx_writer=influx_line_writer,
+)
 
 
 def _remove_rotating_file_handlers(logger_name: str) -> None:
@@ -137,12 +283,19 @@ async def _startup() -> None:
     if hasattr(lock_result_postgres, "start"):
         lock_result_postgres.start()
     diagnosis_probe.start()
+    telemetry_manager.start()
 
 
 async def _shutdown() -> None:
     if hasattr(lock_result_postgres, "stop"):
         lock_result_postgres.stop()
     diagnosis_probe.stop()
+    await telemetry_manager.stop()
+    _shutdown_telemetry_ssh_executor()
+    _shutdown_diagnostics_ssh_executor()
+    # Persist whatever the debounce was still holding, synchronously: the
+    # process is about to go away, so a backgrounded write would not land.
+    board_event_store.close()
 
 
 @asynccontextmanager
@@ -270,6 +423,36 @@ def _emit_log(
         device_key=device_key,
         details=details,
     )
+    _record_board_event(code, message, device_key, details)
+
+
+# Log codes that are also board history. Every one of these already fires
+# exactly once per transition -- `_log_transitions` in rp_telemetry, the
+# category-change guard in DeviceSession.apply_diagnosis -- so mirroring them
+# costs nothing on the poll paths and cannot flood the timeline with repeats of
+# a steady state.
+_BOARD_EVENT_CODES: dict[str, str] = {
+    "poll_failure": KIND_DISCONNECTED,
+    "connection_diagnosis": KIND_DIAGNOSIS,
+    "device_reboot_completed": KIND_REBOOT_REQUESTED,
+    "rp_telemetry_unavailable": KIND_TELEMETRY_OFFLINE,
+    "rp_telemetry_recovered": KIND_TELEMETRY_RECOVERED,
+}
+
+
+def _record_board_event(
+    code: str, message: str, device_key: str | None, details: dict[str, Any] | None
+) -> None:
+    kind = _BOARD_EVENT_CODES.get(code)
+    if kind is None or not device_key:
+        return
+    board_event_store.record(device_key, kind, detail=message, data=details or {})
+    if kind == KIND_REBOOT_REQUESTED:
+        # This restart is already on the timeline. Drop the remembered boot id
+        # so the next diagnosis probe does not notice the change and log it a
+        # second time as a spontaneous reboot -- which would put the operator's
+        # own reboot back into the instability count.
+        board_event_store.forget_boot_id(device_key)
 
 
 def _emit_psd(device_key: str, entry: dict[str, Any]) -> None:
@@ -365,6 +548,7 @@ def _seed_config_store_from_device(device: Device) -> None:
         CONFIG_AUTO_LOCK_SCAN,
         CONFIG_LOCK_INDICATOR,
         CONFIG_AUTO_RELOCK,
+        CONFIG_LOCK_ACCEPTANCE,
     ):
         if config_name in existing:
             continue
@@ -389,6 +573,8 @@ def _normalize_config_payload(config_name: str, value: dict) -> dict:
         return AutoLockScanSettings.model_validate(value).model_dump()
     if config_name == CONFIG_AUTO_RELOCK:
         return AutoRelockConfig.model_validate(value).model_dump()
+    if config_name == CONFIG_LOCK_ACCEPTANCE:
+        return LockAcceptanceSettings.model_validate(value).model_dump()
     raise HTTPException(status_code=422, detail=f"Unknown config name: {config_name}")
 
 
@@ -428,6 +614,7 @@ def _session_for_device(device: Device) -> DeviceSession:
         session.set_log_event_callback(_emit_log)
         session.set_psd_event_callback(_emit_psd)
         session.set_diagnosis_request_callback(diagnosis_probe.request)
+        session.set_telemetry_provider(telemetry_manager.status_fields)
         session.sync_configs_from_device()
         return session
 
@@ -474,6 +661,11 @@ def update_device(key: str, payload: DevicePatch) -> DeviceOut:
 @app.delete("/api/devices/{key}")
 def delete_device(key: str) -> dict:
     device = _get_device_or_404(key)
+    existing = session_registry.get(key)
+    if existing is not None:
+        # Outside the key lock: a guarded center move takes seconds, and every
+        # other request for this device would queue behind it.
+        existing.await_relock_action()
     with session_registry.lock_for(key):
         session = session_registry.remove(key)
         if session is not None:
@@ -482,6 +674,8 @@ def delete_device(key: str) -> dict:
     device_store.remove_device(device)
     device_config_store.remove_device(key)
     group_store.remove_device_from_groups(key)
+    telemetry_manager.forget(key)
+    board_event_store.forget(key)
     return {"ok": True}
 
 
@@ -544,6 +738,7 @@ def connect_device(key: str) -> dict:
 @app.post("/api/devices/{key}/disconnect")
 def disconnect_device(key: str) -> dict:
     session = _get_session(key)
+    session.await_relock_action()
     with session_registry.lock_for(key):
         try:
             session.disconnect()
@@ -635,6 +830,14 @@ def reboot_device(key: str, response: Response) -> dict:
             recovery = session.start_reboot()
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+    # From here on the board may restart, so the remembered boot id is no
+    # longer a baseline for "did this board restart on its own". Cleared on
+    # *dispatch* rather than on completion: the reboot can time out or be
+    # cancelled after the command has already landed, and in those paths no
+    # `device_reboot_completed` is ever emitted -- so a later probe would see
+    # the changed id and file a spontaneous `reboot_detected`, putting the
+    # operator's own reboot into the instability count.
+    board_event_store.forget_boot_id(key)
     response.headers["Cache-Control"] = "no-store"
     return {"ok": True, "operation_id": recovery["operation_id"]}
 
@@ -928,6 +1131,30 @@ def auto_lock_candidates(key: str, payload: AutoLockScanSettings | None = None) 
     return {"found": True, "candidate": candidate, "reason": None}
 
 
+def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:
+    """Board-event payload for a started auto-lock.
+
+    Includes the guarded-move numbers when one ran, so how far the center
+    travelled and how much hysteresis correction it needed are on the per-device
+    record rather than only in the HTTP response.
+    """
+    details: dict[str, Any] = {
+        "target_voltage": result.get("target_voltage"),
+        "target_index": result.get("target_index"),
+        "score": result.get("score"),
+    }
+    refinement = result.get("refinement")
+    if isinstance(refinement, dict):
+        details.update({
+            "refinement_trigger": refinement.get("trigger"),
+            "refinement_stages": len(refinement.get("stages") or []),
+            "refinement_initial_resolution_samples": refinement.get("initial_resolution_samples"),
+            "refinement_final_center_v": refinement.get("final_center_v"),
+            "refinement_final_amplitude_v": refinement.get("final_amplitude_v"),
+        })
+    return details
+
+
 @app.post(
     "/api/devices/{key}/control/auto_lock_scan",
     response_model=AutoLockScanResult,
@@ -948,24 +1175,45 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
     try:
         result = session.auto_lock_from_scan(settings_payload)
     except RuntimeError as exc:
+        report = getattr(exc, "report", None)
+        details: dict[str, Any] = {"error": str(exc)}
+        refinement = getattr(exc, "refinement", None)
+        if isinstance(refinement, dict):
+            details["refinement"] = refinement
+        if isinstance(report, dict):
+            _enqueue_auto_lock_row(session, key, success=False)
         _emit_log(
             level=logging.ERROR,
             source="auto_lock_scan",
             code="auto_lock_scan_failed",
             message="Auto-lock from scan failed.",
             device_key=key,
-            details={"error": str(exc)},
+            details=details,
         )
+        if isinstance(refinement, dict):
+            raise HTTPException(
+                status_code=409,
+                detail={"message": str(exc), "refinement": refinement},
+            )
         raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
+        details = {"error": str(exc)}
+        refinement = getattr(exc, "refinement", None)
+        if isinstance(refinement, dict):
+            details["refinement"] = refinement
         _emit_log(
             level=logging.ERROR,
             source="auto_lock_scan",
             code="auto_lock_scan_failed",
             message="Auto-lock from scan failed.",
             device_key=key,
-            details={"error": str(exc)},
+            details=details,
         )
+        if isinstance(refinement, dict):
+            raise HTTPException(
+                status_code=422,
+                detail={"message": str(exc), "refinement": refinement},
+            )
         raise HTTPException(status_code=422, detail=str(exc))
     _emit_log(
         level=logging.INFO,
@@ -973,12 +1221,24 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
         code="auto_lock_scan_started",
         message="Auto-lock from scan started.",
         device_key=key,
-        details={
-            "target_voltage": result.get("target_voltage"),
-            "target_index": result.get("target_index"),
-            "score": result.get("score"),
-        },
+        details=_auto_lock_event_details(result),
     )
+    _enqueue_auto_lock_row(session, key, success=True)
+    return result
+
+
+def _enqueue_auto_lock_row(
+    session: Any,
+    key: str,
+    *,
+    success: bool,
+) -> None:
+    """Record an auto-lock attempt in postgres, successful or not.
+
+    Aborted attempts are written too: they carry the largest measured offsets,
+    so leaving them out would keep the most informative rows out of the very
+    table you would characterise a laser's hysteresis from.
+    """
     try:
         device = device_store.get_device(key)
         device_name = device.name if device is not None else key
@@ -986,6 +1246,7 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
             device_name=device_name,
             device_key=key,
             lock_source="auto_lock_scan",
+            success=success,
         )
         enqueued = lock_result_postgres.enqueue_lock_result(row)
         if not enqueued:
@@ -1024,7 +1285,6 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
             device_key=key,
             details={"error": str(exc)},
         )
-    return result
 
 
 @app.post(
@@ -1111,6 +1371,26 @@ def update_auto_lock_scan_settings(key: str, payload: AutoLockScanSettings) -> d
     settings_payload = session.update_auto_lock_scan_settings(payload.model_dump())
     _persist_config_block(device, CONFIG_AUTO_LOCK_SCAN, settings_payload)
     _publish_config_update(device.key, CONFIG_AUTO_LOCK_SCAN, settings_payload)
+    return settings_payload
+
+
+@app.get(
+    "/api/devices/{key}/lock-acceptance-settings", response_model=LockAcceptanceSettings
+)
+def get_lock_acceptance_settings(key: str) -> dict:
+    session = _get_session(key)
+    return session.get_lock_acceptance_settings()
+
+
+@app.put(
+    "/api/devices/{key}/lock-acceptance-settings", response_model=LockAcceptanceSettings
+)
+def update_lock_acceptance_settings(key: str, payload: LockAcceptanceSettings) -> dict:
+    device = _get_device_or_404(key)
+    session = _session_for_device(device)
+    settings_payload = session.update_lock_acceptance_settings(payload.model_dump())
+    _persist_config_block(device, CONFIG_LOCK_ACCEPTANCE, settings_payload)
+    _publish_config_update(device.key, CONFIG_LOCK_ACCEPTANCE, settings_payload)
     return settings_payload
 
 
@@ -1340,6 +1620,9 @@ def get_logging_credentials(key: str) -> dict:
         credentials = session.logging_get_credentials()
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    # Cache them for the gateway-side temperature write so the telemetry poll
+    # never needs an RPyC round trip of its own.
+    telemetry_manager.set_influx_credentials(key, credentials)
     return {
         "url": credentials.url,
         "org": credentials.org,
@@ -1349,16 +1632,359 @@ def get_logging_credentials(key: str) -> dict:
     }
 
 
+# One RPyC round trip per board. Bounded per device AND capped in width: a few
+# boards with a wedged RPyC lock must not turn "open the InfluxDB panel" into a
+# request that hangs for as long as the slowest board, nor fill the loop's
+# default executor (which also serves /api/devices/statuses) with blocked
+# threads. A timed-out lookup leaves its worker thread blocked until RPyC gives
+# up -- the same trade RpTelemetryManager._resolve_credentials_bounded makes --
+# so the width cap is what keeps that bounded.
+BULK_CREDENTIALS_TIMEOUT_S = 5.0
+BULK_CREDENTIALS_CONCURRENCY = 8
+
+
+@app.get("/api/devices/logging/credentials")
+async def get_all_logging_credentials() -> dict[str, dict]:
+    """Every device's InfluxDB credentials in one call.
+
+    Fetching them one key at a time meant the operator had to select each board
+    in the UI dropdown before its settings were readable -- and since this is
+    also what primes the telemetry credential cache, boards nobody clicked
+    stayed unprimed. Disconnected devices are reported, not skipped: "this
+    board has no settings because it is offline" is what the UI needs to show,
+    and it costs no round trip.
+    """
+    devices = device_store.list_devices()
+    semaphore = asyncio.Semaphore(BULK_CREDENTIALS_CONCURRENCY)
+
+    def _credentials_for(device: Device) -> dict:
+        session = _session_for_device(device)
+        if not getattr(session, "connected", False):
+            return {"connected": False, "credentials": None, "error": None}
+        credentials = session.logging_get_credentials()
+        # Same cache priming as the per-device endpoint, so one panel open
+        # primes the whole fleet for the gateway-side temperature write.
+        telemetry_manager.set_influx_credentials(device.key, credentials)
+        return {
+            "connected": True,
+            "credentials": {
+                "url": credentials.url,
+                "org": credentials.org,
+                "token": credentials.token,
+                "bucket": credentials.bucket,
+                "measurement": credentials.measurement,
+            },
+            "error": None,
+        }
+
+    async def _bounded(device: Device) -> tuple[str, dict]:
+        async with semaphore:
+            try:
+                entry = await asyncio.wait_for(
+                    asyncio.to_thread(_credentials_for, device),
+                    timeout=BULK_CREDENTIALS_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                entry = {
+                    "connected": True,
+                    "credentials": None,
+                    "error": "Timed out reading InfluxDB credentials",
+                }
+            except Exception as exc:  # noqa: BLE001 - one board must not fail the batch
+                logger.warning(
+                    "bulk influx credential lookup failed for device=%s",
+                    device.key,
+                    exc_info=True,
+                )
+                entry = {"connected": True, "credentials": None, "error": str(exc)}
+            return device.key, entry
+
+    results = await asyncio.gather(*(_bounded(device) for device in devices))
+    return {key: entry for key, entry in results}
+
+
 @app.put("/api/devices/{key}/logging/credentials")
 def update_logging_credentials(key: str, payload: InfluxCredentials) -> dict:
     session = _get_session(key)
+    credentials = InfluxDBCredentials(**payload.model_dump())
     try:
-        success, message = session.logging_update_credentials(
-            InfluxDBCredentials(**payload.model_dump())
+        success, message = session.logging_update_credentials(credentials)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if success:
+        telemetry_manager.set_influx_credentials(key, credentials)
+    return {"success": success, "message": message}
+
+
+# --- Red Pitaya telemetry (Zynq die temperature) ------------------------
+#
+# Management actions (install/uninstall/start/stop/restart/service status) are
+# blocking SSH calls and run on a worker thread so they never occupy the event
+# loop. The read paths below are cache-only.
+
+
+async def _telemetry_action(key: str, action, *args) -> dict:
+    device = _get_device_or_404(key)
+    try:
+        return await _run_telemetry_ssh(action, device, *args)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/api/devices/{key}/telemetry")
+def get_telemetry(key: str) -> dict:
+    _get_device_or_404(key)
+    return telemetry_manager.status_fields(key)
+
+
+@app.post("/api/devices/{key}/telemetry/install")
+async def install_telemetry(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.install)
+
+
+@app.post("/api/devices/{key}/telemetry/uninstall")
+async def uninstall_telemetry(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.uninstall)
+
+
+@app.post("/api/devices/{key}/telemetry/start")
+async def start_telemetry(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.start_service)
+
+
+@app.post("/api/devices/{key}/telemetry/stop")
+async def stop_telemetry(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.stop_service)
+
+
+@app.post("/api/devices/{key}/telemetry/restart")
+async def restart_telemetry(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.restart_service)
+
+
+@app.get("/api/devices/{key}/telemetry/service")
+async def telemetry_service_status(key: str) -> dict:
+    return await _telemetry_action(key, telemetry_manager.service_status)
+
+
+@app.post("/api/devices/{key}/telemetry/read")
+async def read_telemetry_now(key: str) -> dict:
+    device = _get_device_or_404(key)
+    return await telemetry_manager.read_temperature(device)
+
+
+async def _telemetry_bulk(
+    device_keys: list[str], action
+) -> tuple[list[tuple[str, dict]], list[str]]:
+    """Run one telemetry SSH action across several boards, independently.
+
+    Returns the per-device results and the keys that named no device. Boards are
+    handled concurrently but each failure is reported per device; one
+    unreachable board never fails the batch.
+
+    Devices are resolved through `device_store` rather than `session_registry`:
+    telemetry actions touch the stored device record and must work on a board
+    that is not connected -- which, after a power cut, is all of them.
+    """
+    devices = []
+    missing: list[str] = []
+    for key in device_keys:
+        device = device_store.get_device(key)
+        if device is None:
+            missing.append(key)
+        else:
+            devices.append(device)
+
+    # Concurrency is bounded by the shared telemetry SSH pool (see
+    # _get_telemetry_ssh_executor); the gather below simply queues onto it.
+    async def _run(device) -> tuple[str, dict]:
+        try:
+            result = await _run_telemetry_ssh(action, device)
+        except Exception as exc:  # noqa: BLE001 - per-device error, not a batch failure
+            return device.key, {"ok": False, "error": str(exc)}
+        return device.key, result
+
+    results = await asyncio.gather(*(_run(device) for device in devices))
+    return list(results), missing
+
+
+@app.post("/api/telemetry/install")
+async def install_telemetry_many(payload: DeviceKeysIn) -> dict:
+    """Install/update telemetry on several boards, one SSH session each."""
+    results, missing = await _telemetry_bulk(
+        payload.device_keys, telemetry_manager.install
+    )
+    installed = [key for key, result in results if result.get("ok")]
+    failed = {key: result.get("error", "") for key, result in results if not result.get("ok")}
+    for key in missing:
+        failed[key] = "Device not found"
+    return {"installed": installed, "failed": failed}
+
+
+@app.post("/api/telemetry/start")
+async def start_telemetry_many(payload: DeviceKeysIn) -> dict:
+    """Start the telemetry service on several boards, one SSH session each.
+
+    The companion to install-all: after a batch of board reboots every daemon is
+    down, and the per-device menu is twelve visits away.
+
+    Boards whose install record says "not installed" are still attempted. The
+    record can be stale, `systemctl start` on a board with no unit fails fast,
+    and skipping would quietly do nothing to a board that is in fact fine.
+    """
+    results, missing = await _telemetry_bulk(
+        payload.device_keys, telemetry_manager.start_service
+    )
+    started: list[str] = []
+    failed: dict[str, str] = {}
+    for key, result in results:
+        if not result.get("ok"):
+            failed[key] = result.get("error", "")
+        elif result.get("active"):
+            started.append(key)
+        else:
+            # `systemctl start` reports success for a unit that dies straight
+            # afterwards. Counting that as started would be a green result for
+            # a service that is not running -- the single-device UI already
+            # refuses to do so, and the batch summary must not either.
+            state = result.get("state") or "inactive"
+            failed[key] = f"start was accepted but the service is {state}"
+    for key in missing:
+        failed[key] = "Device not found"
+    return {"started": started, "failed": failed}
+
+
+# --- Board diagnostics ---------------------------------------------------
+#
+# Answers "why did this board reset / why did linien-server die?" with evidence
+# rather than inference. All of it is operator-triggered: nothing below runs on
+# a timer, because SSH is deliberately absent from every monitoring path.
+
+
+@app.get("/api/devices/{key}/events")
+def get_board_events(key: str, limit: int = BOARD_EVENT_LIMIT) -> dict:
+    """The device's retained timeline. Cache read; no I/O, no SSH.
+
+    Clamped to what the store actually retains, rather than to a larger number
+    it would silently cut down anyway.
+    """
+    _get_device_or_404(key)
+    safe_limit = max(1, min(int(limit), BOARD_EVENT_LIMIT))
+    return {"events": board_event_store.events(key, limit=safe_limit)}
+
+
+@app.post("/api/devices/{key}/diagnostics/collect")
+async def collect_board_diagnostics(key: str) -> dict:
+    device = _get_device_or_404(key)
+    return await _run_diagnostics_ssh(board_diagnostics.collect_diagnostics, device)
+
+
+@app.post("/api/devices/{key}/diagnostics/clear-reset-cause")
+async def clear_reset_cause(key: str) -> dict:
+    """Zero the board's recorded reset causes.
+
+    The register accumulates and carries no timestamp, so an old board reads
+    as every cause it has ever seen. Clearing after reading is what makes the
+    next reading mean "since I last looked".
+
+    Deliberately not folded into `collect`: an automatic clear on every read
+    would let a second collect erase a cause nobody had looked at yet. It is
+    also the only hardware write in the feature, so it stays an explicit
+    operator action, and the reading it destroys is recorded in the timeline
+    before it goes.
+    """
+    device = _get_device_or_404(key)
+    result = await _run_diagnostics_ssh(board_diagnostics.clear_reboot_status, device)
+    if result.get("ok"):
+        board_event_store.record(
+            key,
+            KIND_RESET_CAUSE_CLEARED,
+            detail=(
+                "Reset causes cleared. Before: "
+                + (result.get("before_description") or "unknown")
+            ),
+        )
+        _emit_log(
+            logging.INFO,
+            "board_diagnostics",
+            "reset_cause_cleared",
+            "Reset-cause register cleared on the Red Pitaya.",
+            key,
+        )
+    return result
+
+
+@app.post("/api/devices/{key}/diagnostics/enable-persistent-log")
+async def enable_persistent_log(key: str) -> dict:
+    """Make this board's journal survive a reboot.
+
+    The one write in the diagnostics feature, and the one that makes the rest
+    worth having: until it runs, a board that resets takes the explanation with
+    it.
+    """
+    device = _get_device_or_404(key)
+    try:
+        result = await _run_diagnostics_ssh(
+            board_diagnostics.enable_persistent_journal, device
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    return {"success": success, "message": message}
+    _emit_log(
+        logging.INFO,
+        "board_diagnostics",
+        "persistent_log_enabled",
+        "Persistent logging enabled on the Red Pitaya.",
+        key,
+    )
+    board_event_store.record(
+        key,
+        KIND_PERSISTENT_LOG_ENABLED,
+        detail="Persistent journald storage enabled; logs now survive a reboot.",
+    )
+    return result
+
+
+@app.post("/api/diagnostics/enable-persistent-log")
+async def enable_persistent_log_many(payload: DeviceKeysIn) -> dict:
+    """One-time fleet-wide setup, per device but concurrent.
+
+    Twelve boards each needing this once is the same friction the bulk
+    telemetry actions exist to remove.
+    """
+    devices = []
+    missing: list[str] = []
+    for device_key in payload.device_keys:
+        device = device_store.get_device(device_key)
+        if device is None:
+            missing.append(device_key)
+        else:
+            devices.append(device)
+
+    async def _enable(device) -> tuple[str, dict]:
+        try:
+            result = await _run_diagnostics_ssh(
+                board_diagnostics.enable_persistent_journal, device
+            )
+        except Exception as exc:  # noqa: BLE001 - per-device, not a batch failure
+            return device.key, {"ok": False, "error": str(exc)}
+        return device.key, result
+
+    results = await asyncio.gather(*(_enable(device) for device in devices))
+    enabled: list[str] = []
+    failed: dict[str, str] = {}
+    for device_key, result in results:
+        if result.get("ok"):
+            enabled.append(device_key)
+            board_event_store.record(
+                device_key,
+                KIND_PERSISTENT_LOG_ENABLED,
+                detail="Persistent journald storage enabled; logs now survive a reboot.",
+            )
+        else:
+            failed[device_key] = result.get("error", "")
+    for device_key in missing:
+        failed[device_key] = "Device not found"
+    return {"enabled": enabled, "failed": failed}
 
 
 @app.get("/api/postgres/manual-lock", response_model=PostgresManualLockState)

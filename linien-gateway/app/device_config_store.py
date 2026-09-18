@@ -16,11 +16,13 @@ logger = logging.getLogger(__name__)
 CONFIG_AUTO_LOCK_SCAN = "auto_lock_scan_settings"
 CONFIG_LOCK_INDICATOR = "lock_indicator_config"
 CONFIG_AUTO_RELOCK = "auto_relock_config"
+CONFIG_LOCK_ACCEPTANCE = "lock_acceptance_settings"
 
 KNOWN_CONFIG_NAMES = (
     CONFIG_AUTO_LOCK_SCAN,
     CONFIG_LOCK_INDICATOR,
     CONFIG_AUTO_RELOCK,
+    CONFIG_LOCK_ACCEPTANCE,
 )
 
 

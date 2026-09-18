@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any, Dict, Literal, Optional
 
@@ -131,6 +131,25 @@ class AutoLockScanSettings(BaseModel):
         default=0.2, ge=0.0, le=1.0,
         description="Min weaker/stronger lobe ratio (dimensionless).",
     )
+    min_signal_scan_fraction: float = Field(
+        default=1.0 / 6.0, ge=0.0, le=1.0,
+        description=(
+            "Smallest share of the scan span the whole PDH error signal "
+            "(sideband to sideband) may occupy before the scan is treated as "
+            "too wide to lock from and is narrowed around the target first. "
+            "Its reciprocal over two is the longest centre move this allows, in "
+            "signal widths: 1/6 means three. 0 disables the test."
+        ),
+    )
+    max_center_step_signal_widths: float = Field(
+        default=1.0, ge=0.0, le=20.0,
+        description=(
+            "Largest centre step a refinement stage may take, in whole "
+            "error-signal widths (sideband to sideband). Bounds the step by the "
+            "distance to the next feature rather than by the scan width. "
+            "Ignored when no sideband spacing was measured."
+        ),
+    )
     single_error_min: float = Field(
         default=0.1, ge=0.0, le=4.0,
         description="Min stronger single lobe when single-side allowed (plot units).",
@@ -159,7 +178,16 @@ class AutoLockScanResult(BaseModel):
     monitor_level: Optional[float] = None
     hz_per_v: Optional[float] = None
     sideband_offset_v: Optional[float] = None
+    # PDH discriminator slope at the carrier crossing, plot units per MHz.
+    # AutoLockScanResult.to_dict() always emits this key, and the model forbids
+    # extras, so leaving it undeclared made every successful auto_lock_scan fail
+    # response validation with a 500 -- after the lock had already started.
+    discriminator_slope_v_per_mhz: Optional[float] = None
     detail: Optional[str] = None
+    # A trajectory-aware run records every temporary geometry and detection so
+    # operators can see when scan-history motion, rather than a bad lock point,
+    # drove the refinement.
+    refinement: Optional[dict[str, Any]] = None
 
 
 class AutoLockCalibrateRequest(BaseModel):
@@ -215,6 +243,40 @@ class AutoRelockState(BaseModel):
 class AutoRelockEnabledUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool
+
+
+class LockAcceptanceSettings(BaseModel):
+    """How close the refinement walk must land, and how long it waits.
+
+    Voltages are derived, not configured: the acceptance window comes from the
+    calibrated feature width, because a lock succeeds whenever the DC point
+    lands between the two lobe extrema. Field names/defaults must match the
+    engine dataclass (lock_acceptance.py); the parity test enforces this.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    capture_fraction: float = Field(
+        default=0.5, ge=0.0, le=4.0,
+        description=(
+            "Acceptance window as a fraction of the calibrated feature half-width "
+            "(auto-lock half_range_sweep_v)."
+        ),
+    )
+    max_correction_span: float = Field(
+        default=4.0, ge=0.0, le=64.0,
+        description=(
+            "Reject a re-detection further than this many feature half-widths out "
+            "as a neighbouring crossing. Used when no sideband offset is known. "
+            "0 disables the guard entirely rather than rejecting everything."
+        ),
+    )
+    settle_ms: int = Field(
+        default=300, ge=0, le=60000,
+        description=(
+            "Dwell after a sweep-geometry write before the trace is believed, and "
+            "the handover interval a measured drift is charged against."
+        ),
+    )
 
 
 class LockIndicatorConfig(BaseModel):
@@ -347,4 +409,3 @@ class LogEntry(BaseModel):
 class LogTailResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     entries: list[LogEntry]
-

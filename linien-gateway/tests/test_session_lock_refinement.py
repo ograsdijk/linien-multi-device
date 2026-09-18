@@ -1,0 +1,1738 @@
+"""The guarded center move, driven against a toy hysteretic actuator.
+
+No board is involved. A fake device stands in for the hardware and a small
+model decides where the crossing APPEARS for a given commanded sweep center,
+which is the only thing the approach loop can observe. That is enough to
+exercise the real control logic -- planning, applying set-points, waiting for a
+fresh sweep, measuring the offset, correcting, flipping direction, aborting --
+against the failure modes it exists to handle.
+
+It does not, and cannot, verify the physical constants. Those need the
+diagnostic and a real board.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import time
+from types import SimpleNamespace
+from typing import Any, Callable
+
+import numpy as np
+import pytest
+
+import app.session as session_module
+from app.auto_lock_scan import AutoLockScanResult, AutoLockScanSettings
+from app.lock_acceptance import AcceptanceSettings
+from app.session import DeviceSession
+
+FEATURE_V = 0.20
+START_CENTER_V = -0.30
+HALF_RANGE_V = 0.02  # -> capture tolerance 0.01 V, neighbour guard 0.08 V
+
+
+class RecordingManager:
+    def publish(self, device_key: str, message: dict[str, Any]) -> None:
+        pass
+
+
+class FlowingPlotState:
+    """Sweeps keep landing on the poll thread, independent of our writes.
+
+    ``last_unlocked_trace_at`` is therefore always current -- until ``flowing``
+    is cleared, which is what a stopped or locked sweep looks like to the
+    verification step.
+    """
+
+    def __init__(self, trace: np.ndarray) -> None:
+        self.last_plot_data = [trace, trace, trace]
+        self.last_monitor_signal = None
+        self.flowing = True
+        self._frozen_at = time.time()
+
+    @property
+    def last_unlocked_trace_at(self) -> float:
+        return time.time() if self.flowing else self._frozen_at
+
+
+class FakeParam:
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+
+class FakeParameters:
+    def __init__(self, **values: Any) -> None:
+        for name, value in values.items():
+            setattr(self, name, FakeParam(value))
+
+
+class FakeBoard:
+    """Records every sweep-center set-point and says where the feature appears.
+
+    ``error_model`` receives the ordered history of commanded centers and
+    returns the displacement between the true feature and where a sweep would
+    show it -- the hysteresis excursion.
+    """
+
+    def __init__(self, error_model: Callable[[list[float]], float]) -> None:
+        self.error_model = error_model
+        self.centers: list[float] = []
+        self.lock_started = False
+        self.detections = 0
+        self.plot_state: Any = None
+        self.parameters: Any = None
+
+    def on_write_registers(self) -> None:  # noqa: D401 - records a set-point
+        self.centers.append(float(self.parameters.sweep_center.value))
+
+    def apparent_feature_v(self) -> float:
+        return FEATURE_V + float(self.error_model(self.centers))
+
+
+class FakeControl:
+    def __init__(self, board: FakeBoard) -> None:
+        self.board = board
+
+    def exposed_write_registers(self) -> None:
+        self.board.on_write_registers()
+
+    def exposed_start_lock(self) -> None:
+        self.board.lock_started = True
+
+
+def _result(target_voltage: float, sideband_offset_v: float | None = None):
+    return AutoLockScanResult(
+        target_index=1024,
+        target_voltage=float(target_voltage),
+        target_slope_rising=True,
+        score=0.9,
+        left_excursion=0.15,
+        right_excursion=0.16,
+        pair_excursion=0.31,
+        symmetry=0.94,
+        monitor_level=None,
+        hz_per_v=None,
+        sideband_offset_v=sideband_offset_v,
+    )
+
+
+def _make_session(
+    monkeypatch,
+    error_model: Callable[[list[float]], float],
+    *,
+    approach: dict[str, Any] | None = None,
+    sideband_offset_v: float | None = None,
+) -> tuple[DeviceSession, FakeBoard]:
+    board = FakeBoard(error_model)
+    device = SimpleNamespace(
+        key="dev-1", name="dev-1", host="127.0.0.1", port=18862, parameters={}
+    )
+    session = DeviceSession(device, RecordingManager())
+    session.parameters = FakeParameters(
+        sweep_center=START_CENTER_V,
+        sweep_amplitude=1.0,
+        target_slope_rising=True,
+        modulation_frequency=0.0,
+        lock=False,
+    )
+    session.control = FakeControl(board)
+    board.parameters = session.parameters
+
+    session.plot_state = FlowingPlotState(np.zeros(256))
+    board.plot_state = session.plot_state
+
+    session.auto_lock_scan_settings["half_range_sweep_v"] = HALF_RANGE_V
+    settings = {
+        "enabled": True,
+        "capture_fraction": 0.5,
+        "max_correction_span": 4.0,
+        "max_direct_jump_v": 2.0,
+        "approach_offset_v": 0.05,
+        "ramp_step_v": 0.02,
+        "ramp_step_delay_ms": 0,
+        "settle_ms": 0,
+        "approach_from_below": True,
+        "max_approach_iterations": 2,
+    }
+    settings.update(approach or {})
+    session.update_lock_acceptance_settings(settings)
+
+    def fake_find(**kwargs):
+        board.detections += 1
+        if board.detections == 1:
+            # The initial scan: the detector picks the right crossing.
+            return _result(FEATURE_V, sideband_offset_v)
+        return _result(board.apparent_feature_v(), sideband_offset_v)
+
+    monkeypatch.setattr(session_module, "find_auto_lock_target", fake_find)
+    return session, board
+
+
+# ---------------------------------------------------------------- error models
+
+
+def _no_error(_centers: list[float]) -> float:
+    return 0.0
+
+
+def _approached_from_below(centers: list[float]) -> bool:
+    if len(centers) < 2:
+        return True
+    return centers[-1] >= centers[-2]
+
+
+def _backlash(width: float) -> Callable[[list[float]], float]:
+    """Sign flips with the direction of the final move -- classic backlash."""
+
+    def model(centers: list[float]) -> float:
+        return width if _approached_from_below(centers) else -width
+
+    return model
+
+
+def _creep(magnitude: float) -> Callable[[list[float]], float]:
+    """Same displacement whichever way you arrive -- creep, not backlash."""
+
+    def model(_centers: list[float]) -> float:
+        return magnitude
+
+    return model
+
+
+def _unrepeatable(width: float) -> Callable[[list[float]], float]:
+    """Displacement that never settles; correction cannot converge on it."""
+
+    state = {"n": 0}
+
+    def model(_centers: list[float]) -> float:
+        state["n"] += 1
+        return width if state["n"] % 2 else -width
+
+    return model
+
+
+# --------------------------------------------------------------------- tests
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_the_approach_is_skipped_entirely_when_disabled(monkeypatch):
+    session, board = _make_session(monkeypatch, _backlash(0.5), approach={"enabled": False})
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert "approach" not in payload
+    assert payload["detail"] == "Auto-lock started from scan."
+    # One write of the detected target, straight to the lock -- unchanged behaviour.
+    assert board.centers == [pytest.approx(FEATURE_V)]
+    assert board.lock_started is True
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _rail_plan(from_below: bool):
+    from app.lock_approach import ApproachPlan, ApproachStep
+
+    return ApproachPlan(
+        steps=(ApproachStep(voltage=1.0, delay_s=0.0),),
+        settle_s=0.0,
+        direct=True,
+        from_below=from_below,
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_the_guard_covers_the_plain_direct_path_too(monkeypatch):
+    session, board = _make_session(monkeypatch, _no_error, approach={"enabled": False})
+    assert session._center_move_lock.acquire(blocking=False)
+    try:
+        with pytest.raises(RuntimeError):
+            session.auto_lock_from_scan(None)
+        assert board.lock_started is False
+    finally:
+        session._center_move_lock.release()
+
+
+def test_a_relock_action_runs_off_the_calling_thread(monkeypatch):
+    """_on_to_plot runs on the poll thread, which is also the only thread that
+    advances last_unlocked_trace_at. A guarded move waits for that stamp, so
+    running the relock action inline would block waiting for output it is itself
+    preventing -- timing out every attempt and stalling the plot pipeline."""
+    import threading
+
+    session, _board = _make_session(monkeypatch, _no_error)
+    completed: list[tuple] = []
+    session.auto_relock = SimpleNamespace(
+        complete_action=lambda *args: completed.append(args)
+    )
+    ran_on: list[int] = []
+    done = threading.Event()
+
+    def _action() -> None:
+        ran_on.append(threading.get_ident())
+        done.set()
+
+    session._relock_action_lock.acquire()
+    session._dispatch_relock_action(_action)
+
+    assert done.wait(timeout=2.0)
+    assert ran_on and ran_on[0] != threading.get_ident()
+    for _ in range(200):
+        if completed:
+            break
+        time.sleep(0.01)
+    assert completed == [("relock", True, None)]
+
+
+def test_a_failed_relock_action_is_still_reported_back(monkeypatch):
+    session, _board = _make_session(monkeypatch, _no_error)
+    completed: list[tuple] = []
+    session.auto_relock = SimpleNamespace(
+        complete_action=lambda *args: completed.append(args)
+    )
+
+    session._relock_action_lock.acquire()
+    session._dispatch_relock_action(
+        lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    for _ in range(200):
+        if completed:
+            break
+        time.sleep(0.01)
+    assert completed == [("relock", False, "boom")]
+
+
+def _relock_session(monkeypatch):
+    """A session wired so _on_to_plot will hand out a "relock" action."""
+    session, board = _make_session(monkeypatch, _no_error)
+    completed: list[tuple] = []
+    dispatched: list[object] = []
+    session.auto_relock = SimpleNamespace(
+        complete_action=lambda *args: completed.append(args),
+        get_status=lambda: {},
+    )
+    return session, board, completed, dispatched
+
+
+def test_a_duplicate_relock_action_is_dropped_not_completed(monkeypatch):
+    """tick() hands out "relock" on every frame until complete_action lands,
+    which was only safe while the action ran synchronously. A duplicate must be
+    skipped outright -- completing it would record a spurious failure and
+    discard the result of the attempt actually in flight."""
+    import threading
+
+    session, _board, completed, _ = _relock_session(monkeypatch)
+    release = threading.Event()
+    started = threading.Event()
+
+    def _slow_action() -> None:
+        started.set()
+        release.wait(timeout=2.0)
+
+    assert session._maybe_dispatch_relock_action(_slow_action) is True
+    assert started.wait(timeout=2.0)
+
+    # What the next plot frame does while the first is still running.
+    assert session._maybe_dispatch_relock_action(_slow_action) is False
+    assert completed == []  # nothing was reported on the pending action
+
+    release.set()
+    for _ in range(200):
+        if completed:
+            break
+        time.sleep(0.01)
+    assert completed == [("relock", True, None)]
+
+
+def test_the_action_lock_is_held_until_the_result_is_applied(monkeypatch):
+    """Releasing before complete_action would let the next frame dispatch again
+    while the controller still reports the action as pending."""
+    import threading
+
+    session, _board, completed, _ = _relock_session(monkeypatch)
+    held_at_completion: list[bool] = []
+    session.auto_relock = SimpleNamespace(
+        complete_action=lambda *args: (
+            held_at_completion.append(
+                session._relock_action_lock.acquire(blocking=False) is False
+            ),
+            completed.append(args),
+        ),
+        get_status=lambda: {},
+    )
+
+    session._relock_action_lock.acquire()
+    session._dispatch_relock_action(lambda: None)
+
+    for _ in range(200):
+        if completed:
+            break
+        time.sleep(0.01)
+    assert held_at_completion == [True]
+    # And released afterwards, so the next attempt can run.
+    assert session._relock_action_lock.acquire(blocking=False)
+    session._relock_action_lock.release()
+
+
+def test_disconnect_waits_for_an_in_flight_relock(monkeypatch):
+    """A guarded move takes seconds; tearing the connection down underneath one
+    strands the sweep center part-way along a ramp."""
+    import threading
+
+    session, _board, _completed, _ = _relock_session(monkeypatch)
+    finished = threading.Event()
+
+    def _slow_action() -> None:
+        time.sleep(0.2)
+        finished.set()
+
+    session._relock_action_lock.acquire()
+    session._dispatch_relock_action(_slow_action)
+
+    session._await_relock_action(timeout_s=2.0)
+
+    assert finished.is_set()
+
+
+def test_disconnect_gives_up_on_a_stuck_relock_rather_than_hanging(monkeypatch):
+    import threading
+
+    session, _board, _completed, _ = _relock_session(monkeypatch)
+    release = threading.Event()
+
+    session._relock_action_lock.acquire()
+    session._dispatch_relock_action(lambda: release.wait(timeout=5.0))
+
+    started = time.time()
+    session._await_relock_action(timeout_s=0.1)
+    assert (time.time() - started) < 1.0
+
+    release.set()
+
+
+
+
+
+
+class SteppedPlotState:
+    """A plot state whose frames land only when the test says so.
+
+    last_unlocked_trace_at records when a frame was PROCESSED, not when the
+    board acquired it, so a single frame after the move proves nothing about the
+    trace's contents.
+    """
+
+    def __init__(self) -> None:
+        self.last_plot_data = [np.zeros(256)] * 3
+        self.last_monitor_signal = None
+        self.last_unlocked_trace_at = time.time()
+
+    def deliver(self) -> None:
+        self.last_unlocked_trace_at = time.time()
+
+
+def test_one_processed_frame_is_not_accepted_as_proof_of_a_fresh_sweep(monkeypatch):
+    """A trace pulled off the device mid-ramp, or before the settle finished,
+    can be processed after the move and would pass a single-frame check -- which
+    is exactly the un-settled state settle_ms exists to let decay."""
+    session, _board = _make_session(monkeypatch, _no_error)
+    stepped = SteppedPlotState()
+    session.plot_state = stepped
+    moved_at = time.time()
+    time.sleep(0.01)  # a real move takes time; two time.time() calls may not
+    stepped.deliver()  # one frame only
+
+    assert session._wait_for_fresh_unlocked_trace(moved_at, 0.3) is False
+    # The same single frame satisfies the old one-frame rule.
+    assert session._wait_for_fresh_unlocked_trace(moved_at, 0.3, frames=1) is True
+
+
+def test_a_second_frame_confirms_the_sweep_post_dates_the_move(monkeypatch):
+    import threading
+
+    session, _board = _make_session(monkeypatch, _no_error)
+    stepped = SteppedPlotState()
+    session.plot_state = stepped
+    moved_at = time.time()
+    time.sleep(0.01)
+
+    def _deliver_two() -> None:
+        time.sleep(0.05)
+        stepped.deliver()
+        time.sleep(0.05)
+        stepped.deliver()
+
+    threading.Thread(target=_deliver_two, daemon=True).start()
+
+    assert session._wait_for_fresh_unlocked_trace(moved_at, 2.0) is True
+
+
+def test_the_wait_budget_is_per_frame(monkeypatch):
+    session, _board = _make_session(monkeypatch, _no_error)
+    stepped = SteppedPlotState()
+    session.plot_state = stepped
+    started = time.time()
+
+    assert session._wait_for_fresh_unlocked_trace(time.time(), 0.2, frames=2) is False
+
+    # Two frames' worth of budget, not one.
+    assert (time.time() - started) >= 0.4
+
+
+
+
+
+
+
+
+
+
+# ------------------------------------------------ refined-lock geometry restore
+
+
+REFINED_AMPLITUDE_V = 0.05
+
+
+def _refined_session(monkeypatch):
+    """A session whose auto-lock goes through trajectory refinement.
+
+    The refinement is stubbed to do what the real one leaves behind on
+    success: a scan narrowed around the feature. Sweep starts are recorded in
+    the same event list as register writes, so ordering can be asserted.
+    """
+    session, board = _make_session(monkeypatch, _no_error)
+    events: list[tuple[str, float, float]] = []
+    board.on_write_registers = lambda: events.append((
+        "write",
+        float(session.parameters.sweep_center.value),
+        float(session.parameters.sweep_amplitude.value),
+    ))
+    session.parameters.fetch_additional_signals = FakeParam(False)
+    session.parameters.task = FakeParam(None)
+
+    def _start_sweep() -> None:
+        session.parameters.lock.value = False
+        events.append(("sweep", float("nan"), float("nan")))
+
+    def _start_lock() -> None:
+        board.lock_started = True
+        session.parameters.lock.value = True
+        events.append(("lock", float(session.parameters.sweep_center.value), float("nan")))
+
+    session.control.exposed_start_sweep = _start_sweep
+    session.control.exposed_start_lock = _start_lock
+    session.plot_state.last_plot_data = [np.linspace(-1e4, 1e4, 256)] * 3
+
+    # Refinement is reached only when the STRICT detector rejects the trace.
+    def _strict_rejects(settings, traces=None, after=None):
+        raise ValueError("no usable crossing")
+
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _strict_rejects)
+    monkeypatch.setattr(
+        session,
+        "_coarse_auto_lock_target",
+        lambda settings, after=None: (
+            _result(FEATURE_V), START_CENTER_V, 1.0, 2.0, {}
+        ),
+    )
+
+    def _refine(settings, approach, center, amplitude, **_kwargs):
+        session.parameters.sweep_center.value = FEATURE_V
+        session.parameters.sweep_amplitude.value = REFINED_AMPLITUDE_V
+        return _result(FEATURE_V), {"attempted": True, "stages": []}
+
+    monkeypatch.setattr(session, "_trajectory_refine_auto_lock", _refine)
+    return session, board, events
+
+
+def test_a_refined_lock_keeps_its_operating_point_while_locked(monkeypatch):
+    """Restoring the old center after start_lock moved the lock's hold point
+    by (target - original center) and dropped the lock."""
+    session, board, events = _refined_session(monkeypatch)
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert board.lock_started
+    assert "refinement" in payload
+    lock_at = [e for e in events if e[0] == "lock"][-1][1]
+    assert lock_at == pytest.approx(FEATURE_V, abs=0.02)
+    after_lock = events[events.index(next(e for e in events if e[0] == "lock")) + 1 :]
+    assert after_lock == []  # nothing written while locked
+    assert session.parameters.sweep_center.value == pytest.approx(lock_at)
+
+
+def test_a_refined_lock_restores_the_scan_when_the_sweep_restarts(monkeypatch):
+    session, _board, events = _refined_session(monkeypatch)
+    session.auto_lock_from_scan(None)
+    events.clear()
+
+    session.stop_lock()
+
+    assert events[0][0] == "sweep"  # unlocked first ...
+    assert events[1] == ("write", START_CENTER_V, 1.0)  # ... then restored
+    assert session.parameters.sweep_center.value == START_CENTER_V
+    assert session.parameters.sweep_amplitude.value == 1.0
+
+    # One-shot: a later sweep start does not write it again.
+    events.clear()
+    session.start_sweep()
+    assert [event[0] for event in events] == ["sweep"]
+
+
+def test_the_operators_own_geometry_cancels_a_pending_restore(monkeypatch):
+    session, _board, events = _refined_session(monkeypatch)
+    monkeypatch.setattr(session, "_update_persistent_setting", lambda *_a: None)
+    session.auto_lock_from_scan(None)
+
+    session.set_param("sweep_amplitude", 0.3, write_registers=False)
+    session.start_sweep()
+
+    assert session.parameters.sweep_amplitude.value == 0.3
+    assert session.parameters.sweep_center.value != START_CENTER_V
+
+
+# ----------------------------------------- auto-relock lock-result rows
+
+
+def _recorded_rows(monkeypatch, session):
+    rows: list[dict] = []
+    monkeypatch.setattr(
+        session,
+        "_write_lock_result_to_postgres",
+        lambda **kwargs: rows.append(kwargs),
+    )
+    monkeypatch.setattr(session, "_emit_log_event", lambda **_kwargs: None)
+    return rows
+
+
+def test_a_relock_that_moved_nothing_writes_no_failure_row(monkeypatch):
+    """E.g. a laser far off resonance fails detection on every relock tick;
+    a row per tick with no approach data would skew the failure statistics."""
+    session, _board = _make_session(monkeypatch, _no_error)
+    rows = _recorded_rows(monkeypatch, session)
+    session.parameters.lock.value = True  # "already locked": nothing moves
+
+    with pytest.raises(RuntimeError, match="already locked"):
+        session._start_auto_relock()
+
+    assert rows == []
+
+
+
+
+def test_a_successful_relock_writes_its_row(monkeypatch):
+    session, board = _make_session(monkeypatch, _no_error)
+    rows = _recorded_rows(monkeypatch, session)
+
+    session._start_auto_relock()
+
+    assert board.lock_started
+    assert len(rows) == 1
+    assert rows[0].get("success", True) is True
+
+
+# ------------------------------------------------- refinement trigger (pass 1)
+#
+# Reconstructed from a field failure on a DFB whose feature moves with scan
+# geometry. Reported geometry: centre 0.54 V, amplitude 0.2 V, 2048 points,
+# calibrated feature half-width 1.778 mV -> 9.1 samples per half-width. The
+# strict detector ACCEPTED that trace (target 0.4964 V). Refinement ran anyway,
+# because 9.1 < a hardcoded 10, narrowed to 0.182 V, re-detected at 0.5019 V
+# -- a 5.42 mV move it accepted without comment -- and then refused the lock
+# because its own final check demanded 0.89 mV agreement.
+
+FIELD_HALF_RANGE_V = 0.001778
+FIELD_TARGET_V = 0.4964412770481911
+
+
+def _under_resolved_session(monkeypatch, *, strict_ok: bool):
+    """The field geometry: a strict detection at 9.1 samples per half-width.
+
+    The guarded move is off: these cover which detector decides the target, not
+    how the centre is then driven onto it.
+    """
+    session, board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    session.parameters.sweep_center.value = 0.54
+    session.parameters.sweep_amplitude.value = 0.2
+    session.plot_state.last_plot_data = [np.linspace(-1e4, 1e4, 2048)] * 3
+
+    def _strict(settings, traces=None, after=None):
+        if not strict_ok:
+            raise ValueError("no usable dispersive crossing found")
+        # 9.1 samples per half-width, exactly as reported.
+        return _result(FIELD_TARGET_V), 0.54, 0.2, 9.1
+
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _strict)
+    return session, board
+
+
+def test_a_strict_detection_locks_directly_even_when_under_resolved(monkeypatch):
+    """The regression. A target the calibrated detector accepted is the target
+    we lock on -- refinement may not discard it over a sample count."""
+    session, _board = _under_resolved_session(monkeypatch, strict_ok=True)
+    refined = []
+    monkeypatch.setattr(
+        session,
+        "_trajectory_refine_auto_lock",
+        lambda *a, **k: refined.append(True) or (_result(FIELD_TARGET_V), {}),
+    )
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert refined == []  # never armed
+    assert "refinement" not in payload
+    assert payload["target_voltage"] == pytest.approx(FIELD_TARGET_V)
+    # The operator's scan width is untouched: nothing narrowed it.
+    assert float(session.parameters.sweep_amplitude.value) == pytest.approx(0.2)
+
+
+def test_refinement_is_armed_only_when_the_strict_detector_rejects(monkeypatch):
+    session, _board = _under_resolved_session(monkeypatch, strict_ok=False)
+    monkeypatch.setattr(
+        session,
+        "_coarse_auto_lock_target",
+        lambda settings, after=None: (_result(FIELD_TARGET_V), 0.54, 0.2, 9.1, {}),
+    )
+    seen: dict[str, Any] = {}
+
+    def _refine(settings, approach, center, amplitude, **kwargs):
+        seen.update(kwargs)
+        return _result(FIELD_TARGET_V), {"attempted": True, "stages": []}
+
+    monkeypatch.setattr(session, "_trajectory_refine_auto_lock", _refine)
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert seen["initial_detector"] == "coarse"
+    assert payload["refinement"]["attempted"] is True
+
+
+def test_a_strict_rejection_reports_itself_when_refinement_also_fails(monkeypatch):
+    """The operator has to act on why the detector refused the trace, so that
+    reason must survive a failed rescue attempt."""
+    session, _board = _under_resolved_session(monkeypatch, strict_ok=False)
+    monkeypatch.setattr(
+        session,
+        "_coarse_auto_lock_target",
+        lambda settings, after=None: (_result(FIELD_TARGET_V), 0.54, 0.2, 9.1, {}),
+    )
+
+    def _refine(*_a, **_k):
+        raise session_module.TrajectoryRefinementAborted("gave up", {"stages": []})
+
+    monkeypatch.setattr(session, "_trajectory_refine_auto_lock", _refine)
+
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        session.auto_lock_from_scan(None)
+    assert "no usable dispersive crossing" in excinfo.value.refinement["strict_rejection"]
+
+
+# ------------------------------------------------ the walk's final gate (pass 1)
+
+FIELD_NARROWED_TARGET_V = 0.5018573522227651  # 5.42 mV from FIELD_TARGET_V
+
+
+def _walking_session(
+    monkeypatch, *, capture_fraction: float, max_correction_span: float = 4.0
+):
+    """Drives the REAL _trajectory_refine_auto_lock over the field sequence.
+
+    Coarse seed -> one narrowing that strict accepts -> two final detections
+    5.42 mV apart, the move the walk itself recorded and accepted in the field.
+    """
+    session, board = _make_session(
+        monkeypatch,
+        _no_error,
+        approach={
+            "capture_fraction": capture_fraction,
+            "max_correction_span": max_correction_span,
+        },
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    captures = iter([
+        (_result(FIELD_NARROWED_TARGET_V), 0.54, 0.182, 10.0),  # narrow -> strict
+        (_result(FIELD_TARGET_V), 0.54, 0.182, 10.0),           # strict_one
+        (_result(FIELD_NARROWED_TARGET_V), 0.54, 0.182, 10.0),  # strict_two
+    ])
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: next(captures),
+    )
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a, settle_s=0.0: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    return session
+
+
+def _run_walk(session):
+    return session._trajectory_refine_auto_lock(
+        AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+        AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+        0.54,
+        0.2,
+        initial_target=_result(FIELD_TARGET_V),
+        initial_center_v=0.54,
+        initial_amplitude_v=0.2,
+        initial_resolution=9.1,
+        initial_detector="coarse",
+        trace_length=2048,
+    )
+
+
+def test_the_final_gate_names_the_numbers_it_rejected_on(monkeypatch):
+    """One message for four conditions, with no values in it, sent two rounds of
+    diagnosis the wrong way. The drift case must say what moved how far."""
+    session = _walking_session(monkeypatch, capture_fraction=0.5)
+
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        _run_walk(session)
+
+    failure = excinfo.value.refinement["failure"]
+    assert "5.416 mV apart" in failure
+    assert "0.889 mV acceptance window" in failure  # 0.5 x 1.778 mV
+    assert excinfo.value.failure_kind == "position"
+
+
+def test_the_final_gate_stays_clear_of_the_neighbour_guard(monkeypatch):
+    """capture_fraction cannot open the window past half the distance to the
+    next feature -- acceptance_window_v tightens it. Inheriting that is the
+    point of sharing the window rather than re-deriving it."""
+    session = _walking_session(monkeypatch, capture_fraction=4.0)
+
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        _run_walk(session)
+    # 4.0 x 1.778 mV would be 7.11 mV; the guard tightens it to half of 7.11.
+    assert "3.556 mV acceptance window" in excinfo.value.refinement["failure"]
+
+
+def test_the_final_gate_widens_with_capture_fraction(monkeypatch):
+    """The gate used to be a bare 0.5 literal that happened to equal
+    capture_fraction's default, so raising the setting moved the guarded move's
+    window and left the walk's own unchanged. One knob, one meaning."""
+    session = _walking_session(
+        monkeypatch, capture_fraction=4.0, max_correction_span=20.0
+    )
+
+    result, refinement = _run_walk(session)
+
+    assert result.target_voltage == pytest.approx(FIELD_NARROWED_TARGET_V)
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+
+
+# --------------------------------------- narrowing a scan too wide to lock from
+
+def _wide_scan_session(monkeypatch, *, amplitude: float, sideband_offset_v: float):
+    session, board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.parameters.sweep_center.value = 0.0
+    session.parameters.sweep_amplitude.value = amplitude
+    session.plot_state.last_plot_data = [np.linspace(-1e4, 1e4, 2048)] * 3
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (
+            _result(FEATURE_V, sideband_offset_v), 0.0, amplitude, 50.0
+        ),
+    )
+    return session, board
+
+
+def test_a_wide_scan_narrows_even_though_the_detector_accepted_it(monkeypatch):
+    """The detector is happy at any width; the centre move is not. A signal
+    filling 5% of the scan is reached by a jump that lands on a neighbour."""
+    session, _board = _wide_scan_session(
+        monkeypatch, amplitude=1.0, sideband_offset_v=0.025
+    )
+    seen: dict[str, Any] = {}
+
+    def _refine(settings, approach, center, amplitude, **kwargs):
+        seen.update(kwargs)
+        return _result(FEATURE_V, 0.025), {"attempted": True, "stages": []}
+
+    monkeypatch.setattr(session, "_trajectory_refine_auto_lock", _refine)
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert seen["initial_detector"] == "strict"  # seeded from the good detection
+    assert payload["refinement"]["attempted"] is True
+
+
+def test_a_scan_that_shows_the_signal_well_is_left_alone(monkeypatch):
+    """The regression guard: this must not put narrowing back on scans that
+    already lock."""
+    session, _board = _wide_scan_session(
+        monkeypatch, amplitude=0.2, sideband_offset_v=0.05
+    )
+    monkeypatch.setattr(
+        session, "_trajectory_refine_auto_lock",
+        lambda *a, **k: pytest.fail("narrowed a scan that was already lockable"),
+    )
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert "refinement" not in payload
+    assert float(session.parameters.sweep_amplitude.value) == pytest.approx(0.2)
+
+
+def test_a_failed_narrowing_still_locks_on_the_detection_it_started_from(monkeypatch):
+    """Narrowing improves a detection that already passed, so failing to narrow
+    must not cost the lock."""
+    session, board = _wide_scan_session(
+        monkeypatch, amplitude=1.0, sideband_offset_v=0.025
+    )
+
+    def _refine(*_a, **_k):
+        raise session_module.TrajectoryRefinementAborted(
+            "could not settle", {"stages": [], "failure_kind": "position"}
+        )
+
+    monkeypatch.setattr(session, "_trajectory_refine_auto_lock", _refine)
+
+    payload = session.auto_lock_from_scan(None)
+
+    assert board.lock_started is True
+    assert payload["refinement"]["fell_back_to_direct"] is True
+    assert payload["target_voltage"] == pytest.approx(FEATURE_V)
+
+
+def test_losing_the_feature_while_narrowing_does_not_fall_back(monkeypatch):
+    """A changed slope or sideband spacing means the walk was tracking a
+    different crossing -- the target is no longer trustworthy, so there is
+    nothing safe to fall back to."""
+    session, _board = _wide_scan_session(
+        monkeypatch, amplitude=1.0, sideband_offset_v=0.025
+    )
+
+    def _refine(*_a, **_k):
+        raise session_module.TrajectoryRefinementAborted(
+            "slope changed", {"stages": [], "failure_kind": "identity"}
+        )
+
+    monkeypatch.setattr(session, "_trajectory_refine_auto_lock", _refine)
+
+    with pytest.raises(session_module.TrajectoryRefinementAborted):
+        session.auto_lock_from_scan(None)
+
+
+# ------------------------------------------- bounded re-centering (field case)
+#
+# From a run at centre 0.6530 V, amplitude 0.6 V. That scan runs to 1.25 V, so
+# the centre sits outside the +/-(1 - amplitude) rails. The rail clamp rewrote a
+# bounded 150 mV step as a 253 mV jump to 0.4 V in one register write, and the
+# walk never recovered: the next coarse detection came back 255 mV away.
+
+def _recenter(center, target, amplitude):
+    return DeviceSession._bounded_recenter_v(center, target, amplitude)
+
+
+def test_the_rail_clamp_cannot_exceed_the_step_bound():
+    """The field failure: centre 0.653 V at amplitude 0.6 was yanked to 0.4 V,
+    four times the intended bound, by the rail clamp alone."""
+    moved = _recenter(0.6530146813051192, 0.47586712261846614, 0.6)
+    assert moved == pytest.approx(0.6530146813051192 - 0.15)  # one bounded step
+    assert moved != pytest.approx(0.4)
+
+
+def test_a_centre_inside_the_rails_still_respects_them():
+    # Target beyond the rail; amplitude 0.6 -> rails at +/-0.4.
+    assert _recenter(0.3, 0.9, 0.6) == pytest.approx(0.4)
+    assert _recenter(-0.3, -0.9, 0.6) == pytest.approx(-0.4)
+
+
+def test_a_near_target_is_reached_exactly():
+    assert _recenter(0.5, 0.52, 0.6) == pytest.approx(0.52)
+
+
+def test_the_step_is_capped_at_a_quarter_of_the_half_range():
+    assert _recenter(0.0, 1.0, 0.2) == pytest.approx(0.05)
+    assert _recenter(0.0, -1.0, 0.2) == pytest.approx(-0.05)
+
+
+# ------------------------------------ the coarse tracker cannot set the identity
+
+def _identity_session(monkeypatch, coarse_sideband, strict_sideband):
+    """Walk that detects coarse once, then strict, with differing sidebands."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a, settle_s=0.0: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (
+            _result(0.22, coarse_sideband), 0.4, 0.6, 3.0, {}
+        ),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (
+            _result(0.449, strict_sideband), 0.4, 0.2, 20.0
+        ),
+    )
+    return session
+
+
+def _walk_from_coarse(session):
+    return session._trajectory_refine_auto_lock(
+        AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+        AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+        0.653, 0.6,
+        initial_target=_result(0.4758, None),  # wide scan resolved no sideband
+        initial_center_v=0.653,
+        initial_amplitude_v=0.6,
+        initial_resolution=3.03,
+        initial_detector="coarse",
+        trace_length=2048,
+    )
+
+
+def test_a_coarse_sideband_estimate_does_not_become_the_identity(monkeypatch):
+    """The field failure: the wide scan resolved no sideband, the coarse tracker
+    measured 33.1 mV, and the next strict detection was then rejected for
+    disagreeing with another algorithm's estimate rather than for any change in
+    the feature. Coarse tracking is declared never sufficient to authorise a
+    lock; defining what the lock must match is not tracking."""
+    session = _identity_session(monkeypatch, coarse_sideband=0.0331,
+                                strict_sideband=0.0500)
+
+    result, refinement = _walk_from_coarse(session)
+
+    assert result.target_voltage == pytest.approx(0.449)
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+
+
+def test_a_recentring_stage_that_changes_the_spacing_is_an_identity_change(monkeypatch):
+    """Where the check still protects. A re-centring stage commands the biggest
+    moves and does NOT improve resolution, so its spacing is comparable to the
+    baseline THAT SAME detector set, and a disagreement means the walk has been
+    carried onto a different crossing."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a, settle_s=0.0: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    # A flipped discriminator slope: checked on every detection whatever path
+    # the stage took, so it is the walk-level assertion that identity failures
+    # still propagate. The sideband-spacing rule, which only bites when two
+    # readings from the SAME estimator disagree, is covered directly against
+    # IdentityGuard in test_lock_refinement.py.
+    # 0.5 V is inside the +/-0.6 V scan: a target beyond the window is refused
+    # on geometry before any detection happens, which is not what this covers.
+    flipped = dataclasses.replace(_result(0.5, 0.20), target_slope_rising=False)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (flipped, 0.4, 0.6, 20.0, {}),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (flipped, 0.4, 0.6, 20.0),
+    )
+
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+            0.0, 0.6,
+            initial_target=_result(0.5, 0.05),  # far out -> forces a geometry step
+            initial_center_v=0.0, initial_amplitude_v=0.6,
+            initial_resolution=20.0,
+            initial_detector="coarse", trace_length=2048,
+        )
+    assert excinfo.value.failure_kind == "identity"
+    assert "slope" in excinfo.value.refinement["failure"]
+
+
+def test_a_coarse_reading_is_not_judged_against_a_strict_baseline(monkeypatch):
+    """The field regression. The strict detector established 17.497 mV and the
+    coarse tracker then read 32.369 mV of the same untroubled feature, 1.85x
+    apart, and the walk aborted. Across eight runs the two estimators sit a
+    systematic ~1.75x apart (coarse 32.22 mV mean, spread 1.86; strict 18.44 mV
+    mean, spread 7.76), so comparing one against the other tests which
+    algorithm ran, not whether the crossing changed."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a, settle_s=0.0: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (
+            _result(0.9, 0.032369), 0.4, 0.6, 20.0, {}
+        ),
+    )
+
+    # Strict baseline at the field value; the coarse stage reads 1.85x that.
+    # It must be taken as this estimator's own first reading, not a violation.
+    try:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+            0.0, 0.6,
+            initial_target=_result(0.9, 0.017497),
+            initial_center_v=0.0, initial_amplitude_v=0.6,
+            initial_resolution=20.0,
+            initial_detector="strict", trace_length=2048,
+        )
+    except session_module.TrajectoryRefinementAborted as exc:
+        assert exc.failure_kind != "identity", (
+            f"aborted on a cross-detector spacing comparison: {exc}"
+        )
+
+
+def test_a_better_resolved_spacing_is_adopted_however_small_the_gain(monkeypatch):
+    """The field failure: an 8.78-sample detection was judged against a
+    6.07-sample identity because 1.45x missed a 1.5x margin. The spacing is
+    biased by resolution (16.9 mV at 6.1 samples, 23.6 mV at 8.8 on the same
+    feature), so comparing across a resolution change tests the sweep width."""
+    session = _identity_session(monkeypatch, coarse_sideband=None,
+                                strict_sideband=0.05)
+    captures = [
+        (_result(0.449, 0.016854), 0.45, 0.3, 6.07),     # sets the identity
+        (_result(0.449, 0.023591), 0.45, 0.09, 8.78),    # 1.45x better resolved
+    ]
+    calls = {"n": 0}
+
+    def _capture(settings, traces=None, after=None):
+        # Settles on the final geometry and stays there, so the verification
+        # pair sees the same thing the last narrowing stage did.
+        item = captures[min(calls["n"], len(captures) - 1)]
+        calls["n"] += 1
+        return item
+
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _capture)
+
+    result, refinement = _walk_from_coarse(session)
+
+    assert result.sideband_offset_v == pytest.approx(0.023591)
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+
+
+def test_the_final_pair_is_judged_on_position_not_sideband_spacing(monkeypatch):
+    """Both detections are at ONE unchanged geometry, where same slope and same
+    voltage already means the same crossing. The sideband fit has its own
+    scatter, so checking it there only adds a way to fail."""
+    session = _identity_session(monkeypatch, coarse_sideband=None,
+                                strict_sideband=0.05)
+    captures = iter([
+        (_result(0.449, 0.05), 0.4, 0.2, 20.0),   # narrow -> sets identity
+        (_result(0.449, 0.05), 0.4, 0.2, 20.0),   # strict_one
+        (_result(0.449, 0.20), 0.4, 0.2, 20.0),   # strict_two: same spot, 4x fit
+    ])
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: next(captures),
+    )
+
+    result, refinement = _walk_from_coarse(session)
+
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+    assert result.target_voltage == pytest.approx(0.449)
+
+
+# ------------------------------- narrowing must not crop the tracked feature
+
+def _cropping_session(monkeypatch, coarse_targets):
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    geometry: list[tuple[float, float]] = []
+    monkeypatch.setattr(
+        session, "_set_sweep_geometry",
+        lambda c, a, settle_s=0.0: (geometry.append((c, a)), time.time())[1],
+    )
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    coarse = iter(coarse_targets)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: next(coarse),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (
+            _result(0.62, 0.0325), 0.6, 0.13, 20.0
+        ),
+    )
+    return session, geometry
+
+
+def test_narrowing_waits_until_the_target_is_inside_the_next_window(monkeypatch):
+    """The field failure: centre stepped 0.2 -> 0.35 V with the target reading
+    0.771 V, then narrowed to +/-0.3 V whose window ends at 0.65 V. The feature
+    being tracked was cropped out and the detector found a different crossing."""
+    session, geometry = _cropping_session(monkeypatch, [
+        # Still 421 mV out after the first bounded step -- must not narrow yet.
+        (_result(0.7712, 0.0325), 0.35, 0.6, 3.03, {}),
+        (_result(0.7712, 0.0325), 0.50, 0.6, 3.03, {}),
+        (_result(0.7712, 0.0325), 0.65, 0.6, 3.03, {}),
+        (_result(0.62, 0.0325), 0.62, 0.6, 3.03, {}),
+    ])
+
+    session._trajectory_refine_auto_lock(
+        AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+        AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+        0.2, 0.6,
+        initial_target=_result(0.622991283778572, 0.0325),
+        initial_center_v=0.2, initial_amplitude_v=0.6,
+        initial_resolution=3.0333333333333337,
+        initial_detector="strict", trace_length=2048,
+    )
+
+    # Every width change must leave the tracked target inside the new window.
+    for center, amplitude in geometry:
+        if amplitude < 0.6:
+            assert abs(0.62 - center) <= amplitude, (
+                f"narrowed to +/-{amplitude} around {center}, cropping the target"
+            )
+
+
+def test_a_better_resolved_detection_replaces_the_identity(monkeypatch):
+    """A spacing measured at 3.0 samples per half-width is an estimate. The
+    6.1-sample detection that narrowing was sent to get must not be rejected
+    for disagreeing with it."""
+    session = _identity_session(monkeypatch, coarse_sideband=None,
+                                strict_sideband=0.050)
+
+    result, refinement = session._trajectory_refine_auto_lock(
+        AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+        AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+        0.35, 0.6,
+        initial_target=_result(0.48, 0.0325),  # poorly resolved estimate
+        initial_center_v=0.35, initial_amplitude_v=0.6,
+        initial_resolution=3.03,
+        initial_detector="coarse", trace_length=2048,
+    )
+
+    assert result.sideband_offset_v == pytest.approx(0.050)
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+
+
+def test_the_centre_step_is_bounded_by_the_signal_not_the_scan_width():
+    """0.25 x a 0.6 V half-range is 150 mV -- 4.6 sideband spacings on this
+    device, enough for one step to vault over a neighbouring feature. The scan
+    width is an operator setting; the distance to the next feature is not."""
+    scan_width_bound = DeviceSession._bounded_recenter_v(0.2, 1.0, 0.6)
+    assert scan_width_bound == pytest.approx(0.35)  # 150 mV
+
+    signal_bound = DeviceSession._bounded_recenter_v(
+        0.2, 1.0, 0.6, signal_width_v=2 * 0.0325, max_signal_widths=1.0
+    )
+    assert signal_bound == pytest.approx(0.2 + 0.065)  # one signal width
+
+
+def test_the_scan_width_rule_still_caps_a_huge_signal_width():
+    """Whichever is tighter: a broad signal must not license a bigger step than
+    the scan-width rule allowed."""
+    moved = DeviceSession._bounded_recenter_v(
+        0.0, 1.0, 0.4, signal_width_v=0.9, max_signal_widths=4.0
+    )
+    assert moved == pytest.approx(0.1)  # 0.25 x 0.4, not 4 x 0.9
+
+
+def test_an_unmeasured_signal_width_falls_back_to_the_scan_rule():
+    moved = DeviceSession._bounded_recenter_v(
+        0.0, 1.0, 0.6, signal_width_v=None, max_signal_widths=1.0
+    )
+    assert moved == pytest.approx(0.15)
+
+
+# ------------------------------- narrowing moves the feature too (field case)
+#
+# Changing the ramp width changes the actuator's trajectory, so the apparent
+# resonance moves with it. Measured on this device: one 2x narrowing (0.6 ->
+# 0.3 V) moved the target 73 mV -- more than the 65 mV signal width that bounds
+# a commanded centre step. The walk bounded the moves it commanded and then made
+# a bigger one by changing the width.
+
+def test_the_allowance_is_the_same_for_a_width_change_and_a_centre_step():
+    settings = AutoLockScanSettings.from_mapping(
+        {"signal_type": "pdh", "max_center_step_signal_widths": 1.0}
+    )
+    allowance = DeviceSession._center_step_allowance_v(settings, 0.6, 0.0325)
+    assert allowance == pytest.approx(0.065)  # one signal width, not 0.25 x 0.6
+
+    step = DeviceSession._bounded_recenter_v(
+        0.0, 1.0, 0.6, signal_width_v=2 * 0.0325, max_signal_widths=1.0
+    )
+    assert step == pytest.approx(allowance)
+
+
+def test_a_narrowing_that_moves_the_feature_too_far_gentles_the_next_one(monkeypatch):
+    """The field numbers: a 50% width cut moved the target 73 mV against a
+    65 mV allowance, so the next cut must be gentler than 50%."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    # Pinned, not inherited: this test is about how one cut sizes the next, so
+    # the goal must not move when the default lock width is retuned.
+    session.auto_lock_scan_settings["min_signal_scan_fraction"] = 0.25
+    widths: list[float] = []
+    monkeypatch.setattr(
+        session, "_set_sweep_geometry",
+        lambda c, a, settle_s=0.0: (widths.append(a), time.time())[1],
+    )
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    # Each capture reports the geometry it was asked for, and a target that has
+    # moved 73 mV per 50% width cut -- 146 mV per unit fraction.
+    state = {"target": 0.5457}
+
+    def _capture(settings, traces=None, after=None):
+        amplitude = widths[-1]
+        state["target"] -= 0.1464 * (1.0 - amplitude / 0.6) if amplitude < 0.6 else 0.0
+        return _result(state["target"], 0.0325), 0.4, amplitude, 0.001778 * 2047 / (2 * amplitude)
+
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _capture)
+
+    try:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+            0.4, 0.6,
+            initial_target=_result(0.5457, 0.0325),
+            initial_center_v=0.4, initial_amplitude_v=0.6,
+            initial_resolution=3.03,
+            initial_detector="strict", trace_length=2048,
+        )
+    except session_module.TrajectoryRefinementAborted:
+        pass  # convergence is not what this asserts
+
+    assert len(widths) >= 2
+    first_cut = 1.0 - widths[0] / 0.6
+    second_cut = 1.0 - widths[1] / widths[0]
+    assert first_cut == pytest.approx(0.5)      # no measurement yet
+    assert second_cut < first_cut, (
+        f"kept cutting {second_cut:.0%} after a {first_cut:.0%} cut moved the "
+        "feature past its allowance"
+    )
+
+
+# --------------------------------------------- the sweep rails (field case)
+#
+# Two runs at amplitude 0.8 V, whose rails pin the centre at +/-0.2 V, with the
+# target at ~0.59 V. The walk stepped the centre 0 -> 0.063 -> 0.127 -> 0.191 ->
+# 0.200 and then spent THIRTEEN more stages re-detecting at 0.2 without one
+# width change, because re-centring could not progress and narrowing was
+# refused for not being centred. Narrowing is the way out: the rail moves
+# outward with the amplitude.
+
+def test_the_minimum_safe_amplitude_keeps_the_target_in_view():
+    safe = DeviceSession._min_safe_amplitude_v(
+        amplitude_v=0.8, offset_v=0.39, shift_per_fraction=0.136, floor_v=0.128
+    )
+    assert safe is not None
+    assert 0.45 < safe < 0.55              # a real cut, not a token one
+    assert abs(0.39) < 0.9 * safe          # target still inside afterwards
+    assert 1.0 - safe > 0.5                # rail moved 0.20 -> ~0.51
+
+
+def test_no_narrowing_is_safe_when_the_target_is_beyond_the_whole_scan():
+    assert DeviceSession._min_safe_amplitude_v(
+        amplitude_v=0.8, offset_v=0.95, shift_per_fraction=0.136, floor_v=0.128
+    ) is None
+
+
+def test_a_rail_pinned_walk_narrows_instead_of_stalling(monkeypatch):
+    """The deadlock: re-centring blocked by the rail, narrowing blocked by not
+    being centred. It must make a width change rather than burn the budget."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    widths: list[float] = []
+
+    def _set(center, amplitude, settle_s=0.0):
+        widths.append(float(amplitude))
+        return time.time()
+
+    monkeypatch.setattr(session, "_set_sweep_geometry", _set)
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    # Centre already pinned at the rail; target far beyond it, as in the field.
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (
+            _result(0.59, 0.0320), 1.0 - 0.8, 0.8, 2.275, {}
+        ),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (
+            _result(0.59, 0.0320), 1.0 - 0.8, 0.8, 2.275
+        ),
+    )
+
+    try:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+            0.0, 0.8,
+            initial_target=_result(0.59, 0.0320),
+            initial_center_v=1.0 - 0.8, initial_amplitude_v=0.8,
+            initial_resolution=2.275,
+            initial_detector="coarse", trace_length=2048,
+        )
+    except session_module.TrajectoryRefinementAborted:
+        pass  # the stub never converges; the stall is what this asserts
+
+    narrowed = [w for w in widths if w < 0.8 - 1e-9]
+    assert narrowed, "pinned at the rail and never changed the width"
+    assert narrowed[0] < 0.6  # a useful cut, moving the rail outward
+
+
+def test_a_centre_on_the_rail_is_recognised_despite_float_noise():
+    """1.0 - 0.8 is 0.19999999999999996; a centre reading back as 0.2 is on the
+    rail, not past it. An exact comparison let 4e-17 decide whether the rails
+    applied at all."""
+    pinned = DeviceSession._bounded_recenter_v(
+        0.2, 0.59, 0.8, signal_width_v=0.064, max_signal_widths=1.0
+    )
+    assert pinned == pytest.approx(1.0 - 0.8, abs=1e-12)
+
+
+def test_a_rail_blocked_narrowing_never_cuts_below_the_safe_floor(monkeypatch):
+    """The field regression. Target 0.6795 V, centre pinned at the 0.2 V rail:
+    the floor that keeps it in view is 0.533 V, but the narrowing schedule
+    wanted 0.4 V and min() took the schedule. The window then ended at 0.6 V,
+    the target was cropped, and the detector found a crossing 247 mV away."""
+    session, _board = _make_session(
+        monkeypatch, _no_error, approach={"enabled": False}
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    writes: list[tuple[float, float]] = []
+    monkeypatch.setattr(
+        session, "_set_sweep_geometry",
+        lambda c, a, settle_s=0.0: (writes.append((float(c), float(a))), time.time())[1],
+    )
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    pinned = (_result(0.6795310210063508, 0.03204689789936493), 1.0 - 0.8, 0.8, 2.275)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (*pinned, {}),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: pinned,
+    )
+
+    try:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+            0.0, 0.8,
+            initial_target=_result(0.6795310210063508, 0.03204689789936493),
+            initial_center_v=1.0 - 0.8, initial_amplitude_v=0.8,
+            initial_resolution=2.275, initial_detector="coarse",
+            trace_length=2048,
+        )
+    except session_module.TrajectoryRefinementAborted:
+        pass  # the stub never converges; the cut size is what this asserts
+
+    target = 0.6795310210063508
+    narrowed = [(c, a) for c, a in writes if a < 0.8 - 1e-9]
+    assert narrowed, "pinned at the rail and never changed the width"
+    # The durable property, whether or not the centre moved in the same write:
+    # a width change must never put the target outside the window it creates.
+    # Asserting a floor computed from the PRE-move offset would now be wrong --
+    # the centre closes part of the gap in the same write, so a smaller
+    # amplitude is legitimately safe.
+    for center, amplitude in narrowed:
+        residual = abs(target - center)
+        assert residual <= 0.9 * amplitude + 1e-9, (
+            f"cut to +/-{amplitude:.4f} V around {center:.4f} V, leaving the "
+            f"target {residual:.4f} V out -- cropped out of its own window"
+        )
+    # And the centre must actually be helping, not held at the rail.
+    assert narrowed[0][0] > (1.0 - 0.8) + 1e-6, (
+        "narrowed without moving the centre; the rail still pins it"
+    )
+
+
+# -------------------------- the shift estimate measures the actuator, not the
+# -------------------------- disagreement between two detectors
+#
+# Field payload, centre 0.2 V amplitude 0.8 V: the initial coarse detection put
+# the feature at 0.5341 V and the first (strict) narrowing stage at 0.4312 V.
+# The walk recorded the 103 mV difference as a width-induced shift, inferred
+# 0.206 V per unit fractional width change, and from then on the predicted
+# shift consumed the entire stage allowance -- so the very next stage narrowed
+# with a centre budget of 7e-18 V. That is the "narrows without recentring"
+# the operator sees. The two numbers were measured by different detectors on
+# different crossings; their difference is not a shift.
+
+def _shift_walk(monkeypatch, *, strict_raises: bool):
+    """Narrow once from a coarse initial detection, with the feature apparently
+    103 mV away afterwards. `strict_raises` decides which detector reports it."""
+    session, _board = _make_session(monkeypatch, _no_error, approach={"enabled": False})
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    monkeypatch.setattr(session, "_set_sweep_geometry", lambda c, a, settle_s=0.0: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+
+    def _coarse(settings, after=None):
+        return _result(0.4312, 0.032), 0.2649, 0.4, 4.55, {}
+
+    def _strict(settings, traces=None, after=None):
+        if strict_raises:
+            raise ValueError("no strict crossing")
+        return _result(0.4312, 0.032), 0.2649, 0.4, 4.55
+
+    monkeypatch.setattr(session, "_coarse_auto_lock_target", _coarse)
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _strict)
+    try:
+        _result_obj, refinement = session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+            0.2, 0.8,
+            initial_target=_result(0.5341, 0.032),
+            initial_center_v=0.2,
+            initial_amplitude_v=0.8,
+            initial_resolution=2.275,
+            initial_detector="coarse", trace_length=2048,
+        )
+    except session_module.TrajectoryRefinementAborted as aborted:
+        refinement = aborted.refinement
+    narrows = [s for s in refinement["stages"] if s["kind"] == "narrow"]
+    assert narrows, "expected the walk to narrow at least once"
+    return narrows[0]
+
+
+def test_a_shift_measured_across_a_detector_change_is_not_charged_to_the_budget(
+    monkeypatch,
+):
+    # coarse -> strict across the write: nothing may be inferred about the actuator.
+    assert _shift_walk(monkeypatch, strict_raises=False)["shift_per_fraction_v"] is None
+
+
+def test_a_shift_measured_by_one_detector_twice_is_charged_to_the_budget(monkeypatch):
+    # coarse -> coarse: the same detector on both sides, so this is a measurement.
+    narrow = _shift_walk(monkeypatch, strict_raises=True)
+    assert narrow["shift_per_fraction_v"] == pytest.approx(
+        abs(0.4312 - 0.5341) / (1.0 - narrow["amplitude_v"] / 0.8), rel=0.02
+    )
+
+
+def test_every_refinement_geometry_write_waits_for_the_calibrated_settle(monkeypatch):
+    """Both sweep axes are actuators with a settling tail.
+
+    The guarded approach has always waited `settle_ms` before believing a trace.
+    The refinement walk commands a larger move than any single approach step and
+    waited for none: it wrote both registers and began counting frames at once,
+    so the frames it counted could show the scan mid-transition. A 123-trace
+    characterization run that settles for 0.5 s before capturing has both
+    detectors agreeing to under 0.2 mV at every width; the walk's own payloads
+    had them 123 mV apart.
+    """
+    session, _board = _make_session(monkeypatch, _no_error, approach={"enabled": False})
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    session.lock_acceptance_settings["settle_ms"] = 250
+    settles: list[float] = []
+
+    def _set(center, amplitude, settle_s=0.0):
+        settles.append(float(settle_s))
+        return time.time()
+
+    monkeypatch.setattr(session, "_set_sweep_geometry", _set)
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (_result(0.45, 0.032), 0.3, 0.4, 4.55, {}),
+    )
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (_result(0.45, 0.032), 0.3, 0.4, 4.55),
+    )
+    try:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+            0.2, 0.8,
+            initial_target=_result(0.5341, 0.032),
+            initial_center_v=0.2, initial_amplitude_v=0.8,
+            initial_resolution=2.275, initial_detector="coarse", trace_length=2048,
+        )
+    except Exception:
+        pass
+
+    assert settles, "expected the walk to command at least one geometry write"
+    assert all(s == pytest.approx(0.25) for s in settles), settles
+
+
+def test_a_narrowing_that_does_not_take_is_reported_not_repeated(monkeypatch):
+    """A width register that clamps or quantizes must not cost 16 stages.
+
+    The planner is a pure function of the geometry it is given, so if the
+    realized amplitude comes back unchanged it will ask for exactly the same
+    width again, and the walk spends its whole budget before reporting only
+    that it ran out of stages -- saying nothing about why.
+    """
+    session, _board = _make_session(monkeypatch, _no_error, approach={"enabled": False})
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    monkeypatch.setattr(session, "_set_sweep_geometry",
+                        lambda c, a, settle_s=0.0: time.time())
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    # The device reports the original width back however narrow the request.
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target",
+        lambda settings, traces=None, after=None: (_result(0.5341, 0.032), 0.2, 0.8, 2.275),
+    )
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target",
+        lambda settings, after=None: (_result(0.5341, 0.032), 0.2, 0.8, 2.275, {}),
+    )
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        session._trajectory_refine_auto_lock(
+            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+            0.2, 0.8,
+            initial_target=_result(0.5341, 0.032),
+            initial_center_v=0.2, initial_amplitude_v=0.8,
+            initial_resolution=2.275, initial_detector="coarse", trace_length=2048,
+        )
+
+    message = str(excinfo.value)
+    assert "did not change" in message
+    assert "not following the commanded value" in message
+    # One stage, not the full budget.
+    assert len(excinfo.value.refinement["stages"]) <= 3
+
+
+# ------------------------------- the final gate measures a rate, not a distance
+#
+# Field payloads, both after the walk had converged cleanly from +/-0.8 V to
+# +/-0.11 V at 16 samples per half-width: the two final detections came back
+# 2.058 mV and 3.326 mV apart and were refused against a 0.889 mV capture
+# window. Verifying a detection costs two fresh sweeps, so those readings are
+# seconds apart, while the window is half a feature half-width -- on a laser
+# whose own characterization run measured 1-3 mV/s of drift, no honest pair of
+# verifications can pass. What the lock actually needs is that the feature still
+# be inside the capture window when the handover happens, which is `settle_ms`
+# after the last detection, not seconds.
+
+def _drift_session(monkeypatch, *, drift_mv: float, interval_s: float,
+                   settle_ms: int = 300):
+    """Two final detections `drift_mv` apart, `interval_s` apart in time."""
+    session, _board = _make_session(
+        monkeypatch, _no_error,
+        approach={"capture_fraction": 0.5, "max_correction_span": 4.0,
+                  "settle_ms": settle_ms},
+    )
+    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(session_module.time, "time", lambda: clock["t"])
+
+    target = 0.5091693630289127          # the field's converged target
+    captures = iter([
+        (_result(target, 0.0341), 0.438, 0.1346, 13.5),                  # narrow
+        (_result(target, 0.0341), 0.438, 0.1346, 13.5),                  # strict_one
+        (_result(target + drift_mv / 1e3, 0.0341), 0.438, 0.1346, 13.5),  # strict_two
+    ])
+
+    def _capture(settings, traces=None, after=None):
+        item = next(captures)
+        clock["t"] += interval_s      # each verification costs real time
+        return item
+
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _capture)
+    monkeypatch.setattr(session, "_set_sweep_geometry",
+                        lambda c, a, settle_s=0.0: clock["t"])
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+    return session
+
+
+def _drift_walk(session):
+    return session._trajectory_refine_auto_lock(
+        AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+        AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+        0.438, 0.2,
+        initial_target=_result(0.5091693630289127, 0.0341),
+        initial_center_v=0.438, initial_amplitude_v=0.2,
+        initial_resolution=9.1, initial_detector="coarse", trace_length=2048,
+    )
+
+
+def test_a_slow_drift_measured_over_seconds_still_locks(monkeypatch):
+    """3.326 mV over 1.5 s is 2.2 mV/s: 0.67 mV during a 300 ms handover."""
+    session = _drift_session(monkeypatch, drift_mv=3.326, interval_s=1.5)
+    result, refinement = _drift_walk(session)
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+    assert result.target_voltage == pytest.approx(0.5091693630289127 + 3.326e-3)
+
+
+def test_the_same_displacement_over_a_short_interval_does_not(monkeypatch):
+    """Identical 3.326 mV, but measured 0.1 s apart -- 33 mV/s, and the feature
+    leaves the capture window before the lock can engage."""
+    session = _drift_session(monkeypatch, drift_mv=3.326, interval_s=0.1)
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        _drift_walk(session)
+    failure = excinfo.value.refinement["failure"]
+    assert "drifting at 33.26 mV/s" in failure
+    assert "during the 300 ms handover" in failure
+    assert excinfo.value.failure_kind == "position"
+
+
+def test_a_shorter_handover_rescues_a_faster_drift(monkeypatch):
+    """The knob the message names actually works: 33.26 mV/s needs the handover
+    under 27 ms to keep the feature inside a 0.889 mV window."""
+    session = _drift_session(monkeypatch, drift_mv=3.326, interval_s=0.1,
+                             settle_ms=20)
+    _result_obj, refinement = _drift_walk(session)
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+
+
+def test_two_detections_past_the_neighbour_bound_are_a_different_crossing(monkeypatch):
+    """No interval makes a jump to the next feature acceptable."""
+    session = _drift_session(monkeypatch, drift_mv=9.0, interval_s=10.0)
+    with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
+        _drift_walk(session)
+    assert "not the same crossing" in excinfo.value.refinement["failure"]
+    assert excinfo.value.failure_kind == "identity"

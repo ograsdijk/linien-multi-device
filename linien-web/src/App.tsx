@@ -33,6 +33,7 @@ import {
 } from '@tabler/icons-react';
 import { useMantineColorScheme } from '@mantine/core';
 import { api } from './api';
+import type { Device } from './types';
 import { DeviceList, type DeviceSortMode } from './components/DeviceList';
 import { DeviceWorkspace } from './components/DeviceWorkspace';
 import { DeviceOverviewCard } from './components/DeviceOverviewCard';
@@ -58,6 +59,7 @@ import {
   toGroupTabDragId,
 } from './features/devices/dragIds';
 import { useDeviceStatusPolling } from './features/devices/useDeviceStatusPolling';
+import { useTelemetryActions } from './features/devices/useTelemetryActions';
 import { useDeviceStateUpdater } from './features/devices/useDeviceStateUpdater';
 
 const DEVICE_BAR_COLLAPSED_KEY = 'linien.deviceBarCollapsed';
@@ -159,7 +161,16 @@ const LogsModal = lazy(async () => {
   return { default: module.LogsModal };
 });
 
+// Lazy for the same reason as LogsModal: it is opened rarely, when something
+// has already gone wrong, and its Accordion/Code tree need not be in the
+// initial bundle.
+const DiagnosticsModal = lazy(async () => {
+  const module = await import('./components/DiagnosticsModal');
+  return { default: module.DiagnosticsModal };
+});
+
 export function App() {
+  const [diagnosticsDevice, setDiagnosticsDevice] = useState<Device | null>(null);
   const [overviewFps, setOverviewFps] = useState<number>(10);
   const [groupFps, setGroupFps] = useState<number>(() => {
     try {
@@ -256,6 +267,12 @@ export function App() {
     logScrollRef,
     appendUiErrorLog,
   } = useLogsController(devices);
+  const {
+    telemetryBusyKeys,
+    runTelemetryCommand,
+    installTelemetryAll,
+    startTelemetryAll,
+  } = useTelemetryActions({ appendUiErrorLog, pushToast });
   const {
     lockBusyKeys,
     autoLockBusyKeys,
@@ -522,6 +539,7 @@ export function App() {
     influxMessage,
     influxMessageError,
     influxDeviceOptions,
+    influxFleet,
     influxSelectedDevice,
     influxDeviceConnected,
     influxLoggingActive,
@@ -596,6 +614,7 @@ export function App() {
             influxChipColor={influxChipColor}
             influxLabel={influxLabel}
             influxDeviceOptions={influxDeviceOptions}
+            influxFleet={influxFleet}
             influxDeviceKey={influxDeviceKey}
             onInfluxDeviceChange={(value) => {
               setInfluxDeviceKey(value);
@@ -703,6 +722,11 @@ export function App() {
             onRebootDevice={async (key) => {
               await api.rebootDevice(key);
             }}
+            onTelemetryCommand={runTelemetryCommand}
+            onInstallTelemetryAll={installTelemetryAll}
+            onStartTelemetryAll={startTelemetryAll}
+            onRequestDiagnostics={setDiagnosticsDevice}
+            telemetryBusyKeys={telemetryBusyKeys}
           />
         </AppShell.Navbar>
       ) : null}
@@ -961,6 +985,14 @@ export function App() {
           onCopyMessage={copyLogMessage}
           onCopyJson={copyLogJson}
           viewportRef={logScrollRef}
+        />
+        <DiagnosticsModal
+          device={diagnosticsDevice}
+          status={
+            diagnosticsDevice ? deviceStatusMap[diagnosticsDevice.key] : undefined
+          }
+          onClose={() => setDiagnosticsDevice(null)}
+          appendUiErrorLog={appendUiErrorLog}
         />
       </Suspense>
       <ToastStack toasts={toasts} onDismiss={dismissToast} />

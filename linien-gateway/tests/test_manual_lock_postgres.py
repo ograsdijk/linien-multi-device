@@ -119,3 +119,82 @@ def test_service_test_connection_and_write_row(monkeypatch, tmp_path: Path):
     assert insert_calls
     assert insert_calls[-1][1]["lock_source"] == "manual_lock"
     assert insert_calls[-1][1]["monitor_trace_y"] == [0.25, 0.5]
+
+
+
+
+def test_the_create_and_the_migration_declare_the_same_columns():
+    """Both used to be hand-maintained copies of one list with nothing keeping
+    them in step."""
+    from app.manual_lock_postgres import (
+        ALTER_TABLE_ADD_SWEEP_SQL,
+        SWEEP_COLUMNS,
+        CREATE_TABLE_SQL,
+        INSERT_SQL,
+    )
+
+    for name, sql_type in SWEEP_COLUMNS:
+        assert f"{name} {sql_type}" in CREATE_TABLE_SQL
+        assert f"ADD COLUMN IF NOT EXISTS {name} {sql_type}" in ALTER_TABLE_ADD_SWEEP_SQL
+        assert f"    {name}" in INSERT_SQL
+
+
+def test_the_migration_runs_on_startup(monkeypatch, tmp_path: Path):
+    from app.manual_lock_postgres import ALTER_TABLE_ADD_SWEEP_SQL
+
+    fake_driver = FakePsycopg()
+    monkeypatch.setattr(mlp, "psycopg", fake_driver)
+    service = LockResultPostgresService(config_path=tmp_path / "cfg.json")
+    service._ensure_table()
+
+    executed = [sql for sql, _params in fake_driver.calls]
+    assert ALTER_TABLE_ADD_SWEEP_SQL.strip() in executed
+
+
+def test_the_first_write_of_a_process_migrates_before_inserting(monkeypatch, tmp_path: Path):
+    """_ensure_table only ran when someone re-saved the settings in the UI, so an
+    upgraded gateway nobody touched would INSERT columns that were never added --
+    silently taking manual and auto-relock logging down with it."""
+    from app.manual_lock_postgres import CREATE_TABLE_SQL, INSERT_SQL
+
+    fake_driver = FakePsycopg()
+    monkeypatch.setattr(mlp, "psycopg", fake_driver)
+    service = LockResultPostgresService(config_path=tmp_path / "cfg.json")
+    service._config.enabled = True
+
+    service._write_row({"laser_name": "l"})
+
+    executed = [sql for sql, _params in fake_driver.calls]
+    assert CREATE_TABLE_SQL.strip() in executed
+    assert executed.index(CREATE_TABLE_SQL.strip()) < executed.index(INSERT_SQL.strip())
+
+
+def test_later_writes_do_not_repeat_the_migration(monkeypatch, tmp_path: Path):
+    from app.manual_lock_postgres import CREATE_TABLE_SQL
+
+    fake_driver = FakePsycopg()
+    monkeypatch.setattr(mlp, "psycopg", fake_driver)
+    service = LockResultPostgresService(config_path=tmp_path / "cfg.json")
+    service._config.enabled = True
+
+    service._write_row({"laser_name": "l"})
+    service._write_row({"laser_name": "l"})
+
+    executed = [sql for sql, _params in fake_driver.calls]
+    assert executed.count(CREATE_TABLE_SQL.strip()) == 1
+
+
+def test_pointing_at_another_database_re_runs_the_migration(monkeypatch, tmp_path: Path):
+    from app.manual_lock_postgres import CREATE_TABLE_SQL
+
+    fake_driver = FakePsycopg()
+    monkeypatch.setattr(mlp, "psycopg", fake_driver)
+    service = LockResultPostgresService(config_path=tmp_path / "cfg.json")
+    service._config.enabled = True
+    service._write_row({"laser_name": "l"})
+
+    service.update_config({"enabled": True, "database": "somewhere_else"})
+    service._write_row({"laser_name": "l"})
+
+    executed = [sql for sql, _params in fake_driver.calls]
+    assert executed.count(CREATE_TABLE_SQL.strip()) >= 2

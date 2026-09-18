@@ -11,6 +11,7 @@ import type {
   LockIndicatorSnapshot,
   PlotFrame,
   StreamMessage,
+  LockAcceptanceSettings,
 } from '../types';
 import { api } from '../api';
 import { useDeviceStream } from '../hooks/useDeviceStream';
@@ -97,6 +98,8 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
   const [selectionSubmitting, setSelectionSubmitting] = useState(false);
   const [lockMode, setLockMode] = useState<'manual' | 'autolock_scan' | 'autolock'>('manual');
   const [autoLockSettings, setAutoLockSettings] = useState<AutoLockScanSettings | null>(null);
+  const [lockAcceptanceSettings, setLockAcceptanceSettings] =
+    useState<LockAcceptanceSettings | null>(null);
   const [lockIndicatorConfig, setLockIndicatorConfig] = useState<LockIndicatorConfig | null>(null);
   const [lockIndicatorSaving, setLockIndicatorSaving] = useState(false);
   const [lockIndicatorError, setLockIndicatorError] = useState<string | null>(null);
@@ -221,6 +224,9 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
           if (autoLockSettingsSaveTimerRef.current === null) {
             setAutoLockSettings(msg.value as AutoLockScanSettings);
           }
+        }
+        if (msg.config_name === 'lock_acceptance_settings') {
+          setLockAcceptanceSettings(msg.value as LockAcceptanceSettings);
         }
         if (msg.config_name === 'auto_relock_config') {
           setAutoRelockConfig(msg.value as AutoRelockConfig);
@@ -583,6 +589,7 @@ export const DeviceWorkspace = memo(function DeviceWorkspace({
             onCalibrateAutoLock={handleCalibrateAutoLock}
             autoLockSettings={autoLockSettings}
             onAutoLockSettingsChange={handleAutoLockSettingsChange}
+            lockAcceptanceSettings={lockAcceptanceSettings}
             onStartOptimizationSelection={startOptimizationSelection}
             onAbortOptimizationSelection={clearSelection}
             onStopTask={handleStopTask}

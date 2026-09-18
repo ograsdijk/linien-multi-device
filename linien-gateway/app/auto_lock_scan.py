@@ -32,6 +32,37 @@ import numpy as np
 # crossings that already pass the gates). Internal; not a user setting.
 _MONITOR_SCORE_WEIGHT = 0.5
 
+# A real +/-Omega pair straddles the carrier symmetrically: both offsets are the
+# same physical modulation frequency seen through the same tuning coefficient.
+# Anything measurably lopsided is not a sideband pair -- it is the carrier paired
+# with a neighbouring feature's crossing, which reports a spacing that is simply
+# wrong rather than absent. Internal; not a user setting.
+_SIDEBAND_SYMMETRY_TOLERANCE = 0.35
+
+
+def _symmetric_sideband_offset(
+    left_offset: float | None, right_offset: float | None
+) -> float | None:
+    """Mean of a candidate +/-Omega pair, or None if it is not a pair.
+
+    Both detectors measure the same physical quantity and must apply the same
+    test: a spacing asserted from one side alone cannot be checked, and a
+    lopsided pair means one of the two crossings belongs to something else.
+    Returning None is safe everywhere -- every consumer of `sideband_offset_v`
+    already handles an unresolved spacing, and an unresolved spacing is far
+    less damaging than a confident wrong one, which silently rescales the scan
+    width test, the centre-step allowance and the tracking identity.
+    """
+    if left_offset is None or right_offset is None:
+        return None
+    if left_offset <= 0.0 or right_offset <= 0.0:
+        return None
+    widest = max(left_offset, right_offset)
+    if abs(left_offset - right_offset) > _SIDEBAND_SYMMETRY_TOLERANCE * widest:
+        return None
+    return (left_offset + right_offset) / 2.0
+
+
 
 @dataclass
 class AutoLockScanSettings:
@@ -48,6 +79,31 @@ class AutoLockScanSettings:
     min_amplitude: float = 0.01  # whole-trace dead-signal floor, plot units
     smooth_window_pts: int = 5
     monitor_threshold: float = 0.1  # monitor (PD) level at the lock point, plot units (+)
+    # Smallest share of the scan span the whole error signal (sideband to
+    # sideband, 2x sideband_offset_v) may occupy before the scan counts as too
+    # wide to lock from. NOT about resolving the feature: on a hysteretic
+    # actuator the centre move that puts the laser on the target is one large
+    # jump, and its error grows with its length, so a feature that is a speck
+    # on a wide scan is reached by a leap that lands on the wrong one. Narrowing
+    # around it first turns that leap into a staircase. 0 disables the test.
+    #
+    # The value is the reciprocal of twice the worst-case move: the target can
+    # sit a half-span from the centre, so a signal occupying fraction f of the
+    # span is at most 1/(2f) signal widths away. 1/6 therefore means "never
+    # command a move longer than three signal widths", and each individual step
+    # is separately bounded to max_center_step_signal_widths, so that distance is
+    # covered in at least three bounded steps rather than one leap. The earlier
+    # 1/4 (two widths) made a laser with a 68 mV error signal narrow to +/-0.136 V
+    # before it would lock, well past the +/-0.2 V an operator locks it by hand.
+    min_signal_scan_fraction: float = 1.0 / 6.0
+    # Largest centre step a refinement stage may take, in whole error-signal
+    # widths (sideband to sideband). The scan width is an operator setting and
+    # says nothing about whether a step is safe; what matters is the distance to
+    # the NEXT feature, which for PDH is the sideband spacing. One signal width
+    # is two sideband spacings, so the default keeps a step from vaulting over a
+    # neighbour while still crossing a wide scan in a handful of stages. Ignored
+    # when no sideband spacing has been measured.
+    max_center_step_signal_widths: float = 1.0
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "AutoLockScanSettings":
@@ -58,6 +114,112 @@ class AutoLockScanSettings:
         for name in defaults.__dataclass_fields__.keys():
             values[name] = payload[name] if name in payload else getattr(defaults, name)
         return cls(**values)
+
+
+
+def _spacing_is_measurable(
+    settings: "AutoLockScanSettings", n_points: int, sweep_amplitude_v: float
+) -> bool:
+    """Can a sideband spacing be measured on a scan this coarse at all?
+
+    Both detectors smooth with a boxcar `smooth_window_pts` wide before looking
+    for crossings. A feature narrower than that window does not survive it, and
+    the crossings whose separation is the spacing are then placed by the
+    smoother rather than by the signal. On a field scan at +/-0.8 V the
+    calibrated feature was 2.3 samples per half-width -- 4.5 samples end to end,
+    against a 5-sample window -- and the two detectors duly returned spacings a
+    factor of two apart, one having paired carrier-to-sideband and the other
+    sideband-to-sideband. Neither was a measurement.
+
+    Reporting None is the honest answer and a safe one: the spacing gates only
+    the scan-width test, the refinement centre-step allowance and the tracking
+    identity, and every one of them already handles an unresolved spacing. The
+    refinement goal is driven by feature resolution, so the walk still narrows
+    -- and once it has narrowed enough to resolve the feature, the spacing
+    becomes measurable on its own merits.
+    """
+    if float(settings.half_range_sweep_v) <= 0.0:
+        # Uncalibrated: there is no feature width to compare a scan against, so
+        # this test has no opinion. `_half_range_to_points` would floor to two
+        # samples and make every scan look unresolvable, which would send an
+        # uncalibrated device into the refinement walk instead of to the
+        # explicit "calibrate first" refusal that exists for it.
+        return True
+    feature_pts = 2.0 * _half_range_to_points(
+        settings.half_range_sweep_v, n_points, sweep_amplitude_v
+    )
+    return feature_pts >= max(1, int(settings.smooth_window_pts))
+
+
+def feature_resolution_samples(
+    settings: AutoLockScanSettings, n_points: int, sweep_amplitude_v: float
+) -> float:
+    """Calibrated feature half-width expressed in samples of this sweep.
+
+    This is deliberately based on the calibrated physical width, rather than a
+    magic sweep-voltage threshold: a broad discriminator can be safely found on
+    a wide sweep while a narrow one cannot.
+    """
+    span_v = 2.0 * abs(float(sweep_amplitude_v))
+    if n_points < 2 or span_v <= 1e-12:
+        return 0.0
+    return float(settings.half_range_sweep_v) * (n_points - 1) / span_v
+
+
+def scan_too_wide_to_lock(
+    settings: AutoLockScanSettings,
+    sweep_amplitude_v: float,
+    sideband_offset_v: float | None,
+    *,
+    trace_points: int | None = None,
+) -> bool:
+    """Is the scan so wide that the centre move to the target is a leap?
+
+    Measured sideband to sideband -- the full width of the PDH error signal as
+    it appears on the plot, ``2 x sideband_offset_v`` -- against the scan span.
+    That ratio, not a sample count, is what bounds the commanded centre move:
+    the target can sit up to a half-span away, so a signal occupying a quarter
+    of the scan means a move of at most about two signal widths.
+
+    The test needs a measured sideband spacing and does not apply without one --
+    a dispersive signal has no sidebands, and a PDH scan that did not resolve
+    ±Ω has not measured the width this rule is about. Treating an unmeasured
+    spacing as "too wide" would narrow every such scan, including ones that lock
+    perfectly well; a scan too wide to lock is better caught by the guarded
+    move, which reports the landing it actually got.
+    """
+    fraction = float(settings.min_signal_scan_fraction)
+    if fraction <= 0.0:
+        return False
+    if str(settings.signal_type) != "pdh":
+        return False
+    span_v = 2.0 * abs(float(sweep_amplitude_v))
+    if span_v <= 1e-12:
+        return False
+    if sideband_offset_v is None:
+        # Two different silences. A scan that simply resolved no sideband may
+        # still lock perfectly well, and narrowing every such scan would be
+        # wrong. But a scan too coarse to resolve the feature at all could not
+        # have measured a spacing whatever the signal did -- that silence is
+        # itself the answer, and the widest scans in a 119-scan run are exactly
+        # where a spacing is withheld while the strict detector still succeeds.
+        # Without this the walk would stop there and try to lock from a scan
+        # carrying five samples of feature.
+        return trace_points is not None and not _spacing_is_measurable(
+            settings, int(trace_points), sweep_amplitude_v
+        )
+    signal_width_v = 2.0 * abs(float(sideband_offset_v))
+    return signal_width_v < fraction * span_v
+
+
+def max_lockable_amplitude_v(
+    settings: AutoLockScanSettings, sideband_offset_v: float | None
+) -> float | None:
+    """Widest half-span satisfying :func:`scan_too_wide_to_lock`, or None."""
+    fraction = float(settings.min_signal_scan_fraction)
+    if fraction <= 0.0 or sideband_offset_v is None:
+        return None
+    return abs(float(sideband_offset_v)) / fraction
 
 
 @dataclass
@@ -95,6 +257,239 @@ class AutoLockScanResult:
             "sideband_offset_v": self.sideband_offset_v,
             "discriminator_slope_v_per_mhz": self.discriminator_slope_v_per_mhz,
         }
+
+
+@dataclass
+class CoarseAutoLockCandidate:
+    """Tracking-only candidate; never sufficient to start a lock."""
+
+    result: AutoLockScanResult
+    metrics: dict[str, Any]
+
+
+def _robust_noise(values: np.ndarray) -> float:
+    """Robust point-to-point noise floor, insensitive to the PDH lobes."""
+    diff = np.diff(values)
+    if len(diff) < 2:
+        return 1e-9
+    mad = 1.4826 * float(np.median(np.abs(diff - np.median(diff))))
+    # Quantised ADC traces often have a zero MAD because most adjacent values
+    # repeat. Use the typical non-zero code step as the resolution floor rather
+    # than reporting an artificial multi-million SNR.
+    nonzero = np.abs(diff[np.abs(diff) > 0.0])
+    quantization = float(np.median(nonzero)) if len(nonzero) else 1e-9
+    return max(1e-9, mad, quantization)
+
+
+def find_coarse_auto_lock_target(
+    *,
+    error_trace_v: np.ndarray,
+    monitor_trace_v: np.ndarray | None,
+    sweep_center_v: float,
+    sweep_amplitude_v: float,
+    settings: AutoLockScanSettings,
+    preferred_slope_rising: bool | None = None,
+    modulation_frequency_hz: float | None = None,
+) -> CoarseAutoLockCandidate:
+    """Find a plausible PDH/dispersive lobe pair for scan *tracking* only.
+
+    Unlike the strict crossing detector this does not rely on a five-point
+    smoother swallowing a narrow lobe. It searches adjacent extrema pairs at
+    three scales, scores their excursion against robust point noise, and, for
+    PDH, requires an opposite-slope sideband pair. Callers must still obtain
+    two strict detections before a lock can be started.
+    """
+    raw = _sanitize_trace(np.asarray(error_trace_v, dtype=float))
+    n = len(raw)
+    if n < 16:
+        raise ValueError("Trace is too short for coarse auto-lock tracking.")
+    noise = _robust_noise(raw)
+    # The monitor discriminates crossings the error signal alone cannot tell
+    # apart, so tracking has to honour it too: a walk that steers onto the wrong
+    # crossing spends its whole stage budget before the strict detector at the
+    # end rejects it. Same baseline/contrast test the strict detector applies,
+    # and gated on the same calibrated use_monitor.
+    monitor = (
+        _sanitize_trace(np.asarray(monitor_trace_v, dtype=float))
+        if monitor_trace_v is not None
+        else None
+    )
+    if monitor is not None and len(monitor) != n:
+        monitor = None
+    use_monitor = bool(settings.use_monitor) and monitor is not None
+    monitor_baseline = _monitor_baseline(monitor) if monitor is not None else None
+    locked_above = str(settings.monitor_mode) != "locked_below"
+    half_pts = _half_range_to_points(settings.half_range_sweep_v, n, sweep_amplitude_v)
+    max_gap = max(3, min(n // 4, half_pts * 6))
+    slope = bool(preferred_slope_rising) if preferred_slope_rising is not None else True
+    options: list[tuple[float, int, float, float, float, int, float | None, float | None]] = []
+    # (score, crossing index, left, right, pair, smoothing width, sideband pts,
+    #  monitor level)
+    monitor_rejects = 0
+
+    exclusion = max(3, half_pts)
+
+    def _opposite_slope_crossings(signal: np.ndarray) -> np.ndarray:
+        """Sorted sideband crossing indices usable by `_two_sided_sidebands`.
+
+        Whether a crossing qualifies (in bounds, slope opposite the carrier's)
+        does not depend on which carrier it is paired with, so it is decided
+        once per smoothing width rather than once per candidate pair.
+        """
+        if str(settings.signal_type) != "pdh":
+            return np.empty(0, dtype=int)
+        kept = []
+        for idx in _extract_crossing_candidates(signal):
+            if idx <= 3 or idx >= n - 4:
+                continue
+            # _extract_crossing_candidates returns whichever endpoint is nearer
+            # zero, so its index is not guaranteed to be the right endpoint of
+            # the sign-change bracket. A local central slope is orientation-safe.
+            rising = float(signal[idx + 1] - signal[idx - 1]) > 0.0
+            if rising != slope:
+                kept.append(int(idx))
+        return np.unique(np.asarray(kept, dtype=int))
+
+    def _two_sided_sidebands(opposite: np.ndarray, crossing: int) -> float | None:
+        # Nearest qualifying crossing on each side, at least `exclusion` away.
+        left_pos = int(np.searchsorted(opposite, crossing - exclusion, side="right")) - 1
+        right_pos = int(np.searchsorted(opposite, crossing + exclusion, side="left"))
+        if left_pos < 0 or right_pos >= len(opposite):
+            return None
+        return _symmetric_sideband_offset(
+            float(crossing - int(opposite[left_pos])),
+            float(int(opposite[right_pos]) - crossing),
+        )
+
+    for width in (1, 3, 5):
+        signal = _moving_average(raw, width)
+        mins = [i for i in range(1, n - 1) if signal[i] <= signal[i - 1] and signal[i] < signal[i + 1]]
+        maxs = [i for i in range(1, n - 1) if signal[i] >= signal[i - 1] and signal[i] > signal[i + 1]]
+        lefts, rights = (mins, maxs) if slope else (maxs, mins)
+        rights_arr = np.asarray(rights, dtype=int)
+        opposite = _opposite_slope_crossings(signal)
+        abs_signal = np.abs(signal)
+        positions = np.arange(max_gap + 1)
+        for left in lefts:
+            # Every right extremum within max_gap after this left one.
+            lo = int(np.searchsorted(rights_arr, left, side="right"))
+            hi = int(np.searchsorted(rights_arr, left + max_gap, side="right"))
+            if lo >= hi:
+                continue
+            pair_rights = rights_arr[lo:hi]
+            # The crossing of [left, right] is the first minimum of |signal|
+            # over that segment -- np.argmin's tie rule -- so one running
+            # first-argmin from `left` serves every right at once.
+            window = abs_signal[left : int(pair_rights[-1]) + 1]
+            running_min = np.minimum.accumulate(window)
+            improved = np.empty(len(window), dtype=bool)
+            improved[0] = True
+            improved[1:] = window[1:] < running_min[:-1]
+            first_argmin = np.maximum.accumulate(
+                np.where(improved, positions[: len(window)], 0)
+            )
+            crosses = left + first_argmin[pair_rights - left]
+            left_exc = np.abs(signal[left] - signal[crosses])
+            right_exc = np.abs(signal[pair_rights] - signal[crosses])
+            pair = left_exc + right_exc
+            symmetry = np.minimum(left_exc, right_exc) / np.maximum(
+                np.maximum(left_exc, right_exc), 1e-12
+            )
+            snr = pair / noise
+            # Prefer balanced high-SNR pairs; require both lobes to be real.
+            # Checked before the sideband search, which is the costly part and
+            # is wasted on the many pairs this rejects.
+            for k in np.flatnonzero((snr >= 6.0) & (symmetry >= 0.12)):
+                cross = int(crosses[k])
+                contrast: float | None = None
+                if monitor is not None and monitor_baseline is not None:
+                    level = _monitor_on_resonance(
+                        monitor, cross, half_pts, locked_above
+                    )
+                    if level is not None:
+                        contrast = (
+                            level - monitor_baseline
+                            if locked_above
+                            else monitor_baseline - level
+                        )
+                    if use_monitor:
+                        # Wrong side of baseline: not this feature. The absolute
+                        # monitor_threshold is deliberately NOT applied here --
+                        # tracking has to survive a scan whose coarse window
+                        # blurs the peak, and the strict detections that
+                        # actually authorise the lock still enforce it.
+                        if contrast is None or contrast <= 0.0:
+                            monitor_rejects += 1
+                            continue
+                sidebands = (
+                    _two_sided_sidebands(opposite, cross)
+                    if str(settings.signal_type) == "pdh"
+                    else None
+                )
+                # A resolvable ±Ω pair gets a preference, but wide scans can
+                # genuinely under-resolve the sidebands. In that case the
+                # carrier pair remains useful for tracking only; strict final
+                # detection still has to establish the full PDH identity.
+                sideband_bonus = 1.15 if sidebands is not None else 1.0
+                pair_score = (
+                    float(snr[k]) * (0.5 + 0.5 * float(symmetry[k])) * sideband_bonus
+                )
+                if use_monitor and contrast is not None:
+                    # Same tie-breaker weight the strict detector uses, scaled
+                    # by SNR because this score is in SNR units, not excursion.
+                    pair_score *= 1.0 + _MONITOR_SCORE_WEIGHT * contrast
+                options.append((
+                    pair_score,
+                    cross,
+                    float(left_exc[k]),
+                    float(right_exc[k]),
+                    float(pair[k]),
+                    width,
+                    sidebands,
+                    None if contrast is None else contrast + float(monitor_baseline),
+                ))
+    if not options:
+        if monitor_rejects:
+            raise ValueError(
+                f"No trackable extrema pair: {monitor_rejects} candidate(s) were "
+                "rejected by the monitor as being on the wrong side of its baseline."
+            )
+        raise ValueError("No extrema pair with robust signal-to-noise was found for tracking.")
+    (
+        score, crossing, left_exc, right_exc, pair, width, sideband_pts, monitor_level
+    ) = max(options, key=lambda item: item[0])
+    sideband_offset_v: float | None = None
+    hz_per_v: float | None = None
+    if str(settings.signal_type) == "pdh" and _spacing_is_measurable(
+        settings, n, sweep_amplitude_v
+    ):
+        if sideband_pts is not None:
+            sideband_offset_v = float(sideband_pts) * (2.0 * abs(float(sweep_amplitude_v)) / (n - 1))
+        if modulation_frequency_hz and sideband_offset_v is not None and sideband_offset_v > 1e-12:
+            hz_per_v = float(modulation_frequency_hz) / sideband_offset_v
+    target = AutoLockScanResult(
+        target_index=int(crossing),
+        target_voltage=_index_to_voltage(crossing, n, sweep_center_v, sweep_amplitude_v),
+        target_slope_rising=slope,
+        score=float(score),
+        left_excursion=float(left_exc),
+        right_excursion=float(right_exc),
+        pair_excursion=float(pair),
+        symmetry=float(min(left_exc, right_exc) / max(left_exc, right_exc, 1e-12)),
+        monitor_level=monitor_level,
+        hz_per_v=hz_per_v,
+        sideband_offset_v=sideband_offset_v,
+    )
+    return CoarseAutoLockCandidate(target, {
+        "method": "multiscale_extrema_pair",
+        "smooth_window_pts": width,
+        "robust_noise": noise,
+        "snr": pair / noise,
+        "pair_excursion": pair,
+        "symmetry": target.symmetry,
+        "sideband_offset_v": sideband_offset_v,
+        "sideband_evidence": "two_sided" if sideband_offset_v is not None else "unresolved",
+    })
 
 
 @dataclass
@@ -162,7 +557,9 @@ def _half_range_to_points(
         return max(2, min(24, n_points // 16))
     span_v = 2.0 * amplitude
     points_per_v = float(n_points - 1) / span_v
-    points = int(round(max(0.001, float(half_range_sweep_v)) * points_per_v))
+    # No millivolt floor here either: `points` is clamped to [2, half-trace]
+    # below, which is the same guard expressed in the units that matter.
+    points = int(round(max(0.0, float(half_range_sweep_v)) * points_per_v))
     return max(2, min(points, (n_points // 2) - 1))
 
 
@@ -280,16 +677,26 @@ def _crossing_slope_v_per_v(
 
 
 def _sideband_offset_pts(
-    error: np.ndarray, anchor: int, carrier_rising: bool
+    error: np.ndarray, anchor: int, carrier_rising: bool, *, exclusion_pts: int
 ) -> float | None:
-    """Mean distance (in samples) from the carrier crossing to the nearest
-    opposite-slope (sideband) crossings on each side.
+    """Mean distance (in samples) from the carrier crossing to its ±Ω crossings.
 
-    In PDH the ±Ω sideband error features cross zero exactly Ω from the carrier and
-    with the opposite slope, so this distance is the sample-equivalent of Ω."""
+    In PDH the ±Ω sideband error features cross zero exactly Ω from the carrier
+    and with the opposite slope, so this distance is the sample-equivalent of Ω.
+
+    Two crossings of the right slope are not on their own a sideband pair. A
+    crossing within the carrier's own measurement window is part of the carrier
+    (or its noise), and a pair that does not straddle the carrier symmetrically
+    belongs to a neighbouring feature -- both are screened out here, by the same
+    test the coarse tracker applies. Without them a scan carrying more than one
+    feature yields a confident spacing well below the true one, which is worse
+    than no spacing at all: it rescales the scan-width test, the centre-step
+    allowance and the tracking identity, all of which then disagree with the
+    coarse tracker measuring the same laser."""
     n = len(error)
     left_idx: int | None = None
     right_idx: int | None = None
+    exclusion = max(1, int(exclusion_pts))
     for i in range(n - 1):
         a = float(error[i])
         b = float(error[i + 1])
@@ -300,6 +707,8 @@ def _sideband_offset_pts(
         if rising == carrier_rising:
             continue  # same slope as carrier -> not a sideband
         idx = i if abs(a) <= abs(b) else i + 1
+        if abs(idx - anchor) < exclusion:
+            continue  # inside the carrier's own window -> not a sideband
         if idx < anchor:
             if left_idx is None or idx > left_idx:
                 left_idx = idx  # nearest on the left
@@ -307,14 +716,10 @@ def _sideband_offset_pts(
             if right_idx is None or idx < right_idx:
                 right_idx = idx  # nearest on the right
 
-    offsets = []
-    if left_idx is not None and (anchor - left_idx) > 0:
-        offsets.append(anchor - left_idx)
-    if right_idx is not None and (right_idx - anchor) > 0:
-        offsets.append(right_idx - anchor)
-    if not offsets:
-        return None
-    return float(sum(offsets)) / float(len(offsets))
+    return _symmetric_sideband_offset(
+        None if left_idx is None else float(anchor - left_idx),
+        None if right_idx is None else float(right_idx - anchor),
+    )
 
 
 def find_auto_lock_target(
@@ -511,8 +916,17 @@ def find_auto_lock_target(
     sideband_offset_v: float | None = None
     hz_per_v: float | None = None
     discriminator_slope_v_per_mhz: float | None = None
-    if str(settings.signal_type) == "pdh" and modulation_frequency_hz:
-        off_pts = _sideband_offset_pts(error, best.index, best.target_slope_rising)
+    if (
+        str(settings.signal_type) == "pdh"
+        and modulation_frequency_hz
+        and _spacing_is_measurable(settings, n_points, sweep_amplitude_v)
+    ):
+        off_pts = _sideband_offset_pts(
+            error,
+            best.index,
+            best.target_slope_rising,
+            exclusion_pts=max(3, half_range_pts),
+        )
         if off_pts and off_pts > 0 and n_points > 1:
             sideband_offset_v = float(off_pts) * (
                 2.0 * abs(float(sweep_amplitude_v)) / (n_points - 1)
@@ -831,8 +1245,19 @@ def calibrate_auto_lock_settings(
     feature_half_width_v = (
         half_width_pts * pts_to_v if pts_to_v > 0.0 else float(base.half_range_sweep_v)
     )
-    half_range_sweep_v = _clamp(
-        factors.half_range_margin * feature_half_width_v, 0.001, 2.0
+    # Bound the calibrated width by the scan that measured it, not by absolute
+    # volts: the narrowest meaningful feature is the two samples `half_width_pts`
+    # is already floored at, and the widest is the half-trace `_peak_offsets`
+    # searched. A fixed millivolt floor would silently widen the calibration of
+    # any laser whose feature is finer than it -- the characterization device calibrates to 1.5 mV.
+    half_range_sweep_v = (
+        _clamp(
+            factors.half_range_margin * feature_half_width_v,
+            2.0 * pts_to_v,
+            ((n_points // 2) - 1) * pts_to_v,
+        )
+        if pts_to_v > 0.0
+        else float(base.half_range_sweep_v)
     )
 
     # Re-measure excursions over the derived window so the calibrated thresholds

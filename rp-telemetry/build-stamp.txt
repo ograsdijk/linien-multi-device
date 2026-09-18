@@ -1,0 +1,6 @@
+# Written by build-arm.sh. Do not edit by hand -- rerun the script instead.
+# source_sha256 is the hash of src/rp_telemetry.c as it was when the bundled
+# binary in linien-gateway/app/assets/ was built.
+version=1.4.0
+source_sha256=a6c4c4d251eca2a8b54c6bba451076fdcc69bd65ad83314060efba920cb28418
+backend=zig

@@ -16,7 +16,9 @@ CREATE TABLE IF NOT EXISTS pdh_lock_results (
     monitor_trace_y DOUBLE PRECISION[] NOT NULL,
     trace_x_units TEXT NOT NULL DEFAULT 'V',
     trace_y_units TEXT NOT NULL DEFAULT 'V',
-    monitor_trace_y_units TEXT NOT NULL DEFAULT 'V'
+    monitor_trace_y_units TEXT NOT NULL DEFAULT 'V',
+    sweep_center_v DOUBLE PRECISION,
+    sweep_amplitude_v DOUBLE PRECISION
 );
 
 ALTER TABLE pdh_lock_results

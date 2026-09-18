@@ -38,13 +38,21 @@ Linien laser-lock devices from one interface.
   and auto-relock actions.
 - Optional InfluxDB logging control from the UI (credentials, interval, loggable
   parameter multiselect), resumed on reconnect.
+- Red Pitaya die-temperature telemetry: a near-zero-CPU C helper on the board,
+  polled over a tiny TCP protocol, shown per device and logged to InfluxDB by the
+  gateway.
 - In-app logs: tail, clear, and a live structured log-event stream surfaced as toasts.
+- Board diagnostics: a retained per-device timeline of reboots and outages, an
+  on-demand post-mortem bundle pulled from the board, and one-click persistent
+  journald so the next crash leaves evidence behind.
 
 ## Repo structure
 
 - `linien-gateway`: FastAPI backend (Python).
 - `linien-web`: React UI (Vite + TypeScript).
 - `linien-sim`: virtual Linien-compatible simulator for local testing.
+- `rp-telemetry`: tiny C daemon deployed to each Red Pitaya to report its Zynq die
+  temperature (see [Red Pitaya telemetry](#red-pitaya-telemetry-zynq-die-temperature)).
 - `docker/`: optional Docker stacks (gateway + UI; Postgres + pgAdmin).
 
 ## Architecture overview
@@ -64,8 +72,10 @@ Linien laser-lock devices from one interface.
 ## Prerequisites
 
 - Python 3.10+
-- Node.js 20 (the Docker build and `package-lock.json` target Node 20; 18 may work but
-  is not what the build is validated against).
+- Node.js 22.22+ (24 or 26 also fine). Running the web tests on Node 20 fails
+  outright: `jsdom` 30 requires `^22.22.2 || ^24.15.0 || >=26.0.0`. CI runs 24.
+  The Docker image still builds the UI on `node:20-bookworm-slim`, which works
+  because that stage only runs `npm ci && npm run build` and never the tests.
 - [`uv`](https://docs.astral.sh/uv/) is recommended for the gateway. The project pins
   `numpy>=2` and reconciles it against `linien-common`/`linien-client 2.1.0` via a
   `[tool.uv]` override; a plain `pip install` does **not** honor that override and will
@@ -111,6 +121,9 @@ Network and plot-stream settings, read by the gateway at startup:
   This file is **gitignored and created at runtime** — do not expect it in a fresh
   checkout. These settings are broadcast to all connected clients for the same device
   via WebSocket `config_update` events.
+- `board_events.json` (repo root): the per-device board/server timeline (see
+  [Board diagnostics](#board-diagnostics)). Also gitignored and created at
+  runtime; capped at 200 events and 30 days per device.
 - The Linien client also persists a device list (`devices.json`) and
   `manual_lock_postgres.json` under `linien_common.config.USER_DATA_PATH`.
 - In addition to the three config blocks above, the gateway snapshots a set of
@@ -205,6 +218,141 @@ the cause out-of-band and surfaces it in the device status as a `diagnosis` obje
 needs SSH access to the Red Pitaya. Note that the gateway does **not** auto-reconnect — the
 "recovering" wording is informational only, and reconnect is operator-driven.
 
+## Board diagnostics
+
+Connection diagnosis says *what* happened. This says *why*, and keeps a record.
+Open it from **Diagnostics** on a device card.
+
+### Timeline
+
+The gateway retains each board's transitions in `board_events.json`: connection
+losses, diagnosis changes, reboots, and telemetry outages and recoveries. It
+survives a gateway restart, which is often itself part of the incident, so
+"this board rebooted three times last night" is answerable the next morning.
+
+Nothing new is polled to produce it. Every entry mirrors a log event the
+gateway already emits exactly once per transition, so the poll paths are
+untouched and the timeline cannot fill with repeats of a steady state.
+
+Reboots are detected by comparing `/proc/sys/kernel/random/boot_id` between
+probes. That is free — it rides along in a compound read `diagnosis.py` already
+sends — and it is a fact rather than the previous 600 s uptime heuristic, which
+was wrong in both directions: it missed a reboot on a board that had since been
+up for a day, and it called a crash-on-a-freshly-booted-board a reboot and
+wrongly declared the lock lost.
+
+### Collect diagnostics
+
+`POST /api/devices/{key}/diagnostics/collect` gathers, over one SSH connection:
+
+- board identity, uptime and boot ID;
+- whether the board keeps logs at all;
+- `linien-server.service` state and exit status, including `NRestarts` and
+  whether it died on a signal;
+- its journal for this boot **and the previous one**;
+- the kernel ring buffer, with watchdog/reset/OOM/panic lines pre-extracted;
+- `pstore` crash remnants, memory, disk, load, and FPGA manager state;
+- the `rp-telemetry` journal;
+- the Zynq reset-cause register.
+
+### Reset cause
+
+`journalctl` cannot tell you why a board reset, because a board that lost power
+wrote nothing before it went. SLCR `REBOOT_STATUS` can: a watchdog timeout, a
+software `reboot`, an external reset and a power-on each leave a different bit.
+
+Reading it needed five attempts before one worked on a real board. Field images
+turned out to carry no `devmem`, no `devmem2`, no Red Pitaya `monitor` and no
+busybox at all; and `dd` on `/dev/mem` fails with `EFAULT` no matter the image,
+because `read()` copies from `__va(phys)`, which is valid only for RAM — SLCR
+is IO space and the kernel reaches it only through `ioremap`, i.e. `mmap`. So
+the reader that works is a python3 `mmap` of the SLCR page, and python3 is a
+fair assumption on a board whose Linien server is itself a Python process. Each
+reader is tried whenever the previous produced nothing, rather than whenever its
+tool is absent: one that exists and fails silently used to end the chain.
+
+**The bits accumulate.** A field board read `0x00410000` — a system watchdog
+timeout and a power-on standing together, which is impossible if each reset
+cleared the register first. So a reading is every cause recorded *since the
+register was last cleared*, in no order and with no timestamp; the board
+timeline is what dates the restart. This corrected an earlier reading in this
+codebase that was exactly backwards: an empty register was reported as "the
+board lost power", when in fact a power-on **sets** bit 22 and an empty register
+means only that something cleared it.
+
+Because they accumulate, `POST /api/devices/{key}/diagnostics/clear-reset-cause`
+zeroes them, so the next incident stands alone. It is the only hardware write in
+the feature and stays an explicit operator action rather than something
+`collect` does — an automatic clear on every read would let a second collect
+erase a cause nobody had looked at yet. The pre-clear reading goes into the
+timeline before it is destroyed. SLCR's write protection is lifted and put back
+in a `finally`, and since the manual does not settle whether these bits are
+write-one-to-clear or plain read/write, the script tries the first, reads back,
+falls back to the second, and reports which one worked rather than assuming.
+Bits 31:24 are the bootloader's scratch space and are preserved.
+
+Bits 16–19 are as documented in UG585; bit 22 was confirmed in the field. Bits
+20 and 21 follow the order the TRM lists the reset sources in and are unverified
+— a decode resting on them says so, and the raw value stays in the section
+output either way.
+
+Every command is `timeout`-bounded and every section fails independently —
+these images vary, and a missing tool is a finding, not a reason to lose the
+other eleven sections. Collection is operator-triggered only, on its own small
+SSH pool, so it can never queue ahead of a telemetry action or slow a status
+endpoint. It is read-only.
+
+### Enable persistent logs
+
+**This is the one that matters, and it has to be done before the crash you want
+to read about.** Stock Red Pitaya images keep the journal in RAM: after a reset
+`journalctl -b -1` has nothing, and the pre-crash evidence is simply gone. No
+amount of collecting recovers it retroactively.
+
+`POST /api/devices/{key}/diagnostics/enable-persistent-log` writes a capped
+`Storage=persistent` journald drop-in (32 MB, 8 MB per file — these are SD
+cards), creates `/var/log/journal`, and restarts journald. The write is
+checksum-verified and `sync`ed, with the same care the telemetry unit write
+earned on real hardware.
+
+On these images that is not enough on its own: `/var/log` is itself a 5 MB RAM
+disk, so journald obeys `Storage=persistent`, cannot fit an 8 MB journal file
+there, and falls back to logging in RAM — silently, leaving a board that looks
+exactly like one that was never configured. So before restarting journald, the
+action checks what filesystem is under `/var/log/journal` (from `/proc/mounts`,
+not from `df`'s device column — a tmpfs is usually mounted as `none`), and when
+it finds a RAM disk it puts real storage under the path: a
+`var-log-journal.mount` unit bind-mounting `/var/log-persistent/journal` from
+the root filesystem.
+
+That unit has no `[Install]` section on purpose. `systemd-journal-flush.service`
+carries `RequiresMountsFor=/var/log/journal`, which pulls the mount in *and*
+orders it ahead of the flush at every boot, so nothing needs enabling. The
+tidier-looking `WantedBy=local-fs.target` is a trap: it would make a failed
+mount a boot failure, and a headless board in emergency mode needs a lab visit
+with an SD reader. Pulled in only by the flush, a broken mount costs you the
+journal and nothing else. (A boot-time symlink is not an option either — the
+flush runs `Before=systemd-tmpfiles-setup.service`, so the link would not exist
+yet and the whole boot would stay in RAM.)
+
+It then asks journald which file it is *actually* writing to, rather than
+checking that `/var/log/journal` exists — that directory is created by this
+very action, so its presence proves nothing. The check retries for a few
+seconds, because `journalctl --flush` returns before the flush has finished on
+older systemd and a board configured correctly was being reported as a failure.
+A board whose `Storage=` is still overridden by another drop-in reports failure
+and says where to look, along with what the board itself reports: both journal
+directories, the filesystem under them, every effective `Storage=` line with the
+file it came from, and journald's state. `POST /api/diagnostics/enable-persistent-log` does a
+set of boards at once, which is how you would want to do it the first time.
+
+A board where even `/var` is a RAM disk is refused outright rather than
+half-configured: there is nowhere to put a journal, and only a change to the
+image can fix that.
+
+The modal offers the action only when a collected bundle shows the board has no
+persistent journal, and stops offering it once it does.
+
 ## Multi-device operations
 
 - **Overview grid** — compact per-device cards with locked control/monitor history plots
@@ -237,8 +385,8 @@ Configure in the UI:
 Logging behavior:
 
 - Best effort, non-blocking for lock actions.
-- Writes include `lock_source` — one of `manual_lock`, `auto_lock_scan`, or
-  `auto_relock` — plus error/monitor traces.
+- Writes include `lock_source` — one of `manual_lock`, `auto_lock_scan` or
+  `auto_relock` — plus error/monitor traces and the sweep geometry.
 
 Expected Postgres schema (`pdh_lock_results`):
 
@@ -261,9 +409,25 @@ CREATE TABLE IF NOT EXISTS pdh_lock_results (
     monitor_trace_y DOUBLE PRECISION[] NOT NULL,
     trace_x_units TEXT NOT NULL DEFAULT 'V',
     trace_y_units TEXT NOT NULL DEFAULT 'V',
-    monitor_trace_y_units TEXT NOT NULL DEFAULT 'V'
+    monitor_trace_y_units TEXT NOT NULL DEFAULT 'V',
+    -- The sweep itself, previously only recoverable by inverting trace_x:
+    sweep_center_v DOUBLE PRECISION,
+    sweep_amplitude_v DOUBLE PRECISION
 );
 ```
+
+Existing deployments migrate themselves: the first write of each gateway process applies
+`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` on the same connection before
+inserting, so no hand-run migration and no re-saving of the settings is needed. (The
+schema step previously ran only from `Test connection`, which meant an upgraded gateway
+nobody re-saved would insert columns that had never been added — and the failure is
+swallowed by the best-effort writer, so *all* lock logging would have gone quiet.)
+
+**Aborted auto-locks are written too**, with `success = false`. They carry the largest
+measured offsets, so leaving them out would keep the most informative rows out of the
+table you would characterise a laser's hysteresis from. The same numbers also ride on
+the `auto_lock_scan_started` / `auto_lock_scan_failed` board events, so per-device
+history is visible in the UI without querying the database.
 
 For a local Dockerized Postgres/pgAdmin setup, see [docker/README.md](docker/README.md).
 The shipped init SQL is `docker/postgres/postgres-init/01-init.sql`.
@@ -273,6 +437,278 @@ The shipped init SQL is `docker/postgres/postgres-init/01-init.sql`.
 - Use the `InfluxDB` chip in the top header.
 - Select a device, configure credentials, interval, and logged parameters.
 - Start/stop logging from the same popover.
+
+## Red Pitaya telemetry (Zynq die temperature)
+
+Each Red Pitaya can run **`rp-telemetry`**, a tiny C daemon that reports the
+board's **Zynq die (junction) temperature** — the temperature of the SoC itself,
+*not* ambient/room temperature and *not* a laser temperature. The gateway polls
+it, shows it on each device card, and (optionally) logs it to InfluxDB.
+
+The daemon is written in C and does almost nothing on purpose: CPU time on a Gen
+1 STEMlab 125-14 is needed by `linien-server`. It spends its whole life blocked
+in `accept()` — no polling loop, no timer, no thread, no HTTP, no JSON, no
+Python, and no InfluxDB client on the board. Source and build instructions:
+[`rp-telemetry/`](rp-telemetry/README.md).
+
+### Protocol and port
+
+Line-based TCP on port **18864**, one request per (short-lived) connection:
+
+```text
+->  STATUS\n      <-  RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216
+                          memavail=311044 uptime=690.2 rootfree=1204880
+                          vccaux=1.802\n
+                          (one line; wrapped here to fit)
+                  <-  RPT1 ERR XADC\n       sysfs read failed
+->  VERSION\n     <-  RPT1 VERSION 1.4.0\n
+->  anything else <-  RPT1 ERR COMMAND\n
+```
+
+The temperature (°C) is the first field and always in the same place. What
+follows it is an optional tail of `key=value` host metrics, added in 1.2.0:
+
+| key | meaning |
+| --- | --- |
+| `cpu` | busy percent **since the previous STATUS request** |
+| `load1` | 1-minute load average |
+| `memtotal`, `memavail` | kB; `memavail` is the kernel's MemAvailable (MemFree on kernels too old to have it) |
+| `uptime` | seconds since boot |
+| `rootfree` | free kB on the root filesystem (the SD card) |
+| `vccaux` | FPGA auxiliary rail in volts, nominally 1.8 V, from the PS XADC (1.4.0+); see below |
+
+Each key is independently optional — a metric the board could not read is left
+out rather than sent as zero — and a reader must ignore keys it does not know.
+That is why this is a tail rather than a new command: a client written against
+1.1.0 parses the temperature from these lines unchanged.
+
+`RPT1` is the protocol/version identifier. Requests are capped at 64 bytes and
+accepted sockets have a 2 s receive timeout.
+
+Manual test:
+
+```bash
+printf 'STATUS\n' | nc <red-pitaya-host> 18864
+```
+
+```text
+RPT1 57.34 cpu=3.2 load1=0.41 memtotal=509216 memavail=311044 uptime=690.2 rootfree=1204880
+```
+
+The temperature comes from the Zynq XADC through Linux IIO. The daemon
+discovers the IIO device exposing `in_temp0_raw` at startup (the device index is
+not hard-coded), reads the constant `in_temp0_offset` / `in_temp0_scale` once,
+and per request re-reads only `in_temp0_raw`:
+
+```text
+temperature_c = (raw + offset) * scale / 1000.0
+```
+
+### Deployment
+
+Installation is always an **explicit operator action** — the gateway never
+installs the daemon just because a device exists or connects.
+
+Build the ARM binary once (Docker or zig, no local toolchain needed):
+
+```bash
+cd rp-telemetry
+./build-arm.sh
+```
+
+That drops a statically linked armv7 binary at
+`linien-gateway/app/assets/rp-telemetry-armv7`, which is what the gateway
+deploys. Until it exists, the install action fails with a message saying so
+rather than deploying anything.
+
+Then, per device: open the thermometer menu on the device card and choose
+**Install**. Or use **Telemetry: install all** in the devices panel header to do
+every board at once (each board is handled independently; one unreachable board
+does not fail the batch).
+
+Beside it, **Telemetry: start all** starts the service on every board — the
+action you want after a power cut or a batch of reboots, when every daemon is
+down and the per-device menu is twelve visits away. It asks for no confirmation
+because starting an already-running service is a no-op, and a board whose unit
+starts and then dies immediately is reported as a failure rather than counted
+as started.
+
+Install is idempotent and does the whole job over SSH:
+
+1. upload the binary to `/tmp/rp-telemetry.upload`,
+2. verify it (sha256, falling back to a byte-size check on images without
+   `sha256sum`),
+3. stage it at `/usr/local/bin/.rp-telemetry.new` with mode `0755` and **rename
+   it atomically** onto `/usr/local/bin/rp-telemetry`, so a failed upload can
+   never leave a truncated executable,
+4. write `/etc/systemd/system/rp-telemetry.service`,
+5. `systemctl daemon-reload`, `enable` (so it comes back after a reboot),
+   `restart`,
+6. confirm `systemctl is-active`,
+7. confirm the TCP protocol returns a plausible temperature.
+
+The unit is:
+
+```ini
+[Unit]
+Description=Red Pitaya telemetry (Zynq die temperature)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rp-telemetry --port 18864
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Uninstall / reinstall** — the same menu offers `Start`, `Stop`, `Restart`, and
+`Uninstall` per device (`Stop`, `Restart` and `Uninstall` are deliberately not
+offered fleet-wide: a mistake there should cost one board, not twelve). Uninstall stops and disables the service, removes the unit and the
+binary, and clears the gateway's install record. Reinstalling is just
+**Install** again; it replaces the binary and restarts the service. When the
+board runs an older build than the one bundled with the gateway, the card shows
+an **Update** action.
+
+### Polling, caching, and staleness
+
+- The gateway polls every device every **30 s**, all devices concurrently, over
+  TCP only. Connect and read timeouts are 1 s each, so one unreachable board
+  never delays the others.
+- **SSH is never used for monitoring** — only for the explicit management
+  actions above. Installation state is remembered in the device record so the
+  gateway can tell "installed but stopped" from "never installed" without an SSH
+  round trip.
+- Readings are cached. `GET /api/devices/statuses`, `GET /api/devices/{key}/status`
+  and `DeviceSession.status()` read that cache and make no remote calls, so
+  telemetry cannot slow the status endpoints, the RPyC poll loop, plot
+  processing, WebSocket streaming, auto-relock, or connection diagnosis.
+- A changed reading is pushed over the existing per-device WebSocket `status`
+  message, so the UI updates without waiting for the REST backstop poll.
+  Temperature is compared at 0.1 °C resolution, so a settled board does not
+  generate a message every cycle.
+- **Staleness**: a successful reading older than **90 s** (three missed polls) is
+  reported as `stale` and the UI stops presenting it as current. The last value
+  is kept internally for context but is never shown as a live number. Note that
+  a *failed* poll reports `offline`/`stopped`/`error` instead, so `stale` means
+  the gateway stopped polling, not that the board is unwell.
+
+### When something goes wrong
+
+Failures of an action you triggered (Install, Start, Stop, Restart, Uninstall)
+surface as an error toast **and** an entry in the Logs modal, carrying the
+reason — a missing bundled binary, a checksum mismatch, a truncated upload, a
+service that would not start, or one that started but never answered.
+
+If a board *reboots* the moment a temperature is requested, it is running
+daemon 1.0.0 and has picked the FPGA-backed XADC; update it from the telemetry
+panel and see
+[rp-telemetry/TROUBLESHOOTING.md](rp-telemetry/TROUBLESHOOTING.md).
+
+Because the daemon's own output goes to the board's systemd journal, the
+gateway pulls the last 20 journal lines back when a start or verification step
+fails and appends them to the message. That is what turns the most likely
+first-install failure — a binary built for the wrong architecture — from
+"service did not become active" into `Exec format error`, without an SSH
+session. `GET /api/devices/{key}/telemetry/service` returns the same journal
+tail in its `journal` field.
+
+Background problems the operator never triggered — sustained telemetry loss, a
+version mismatch, a failed InfluxDB write, and the recoveries from each — are
+toasted once per state transition, not once per poll, and are always in the
+Logs modal.
+
+Per-device telemetry state is one of `unknown` (not polled yet),
+`not_installed`, `running`, `stopped`, `offline`, `stale`, `error`, or
+`version_mismatch` (the endpoint answered something that is not this protocol).
+
+### UI
+
+Each device card shows, under the host/IP:
+
+```text
+Laser A
+192.168.1.42:18862
+RP temperature: 57.3 °C
+CPU 4% · RAM 41% · disk 1.1 GB · VCCAUX 1.80 V · up 3d 4h
+```
+
+The second line is the board's own health, sampled on the same request as the
+temperature and therefore withdrawn with it the moment the reading goes stale.
+`CPU` is the busy fraction between the gateway's last two polls, not an instant.
+Memory turns amber above 90 % used and red above 97 %; free disk turns amber
+below 200 MB and red below 50 MB. `VCCAUX` is the board's FPGA auxiliary rail,
+nominally 1.8 V, as measured by the XADC (daemon 1.4.0+). It is shown without
+any colour threshold and is meant for comparing boards, not for judging them.
+It is a regulated output rather than the board's 5 V input, and at one sample
+per poll it cannot catch brief droops. Boards running a telemetry daemon older
+than 1.2.0 report no metrics and show only the temperature line; boards older
+than 1.4.0 show no `VCCAUX`.
+
+and when it is unavailable, the reason plus a one-click remedy:
+
+```text
+RP temperature: unavailable
+Telemetry not installed   [Install]
+```
+
+The multi-device overview cards show the temperature alone: CPU and memory move
+on every poll, and putting them in the card would re-render every plot card in
+the grid twice a minute to display a number nobody is watching there. Temperatures are
+shown neutrally up to 75 °C, amber to 85 °C, and red above that — see
+`linien-web/src/features/devices/telemetryDisplay.ts` for the thresholds and the
+rationale (the XC7Z010 is rated to a maximum junction temperature of 85 °C).
+Nothing is ever shut down automatically.
+
+### InfluxDB logging
+
+The **gateway** writes the temperature — the daemon never talks to InfluxDB, and
+the Red Pitaya makes no extra HTTP/TLS request.
+
+- Field name: **`rp_temperature_c`**, written to the same measurement, bucket,
+  org, and URL already configured for that device.
+- Alongside it, the board's host metrics from the same sample:
+  **`rp_cpu_percent`**, **`rp_load1`**, **`rp_mem_used_percent`**,
+  **`rp_mem_available_kb`**, **`rp_root_free_kb`**, **`rp_uptime_s`** and
+  **`rp_vccaux_v`** (daemon 1.4.0+) — one
+  point per device per cycle, not one per metric. A metric the board did not
+  report is **absent** from the point rather than written as zero: a gap in the
+  series is the truth, a zero is a measurement that never happened. Boards
+  running a daemon older than 1.2.0 log the temperature alone.
+- Written **untagged**, exactly like the Linien parameter logging, so the
+  temperature lands in the same series as the rest of that device's data
+  instead of a neighbouring one. Each device is expected to have its own
+  destination — as it already must for the Linien parameters themselves.
+- Cadence matches the telemetry poll (30 s).
+- Only written for devices that have InfluxDB logging **enabled**.
+- Points for devices sharing a destination are batched into one request, and the
+  HTTP connection is kept alive between cycles.
+- Best effort: a failed write never affects telemetry polling, the Linien
+  connection, locking, plotting, or auto-relock, and a sustained outage is logged
+  once (with one recovery message) rather than every 30 s.
+
+The existing Linien parameter logging is unchanged: it still runs on the Red
+Pitaya, driven by `linien-server`, and remains authoritative for those
+parameters.
+
+### Testing without hardware
+
+`linien-sim` ships a host-side stand-in that speaks the same protocol:
+
+```bash
+linien-rp-telemetry-sim --port 18864 --base 57
+linien-rp-telemetry-sim --port 18864 --fail          # exercise the error state
+linien-rp-telemetry-sim --port 18864 --version 0.9.0 # exercise "update available"
+```
+
+### Security note
+
+`rp-telemetry` answers only the fixed protocol above — there is no path to
+arbitrary command execution — but it is unauthenticated and binds all interfaces
+so the gateway can reach it over the LAN. Like the rest of this deployment it
+assumes a trusted, isolated lab network. See [Security model](#security-model).
 
 ## Logs and observability
 
