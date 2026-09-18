@@ -59,6 +59,10 @@ SECTION_MAX_CHARS = 20_000
 # the decoder can find it without re-running anything.
 REBOOT_STATUS_ADDR = "0xF8000258"
 REBOOT_STATUS_PREFIX = "REBOOT_STATUS="
+# The same address as a count of 4-byte words, for the `dd` fallback below.
+# Derived rather than written out so the two can never disagree, and kept in
+# words because `dd`'s byte offset would overflow 32-bit shell arithmetic.
+REBOOT_STATUS_SKIP_WORDS = int(REBOOT_STATUS_ADDR, 16) // 4
 # Bit -> what caused the last reset. Bits 16-19 are as documented for the
 # Zynq-7000 (UG585 section 6.3.12); 20-22 follow the same order the TRM lists
 # the reset sources in, but I could not verify them against the manual here --
@@ -331,19 +335,40 @@ _SECTIONS: tuple[tuple[str, str, str, bool], ...] = (
         # kernel log cannot answer that, because a board that lost power wrote
         # nothing before it went.
         #
-        # Three ways to read a PS register, because these images differ: the
-        # busybox applet, devmem2 where it was installed, and Red Pitaya's own
-        # `monitor`. Reading SLCR touches nothing in the FPGA fabric.
+        # Five ways to read one PS register, because these images differ and a
+        # board that cannot be read is a board whose reset cause is gone for
+        # good. In order of directness: the busybox `devmem` applet, `devmem2`,
+        # Red Pitaya's own `monitor`, busybox invoked by name for an image that
+        # never symlinked the applet, and -- needing nothing installed at all
+        # -- `dd` on /dev/mem formatted by `od`. A field board had none of the
+        # first three and reported "no way to read", which is what the last two
+        # are for.
+        #
+        # Each step runs when the previous produced nothing, not merely when
+        # its tool was absent: the chain used to be an if/elif, so a `devmem`
+        # that existed and failed silently ended it with an empty answer and
+        # the remaining tools were never tried.
+        #
+        # `dd` seeks in 4-byte words rather than bytes, so the offset stays
+        # inside 32-bit shell arithmetic on armv7. Reading SLCR touches nothing
+        # in the FPGA fabric.
         'V=""; '
         "if command -v devmem >/dev/null 2>&1; then "
-        'V=$(devmem ' + REBOOT_STATUS_ADDR + ' 32 2>/dev/null); '
-        "elif command -v devmem2 >/dev/null 2>&1; then "
+        'V=$(devmem ' + REBOOT_STATUS_ADDR + ' 32 2>/dev/null); fi; '
+        'if [ -z "$V" ] && command -v devmem2 >/dev/null 2>&1; then '
         'V=$(devmem2 ' + REBOOT_STATUS_ADDR + ' w 2>/dev/null '
-        '| sed -n "s/.*: 0x/0x/p" | tail -n 1); '
-        "elif command -v monitor >/dev/null 2>&1; then "
+        '| sed -n "s/.*: 0x/0x/p" | tail -n 1); fi; '
+        'if [ -z "$V" ] && command -v monitor >/dev/null 2>&1; then '
         'V=$(monitor ' + REBOOT_STATUS_ADDR + ' 2>/dev/null); fi; '
+        'if [ -z "$V" ] && command -v busybox >/dev/null 2>&1; then '
+        'V=$(busybox devmem ' + REBOOT_STATUS_ADDR + ' 32 2>/dev/null); fi; '
+        'if [ -z "$V" ] && [ -r /dev/mem ]; then '
+        'W=$(dd if=/dev/mem bs=4 count=1 skip=' + str(REBOOT_STATUS_SKIP_WORDS)
+        + ' 2>/dev/null | od -An -tx4 | tr -d " \\n"); '
+        '[ -n "$W" ] && V="0x$W"; fi; '
         'if [ -n "$V" ]; then echo "' + REBOOT_STATUS_PREFIX + '$V"; '
-        'else echo "no way to read ' + REBOOT_STATUS_ADDR + '"; fi',
+        'else echo "no way to read ' + REBOOT_STATUS_ADDR
+        + ' (tried devmem, devmem2, monitor, busybox devmem, /dev/mem)"; fi',
         True,
     ),
     (

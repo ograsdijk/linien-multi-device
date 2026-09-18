@@ -367,6 +367,44 @@ def test_a_decimal_register_value_is_accepted_too():
     assert bd.parse_reboot_status("REBOOT_STATUS=524288") == 1 << 19
 
 
+def test_every_reader_is_tried_rather_than_only_the_first_one_present():
+    """The chain was an if/elif, so a `devmem` that exists and fails silently
+    ended it with an empty answer and nothing else was attempted."""
+    command = next(s for s in bd._SECTIONS if s[0] == "reboot_status")[2]
+
+    # One `if` per reader, each guarded on the value still being empty, rather
+    # than a single if/elif whose first present tool decides the outcome.
+    assert "elif" not in command
+    assert command.count('if [ -z "$V" ]') == 4
+
+
+def test_the_register_can_be_read_with_nothing_installed():
+    """A field board had no devmem, no devmem2 and no monitor, and reported
+    "no way to read". `dd` and `od` are in every busybox."""
+    command = next(s for s in bd._SECTIONS if s[0] == "reboot_status")[2]
+
+    assert "if=/dev/mem" in command
+    # Seeking in 4-byte words, not bytes: the byte offset is 0xF8000258, which
+    # overflows 32-bit shell arithmetic on the armv7 boards.
+    assert "bs=4" in command
+    assert "skip=" + str(bd.REBOOT_STATUS_SKIP_WORDS) in command
+    assert bd.REBOOT_STATUS_SKIP_WORDS * 4 == int(bd.REBOOT_STATUS_ADDR, 16)
+
+
+def test_an_unreadable_register_says_what_was_tried():
+    """"no way to read 0xF8000258" alone sent a whole round of diagnosis
+    looking for a gateway bug rather than a missing tool on the board."""
+    bundle = _reboot_bundle(
+        "no way to read 0xF8000258 "
+        "(tried devmem, devmem2, monitor, busybox devmem, /dev/mem)"
+    )
+
+    assert bundle["reboot_status"] is None
+    section = next(s for s in bundle["sections"] if s["name"] == "reboot_status")
+    for tool in ("devmem", "devmem2", "monitor", "/dev/mem"):
+        assert tool in section["output"]
+
+
 def test_reading_the_register_never_touches_the_fpga():
     """The PL-backed XADC hangs the AXI bus when the Linien bitstream is
     loaded; the same caution applies to anything else read over /dev/mem."""
