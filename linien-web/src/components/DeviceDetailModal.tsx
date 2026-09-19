@@ -22,7 +22,6 @@ import { usePlotStream } from '../features/devices/usePlotStream';
 import { OverviewPlotPanel } from './OverviewPlotPanel';
 import { ThrottledStatusRow } from './ThrottledStatusRow';
 import { RpTemperatureLine } from './RpTemperatureLine';
-import { RpHostMetricsLine } from './RpHostMetricsLine';
 import type { TelemetryCommand } from './DeviceList';
 
 export type DeviceDetailModalProps = {
@@ -158,7 +157,6 @@ export function DeviceDetailModal({
                 void onTelemetryCommand(device.key, action === 'update' ? 'install' : action);
               }}
             />
-            <RpHostMetricsLine status={status} deviceKey={device.key} />
           </div>
           <Group gap={6} align="center">
             <div

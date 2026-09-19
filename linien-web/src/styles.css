@@ -299,6 +299,17 @@ body {
   color: var(--tag-text);
 }
 
+/* Icon-only variant for the collapsed row: square, so two of them cost about
+   the width of one word and the device name keeps the rest of the line. */
+.device-tag-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  flex: 0 0 auto;
+  line-height: 0;
+}
+
 .device-tag-button {
   appearance: none;
   font-family: inherit;

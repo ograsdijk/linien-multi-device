@@ -17,12 +17,18 @@ import {
   TextInput,
 } from '@mantine/core';
 import {
+  IconAlertTriangle,
   IconChevronDown,
   IconChevronLeft,
   IconChevronRight,
   IconDevices,
   IconLayoutSidebarRightExpand,
+  IconLoader2,
+  IconLock,
+  IconLockOpen,
   IconPencil,
+  IconPlugConnected,
+  IconPlugConnectedX,
   IconSearch,
   IconTemperature,
   IconTrash,
@@ -276,10 +282,34 @@ function DeviceRow({
               {device.host}:{device.port}
             </Text>
           </div>
-          <div className={`device-tag status-${state}`}>{tagLabel}</div>
-          <div className={`device-tag status-lock-${lockDisplay.uiState}`}>
-            {lockDisplay.label}
-          </div>
+          <span
+            className={`device-tag device-tag-glyph status-${state}`}
+            title={tagLabel}
+            role="img"
+            aria-label={tagLabel}
+          >
+            {state === 'error' ? (
+              <IconAlertTriangle size={13} />
+            ) : state === 'connecting' ? (
+              <IconLoader2 size={13} />
+            ) : state === 'connected' ? (
+              <IconPlugConnected size={13} />
+            ) : (
+              <IconPlugConnectedX size={13} />
+            )}
+          </span>
+          <span
+            className={`device-tag device-tag-glyph status-lock-${lockDisplay.uiState}`}
+            title={lockDisplay.label}
+            role="img"
+            aria-label={lockDisplay.label}
+          >
+            {lockDisplay.uiState === 'locked' || lockDisplay.uiState === 'marginal' ? (
+              <IconLock size={13} />
+            ) : (
+              <IconLockOpen size={13} />
+            )}
+          </span>
           <ActionIcon
             size="sm"
             variant="subtle"
@@ -335,7 +365,11 @@ function DeviceRow({
                   </Text>
                 ) : null}
               </div>
-              <Group gap={6} align="center" wrap="nowrap">
+              <Group gap={6} align="center" wrap="wrap" justify="flex-end">
+                <div className={`device-tag status-${state}`}>{tagLabel}</div>
+                <div className={`device-tag status-lock-${lockDisplay.uiState}`}>
+                  {lockDisplay.label}
+                </div>
                 {connectionDisplay.show ? (
                   <div
                     className={`device-tag diag-${connectionDisplay.color}`}

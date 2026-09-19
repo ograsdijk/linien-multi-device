@@ -107,6 +107,22 @@ describe('DeviceList search and rows', () => {
     expect(screen.getByText(/clear filters to reorder/)).toBeTruthy();
   });
 
+  it('carries state as a glyph, so the name keeps the row', () => {
+    renderList({ 'dev-1': { connected: true, lock: true } as DeviceStatus });
+
+    // Spelled out, these two tags left roughly 50px for the name in a 320px
+    // navbar and every device rendered as an ellipsis. The state stays
+    // reachable by its accessible name while costing no width: the glyph
+    // renders an icon and no text at all.
+    const connection = screen.getAllByRole('img', { name: 'Connected' });
+    expect(connection).toHaveLength(1);
+    expect(connection[0].textContent).toBe('');
+
+    const lock = screen.getAllByRole('img', { name: /^Lock: / });
+    expect(lock).toHaveLength(3);
+    lock.forEach((glyph) => expect(glyph.textContent).toBe(''));
+  });
+
   it('opens one row at a time', () => {
     renderList();
     fireEvent.click(screen.getByLabelText('Expand cavity-north'));
