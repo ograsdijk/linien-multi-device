@@ -135,7 +135,7 @@ export const DeviceOverviewCard = memo(function DeviceOverviewCard({
           />
         </div>
         <Group gap="xs" align="center">
-          <Text size="xs" c="dimmed">
+          <Text size="xs" c={connected ? lockDisplay.color : 'dimmed'}>
             {statusLabel}
           </Text>
           {connectionDisplay.show ? (

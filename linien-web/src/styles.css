@@ -24,6 +24,9 @@
   --tag-amber-bg: #fff1da;
   --tag-amber-border: #f4d6a6;
   --tag-amber-text: #8a5a10;
+  --tag-blue-bg: #e2eef7;
+  --tag-blue-border: #bcd7ea;
+  --tag-blue-text: #1d5578;
 }
 
 :root[data-mantine-color-scheme='dark'] {
@@ -50,6 +53,9 @@
   --tag-amber-bg: #3d2c18;
   --tag-amber-border: #644324;
   --tag-amber-text: #f3d39b;
+  --tag-blue-bg: #1c2f3b;
+  --tag-blue-border: #2c4a5e;
+  --tag-blue-text: #b3d8ef;
 }
 
 body {
@@ -339,6 +345,15 @@ body {
   background: var(--tag-amber-bg);
   border-color: var(--tag-amber-border);
   color: var(--tag-amber-text);
+}
+
+/* Lock engaged, but no indicator is confirming it. Distinct from green so a
+   verified lock still reads differently from one we are only told about, and
+   distinct from the neutral tag so "on" never looks like "off". */
+.device-tag.status-lock-on {
+  background: var(--tag-blue-bg);
+  border-color: var(--tag-blue-border);
+  color: var(--tag-blue-text);
 }
 
 .device-tag.status-lock-locked {

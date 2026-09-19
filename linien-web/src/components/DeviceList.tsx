@@ -304,7 +304,9 @@ function DeviceRow({
             role="img"
             aria-label={lockDisplay.label}
           >
-            {lockDisplay.uiState === 'locked' || lockDisplay.uiState === 'marginal' ? (
+            {lockDisplay.uiState === 'locked' ||
+            lockDisplay.uiState === 'marginal' ||
+            lockDisplay.uiState === 'on' ? (
               <IconLock size={13} />
             ) : (
               <IconLockOpen size={13} />
