@@ -663,8 +663,8 @@ def delete_device(key: str) -> dict:
     device = _get_device_or_404(key)
     existing = session_registry.get(key)
     if existing is not None:
-        # Outside the key lock: a guarded center move takes seconds, and every
-        # other request for this device would queue behind it.
+        # Outside the key lock: a relock action takes seconds, and every other
+        # request for this device would queue behind it.
         existing.await_relock_action()
     with session_registry.lock_for(key):
         session = session_registry.remove(key)
@@ -1134,9 +1134,8 @@ def auto_lock_candidates(key: str, payload: AutoLockScanSettings | None = None) 
 def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:
     """Board-event payload for a started auto-lock.
 
-    Includes the guarded-move numbers when one ran, so how far the center
-    travelled and how much hysteresis correction it needed are on the per-device
-    record rather than only in the HTTP response.
+    Puts the detection the lock was started from on the per-device record
+    rather than only in the HTTP response.
     """
     details: dict[str, Any] = {
         "target_voltage": result.get("target_voltage"),

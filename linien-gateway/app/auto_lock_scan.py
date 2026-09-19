@@ -185,8 +185,7 @@ def scan_too_wide_to_lock(
     a dispersive signal has no sidebands, and a PDH scan that did not resolve
     ±Ω has not measured the width this rule is about. Treating an unmeasured
     spacing as "too wide" would narrow every such scan, including ones that lock
-    perfectly well; a scan too wide to lock is better caught by the guarded
-    move, which reports the landing it actually got.
+    perfectly well.
     """
     fraction = float(settings.min_signal_scan_fraction)
     if fraction <= 0.0:
