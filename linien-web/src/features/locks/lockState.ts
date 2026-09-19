@@ -5,8 +5,8 @@ import type {
   LockIndicatorSnapshot,
 } from '../../types';
 
-export type LockUiState = 'unknown' | 'locked' | 'marginal' | 'lost';
-export type LockUiColor = 'dimmed' | 'green' | 'orange' | 'red';
+export type LockUiState = 'unknown' | 'on' | 'locked' | 'marginal' | 'lost';
+export type LockUiColor = 'dimmed' | 'blue' | 'green' | 'orange' | 'red';
 
 export type LockDisplay = {
   uiState: LockUiState;
@@ -43,7 +43,10 @@ export const resolveLockDisplay = (args: {
   }
   const indicatorEnabled = isLockIndicatorEnabled(indicator);
   if (!indicatorEnabled) {
-    return { uiState: 'unknown', label: 'Lock: on', color: 'dimmed', effectiveLocked: true };
+    // The lock IS engaged; only the confirmation is missing. Reporting that as
+    // 'unknown'/dimmed made it indistinguishable from "Lock: off" everywhere
+    // the tag is drawn, so on/off could only be told apart by reading the text.
+    return { uiState: 'on', label: 'Lock: on', color: 'blue', effectiveLocked: true };
   }
   const state = indicator?.state ?? 'unknown';
   if (state === 'locked') {

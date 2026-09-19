@@ -24,6 +24,9 @@
   --tag-amber-bg: #fff1da;
   --tag-amber-border: #f4d6a6;
   --tag-amber-text: #8a5a10;
+  --tag-blue-bg: #e2eef7;
+  --tag-blue-border: #bcd7ea;
+  --tag-blue-text: #1d5578;
 }
 
 :root[data-mantine-color-scheme='dark'] {
@@ -50,6 +53,9 @@
   --tag-amber-bg: #3d2c18;
   --tag-amber-border: #644324;
   --tag-amber-text: #f3d39b;
+  --tag-blue-bg: #1c2f3b;
+  --tag-blue-border: #2c4a5e;
+  --tag-blue-text: #b3d8ef;
 }
 
 body {
@@ -103,6 +109,35 @@ body {
 
 .device-card-sortable[data-dragging='true'] {
   opacity: 0.22;
+}
+
+.device-row {
+  cursor: default;
+}
+
+.device-row-head {
+  cursor: grab;
+  padding: 2px;
+}
+
+.device-row[data-sortable='false'] .device-row-head {
+  cursor: pointer;
+}
+
+.device-row-head:active {
+  cursor: grabbing;
+}
+
+/* Name and host have to give way inside a 320px navbar; without a zero
+   min-width the flex item refuses to shrink and the tags fall off the row. */
+.device-row-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.device-row-body {
+  position: relative;
+  padding: 6px 2px 28px;
 }
 
 .device-card-drag-overlay {
@@ -270,6 +305,17 @@ body {
   color: var(--tag-text);
 }
 
+/* Icon-only variant for the collapsed row: square, so two of them cost about
+   the width of one word and the device name keeps the rest of the line. */
+.device-tag-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  flex: 0 0 auto;
+  line-height: 0;
+}
+
 .device-tag-button {
   appearance: none;
   font-family: inherit;
@@ -299,6 +345,15 @@ body {
   background: var(--tag-amber-bg);
   border-color: var(--tag-amber-border);
   color: var(--tag-amber-text);
+}
+
+/* Lock engaged, but no indicator is confirming it. Distinct from green so a
+   verified lock still reads differently from one we are only told about, and
+   distinct from the neutral tag so "on" never looks like "off". */
+.device-tag.status-lock-on {
+  background: var(--tag-blue-bg);
+  border-color: var(--tag-blue-border);
+  color: var(--tag-blue-text);
 }
 
 .device-tag.status-lock-locked {
