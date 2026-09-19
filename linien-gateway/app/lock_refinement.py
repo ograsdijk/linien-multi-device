@@ -5,8 +5,7 @@ around a detected feature, one bounded stage at a time, so the lock can be
 handed over safely. This module states the constraint order once and does
 the arithmetic; ``session.py`` performs the I/O (writing scan geometry,
 capturing a fresh trace, re-detecting) and drives its loop from what this
-module decides. It mirrors the split ``lock_approach.py`` already uses for
-the guarded move: that module "plans the move; it does not perform it."
+module decides: it plans the walk, it does not perform it.
 
 Across eight rounds of field testing on a DFB whose apparent feature position
 moves with scan geometry, the next amplitude came to depend on four

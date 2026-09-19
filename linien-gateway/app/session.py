@@ -152,8 +152,8 @@ class TrajectoryRefinementAborted(RuntimeError):
 # (_trajectory_refine_auto_lock, below) is the only remaining consumer.
 
 # How long a disconnect waits for an in-flight relock action to finish before
-# going ahead anyway. A guarded center move takes seconds; abandoning one
-# mid-ramp leaves the sweep center on an arbitrary set-point.
+# going ahead anyway. A relock scan takes seconds; abandoning one part-way
+# leaves the sweep center on an arbitrary set-point.
 RELOCK_ACTION_DRAIN_TIMEOUT_S = 5.0
 
 # Frames a verification sweep must observe before it trusts what it sees. One is
@@ -272,8 +272,8 @@ class DeviceSession:
         self._state_lock = threading.RLock()
         self._relock_action_lock = threading.Lock()
         # Serialises everything that drives the sweep center over time. A
-        # guarded move and a hysteresis measurement both walk the actuator for
-        # seconds; interleaved they would each measure offsets the other caused.
+        # refinement walk moves the actuator for seconds; interleaved runs would
+        # each measure offsets the other caused.
         self._center_move_lock = threading.Lock()
         # (center_v, amplitude_v) to put back when the sweep next starts, after
         # a refined auto-lock narrowed it. Deferred rather than written at lock
@@ -1098,8 +1098,8 @@ class DeviceSession:
         )
         # Validated through the same Pydantic model the HTTP boundary uses, for
         # the reasons given in _initial_auto_lock_scan_settings: a stored block
-        # that fails validation falls back to defaults (i.e. the guarded move
-        # off) rather than feeding out-of-range motion settings to the hardware.
+        # that fails validation falls back to defaults rather than feeding
+        # out-of-range acceptance settings to the refinement walk.
         if isinstance(payload, dict):
             try:
                 payload = schemas.LockAcceptanceSettings.model_validate(
@@ -1641,9 +1641,9 @@ class DeviceSession:
     def _await_relock_action(self, timeout_s: float = RELOCK_ACTION_DRAIN_TIMEOUT_S) -> None:
         """Give an in-flight relock a moment to stop driving the sweep center.
 
-        A guarded move takes seconds, so tearing the connection down underneath
-        one can strand the center part-way along a ramp. Bounded: a stuck action
-        must not block a disconnect indefinitely.
+        A relock takes seconds, so tearing the connection down underneath one
+        can strand the center part-way through. Bounded: a stuck action must not
+        block a disconnect indefinitely.
 
         Waits on `_relock_action_lock` rather than a thread handle: the lock is
         claimed synchronously before the worker thread even exists, so a
@@ -2327,9 +2327,9 @@ class DeviceSession:
         # and snapshot reads don't stall during a (possibly multi-second)
         # relock sweep/scan. complete_action() applies the result. (#26)
         if relock_action == "relock":
-            # Off the poll thread, not just outside _state_lock. A guarded
-            # center move waits for a fresh unlocked trace, and this callback IS
-            # the thread that produces them -- run inline, it would block
+            # Off the poll thread, not just outside _state_lock. A refinement
+            # walk waits for a fresh unlocked trace, and this callback IS the
+            # thread that produces them -- run inline, it would block
             # waiting for output it is itself preventing, time out on every
             # attempt, and stall the plot pipeline meanwhile. Note that tick()
             # keeps handing out "relock" every frame until complete_action
@@ -3043,7 +3043,7 @@ class DeviceSession:
                 # disagreed about where the feature was.
 
             # The coarse result only guides geometry. Demand two fresh strict
-            # detections at the final unchanged geometry before any guarded move.
+            # detections at the final unchanged geometry before the handover.
             try:
                 strict_one, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
                     settings, after=time.time()
@@ -3076,9 +3076,9 @@ class DeviceSession:
             identity.check(
                 strict_two, amplitude_v=amplitude_v, resolution_samples=resolution, check_sideband=False
             )
-            # One definition of "the feature moved too far", shared with the
-            # guarded move, rather than a second inline literal that silently
-            # diverges from capture_fraction the moment anyone changes it.
+            # One definition of "the feature moved too far", taken from the
+            # acceptance settings rather than a second inline literal that
+            # silently diverges from capture_fraction when anyone changes it.
             # Floored at one sample: nothing can be resolved finer than that.
             window = acceptance_window_v(
                 acceptance, settings.half_range_sweep_v, strict_two.sideband_offset_v
