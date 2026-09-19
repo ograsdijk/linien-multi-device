@@ -1,8 +1,13 @@
 name: CI
 
+# Branch pushes are covered by the pull_request event, so `push` is scoped to
+# main. Listening to both for every branch ran the whole suite twice on any
+# branch with an open PR -- and the concurrency group below cannot dedupe them,
+# because the two events see different refs (refs/heads/<branch> vs
+# refs/pull/<n>/merge) and so land in different groups.
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 
 # A second push to the same branch supersedes the first; there is no value in
