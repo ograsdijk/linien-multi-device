@@ -712,16 +712,29 @@ def clear_reboot_status(
     script = _clear_reboot_status_script()
     # Written to a file and run, not passed with -c: the script is multi-line
     # and crossing SSH as one quoted argument is how quoting bugs get in.
+    # The quotes around the escaped text are load-bearing -- without them the
+    # remote shell reads the script's own newlines as command separators and
+    # the file is never written, which reads back as "the board printed no
+    # reading" rather than as the quoting mistake it is.
     remote = "/tmp/linien-clear-reset-cause.py"
+    # The interpreter is what has to run as root -- it is the one opening
+    # /dev/mem for writing. Privileging the whole compound instead would put
+    # `sudo -n` in front of the `printf` alone, leaving the write to fail with
+    # a permission error on any board that does not log in as root.
     command = (
-        "printf %s " + shell_single_quote(script) + " > " + remote + " && "
-        "{ python3 " + remote + " || python " + remote + "; }; "
+        "printf %s '" + shell_single_quote(script) + "' > " + remote + " && "
+        "{ " + privileged(device, "python3 " + remote) + " || "
+        + privileged(device, "python " + remote) + "; }; "
         "rm -f " + remote
     )
     try:
         with _open(device, connection_factory) as conn:
             exited, stdout, stderr = run_remote(
-                conn, device, command, timeout=SECTION_TIMEOUT_S + 5.0
+                conn,
+                device,
+                command,
+                timeout=SECTION_TIMEOUT_S + 5.0,
+                privileged_command=False,
             )
     except Exception as exc:  # noqa: BLE001 - reported, never raised at the API
         logger.debug("clearing the reset register failed", exc_info=True)

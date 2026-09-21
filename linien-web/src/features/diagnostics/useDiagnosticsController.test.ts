@@ -188,3 +188,21 @@ it('never renders one board’s bundle under another board’s title', async () 
   expect(hook.result.current.collecting).toBe(false);
 });
 
+
+it('keeps saying the bits did not clear after the re-collect', async () => {
+  // The re-collect resets the error on its way in, so a failure reported
+  // before it would vanish and leave the operator watching the same causes
+  // come back with no explanation.
+  vi.spyOn(api, 'clearResetCause').mockResolvedValue({
+    ok: false,
+    error: 'the bits did not clear',
+  });
+  vi.spyOn(api, 'collectDiagnostics').mockResolvedValue(bundle());
+  const { hook } = setup();
+
+  await act(async () => {
+    await hook.result.current.clearResetCause();
+  });
+
+  expect(hook.result.current.error).toBe('the bits did not clear');
+});

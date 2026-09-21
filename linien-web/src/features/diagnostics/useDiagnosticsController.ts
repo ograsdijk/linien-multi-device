@@ -109,12 +109,18 @@ export const useDiagnosticsController = ({
       // throwing -- the write went out and was read back, it just did not
       // take. Saying nothing would leave the operator believing the next
       // reading starts from zero.
-      if (!result.ok) {
-        setError(result.error || 'The reset-cause bits did not clear.');
-      }
+      //
+      // Reported after the re-collect, not before: `collect` clears the error
+      // on the way in, so a message set here would be wiped by it and the
+      // operator would see only the same causes coming back unexplained.
+      const failure = result.ok
+        ? null
+        : result.error || 'The reset-cause bits did not clear.';
       // Re-collect either way: the register now reads differently, and the
       // timeline has the pre-clear reading in it.
       await Promise.all([collect(), loadEvents()]);
+      if (currentKeyRef.current !== deviceKey) return;
+      if (failure) setError(failure);
     } catch (err) {
       const message = toErrorMessage(err, 'Could not clear the reset causes.');
       appendUiErrorLog('board_diagnostics', 'reset_cause_clear_failed', message, deviceKey);
