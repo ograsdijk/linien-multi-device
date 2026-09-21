@@ -710,22 +710,25 @@ def clear_reboot_status(
     cause nobody had looked at yet.
     """
     script = _clear_reboot_status_script()
-    # Written to a file and run, not passed with -c: the script is multi-line
-    # and crossing SSH as one quoted argument is how quoting bugs get in.
+    # Piped to the interpreter on stdin rather than staged in a file. The
+    # interpreter is what needs root -- it opens /dev/mem for writing -- and a
+    # script root executes must never sit, however briefly, at a fixed path in
+    # a world-writable directory: any other account on the board could swap it
+    # between the write and the run, or simply pre-create it and make our own
+    # write fail. Nothing touches the filesystem this way.
+    #
     # The quotes around the escaped text are load-bearing -- without them the
     # remote shell reads the script's own newlines as command separators and
-    # the file is never written, which reads back as "the board printed no
-    # reading" rather than as the quoting mistake it is.
-    remote = "/tmp/linien-clear-reset-cause.py"
-    # The interpreter is what has to run as root -- it is the one opening
-    # /dev/mem for writing. Privileging the whole compound instead would put
-    # `sudo -n` in front of the `printf` alone, leaving the write to fail with
-    # a permission error on any board that does not log in as root.
+    # the interpreter is fed nothing, which reads back as "the board printed
+    # no reading" rather than as the quoting mistake it is.
+    #
+    # The interpreter is resolved before the pipe so the script crosses once:
+    # a `python3 || python` fallback around the pipeline would have to repeat
+    # the whole text, the first run having consumed stdin.
     command = (
-        "printf %s '" + shell_single_quote(script) + "' > " + remote + " && "
-        "{ " + privileged(device, "python3 " + remote) + " || "
-        + privileged(device, "python " + remote) + "; }; "
-        "rm -f " + remote
+        "PY=$(command -v python3 || command -v python); "
+        "printf %s '" + shell_single_quote(script) + "' | "
+        + privileged(device, "$PY -")
     )
     try:
         with _open(device, connection_factory) as conn:

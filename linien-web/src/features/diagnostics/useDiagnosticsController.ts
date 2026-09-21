@@ -42,16 +42,21 @@ export const useDiagnosticsController = ({
   const currentKeyRef = useRef<string | null>(deviceKey);
   currentKeyRef.current = deviceKey;
 
-  const loadEvents = useCallback(async () => {
-    if (!deviceKey) return;
+  // Both of these return the message they reported, or null. The clear
+  // re-runs them and has a failure of its own to weigh against theirs.
+  const loadEvents = useCallback(async (): Promise<string | null> => {
+    if (!deviceKey) return null;
     setEventsLoading(true);
     try {
       const result = await api.getBoardEvents(deviceKey);
-      if (currentKeyRef.current !== deviceKey) return;
+      if (currentKeyRef.current !== deviceKey) return null;
       setEvents(result.events ?? []);
+      return null;
     } catch (err) {
-      if (currentKeyRef.current !== deviceKey) return;
-      setError(toErrorMessage(err, 'Could not load the board timeline.'));
+      if (currentKeyRef.current !== deviceKey) return null;
+      const message = toErrorMessage(err, 'Could not load the board timeline.');
+      setError(message);
+      return message;
     } finally {
       if (currentKeyRef.current === deviceKey) setEventsLoading(false);
     }
@@ -74,25 +79,30 @@ export const useDiagnosticsController = ({
     if (deviceKey) void loadEvents();
   }, [deviceKey, loadEvents]);
 
-  const collect = useCallback(async () => {
-    if (!deviceKey) return;
+  const collect = useCallback(async (): Promise<string | null> => {
+    if (!deviceKey) return null;
     setCollecting(true);
     setError(null);
     try {
       const result = await api.collectDiagnostics(deviceKey);
-      if (currentKeyRef.current !== deviceKey) return;
+      if (currentKeyRef.current !== deviceKey) return null;
       setBundle(result);
       // A bundle that came back `ok: false` still carries whatever was read
       // before the board stopped answering, so it is shown rather than
       // discarded -- with the reason alongside it.
-      if (!result.ok && result.error) setError(result.error);
+      if (!result.ok && result.error) {
+        setError(result.error);
+        return result.error;
+      }
+      return null;
     } catch (err) {
       const message = toErrorMessage(err, 'Could not collect diagnostics.');
       // Logged whichever board is in front of the operator now: the failure
       // happened, and the log entry carries the key it happened to.
       appendUiErrorLog('board_diagnostics', 'diagnostics_collect_failed', message, deviceKey);
-      if (currentKeyRef.current !== deviceKey) return;
+      if (currentKeyRef.current !== deviceKey) return null;
       setError(message);
+      return message;
     } finally {
       if (currentKeyRef.current === deviceKey) setCollecting(false);
     }
@@ -118,9 +128,16 @@ export const useDiagnosticsController = ({
         : result.error || 'The reset-cause bits did not clear.';
       // Re-collect either way: the register now reads differently, and the
       // timeline has the pre-clear reading in it.
-      await Promise.all([collect(), loadEvents()]);
+      const reread = await Promise.all([collect(), loadEvents()]);
       if (currentKeyRef.current !== deviceKey) return;
-      if (failure) setError(failure);
+      // Everything that went wrong, not just the last thing to set it. A
+      // board that stopped answering explains the stale bundle, and the clear
+      // failure is the answer to what the operator actually asked for --
+      // showing either one alone leaves the other looking fine.
+      const problems = [failure, ...reread].filter(
+        (message): message is string => Boolean(message)
+      );
+      if (problems.length > 0) setError(problems.join(' — '));
     } catch (err) {
       const message = toErrorMessage(err, 'Could not clear the reset causes.');
       appendUiErrorLog('board_diagnostics', 'reset_cause_clear_failed', message, deviceKey);
