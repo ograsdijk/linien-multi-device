@@ -1,4 +1,5 @@
 import builtins
+import subprocess
 import struct
 from types import SimpleNamespace
 
@@ -609,6 +610,62 @@ def test_the_clear_relocks_slcr_even_when_the_write_fails():
             _run_clear_script(page)
 
     assert page.unlocked is False
+
+
+def test_the_script_reaches_the_board_intact(tmp_path):
+    """The script is multi-line, so the shell only sees one command if the
+    escaped text is quoted. Unquoted, the board read the script's own newlines
+    as command separators: nothing reached the interpreter, nothing was
+    cleared, and the causes came back unchanged on the next collect."""
+    conn = FakeConnection(
+        rules={"/dev/mem": FakeResult(stdout="BEFORE=0x1\nAFTER=0x0\nMETHOD=x\n")}
+    )
+
+    bd.clear_reboot_status(Device(), connection_factory=factory_for(conn))
+
+    # Run the real command through a real shell with the interpreter replaced
+    # by `cat`, and compare what would have been fed in against the script.
+    # rsplit: the script's own text contains " | " (`mmap.PROT_READ |
+    # mmap.PROT_WRITE`), so only the last one is the pipe to the interpreter.
+    landed = tmp_path / "fed-in.py"
+    command = conn.commands[0].rsplit(" | ", 1)[0] + " > " + str(landed)
+    subprocess.run(["sh", "-c", command], check=True)
+
+    assert landed.read_text() == bd._clear_reboot_status_script()
+
+
+def test_the_script_is_never_staged_on_the_board(tmp_path):
+    """Root runs this script, so it must not exist as a file first. A fixed
+    path under a world-writable /tmp is swappable between the write and the
+    run by any other account on the board -- and root then runs their file,
+    with /dev/mem open."""
+    conn = FakeConnection(
+        rules={"/dev/mem": FakeResult(stdout="BEFORE=0x1\nAFTER=0x0\nMETHOD=x\n")}
+    )
+
+    bd.clear_reboot_status(Device(), connection_factory=factory_for(conn))
+
+    command = conn.commands[0]
+    assert "/tmp" not in command
+    assert " > " not in command.rsplit("'", 1)[-1]
+
+
+def test_the_interpreter_is_the_part_that_runs_as_root():
+    """It is the process opening /dev/mem for writing. `sudo -n` in front of
+    the compound would privilege the `printf` and nothing else."""
+
+    class Sudoer(Device):
+        username = "pi"
+
+    conn = FakeConnection(
+        rules={"/dev/mem": FakeResult(stdout="BEFORE=0x1\nAFTER=0x0\nMETHOD=x\n")}
+    )
+
+    bd.clear_reboot_status(Sudoer(), connection_factory=factory_for(conn))
+
+    command = conn.commands[0]
+    assert command.endswith("| sudo -n $PY -")
+    assert not command.startswith("sudo")
 
 
 def test_a_board_that_prints_no_reading_is_not_reported_as_cleared():

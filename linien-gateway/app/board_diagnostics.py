@@ -710,18 +710,34 @@ def clear_reboot_status(
     cause nobody had looked at yet.
     """
     script = _clear_reboot_status_script()
-    # Written to a file and run, not passed with -c: the script is multi-line
-    # and crossing SSH as one quoted argument is how quoting bugs get in.
-    remote = "/tmp/linien-clear-reset-cause.py"
+    # Piped to the interpreter on stdin rather than staged in a file. The
+    # interpreter is what needs root -- it opens /dev/mem for writing -- and a
+    # script root executes must never sit, however briefly, at a fixed path in
+    # a world-writable directory: any other account on the board could swap it
+    # between the write and the run, or simply pre-create it and make our own
+    # write fail. Nothing touches the filesystem this way.
+    #
+    # The quotes around the escaped text are load-bearing -- without them the
+    # remote shell reads the script's own newlines as command separators and
+    # the interpreter is fed nothing, which reads back as "the board printed
+    # no reading" rather than as the quoting mistake it is.
+    #
+    # The interpreter is resolved before the pipe so the script crosses once:
+    # a `python3 || python` fallback around the pipeline would have to repeat
+    # the whole text, the first run having consumed stdin.
     command = (
-        "printf %s " + shell_single_quote(script) + " > " + remote + " && "
-        "{ python3 " + remote + " || python " + remote + "; }; "
-        "rm -f " + remote
+        "PY=$(command -v python3 || command -v python); "
+        "printf %s '" + shell_single_quote(script) + "' | "
+        + privileged(device, "$PY -")
     )
     try:
         with _open(device, connection_factory) as conn:
             exited, stdout, stderr = run_remote(
-                conn, device, command, timeout=SECTION_TIMEOUT_S + 5.0
+                conn,
+                device,
+                command,
+                timeout=SECTION_TIMEOUT_S + 5.0,
+                privileged_command=False,
             )
     except Exception as exc:  # noqa: BLE001 - reported, never raised at the API
         logger.debug("clearing the reset register failed", exc_info=True)

@@ -170,7 +170,7 @@ it('never renders one board’s bundle under another board’s title', async () 
     { initialProps: { deviceKey: 'dev-1' as string | null } }
   );
 
-  let pending!: Promise<void>;
+  let pending!: Promise<string | null>;
   act(() => {
     pending = hook.result.current.collect();
   });
@@ -188,3 +188,39 @@ it('never renders one board’s bundle under another board’s title', async () 
   expect(hook.result.current.collecting).toBe(false);
 });
 
+
+it('keeps saying the bits did not clear after the re-collect', async () => {
+  // The re-collect resets the error on its way in, so a failure reported
+  // before it would vanish and leave the operator watching the same causes
+  // come back with no explanation.
+  vi.spyOn(api, 'clearResetCause').mockResolvedValue({
+    ok: false,
+    error: 'the bits did not clear',
+  });
+  vi.spyOn(api, 'collectDiagnostics').mockResolvedValue(bundle());
+  const { hook } = setup();
+
+  await act(async () => {
+    await hook.result.current.clearResetCause();
+  });
+
+  expect(hook.result.current.error).toBe('the bits did not clear');
+});
+
+it('reports the board going away as well as the bits not clearing', async () => {
+  // Showing only the clear failure would leave the operator staring at a
+  // stale bundle with nothing to say the board had stopped answering.
+  vi.spyOn(api, 'clearResetCause').mockResolvedValue({
+    ok: false,
+    error: 'the bits did not clear',
+  });
+  vi.spyOn(api, 'collectDiagnostics').mockRejectedValue(new Error('no route to host'));
+  const { hook } = setup();
+
+  await act(async () => {
+    await hook.result.current.clearResetCause();
+  });
+
+  expect(hook.result.current.error).toContain('the bits did not clear');
+  expect(hook.result.current.error).toContain('no route to host');
+});
