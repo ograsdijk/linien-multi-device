@@ -47,6 +47,7 @@ class SignalStats:
     error_std_v: float | None = None
     error_mean_abs_v: float | None = None
     monitor_mean_v: float | None = None
+    monitor_std_v: float | None = None
 
 
 def compute_signal_stats(to_plot: Mapping[str, Any] | None) -> SignalStats:
@@ -71,5 +72,6 @@ def compute_signal_stats(to_plot: Mapping[str, Any] | None) -> SignalStats:
     monitor = _plot_array(to_plot, "monitor_signal")
     if monitor is not None:
         stats.monitor_mean_v = float(np.mean(monitor) / ADC_SCALE)
+        stats.monitor_std_v = float(np.std(monitor) / ADC_SCALE)
 
     return stats
