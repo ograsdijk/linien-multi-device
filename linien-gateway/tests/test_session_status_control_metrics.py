@@ -59,6 +59,20 @@ def test_status_exposes_control_metrics_when_indicator_disabled() -> None:
     assert status["lock_indicator_state"] == "unknown"
 
 
+def test_status_exposes_monitor_metrics_from_cached_frame() -> None:
+    session = _make_session()
+    session.last_plot_frame = {
+        "lock": True,
+        "lock_indicator": {"state": "locked"},
+        "signal_stats": {"monitor_mean_v": 0.3, "monitor_std_v": 0.01},
+    }
+
+    status = session.status()
+
+    assert status["monitor_mean_v"] == 0.3
+    assert status["monitor_std_v"] == 0.01
+
+
 def test_status_control_metrics_null_without_frame() -> None:
     session = _make_session()
     assert session.last_plot_frame is None
@@ -67,6 +81,8 @@ def test_status_control_metrics_null_without_frame() -> None:
 
     assert status["control_mean_v"] is None
     assert status["control_std_v"] is None
+    assert status["monitor_mean_v"] is None
+    assert status["monitor_std_v"] is None
     assert status["lock_indicator_state"] is None
 
 

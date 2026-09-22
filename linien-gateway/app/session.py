@@ -1802,6 +1802,8 @@ class DeviceSession:
             control_mean_v: float | None = None
             control_std_v: float | None = None
             error_std_v: float | None = None
+            monitor_mean_v: float | None = None
+            monitor_std_v: float | None = None
             indicator_state: str | None = None
             slope_v_per_mhz = self._discriminator_slope_v_per_mhz
             if isinstance(self.last_plot_frame, dict):
@@ -1820,11 +1822,15 @@ class DeviceSession:
                     control_mean_v = _coerce_float(stats.get("control_mean_v"))
                     control_std_v = _coerce_float(stats.get("control_std_v"))
                     error_std_v = _coerce_float(stats.get("error_std_v"))
+                    monitor_mean_v = _coerce_float(stats.get("monitor_mean_v"))
+                    monitor_std_v = _coerce_float(stats.get("monitor_std_v"))
         auto_relock_status = self.auto_relock.get_status()
         control_metrics = {
             "control_mean_v": control_mean_v,
             "control_std_v": control_std_v,
             "error_std_v": error_std_v,
+            "monitor_mean_v": monitor_mean_v,
+            "monitor_std_v": monitor_std_v,
             "discriminator_slope_v_per_mhz": slope_v_per_mhz,
             "lock_error_mhz": _lock_error_mhz(error_std_v, slope_v_per_mhz),
             "lock_indicator_state": indicator_state,
@@ -2443,6 +2449,10 @@ class DeviceSession:
             # / no frame yet.
             "control_mean_v": control_metrics["control_mean_v"],
             "control_std_v": control_metrics["control_std_v"],
+            # Mean/std monitor-signal voltage (V), same cadence/nullability as
+            # control_mean_v/control_std_v.
+            "monitor_mean_v": control_metrics["monitor_mean_v"],
+            "monitor_std_v": control_metrics["monitor_std_v"],
             # Error-signal std (error plot-units, a.u.), the PDH discriminator
             # slope from the last auto-lock scan (a.u./MHz), and the derived
             # in-loop lock error (MHz = error_std_v / slope). lock_error_mhz is

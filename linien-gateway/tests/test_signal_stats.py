@@ -29,6 +29,7 @@ def test_error_and_monitor_stats():
     assert stats.error_std_v == float(np.std(error) / ADC_SCALE)
     assert stats.error_mean_abs_v == abs(float(np.mean(error) / ADC_SCALE))
     assert stats.monitor_mean_v == float(np.mean(monitor) / ADC_SCALE)
+    assert stats.monitor_std_v == float(np.std(monitor) / ADC_SCALE)
     # control absent -> None
     assert stats.control_mean_v is None
 
@@ -37,6 +38,7 @@ def test_missing_signal_yields_none():
     stats = compute_signal_stats({"control_signal": [1, 2, 3]})
     assert stats.error_std_v is None
     assert stats.monitor_mean_v is None
+    assert stats.monitor_std_v is None
     assert stats.control_mean_v is not None
 
 
