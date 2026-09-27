@@ -3625,6 +3625,44 @@ class DeviceSession:
 
     # ---------------------------------------------------------- staged autolock
 
+    def staged_autolock_begin_precheck(self) -> None:
+        """Refuse BEFORE any device I/O that would touch sweep/lock state.
+
+        `staged_autolock/begin`'s route used to call `_trigger_and_acquire`
+        (-> `_prepare_sweep` -> `start_sweep()`, which switches the lock OFF)
+        before ever asking whether the request should be allowed at all -- so
+        `begin` on a locked laser unlocked it, and a second `begin` during an
+        active run restarted the sweep underneath that run. This runs the
+        same refusals `staged_autolock_begin` itself applies -- already-active
+        run, device locked -- plus the center-move-lock probe fix #3 needs
+        (a one-shot refinement walk in flight), all off the event loop and
+        with no side effect, so the route can 409 before ever triggering
+        anything. Raises `RuntimeError` (mapped to 409 by the route).
+        """
+        if self.control is None or self.parameters is None:
+            raise RuntimeError("Device not connected")
+        self._ensure_no_staged_autolock_run("staged auto-lock begin")
+        # require_unlocked=True raises "Device is already locked..." without
+        # writing anything.
+        self._snapshot_sweep_params(require_unlocked=True)
+        if not self._center_move_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "Another sweep-center move is already running; staged "
+                "auto-lock begin was not started."
+            )
+        self._center_move_lock.release()
+
+    def auto_lock_candidates_acquire_precheck(self) -> None:
+        """Refuse `auto_lock_candidates?acquire=true` BEFORE it triggers a
+        sweep restart, if the device is locked (fix #1). Unlike `begin`, an
+        active staged run does NOT refuse this call -- the orchestrator is
+        explicitly allowed to probe with `acquire=true` while a staged run is
+        active (see `staged_autolock_observe_frame`); only "locked" does.
+        """
+        if self.control is None or self.parameters is None:
+            raise RuntimeError("Device not connected")
+        self._snapshot_sweep_params(require_unlocked=True)
+
     def _ensure_no_staged_autolock_run(self, what: str) -> None:
         with self._state_lock:
             active = self._staged_autolock

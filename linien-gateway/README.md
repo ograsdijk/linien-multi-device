@@ -63,6 +63,10 @@ frame; never persists settings. Body: optional `AutoLockScanSettings`.
   `timeout_s` bounds the wait. The analysed frame is always at least as new
   as the one the acquire triggered (the sweep keeps running, so it may be a
   slightly newer frame at the same geometry) — never an older one.
+  **409** if the device is locked — checked *before* the restart-and-capture
+  trigger runs, since that trigger switches the lock off; this is refused
+  even while a staged run is active, since it is otherwise legitimate for
+  the orchestrator to probe with `acquire=true` during a run.
 
 Response:
 

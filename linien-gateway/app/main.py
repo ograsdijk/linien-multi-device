@@ -1141,6 +1141,16 @@ async def auto_lock_candidates(
     settings_payload = payload.model_dump() if payload is not None else None
     min_frame_id: int | None = None
     if acquire:
+        # Refuse a locked device BEFORE triggering a sweep restart: the
+        # restart-and-capture mechanism switches the lock OFF via
+        # start_sweep(), which must never happen as a side effect of what is
+        # documented as a read-only, never-locks endpoint (fix #1). An active
+        # staged run does NOT refuse this call -- the orchestrator probing
+        # with acquire=true while a run is active is explicitly allowed.
+        try:
+            await asyncio.to_thread(session.auto_lock_candidates_acquire_precheck)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         traces, skipped = await _trigger_and_acquire([(key, session)], timeout_s)
         if key not in traces:
             raise HTTPException(
@@ -1423,6 +1433,14 @@ async def staged_autolock_begin(
     device = _get_device_or_404(key)
     session = _session_for_device(device)
     body = payload or StagedAutolockBeginRequest()
+    # Refuse BEFORE triggering anything: `_trigger_and_acquire` restarts the
+    # sweep (lock OFF) regardless of current state, so an already-active run,
+    # a locked device, or a one-shot walk in flight must all be caught here,
+    # not after the sweep has already been kicked (fix #1 / #3).
+    try:
+        await asyncio.to_thread(session.staged_autolock_begin_precheck)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     traces, skipped = await _trigger_and_acquire([(key, session)], None)
     if key not in traces:
         raise HTTPException(
