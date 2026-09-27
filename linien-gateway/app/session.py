@@ -39,6 +39,7 @@ from .auto_lock_scan import (
     feature_resolution_samples,
     find_auto_lock_candidates,
     find_coarse_auto_lock_candidates,
+    find_plausible_coarse_candidates,
     find_coarse_auto_lock_target,
     find_auto_lock_target,
     scan_too_wide_to_lock,
@@ -3095,7 +3096,7 @@ class DeviceSession:
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
             require_unlocked=True
         )
-        candidates = find_coarse_auto_lock_candidates(
+        candidates = find_plausible_coarse_candidates(
             error_trace_v=error_trace,
             monitor_trace_v=monitor_trace,
             sweep_center_v=center_v,
@@ -3104,6 +3105,8 @@ class DeviceSession:
             preferred_slope_rising=rising,
             modulation_frequency_hz=mod_hz,
         )
+        if not candidates:
+            raise ValueError("No plausible coarse candidate on this frame.")
         resolution = feature_resolution_samples(settings, len(error_trace), amplitude_v)
         results = [c.result for c in candidates]
         frame = _frame_summary(

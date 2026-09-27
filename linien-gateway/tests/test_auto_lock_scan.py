@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from app.auto_lock_scan import (
+    AutoLockScanResult,
     AutoLockScanSettings,
     calibrate_auto_lock_settings,
     feature_resolution_samples,
@@ -11,6 +12,8 @@ from app.auto_lock_scan import (
     find_coarse_auto_lock_candidates,
     find_coarse_auto_lock_target,
     find_auto_lock_target,
+    find_plausible_coarse_candidates,
+    suppress_duplicate_candidates,
     _sideband_offset_pts,
     max_lockable_amplitude_v,
     scan_too_wide_to_lock,
@@ -1115,3 +1118,89 @@ def test_coarse_candidates_deduplicate_the_same_crossing_across_scales():
     )
     target_indices = [c.result.target_index for c in candidates]
     assert len(target_indices) == len(set(target_indices))
+
+
+# ---------------------------------------------------------------------------
+# Candidate menus for serrodyne-order selection: one entry per physical
+# feature, never a PDH sideband, best-score candidate unchanged.
+# ---------------------------------------------------------------------------
+
+def _falling_pdh_triplet(n: int, center: float, *, weight: float, width: float = 6.0,
+                 sideband: float = 60.0) -> np.ndarray:
+    # Carrier with a FALLING zero crossing, sidebands with rising crossings.
+    x = np.arange(n, dtype=float)
+
+    def disp(u: np.ndarray) -> np.ndarray:
+        return -u / (1.0 + (u / width) ** 2) / width
+
+    return 0.4 * weight * (
+        disp(x - center) - 0.5 * disp(x - center - sideband) - 0.5 * disp(x - center + sideband)
+    )
+
+
+def _multi_order_trace(noise: float, seed: int) -> np.ndarray:
+    n = 2048
+    rng = np.random.default_rng(seed)
+    return (
+        _falling_pdh_triplet(n, 700, weight=1.0)
+        + _falling_pdh_triplet(n, 1300, weight=0.5)
+        + noise * rng.standard_normal(n)
+    )
+
+
+@pytest.mark.parametrize("noise", [0.0, 0.002, 0.01])
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_strict_candidates_hold_one_entry_per_feature(noise, seed):
+    trace = _multi_order_trace(noise, seed)
+    kwargs = dict(
+        error_trace_v=trace, monitor_trace_v=None, sweep_center_v=0.0,
+        sweep_amplitude_v=1.0, settings=AutoLockScanSettings(),
+        preferred_slope_rising=False,
+    )
+    candidates = find_auto_lock_candidates(**kwargs)
+    positions = sorted(c.target_index for c in candidates)
+    assert positions == [700, 1300] or (
+        len(positions) == 2 and abs(positions[0] - 700) <= 1 and abs(positions[1] - 1300) <= 1
+    )
+    assert find_auto_lock_target(**kwargs).target_index == candidates[0].target_index
+
+
+def test_suppression_keeps_the_best_and_never_merges_opposite_slopes():
+    def result(idx: float, score: float, rising: bool) -> AutoLockScanResult:
+        return AutoLockScanResult(
+            target_index=int(idx), target_voltage=0.0, target_slope_rising=rising,
+            score=score, left_excursion=0.1, right_excursion=0.1, pair_excursion=0.2,
+            symmetry=1.0, monitor_level=None, hz_per_v=None, sideband_offset_v=None,
+            crossing_index=float(idx),
+        )
+
+    ranked = [result(100, 5.0, True), result(104, 4.0, True), result(103, 3.0, False),
+              result(300, 2.0, True)]
+    kept = suppress_duplicate_candidates(ranked, window_samples=10)
+    assert [(r.target_index, r.target_slope_rising) for r in kept] == [
+        (100, True), (103, False), (300, True)
+    ]
+
+
+@pytest.mark.parametrize("noise", [0.0, 0.002, 0.01])
+def test_plausible_coarse_candidates_exclude_sidebands_and_duplicates(noise):
+    trace = _multi_order_trace(noise, 7)
+    kwargs = dict(
+        error_trace_v=trace, monitor_trace_v=None, sweep_center_v=0.0,
+        sweep_amplitude_v=1.0, settings=AutoLockScanSettings(),
+        preferred_slope_rising=False,
+    )
+    plausible = find_plausible_coarse_candidates(**kwargs)
+    positions = [c.result.target_index for c in plausible]
+    # Both real carriers are offered, strongest first ...
+    assert abs(positions[0] - 700) <= 1
+    assert any(abs(p - 1300) <= 1 for p in positions)
+    # ... never one of their (opposite-slope) sidebands ...
+    for sideband in (640, 760, 1240, 1360):
+        assert all(abs(p - sideband) > 3 for p in positions)
+    # ... every entry has the measured carrier slope, and no feature twice.
+    assert all(c.result.target_slope_rising is False for c in plausible)
+    assert len(positions) == len({round(p / 20) for p in positions})
+    assert len(plausible) <= 8
+    # The one-shot coarse tracker's own choice is unchanged by this filter.
+    assert abs(find_coarse_auto_lock_target(**kwargs).result.target_index - 700) <= 1

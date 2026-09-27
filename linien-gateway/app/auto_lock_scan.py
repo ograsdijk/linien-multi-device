@@ -611,6 +611,111 @@ def find_coarse_auto_lock_candidates(
     ]
 
 
+def suppress_duplicate_candidates(
+    results: list[AutoLockScanResult], *, window_samples: float
+) -> list[AutoLockScanResult]:
+    """Greedy non-maximum suppression over score-sorted candidates.
+
+    A candidate is dropped when a higher-scoring candidate of the SAME slope
+    orientation lies within ``window_samples`` of it (crossing positions in
+    samples): that is the same physical feature re-detected, not a second
+    feature. Opposite-slope crossings (PDH sidebands) are never merged into a
+    carrier. Input order is preserved for survivors, so ``results[0]`` -- the
+    best-score candidate -- always survives.
+    """
+    kept: list[AutoLockScanResult] = []
+    window = max(1.0, float(window_samples))
+    for result in results:
+        position = float(result.crossing_index)
+        if any(
+            other.target_slope_rising == result.target_slope_rising
+            and abs(float(other.crossing_index) - position) < window
+            for other in kept
+        ):
+            continue
+        kept.append(result)
+    return kept
+
+
+def _local_slope_rising(trace: np.ndarray, index: int, half_width: int) -> bool | None:
+    """Measured slope orientation of ``trace`` at ``index``: sign of the
+    least-squares line over +/- ``half_width`` samples. None when flat."""
+    lo = max(0, int(index) - int(half_width))
+    hi = min(len(trace), int(index) + int(half_width) + 1)
+    if hi - lo < 3:
+        return None
+    xs = np.arange(lo, hi, dtype=float)
+    ys = np.asarray(trace[lo:hi], dtype=float)
+    slope = float(np.polyfit(xs, ys, 1)[0])
+    if slope == 0.0 or not np.isfinite(slope):
+        return None
+    return slope > 0.0
+
+
+def find_plausible_coarse_candidates(
+    *,
+    error_trace_v: np.ndarray,
+    monitor_trace_v: np.ndarray | None,
+    sweep_center_v: float,
+    sweep_amplitude_v: float,
+    settings: AutoLockScanSettings,
+    preferred_slope_rising: bool | None = None,
+    modulation_frequency_hz: float | None = None,
+    min_relative_score: float = 0.2,
+    max_candidates: int = 8,
+) -> list[CoarseAutoLockCandidate]:
+    """Coarse candidates a caller may CHOOSE between (staged auto-lock only).
+
+    `find_coarse_auto_lock_candidates` lists every option the permissive
+    coarse tracker accepted, which is fine for picking its best but is mostly
+    noise pairs and PDH sidebands when read as a menu. The coarse search does
+    not measure slope orientation (it reports the preferred one for every
+    option), so here each crossing's slope is MEASURED on the trace and only
+    crossings matching the configured carrier slope are kept (a PDH sideband
+    has the opposite slope); same-feature duplicates are suppressed within the
+    lobe window; options scoring below ``min_relative_score`` of the best
+    surviving one are dropped; at most ``max_candidates`` are returned, best
+    first. Never used by the one-shot path, whose `find_coarse_auto_lock_target`
+    is unchanged. Raises the coarse tracker's ValueError when nothing is
+    accepted at all; may return an empty list when nothing is plausible.
+    """
+    candidates = find_coarse_auto_lock_candidates(
+        error_trace_v=error_trace_v,
+        monitor_trace_v=monitor_trace_v,
+        sweep_center_v=sweep_center_v,
+        sweep_amplitude_v=sweep_amplitude_v,
+        settings=settings,
+        preferred_slope_rising=preferred_slope_rising,
+        modulation_frequency_hz=modulation_frequency_hz,
+    )
+    raw = _sanitize_trace(np.asarray(error_trace_v, dtype=float))
+    n = len(raw)
+    half_range_pts = _half_range_to_points(
+        float(settings.half_range_sweep_v), n, float(sweep_amplitude_v)
+    )
+    slope_half_width = max(2, int(settings.smooth_window_pts))
+    plausible: list[CoarseAutoLockCandidate] = []
+    for candidate in candidates:
+        measured = _local_slope_rising(
+            raw, candidate.result.target_index, slope_half_width
+        )
+        if measured is None:
+            continue
+        if preferred_slope_rising is not None and measured != bool(preferred_slope_rising):
+            continue
+        candidate.result.target_slope_rising = measured
+        plausible.append(candidate)
+    kept_results = suppress_duplicate_candidates(
+        [c.result for c in plausible], window_samples=float(half_range_pts)
+    )
+    kept_ids = {id(r) for r in kept_results}
+    plausible = [c for c in plausible if id(c.result) in kept_ids]
+    if plausible:
+        floor = float(min_relative_score) * float(plausible[0].result.score)
+        plausible = [c for c in plausible if float(c.result.score) >= floor]
+    return plausible[: max(1, int(max_candidates))]
+
+
 def find_coarse_auto_lock_target(
     *,
     error_trace_v: np.ndarray,
@@ -1230,7 +1335,11 @@ def find_auto_lock_candidates(
         for candidate in accepted
     ]
     results.sort(key=lambda result: result.score, reverse=True)
-    return results
+    # One physical feature can yield several accepted crossings (noise
+    # re-crossings inside its own lobes). The best-score one is always kept,
+    # so `find_auto_lock_target` is unaffected; the list a caller chooses a
+    # serrodyne order from holds one entry per feature.
+    return suppress_duplicate_candidates(results, window_samples=float(half_range_pts))
 
 
 def find_auto_lock_target(
