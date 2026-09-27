@@ -489,6 +489,65 @@ class VirtualLinienControlService(rpyc.Service):
         with self._sim_lock:
             self.model.set_detuning_jitter(sigma_v)
 
+    def cli_set_serrodyne_enabled(self, enabled: bool) -> None:
+        with self._sim_lock:
+            self.model.configure_serrodyne(enabled=bool(enabled))
+
+    def cli_set_serrodyne_frequency_hz(self, frequency_hz: float) -> None:
+        with self._sim_lock:
+            self.model.configure_serrodyne(frequency_hz=float(frequency_hz))
+
+    def cli_set_serrodyne_power_dbm(self, rf_power_dbm: float) -> None:
+        with self._sim_lock:
+            self.model.configure_serrodyne(rf_power_dbm=float(rf_power_dbm))
+
+    def cli_set_serrodyne_p_opt_dbm(self, p_opt_dbm: float) -> None:
+        with self._sim_lock:
+            self.model.configure_serrodyne(p_opt_dbm=float(p_opt_dbm))
+
+    def cli_set_serrodyne_sign(self, sweep_frequency_sign: int) -> None:
+        with self._sim_lock:
+            self.model.configure_serrodyne(sweep_frequency_sign=int(sweep_frequency_sign))
+
+    def cli_set_serrodyne_orders(self, orders: list[int]) -> None:
+        with self._sim_lock:
+            self.model.configure_serrodyne(orders=[int(n) for n in orders])
+
+    def cli_set_serrodyne_power_dependence(self, enabled: bool) -> None:
+        with self._sim_lock:
+            self.model.configure_serrodyne(use_power_dependence=bool(enabled))
+
+    def cli_set_serrodyne_fixed_weights(self, weights: dict[int, float]) -> None:
+        with self._sim_lock:
+            self.model.configure_serrodyne(fixed_base_weights=dict(weights))
+
+    def cli_configure_serrodyne(self, **kwargs: Any) -> None:
+        """Generic passthrough for the less-common serrodyne knobs (weight
+        shape parameters); see `VirtualPdhModel.configure_serrodyne`."""
+        with self._sim_lock:
+            self.model.configure_serrodyne(**kwargs)
+
+    def cli_get_serrodyne_status(self) -> dict[str, Any]:
+        with self._sim_lock:
+            cfg = self.model.serrodyne
+            return {
+                "enabled": cfg.enabled,
+                "frequency_hz": cfg.frequency_hz,
+                "rf_power_dbm": cfg.rf_power_dbm,
+                "orders": list(cfg.orders),
+                "sweep_frequency_sign": cfg.sweep_frequency_sign,
+                "use_power_dependence": cfg.use_power_dependence,
+                "p_opt_dbm": cfg.p_opt_dbm,
+                "weight_sigma_db": cfg.weight_sigma_db,
+                "desired_peak_weight": cfg.desired_peak_weight,
+                "asymmetry_ratio": cfg.asymmetry_ratio,
+                "carrier_floor_weight": cfg.carrier_floor_weight,
+                "carrier_growth_per_db2": cfg.carrier_growth_per_db2,
+                "second_order_floor_weight": cfg.second_order_floor_weight,
+                "second_order_growth_per_db2": cfg.second_order_growth_per_db2,
+                "fixed_base_weights": dict(cfg.fixed_base_weights),
+            }
+
     def cli_get_tunables(self) -> dict[str, Any]:
         with self._sim_lock:
             control_channel = int(float(self.parameters.control_channel.value))

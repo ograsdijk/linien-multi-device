@@ -82,6 +82,8 @@ At runtime, use commands:
 - `linewidthhz <hz>`
 - `linewidthv <v>`
 - `fsrhz <hz>`
+- `serrodyne <on|off|freq|power|popt|sign|orders|powerdep|status> [...]` --
+  see [Imperfect-serrodyne orders](#imperfect-serrodyne-orders-optional)
 - `pid <p> <i> <d>`
 - `seed <int>`
 - `exit`
@@ -97,6 +99,87 @@ At runtime, use commands:
 - `L` starts lock mode.
 - `S` starts sweep mode.
 - `Q` quits the simulator UI.
+
+## Imperfect-serrodyne orders (optional)
+
+The simulator can optionally add extra "optical order" PDH/monitor features on
+top of the ordinary single-order signal, to emulate an imperfect serrodyne
+(NLTL) frequency shifter that leaks power into the carrier and neighbouring
+orders instead of putting it all into the desired first order. **Disabled by
+default** -- with it off, `error_signal_*`/`monitor_signal` are computed
+exactly as before this feature existed (see
+`linien_sim/model.py::_pdh_error`/`_monitor_signal`, which just call through
+to the original single-order implementation).
+
+### Model
+
+```
+S(detuning) = sum_n  w_n(P) * PDH(detuning + offset_n)
+```
+
+reusing the simulator's existing single-order PDH/monitor computation
+(`VirtualPdhModel._pdh_error_single_order` / `_monitor_signal_single_order`)
+for every order `n` -- see `linien_sim/model.py::_serrodyne_order_sum`.
+
+**Feature offsets** (`linien_sim.serrodyne.serrodyne_feature_offsets_hz`):
+order-`n` optical component is at `nu_0 + n*f_serrodyne`; it resonates where
+`nu_0 = nu_cav - n*f_serrodyne`, i.e. at optical detuning `-n*f_serrodyne`.
+`sweep_frequency_sign` (`s in {+1,-1}`) maps the simulator's internal
+detuning/sweep coordinate to true optical detuning
+(`optical_detuning = s * internal_detuning`), so the order-`n` feature sits at
+
+```
+offset_n = -n * s * f_serrodyne_hz
+```
+
+in the internal coordinate. Moving `f_serrodyne_hz` by `delta_f` therefore
+moves order `n`'s feature by `-n*s*delta_f` Hz, i.e. by
+`-n*s*N_SB*delta_f/f_PDH` sweep samples (`N_SB` = carrier-to-sideband spacing
+in samples, `f_PDH` = the modulation frequency).
+
+**Order weights vs RF power** (`linien_sim.serrodyne.serrodyne_order_weights`),
+power-dependent mode (default): let `d = rf_power_dbm - p_opt_dbm`.
+
+- `w[+1] = desired_peak_weight * exp(-d^2 / (2*weight_sigma_db^2))` -- the
+  desired first order, peaking exactly at the known optimum `p_opt_dbm`.
+- `w[-1] = asymmetry_ratio * w[+1]` -- the unwanted first order, suppressed by
+  a fixed ratio relative to the desired one (imperfect-serrodyne asymmetry).
+- `w[0] = carrier_floor_weight + carrier_growth_per_db2 * d^2` -- carrier
+  leakage, minimal at the optimum, growing quadratically away from it.
+- `w[+2] = w[-2] = second_order_floor_weight + second_order_growth_per_db2 *
+  d^2` -- second-order leakage, same shape with its own floor/growth. Any
+  other configured order uses this same formula.
+
+Fixed mode (`use_power_dependence=False`): every configured order's weight
+comes straight from `fixed_base_weights`, e.g. the documented
+`{0: 0.10, 1: 0.82, -1: 0.03, 2: 0.05, -2: 0.02}` (0.0 if an order is absent).
+
+### Control surface
+
+Same mechanism as every other tunable (`noise`, `drift`, `linewidthhz`, ...):
+a `VirtualPdhModel.configure_serrodyne(...)` method, wrapped by
+`VirtualLinienControlService.cli_set_serrodyne_*`/`cli_configure_serrodyne`/
+`cli_get_serrodyne_status`, exposed in the REPL as `serrodyne ...`
+sub-commands:
+
+```
+serrodyne <on|off>              # enable/disable the whole model
+serrodyne freq <hz>             # serrodyne (NLTL) frequency, Hz
+serrodyne power <dbm>           # RF power driving the serrodyne, dBm
+serrodyne popt <dbm>            # known power optimum for the desired order
+serrodyne sign <1|-1>           # sweep_frequency_sign (s)
+serrodyne orders <n1,n2,...>    # which orders to sum, e.g. -2,-1,0,1,2
+serrodyne powerdep <on|off>     # power-dependent weights vs fixed weights
+serrodyne status                # print the current serrodyne config
+```
+
+The remaining shape parameters (`weight_sigma_db`, `desired_peak_weight`,
+`asymmetry_ratio`, `carrier_floor_weight`, `carrier_growth_per_db2`,
+`second_order_floor_weight`, `second_order_growth_per_db2`,
+`fixed_base_weights`) are reachable via `VirtualLinienControlService.
+cli_configure_serrodyne(**kwargs)` (same keyword names as
+`VirtualPdhModel.configure_serrodyne`) for scripted/test use; they don't have
+dedicated REPL shortcuts.
 
 ## Red Pitaya telemetry simulator
 

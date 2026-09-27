@@ -31,6 +31,14 @@ Commands:
   fsrhz <hz>
   pid <p> <i> <d>
   seed <int>
+  serrodyne <on|off>
+  serrodyne freq <hz>
+  serrodyne power <dbm>
+  serrodyne popt <dbm>
+  serrodyne sign <1|-1>
+  serrodyne orders <n1,n2,...>
+  serrodyne powerdep <on|off>
+  serrodyne status
   exit
 """.strip()
 
@@ -162,6 +170,42 @@ def _run_repl(service: VirtualLinienControlService) -> None:
             if cmd == "seed" and len(parts) == 2:
                 service.cli_set_seed(int(parts[1]))
                 print("Updated RNG seed.")
+                continue
+            if cmd == "serrodyne" and len(parts) >= 2:
+                sub = parts[1].lower()
+                if sub in {"on", "off"} and len(parts) == 2:
+                    service.cli_set_serrodyne_enabled(sub == "on")
+                    print(f"Serrodyne order model {'enabled' if sub == 'on' else 'disabled'}.")
+                    continue
+                if sub == "freq" and len(parts) == 3:
+                    service.cli_set_serrodyne_frequency_hz(float(parts[2]))
+                    print("Updated serrodyne frequency.")
+                    continue
+                if sub == "power" and len(parts) == 3:
+                    service.cli_set_serrodyne_power_dbm(float(parts[2]))
+                    print("Updated serrodyne RF power.")
+                    continue
+                if sub == "popt" and len(parts) == 3:
+                    service.cli_set_serrodyne_p_opt_dbm(float(parts[2]))
+                    print("Updated serrodyne power optimum.")
+                    continue
+                if sub == "sign" and len(parts) == 3:
+                    service.cli_set_serrodyne_sign(int(parts[2]))
+                    print("Updated sweep_frequency_sign.")
+                    continue
+                if sub == "orders" and len(parts) == 3:
+                    orders = [int(x) for x in parts[2].split(",")]
+                    service.cli_set_serrodyne_orders(orders)
+                    print("Updated serrodyne orders.")
+                    continue
+                if sub == "powerdep" and len(parts) == 3 and parts[2].lower() in {"on", "off"}:
+                    service.cli_set_serrodyne_power_dependence(parts[2].lower() == "on")
+                    print("Updated serrodyne power-dependence toggle.")
+                    continue
+                if sub == "status" and len(parts) == 2:
+                    print(service.cli_get_serrodyne_status())
+                    continue
+                print("Unknown serrodyne subcommand. Type 'help' for supported commands.")
                 continue
             print("Unknown command. Type 'help' for supported commands.")
         except Exception as exc:  # noqa: BLE001 - interactive command loop

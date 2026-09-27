@@ -23,3 +23,11 @@ linien-rp-telemetry-sim = "linien_sim.rp_telemetry_sim:main"
 
 [tool.setuptools.packages.find]
 namespaces = false
+
+# Test-only dependencies, matching linien-gateway's style: a PEP 735 group so
+# CI/dev installs exactly what's run (`uv sync --group dev`) instead of
+# pip-installing pytest ad hoc.
+[dependency-groups]
+dev = [
+  "pytest>=8",
+]

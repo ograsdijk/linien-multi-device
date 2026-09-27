@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 from linien_common.common import N_POINTS
 
 from .parameters import MHZ_UNIT, VPP_UNIT
+from .serrodyne import SerrodyneConfig, serrodyne_order_weights_and_offsets
 
 ADC_SCALE = 8192.0
 OFFSET_SCALE = 8191.0
@@ -98,6 +99,11 @@ class VirtualPdhModel:
         self.control_limit_v = 1.0
         self.actuator_gain = 0.9
 
+        # Optional imperfect-serrodyne order model (spec §C3). Disabled by
+        # default: `_pdh_error`/`_monitor_signal` then compute exactly the
+        # single-order signal as before this feature existed.
+        self.serrodyne = SerrodyneConfig()
+
     def _electronics_noise(
         self,
         *,
@@ -128,6 +134,62 @@ class VirtualPdhModel:
 
     def set_detuning_jitter(self, sigma_v: float) -> None:
         self.detuning_jitter_v = max(0.0, float(sigma_v))
+
+    def configure_serrodyne(
+        self,
+        *,
+        enabled: bool | None = None,
+        frequency_hz: float | None = None,
+        rf_power_dbm: float | None = None,
+        orders: Sequence[int] | None = None,
+        sweep_frequency_sign: int | None = None,
+        use_power_dependence: bool | None = None,
+        p_opt_dbm: float | None = None,
+        weight_sigma_db: float | None = None,
+        desired_peak_weight: float | None = None,
+        asymmetry_ratio: float | None = None,
+        carrier_floor_weight: float | None = None,
+        carrier_growth_per_db2: float | None = None,
+        second_order_floor_weight: float | None = None,
+        second_order_growth_per_db2: float | None = None,
+        fixed_base_weights: dict[int, float] | None = None,
+    ) -> None:
+        """Update the imperfect-serrodyne order model. Any argument left as
+        ``None`` keeps its current value. See `SerrodyneConfig` for the exact
+        weight formulas."""
+        cfg = self.serrodyne
+        if enabled is not None:
+            cfg.enabled = bool(enabled)
+        if frequency_hz is not None:
+            cfg.frequency_hz = max(0.0, float(frequency_hz))
+        if rf_power_dbm is not None:
+            cfg.rf_power_dbm = float(rf_power_dbm)
+        if orders is not None:
+            cfg.orders = tuple(int(n) for n in orders)
+        if sweep_frequency_sign is not None:
+            cfg.sweep_frequency_sign = 1 if int(sweep_frequency_sign) >= 0 else -1
+        if use_power_dependence is not None:
+            cfg.use_power_dependence = bool(use_power_dependence)
+        if p_opt_dbm is not None:
+            cfg.p_opt_dbm = float(p_opt_dbm)
+        if weight_sigma_db is not None:
+            cfg.weight_sigma_db = max(1e-6, float(weight_sigma_db))
+        if desired_peak_weight is not None:
+            cfg.desired_peak_weight = max(0.0, float(desired_peak_weight))
+        if asymmetry_ratio is not None:
+            cfg.asymmetry_ratio = max(0.0, float(asymmetry_ratio))
+        if carrier_floor_weight is not None:
+            cfg.carrier_floor_weight = max(0.0, float(carrier_floor_weight))
+        if carrier_growth_per_db2 is not None:
+            cfg.carrier_growth_per_db2 = max(0.0, float(carrier_growth_per_db2))
+        if second_order_floor_weight is not None:
+            cfg.second_order_floor_weight = max(0.0, float(second_order_floor_weight))
+        if second_order_growth_per_db2 is not None:
+            cfg.second_order_growth_per_db2 = max(
+                0.0, float(second_order_growth_per_db2)
+            )
+        if fixed_base_weights is not None:
+            cfg.fixed_base_weights = {int(k): float(v) for k, v in fixed_base_weights.items()}
 
     def _recalculate_cavity_from_linewidth(self) -> None:
         self.scan_hz_per_v = self.linewidth_hz / max(self.linewidth_v, 1e-6)
@@ -248,7 +310,7 @@ class VirtualPdhModel:
     def _modulation_amplitude_vpp(self, raw_modulation_amp: Any) -> float:
         return max(0.0, float(raw_modulation_amp) / VPP_UNIT)
 
-    def _pdh_error(
+    def _pdh_error_single_order(
         self,
         detuning_v: np.ndarray | float,
         *,
@@ -274,7 +336,7 @@ class VirtualPdhModel:
         )
         return 2.0 * harmonic_gain * j0 * j1 * mixed
 
-    def _monitor_signal(
+    def _monitor_signal_single_order(
         self, detuning_v: np.ndarray | float, *, modulation_hz: float, modulation_vpp: float
     ) -> np.ndarray:
         detuning_hz = np.asarray(detuning_v, dtype=float) * self.scan_hz_per_v
@@ -297,6 +359,72 @@ class VirtualPdhModel:
             power = (j0 * j0) * t0 + (j1 * j1) * (tp + tm)
 
         return 1.6 * (power - 0.5)
+
+    def _serrodyne_order_sum(
+        self,
+        single_order_fn: Any,
+        detuning_v: np.ndarray | float,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        """S(detuning) = sum_n w_n(P) * single_order_fn(detuning + offset_n),
+        reusing the existing single-order PDH/monitor computation for every
+        order (spec §C3). `offset_n` (Hz, internal detuning coordinate) comes
+        from `serrodyne_feature_offsets_hz`; converting it to the same units
+        as `detuning_v` divides by `scan_hz_per_v` so the shift lands at the
+        correct sweep-voltage location.
+        """
+        cfg = self.serrodyne
+        weights, offsets_hz = serrodyne_order_weights_and_offsets(
+            cfg.rf_power_dbm, cfg.frequency_hz, cfg
+        )
+        detuning_arr = np.asarray(detuning_v, dtype=float)
+        scan_hz_per_v = max(self.scan_hz_per_v, 1e-9)
+        total: np.ndarray | None = None
+        for n in cfg.orders:
+            weight = weights.get(n, 0.0)
+            if weight == 0.0:
+                continue
+            # `single_order_fn`'s own crossing is at argument==0, i.e. at
+            # `detuning == -shift`. To place that crossing at `offset_n` (the
+            # physically-derived feature location) the shift must be the
+            # NEGATIVE of the offset.
+            shift_v = -offsets_hz.get(n, 0.0) / scan_hz_per_v
+            contribution = weight * single_order_fn(detuning_arr + shift_v, **kwargs)
+            total = contribution if total is None else total + contribution
+        if total is None:
+            return np.zeros_like(detuning_arr)
+        return total
+
+    def _pdh_error(
+        self,
+        detuning_v: np.ndarray | float,
+        *,
+        modulation_hz: float,
+        modulation_vpp: float,
+        demod_phase_deg: float,
+        demod_multiplier: float,
+    ) -> np.ndarray:
+        kwargs = dict(
+            modulation_hz=modulation_hz,
+            modulation_vpp=modulation_vpp,
+            demod_phase_deg=demod_phase_deg,
+            demod_multiplier=demod_multiplier,
+        )
+        if not self.serrodyne.enabled:
+            return self._pdh_error_single_order(detuning_v, **kwargs)
+        return self._serrodyne_order_sum(
+            self._pdh_error_single_order, detuning_v, **kwargs
+        )
+
+    def _monitor_signal(
+        self, detuning_v: np.ndarray | float, *, modulation_hz: float, modulation_vpp: float
+    ) -> np.ndarray:
+        kwargs = dict(modulation_hz=modulation_hz, modulation_vpp=modulation_vpp)
+        if not self.serrodyne.enabled:
+            return self._monitor_signal_single_order(detuning_v, **kwargs)
+        return self._serrodyne_order_sum(
+            self._monitor_signal_single_order, detuning_v, **kwargs
+        )
 
     @staticmethod
     def _apply_invert_and_offset(
