@@ -220,3 +220,25 @@ def test_endpoint_never_calls_a_locking_or_settings_persisting_method(monkeypatc
         "wait_for_fresh_trace",
         "auto_lock_detect",
     }
+
+
+def test_acquire_true_rejects_an_analysed_frame_older_than_the_acquired_one(monkeypatch):
+    # Guards the contract that acquire=true never detects on a frame from before
+    # the trigger: if the cached frame somehow predates the acquired frame, 409.
+    session = FakeCandidatesSession()
+    real_detect = session.auto_lock_detect
+
+    def stale_detect(settings_payload):
+        result = real_detect(settings_payload)
+        result["frame"]["frame_id"] = 1  # older than the acquired frame (2)
+        return result
+
+    session.auto_lock_detect = stale_detect
+    _patch(monkeypatch, session)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/devices/dev/control/auto_lock_candidates?acquire=true", json=None
+    )
+    assert response.status_code == 409
+    assert "predates" in response.json()["detail"]

@@ -1135,16 +1135,36 @@ async def auto_lock_candidates(
     device = _get_device_or_404(key)
     session = _session_for_device(device)
     settings_payload = payload.model_dump() if payload is not None else None
+    min_frame_id: int | None = None
     if acquire:
         traces, skipped = await _trigger_and_acquire([(key, session)], timeout_s)
         if key not in traces:
             raise HTTPException(
                 status_code=409, detail=skipped.get(key, "Failed to acquire trace")
             )
+        min_frame_id = traces[key].get("frame_id")
     try:
-        return session.auto_lock_detect(settings_payload)
+        # Detection reads sweep params over rpyc and runs the detector: keep it off
+        # the event loop, as every other session call from an async route does.
+        result = await asyncio.to_thread(session.auto_lock_detect, settings_payload)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    # The sweep keeps running, so the analysed frame may be a newer one than the
+    # acquired frame -- still after the trigger and at the same geometry. It must
+    # never be an OLDER one; `frame` always reports the frame actually analysed.
+    analysed_id = (result.get("frame") or {}).get("frame_id")
+    if (
+        min_frame_id is not None
+        and analysed_id is not None
+        and int(analysed_id) < int(min_frame_id)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Analysed frame {analysed_id} predates the acquired frame {min_frame_id}."
+            ),
+        )
+    return result
 
 
 def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:
