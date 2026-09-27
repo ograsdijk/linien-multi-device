@@ -1500,6 +1500,12 @@ async def staged_autolock_step(
         )
     except StagedAutolockError as exc:
         raise _staged_autolock_http_error(exc)
+    except ValueError as exc:
+        # Defensive: `session.staged_autolock_step` converts every detection
+        # failure into a `StagedAutolockError(422)` itself (fix #4), but a
+        # raw `ValueError` reaching here must never surface as the generic
+        # 500 it used to.
+        raise HTTPException(status_code=422, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 

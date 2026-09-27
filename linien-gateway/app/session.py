@@ -3887,12 +3887,23 @@ class DeviceSession:
         while `busy`, the run is left alone and its own `finally`
         (`_staged_autolock_finish_busy`) expires it as soon as it completes,
         if the deadline has by then passed.
+
+        Fix #5: also checks `expires_at`, not just `busy`. `renew` re-arms a
+        new `threading.Timer` and cancels the old one, but `Timer.cancel()`
+        cannot stop a callback that has already started running -- if this
+        callback's thread was already past that point when `renew` ran
+        (renew held `_state_lock` first), it lands here AFTER `renew` already
+        extended `expires_at`. Without this check it would abort a run the
+        client was just told was extended; the new timer armed by `renew`
+        will handle the real expiry when it actually arrives.
         """
         with self._state_lock:
             run = self._staged_autolock
             if run is None or run.token != token:
                 return
             if run.busy:
+                return
+            if time.time() < run.expires_at:
                 return
             self._staged_autolock = None
         restored = self._restore_sweep_geometry(
@@ -4160,6 +4171,57 @@ class DeviceSession:
             run.latest_candidates = rebuilt
             run.latest_frame = dict(frame)
 
+    def _recover_staged_run_after_failed_stage(
+        self, token: str, exc: Exception
+    ) -> None:
+        """`step`'s failure path once a stage's geometry write has already
+        landed but the detection that follows it then failed (fix #4): a
+        `ValueError` from the coarse detector (`find_plausible_coarse_candidates`,
+        reached when strict also rejects the new trace) or a `RuntimeError`
+        ("No fresh sweep arrived after changing scan geometry.").
+
+        Before this fix, a failure here left `run.center_v`/`amplitude_v`/
+        `latest_frame` pointing at the OLD geometry while the device sat at
+        the NEW one, so `lock`'s geometry-unchanged check failed forever
+        after and `observe_frame` rejected every later frame as being at the
+        "wrong" geometry. This re-reads the device's ACTUAL geometry,
+        advances `stage_index`, clears `latest_candidates`/`pending_shift`,
+        and records whatever frame is current if one is available -- the run
+        stays ACTIVE so the caller can retry `step` from here, or `abort`.
+
+        Always raises `StagedAutolockError(422)`; never returns normally.
+        """
+        with self._state_lock:
+            run = self._staged_autolock
+            if run is None or run.token != token:
+                raise StagedAutolockError(
+                    f"No candidate at the new geometry -- abort or retry ({exc})",
+                    status_code=422,
+                ) from exc
+            try:
+                center_v, amplitude_v, _rising, mod_hz = self._snapshot_sweep_params()
+            except Exception:  # noqa: BLE001 - keep the run's last-known geometry
+                center_v, amplitude_v, mod_hz = run.center_v, run.amplitude_v, None
+            run.stage_index += 1
+            run.center_v = float(center_v)
+            run.amplitude_v = float(amplitude_v)
+            run.latest_candidates = []
+            run.pending_shift = None
+            try:
+                error_trace, _monitor_trace, frame_id, acquired_at = (
+                    self._snapshot_auto_lock_traces_with_frame()
+                )
+                run.latest_frame = _frame_summary(
+                    error_trace, frame_id, acquired_at, center_v, amplitude_v,
+                    mod_hz, [],
+                )
+            except Exception:  # noqa: BLE001 - keep the previous latest_frame
+                pass
+        raise StagedAutolockError(
+            f"No candidate at the new geometry -- abort or retry ({exc})",
+            status_code=422,
+        ) from exc
+
     def staged_autolock_step(
         self, token: str, selected_frame_id: int, selected_target_index: int
     ) -> dict[str, Any]:
@@ -4227,9 +4289,16 @@ class DeviceSession:
         try:
             latest_frame_box: dict[str, Any] = {}
             latest_candidates_box: list[Any] = []
+            # Set the instant a geometry write lands, inside either callback --
+            # distinguishes "the center-move lock was busy" (raised before
+            # this stage ever wrote anything -- 409, run untouched) from "the
+            # write succeeded but detection then failed" (fix #4 -- 422, run
+            # recovered to the device's ACTUAL geometry).
+            geometry_written = {"done": False}
 
             def _detect_narrow(c, a, settle_s):
                 moved_at = self._set_sweep_geometry(c, a, settle_s=settle_s)
+                geometry_written["done"] = True
                 try:
                     candidates, cc, aa, r, frame = self._capture_auto_lock_candidates_strict(
                         settings, after=moved_at
@@ -4249,6 +4318,7 @@ class DeviceSession:
 
             def _detect_recenter(c, a, settle_s):
                 moved_at = self._set_sweep_geometry(c, a, settle_s=settle_s)
+                geometry_written["done"] = True
                 candidates, cc, aa, r, m, frame = self._coarse_auto_lock_candidates(
                     settings, after=moved_at
                 )
@@ -4257,18 +4327,32 @@ class DeviceSession:
                 latest_candidates_box[:] = candidates
                 return candidates[0], cc, aa, r, m
 
-            outcome = self._run_refinement_stage(
-                settings,
-                center_v=center_v,
-                amplitude_v=amplitude_v,
-                target=selected,
-                detector=detector,
-                trace_length=trace_length,
-                shift_per_fraction=shift_per_fraction,
-                geometry_settle_s=geometry_settle_s,
-                detect_narrow=_detect_narrow,
-                detect_recenter=_detect_recenter,
-            )
+            # The geometry-writing part of a stage must not interleave with a
+            # one-shot refinement walk driving the same actuator (fix #3) --
+            # `auto_lock_from_scan` already refuses outright while a staged
+            # run exists, so the only way this lock is held here is a walk
+            # that was already in flight when this run began.
+            try:
+                with self._exclusive_center_move("staged auto-lock step"):
+                    outcome = self._run_refinement_stage(
+                        settings,
+                        center_v=center_v,
+                        amplitude_v=amplitude_v,
+                        target=selected,
+                        detector=detector,
+                        trace_length=trace_length,
+                        shift_per_fraction=shift_per_fraction,
+                        geometry_settle_s=geometry_settle_s,
+                        detect_narrow=_detect_narrow,
+                        detect_recenter=_detect_recenter,
+                    )
+            except (ValueError, RuntimeError) as exc:
+                if geometry_written["done"]:
+                    # Always raises StagedAutolockError(422); the run's
+                    # bookkeeping is brought back in line with the device's
+                    # actual geometry first (fix #4).
+                    self._recover_staged_run_after_failed_stage(token, exc)
+                raise StagedAutolockError(str(exc), status_code=409) from exc
             step = outcome.step
 
             with self._state_lock:
