@@ -183,6 +183,14 @@ class AutoLockScanResult(BaseModel):
     # extras, so leaving it undeclared made every successful auto_lock_scan fail
     # response validation with a 500 -- after the lock had already started.
     discriminator_slope_v_per_mhz: Optional[float] = None
+    # Optional so payloads from before these fields existed stay valid. See
+    # AutoLockScanResult in auto_lock_scan.py for the exact definitions
+    # (feature_amplitude in particular: PDH lobe peak-to-peak on the
+    # unsmoothed trace, independent of `score`).
+    feature_amplitude: Optional[float] = None
+    sideband_offset_samples: Optional[float] = None
+    monitor_contrast: Optional[float] = None
+    crossing_index: Optional[float] = None
     detail: Optional[str] = None
     # A trajectory-aware run records every temporary geometry and detection so
     # operators can see when scan-history motion, rather than a bad lock point,

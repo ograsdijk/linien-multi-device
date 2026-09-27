@@ -240,6 +240,29 @@ class AutoLockScanResult:
     # known modulation frequency and a resolvable slope. An in-loop frequency
     # error is then error_std_v / discriminator_slope_v_per_mhz [MHz].
     discriminator_slope_v_per_mhz: float | None = None
+    # Deterministic feature-strength metric for comparing optical-order content
+    # across candidates: PDH lobe peak-to-peak -- the sum of the two
+    # opposite-sign lobe excursions around the crossing (same +/-half_range_pts
+    # window the crossing/threshold logic uses), measured on the UNSMOOTHED
+    # trace, in plot units. Deliberately independent of `score`: score also
+    # folds in the weaker-lobe bonus and (when enabled) the monitor-contrast
+    # tie-breaker, so two candidates of identical physical strength but
+    # different monitor contrast score differently while reporting the same
+    # feature_amplitude. See `_finalize_candidate`.
+    feature_amplitude: float = 0.0
+    # Carrier -> sideband spacing in samples (N_SB), independent of whether a
+    # modulation frequency is known (unlike sideband_offset_v/hz_per_v, which
+    # need it to convert to volts/Hz). None when unresolved -- see
+    # `_sideband_offset_pts`.
+    sideband_offset_samples: float | None = None
+    # Monitor dip/peak depth vs the robust off-resonance baseline at this
+    # crossing, in plot units. None when no monitor trace exists. Reported
+    # whether or not `use_monitor` gating is enabled, so a diagnostic caller
+    # sees the raw monitor behaviour at every candidate.
+    monitor_contrast: float | None = None
+    # Sub-sample (linearly interpolated) crossing position, in samples --
+    # `target_index` rounded to the nearest sample.
+    crossing_index: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -255,6 +278,10 @@ class AutoLockScanResult:
             "hz_per_v": self.hz_per_v,
             "sideband_offset_v": self.sideband_offset_v,
             "discriminator_slope_v_per_mhz": self.discriminator_slope_v_per_mhz,
+            "feature_amplitude": self.feature_amplitude,
+            "sideband_offset_samples": self.sideband_offset_samples,
+            "monitor_contrast": self.monitor_contrast,
+            "crossing_index": self.crossing_index,
         }
 
 
@@ -502,6 +529,7 @@ class _Candidate:
     pair_excursion: float
     symmetry: float
     monitor_level: float | None
+    monitor_contrast: float | None = None
 
 
 def _sanitize_trace(values: np.ndarray) -> np.ndarray:
@@ -721,16 +749,24 @@ def _sideband_offset_pts(
     )
 
 
-def find_auto_lock_target(
+def _gather_auto_lock_candidates(
     *,
     error_trace_v: np.ndarray,
     monitor_trace_v: np.ndarray | None,
-    sweep_center_v: float,
     sweep_amplitude_v: float,
     settings: AutoLockScanSettings,
-    preferred_slope_rising: bool | None = None,
-    modulation_frequency_hz: float | None = None,
-) -> AutoLockScanResult:
+    preferred_slope_rising: bool | None,
+) -> tuple[list[_Candidate], np.ndarray, np.ndarray, int, int]:
+    """Shared crossing-detection core of ``find_auto_lock_candidates``.
+
+    Every accepted crossing (unsorted), plus the arrays/sizes the per-candidate
+    post-processing in ``_finalize_candidate`` needs: the unsmoothed trace
+    (``error_raw``, for ``feature_amplitude``), the smoothed trace actually
+    used for threshold/crossing decisions (``error``), the trace length, and
+    the lobe half-window in samples. Raises the same ``ValueError`` messages
+    ``find_auto_lock_target`` has always raised when nothing is accepted --
+    this is what lets it delegate to ``find_auto_lock_candidates`` unchanged.
+    """
     if error_trace_v is None:
         raise ValueError("No error trace available.")
 
@@ -895,6 +931,9 @@ def find_auto_lock_target(
                 monitor_level=(
                     float(monitor_level) if monitor_level is not None else None
                 ),
+                monitor_contrast=(
+                    float(contrast) if contrast is not None else None
+                ),
             )
         )
 
@@ -910,58 +949,97 @@ def find_auto_lock_target(
             )
         raise ValueError("No valid crossing passed the configured thresholds.")
 
-    best = max(accepted, key=lambda item: item.score)
+    return accepted, error_raw, error, n_points, half_range_pts
 
+
+def _finalize_candidate(
+    candidate: _Candidate,
+    *,
+    error_raw: np.ndarray,
+    error: np.ndarray,
+    n_points: int,
+    sweep_center_v: float,
+    sweep_amplitude_v: float,
+    settings: AutoLockScanSettings,
+    modulation_frequency_hz: float | None,
+    half_range_pts: int,
+) -> AutoLockScanResult:
+    """Build the public ``AutoLockScanResult`` for one accepted crossing.
+
+    Runs the sideband / discriminator-slope / feature-amplitude measurements
+    that used to run only for the single best-score candidate, identically for
+    every accepted one, so ``find_auto_lock_target`` and
+    ``find_auto_lock_candidates`` can never disagree about a shared
+    candidate's numbers.
+    """
+    sideband_offset_samples: float | None = None
     sideband_offset_v: float | None = None
     hz_per_v: float | None = None
     discriminator_slope_v_per_mhz: float | None = None
-    if (
-        str(settings.signal_type) == "pdh"
-        and modulation_frequency_hz
-        and _spacing_is_measurable(settings, n_points, sweep_amplitude_v)
+
+    if str(settings.signal_type) == "pdh" and _spacing_is_measurable(
+        settings, n_points, sweep_amplitude_v
     ):
         off_pts = _sideband_offset_pts(
             error,
-            best.index,
-            best.target_slope_rising,
+            candidate.index,
+            candidate.target_slope_rising,
             exclusion_pts=max(3, half_range_pts),
         )
-        if off_pts and off_pts > 0 and n_points > 1:
-            sideband_offset_v = float(off_pts) * (
-                2.0 * abs(float(sweep_amplitude_v)) / (n_points - 1)
-            )
-            if sideband_offset_v > 1e-12:
-                hz_per_v = float(modulation_frequency_hz) / sideband_offset_v
-            else:
-                sideband_offset_v = None
-        if hz_per_v is not None and hz_per_v > 0.0:
-            # Discriminator gain: error-curve steepness on the sweep axis
-            # [err/sweep-V] divided by the sideband frequency calibration
-            # [Hz/sweep-V] gives err/Hz; ×1e6 -> err per MHz. Magnitude only
-            # (sign is the lock-slope direction, irrelevant for a noise std).
-            s_err = _crossing_slope_v_per_v(
-                error, best.index_float, half_range_pts, float(sweep_amplitude_v)
-            )
-            if s_err is not None and s_err != 0.0:
-                discriminator_slope_v_per_mhz = abs(s_err) / hz_per_v * 1.0e6
+        # sideband_offset_samples is a pure sample-domain measurement (N_SB) and
+        # does not need a known modulation frequency; sideband_offset_v/hz_per_v
+        # do, so they stay gated on it exactly as before (unchanged behaviour
+        # for find_auto_lock_target).
+        if off_pts and off_pts > 0:
+            sideband_offset_samples = float(off_pts)
+            if modulation_frequency_hz and n_points > 1:
+                sideband_offset_v = float(off_pts) * (
+                    2.0 * abs(float(sweep_amplitude_v)) / (n_points - 1)
+                )
+                if sideband_offset_v > 1e-12:
+                    hz_per_v = float(modulation_frequency_hz) / sideband_offset_v
+                else:
+                    sideband_offset_v = None
+
+    if hz_per_v is not None and hz_per_v > 0.0:
+        # Discriminator gain: error-curve steepness on the sweep axis
+        # [err/sweep-V] divided by the sideband frequency calibration
+        # [Hz/sweep-V] gives err/Hz; ×1e6 -> err per MHz. Magnitude only
+        # (sign is the lock-slope direction, irrelevant for a noise std).
+        s_err = _crossing_slope_v_per_v(
+            error, candidate.index_float, half_range_pts, float(sweep_amplitude_v)
+        )
+        if s_err is not None and s_err != 0.0:
+            discriminator_slope_v_per_mhz = abs(s_err) / hz_per_v * 1.0e6
+
+    # feature_amplitude: PDH lobe peak-to-peak -- the sum of the two
+    # opposite-sign lobe excursions around the crossing, on the UNSMOOTHED
+    # trace (error_raw, not the boxcar-smoothed `error` the crossing/threshold
+    # logic uses), within the same +/-half_range_pts lobe window. See the
+    # field docstring on AutoLockScanResult for why this must stay independent
+    # of `score`.
+    left_raw, right_raw = _excursions_for_slope(
+        error_raw, candidate.index, half_range_pts, candidate.target_slope_rising
+    )
+    feature_amplitude = float(left_raw + right_raw)
 
     target_voltage = _index_to_voltage(
-        best.index_float,
+        candidate.index_float,
         n_points,
         float(sweep_center_v),
         float(sweep_amplitude_v),
     )
     return AutoLockScanResult(
-        target_index=best.index,
+        target_index=candidate.index,
         target_voltage=float(target_voltage),
-        target_slope_rising=bool(best.target_slope_rising),
-        score=float(best.score),
-        left_excursion=float(best.left_excursion),
-        right_excursion=float(best.right_excursion),
-        pair_excursion=float(best.pair_excursion),
-        symmetry=float(best.symmetry),
+        target_slope_rising=bool(candidate.target_slope_rising),
+        score=float(candidate.score),
+        left_excursion=float(candidate.left_excursion),
+        right_excursion=float(candidate.right_excursion),
+        pair_excursion=float(candidate.pair_excursion),
+        symmetry=float(candidate.symmetry),
         monitor_level=(
-            float(best.monitor_level) if best.monitor_level is not None else None
+            float(candidate.monitor_level) if candidate.monitor_level is not None else None
         ),
         hz_per_v=(float(hz_per_v) if hz_per_v is not None else None),
         sideband_offset_v=(
@@ -972,7 +1050,88 @@ def find_auto_lock_target(
             if discriminator_slope_v_per_mhz is not None
             else None
         ),
+        feature_amplitude=feature_amplitude,
+        sideband_offset_samples=(
+            float(sideband_offset_samples) if sideband_offset_samples is not None else None
+        ),
+        monitor_contrast=(
+            float(candidate.monitor_contrast)
+            if candidate.monitor_contrast is not None
+            else None
+        ),
+        crossing_index=float(candidate.index_float),
     )
+
+
+def find_auto_lock_candidates(
+    *,
+    error_trace_v: np.ndarray,
+    monitor_trace_v: np.ndarray | None,
+    sweep_center_v: float,
+    sweep_amplitude_v: float,
+    settings: AutoLockScanSettings,
+    preferred_slope_rising: bool | None = None,
+    modulation_frequency_hz: float | None = None,
+) -> list[AutoLockScanResult]:
+    """THE single auto-lock target detector.
+
+    Returns every accepted PDH/dispersive crossing on this trace (same
+    acceptance criteria as ``find_auto_lock_target`` always applied), sorted
+    by descending score. Raises the same ``ValueError`` as before when nothing
+    is accepted (see ``_gather_auto_lock_candidates``).
+    """
+    accepted, error_raw, error, n_points, half_range_pts = _gather_auto_lock_candidates(
+        error_trace_v=error_trace_v,
+        monitor_trace_v=monitor_trace_v,
+        sweep_amplitude_v=sweep_amplitude_v,
+        settings=settings,
+        preferred_slope_rising=preferred_slope_rising,
+    )
+    results = [
+        _finalize_candidate(
+            candidate,
+            error_raw=error_raw,
+            error=error,
+            n_points=n_points,
+            sweep_center_v=sweep_center_v,
+            sweep_amplitude_v=sweep_amplitude_v,
+            settings=settings,
+            modulation_frequency_hz=modulation_frequency_hz,
+            half_range_pts=half_range_pts,
+        )
+        for candidate in accepted
+    ]
+    results.sort(key=lambda result: result.score, reverse=True)
+    return results
+
+
+def find_auto_lock_target(
+    *,
+    error_trace_v: np.ndarray,
+    monitor_trace_v: np.ndarray | None,
+    sweep_center_v: float,
+    sweep_amplitude_v: float,
+    settings: AutoLockScanSettings,
+    preferred_slope_rising: bool | None = None,
+    modulation_frequency_hz: float | None = None,
+) -> AutoLockScanResult:
+    """Backward-compatible best-score wrapper around ``find_auto_lock_candidates``.
+
+    Unchanged signature/behaviour: returns the best-score candidate, raising
+    the same ``ValueError`` messages as before when none qualify (propagated
+    from ``find_auto_lock_candidates``, which never returns an empty list --
+    it raises instead).
+    """
+    candidates = find_auto_lock_candidates(
+        error_trace_v=error_trace_v,
+        monitor_trace_v=monitor_trace_v,
+        sweep_center_v=sweep_center_v,
+        sweep_amplitude_v=sweep_amplitude_v,
+        settings=settings,
+        preferred_slope_rising=preferred_slope_rising,
+        modulation_frequency_hz=modulation_frequency_hz,
+    )
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------

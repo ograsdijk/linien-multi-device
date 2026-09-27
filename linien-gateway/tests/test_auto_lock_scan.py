@@ -7,6 +7,7 @@ from app.auto_lock_scan import (
     AutoLockScanSettings,
     calibrate_auto_lock_settings,
     feature_resolution_samples,
+    find_auto_lock_candidates,
     find_coarse_auto_lock_target,
     find_auto_lock_target,
     _sideband_offset_pts,
@@ -892,3 +893,153 @@ def test_the_default_lock_width_is_three_signal_widths_of_centre_travel():
     assert max_lockable_amplitude_v(settings, measured_sideband_v / 2) == pytest.approx(
         goal / 2
     )
+
+
+# ------------------------------------- find_auto_lock_candidates (all candidates)
+#
+# find_auto_lock_candidates is THE detector; find_auto_lock_target is a thin
+# backward-compatible wrapper around it (candidates[0]). These tests cover the
+# multi-candidate contract (C1 in the shared serrodyne spec) and pin that the
+# wrapper's behaviour has not moved.
+
+
+def _pdh_feature(
+    n, center, weight, width=0.02, sb_off=0.12, carrier_amp=0.4, sideband_amp=0.15
+):
+    """A PDH triplet (carrier + symmetric +/-sb_off sidebands) scaled by ``weight``.
+
+    Several of these at well-separated centers give the detector multiple
+    identical-morphology candidates that differ only in strength -- exactly
+    what a serrodyne order comparison needs to distinguish via feature_amplitude.
+    """
+    return (
+        _dispersive(n, amplitude=weight * carrier_amp, width=width, center=center)
+        + _dispersive(
+            n, amplitude=-weight * sideband_amp, width=width, center=center - sb_off
+        )
+        + _dispersive(
+            n, amplitude=-weight * sideband_amp, width=width, center=center + sb_off
+        )
+    )
+
+
+_MULTI_CANDIDATE_CENTERS = (-0.6, 0.0, 0.6)
+_MULTI_CANDIDATE_WEIGHTS = (1.0, 2.0, 3.0)
+_MULTI_CANDIDATE_SB_OFF = 0.12
+_MULTI_CANDIDATE_SETTINGS = AutoLockScanSettings(
+    signal_type="pdh",
+    half_range_sweep_v=0.05,
+    error_min=0.02,
+    symmetry_min=0.2,
+    min_amplitude=0.01,
+)
+
+
+def _multi_candidate_trace(n=2048):
+    trace = np.zeros(n)
+    for center, weight in zip(_MULTI_CANDIDATE_CENTERS, _MULTI_CANDIDATE_WEIGHTS):
+        trace = trace + _pdh_feature(
+            n, center, weight, sb_off=_MULTI_CANDIDATE_SB_OFF
+        )
+    return trace
+
+
+def _multi_candidate_kwargs(trace):
+    return dict(
+        error_trace_v=trace,
+        monitor_trace_v=None,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=_MULTI_CANDIDATE_SETTINGS,
+        preferred_slope_rising=True,
+        modulation_frequency_hz=25.0e6,
+    )
+
+
+def test_multiple_accepted_candidates_are_returned_sorted_by_score():
+    trace = _multi_candidate_trace()
+    candidates = find_auto_lock_candidates(**_multi_candidate_kwargs(trace))
+    assert len(candidates) == len(_MULTI_CANDIDATE_WEIGHTS)
+    scores = [c.score for c in candidates]
+    assert scores == sorted(scores, reverse=True)
+    # Strongest feature (weight 3.0, centered at +0.6) scores highest.
+    assert candidates[0].target_voltage == pytest.approx(0.6, abs=0.05)
+
+
+def test_find_auto_lock_target_matches_the_best_candidate():
+    """Regression: the backward-compatible wrapper returns candidates[0] exactly."""
+    trace = _multi_candidate_trace()
+    kwargs = _multi_candidate_kwargs(trace)
+    candidates = find_auto_lock_candidates(**kwargs)
+    target = find_auto_lock_target(**kwargs)
+    assert target == candidates[0]
+
+
+def test_no_candidates_raises_the_same_error_as_find_auto_lock_target():
+    n = 2048
+    error = 0.003 * np.sin(np.linspace(0.0, 8.0 * np.pi, n))
+    settings = AutoLockScanSettings()
+    kwargs = dict(
+        error_trace_v=error,
+        monitor_trace_v=None,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=settings,
+    )
+    with pytest.raises(ValueError, match="min_amplitude|lockable signal") as target_exc:
+        find_auto_lock_target(**kwargs)
+    with pytest.raises(ValueError, match="min_amplitude|lockable signal") as candidates_exc:
+        find_auto_lock_candidates(**kwargs)
+    assert str(target_exc.value) == str(candidates_exc.value)
+
+
+def test_feature_amplitude_scales_linearly_with_feature_weight_independent_of_score():
+    trace = _multi_candidate_trace()
+    candidates = find_auto_lock_candidates(**_multi_candidate_kwargs(trace))
+    by_voltage = {round(c.target_voltage, 1): c for c in candidates}
+    amp_at = {
+        center: by_voltage[round(center, 1)].feature_amplitude
+        for center in _MULTI_CANDIDATE_CENTERS
+    }
+    weight_at = dict(zip(_MULTI_CANDIDATE_CENTERS, _MULTI_CANDIDATE_WEIGHTS))
+
+    # feature_amplitude / weight is constant across candidates (linear scaling).
+    ratios = [amp_at[c] / weight_at[c] for c in _MULTI_CANDIDATE_CENTERS]
+    assert ratios[0] == pytest.approx(ratios[1], rel=0.05)
+    assert ratios[1] == pytest.approx(ratios[2], rel=0.05)
+
+    # Independent of score: score also folds in the weaker-lobe bonus and is not
+    # proportional to feature_amplitude the same way across candidates -- in
+    # particular feature_amplitude must not just equal score.
+    for c in candidates:
+        assert c.feature_amplitude != pytest.approx(c.score)
+
+
+def test_sideband_offset_samples_matches_the_known_spacing():
+    trace = _multi_candidate_trace()
+    candidates = find_auto_lock_candidates(**_multi_candidate_kwargs(trace))
+    n = 2048
+    expected_samples = _MULTI_CANDIDATE_SB_OFF * (n - 1) / 2.0
+    for c in candidates:
+        assert c.sideband_offset_samples is not None
+        assert c.sideband_offset_samples == pytest.approx(expected_samples, rel=0.1)
+
+
+def test_crossing_index_and_monitor_contrast_reported():
+    n = 2048
+    x = np.linspace(-1.0, 1.0, n)
+    error = _dispersive(n, amplitude=0.3, width=0.05)
+    monitor = 0.7 * np.exp(-0.5 * (x / 0.1) ** 2)  # transmission peak at center
+    candidates = find_auto_lock_candidates(
+        error_trace_v=error,
+        monitor_trace_v=monitor,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=AutoLockScanSettings(),
+        preferred_slope_rising=True,
+    )
+    assert len(candidates) == 1
+    best = candidates[0]
+    assert best.crossing_index == pytest.approx(best.target_index, abs=1.0)
+    assert best.monitor_contrast is not None
+    assert best.monitor_contrast > 0.0

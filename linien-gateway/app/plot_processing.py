@@ -60,6 +60,12 @@ class PlotState:
     # from last_plot_data[1] (= monitor_or_error_signal_2, which can be a 2nd error signal).
     last_monitor_signal: Optional[np.ndarray] = None
     last_unlocked_trace_at: float | None = None
+    # Monotonically increasing per-device identity for each stored unlocked
+    # trace (1-based; 0 = none stored yet). Incremented alongside
+    # last_unlocked_trace_at below, under the same lock, so a caller reading
+    # both together always sees a consistent (frame_id, acquired_at) pair for
+    # whichever frame is currently cached.
+    last_unlocked_frame_id: int = 0
     autolock_ref_spectrum: Optional[np.ndarray] = None
     last_lock_state: Optional[bool] = None
     # Cached scaled history series for the full-detail path. Rebuilding
@@ -359,6 +365,7 @@ def build_plot_frame(
         # monitor_or_error_signal_2 (which is error_signal_2 on dual-error devices).
         state.last_monitor_signal = monitor_signal
         state.last_unlocked_trace_at = time.time()
+        state.last_unlocked_frame_id += 1
 
         state.combined_error_cache.append(combined_error)
         state.combined_error_cache = state.combined_error_cache[-20:]

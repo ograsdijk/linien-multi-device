@@ -93,3 +93,35 @@ def test_dual_error_signal_leaves_no_true_monitor():
     # ...but the true monitor is absent, so auto-lock won't treat it as one.
     assert state.last_monitor_signal is None
 
+
+def test_unlocked_frame_id_increments_monotonically_per_stored_trace():
+    """Frame identity for stored unlocked traces (serrodyne spec C1): each
+    processed unlocked frame gets a new, strictly increasing frame_id, paired
+    with the acquisition timestamp under the same state."""
+    to_plot = {
+        "error_signal_1": np.array([0, 1, 2, 3]),
+        "monitor_signal": np.array([0, 1, 1, 0]),
+    }
+    state = PlotState()
+    assert state.last_unlocked_frame_id == 0
+
+    build_plot_frame(to_plot, {**_UNLOCKED_PARAMS, "dual_channel": False}, state)
+    first_id = state.last_unlocked_frame_id
+    first_at = state.last_unlocked_trace_at
+    assert first_id == 1
+    assert first_at is not None
+
+    build_plot_frame(to_plot, {**_UNLOCKED_PARAMS, "dual_channel": False}, state)
+    second_id = state.last_unlocked_frame_id
+    second_at = state.last_unlocked_trace_at
+    assert second_id == 2
+    assert second_at is not None and second_at >= first_at
+
+    # A locked frame does not touch the unlocked-trace identity.
+    locked_to_plot = {
+        "error_signal": np.array([0, 1, 2, 3]),
+        "control_signal": np.array([0, -1, -2, -3]),
+    }
+    build_plot_frame(to_plot=locked_to_plot, params={**_UNLOCKED_PARAMS, "lock": True}, state=state)
+    assert state.last_unlocked_frame_id == 2
+

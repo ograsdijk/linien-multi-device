@@ -33,8 +33,10 @@ from . import schemas
 from .auto_lock_scan import (
     AutoLockCalibration,
     AutoLockScanSettings,
+    _robust_noise,
     calibrate_auto_lock_settings,
     feature_resolution_samples,
+    find_auto_lock_candidates,
     find_coarse_auto_lock_target,
     find_auto_lock_target,
     scan_too_wide_to_lock,
@@ -2509,21 +2511,65 @@ class DeviceSession:
         with self._rpyc_lock:
             self.control.exposed_start_lock()
 
+    def _snapshot_auto_lock_traces_with_frame(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray | None, int, float | None]:
+        """Same traces as ``_snapshot_auto_lock_traces``, plus the identity
+        (frame_id, acquired_at) of the exact stored frame they came from,
+        captured under the same lock so the two can never refer to different
+        frames."""
+        with self._state_lock:
+            plot_data = self.plot_state.last_plot_data
+            if plot_data is None or len(plot_data) < 3:
+                raise RuntimeError("No unlocked trace available")
+            error_trace_raw = plot_data[2]
+            # The *true* monitor (None if the device has no monitor signal), not
+            # last_plot_data[1] which is monitor_or_error_signal_2.
+            monitor_trace_raw = self.plot_state.last_monitor_signal
+            frame_id = int(self.plot_state.last_unlocked_frame_id)
+            acquired_at = self.plot_state.last_unlocked_trace_at
+        if error_trace_raw is None:
+            raise RuntimeError("No error trace available")
+        # Plot units: divide by ADC_SCALE (= plot_processing.V) so auto-lock thresholds
+        # read on the same fixed scale as the plotted traces (not per-trace normalized).
+        error_trace = np.array(error_trace_raw, copy=True) / ADC_SCALE
+        monitor_trace = (
+            np.array(monitor_trace_raw, copy=True) / ADC_SCALE
+            if monitor_trace_raw is not None
+            else None
+        )
+        return error_trace, monitor_trace, frame_id, acquired_at
+
     def auto_lock_detect(
         self, settings_payload: dict[str, Any] | None
     ) -> dict[str, Any]:
-        """Run the auto-lock target finder against the latest trace WITHOUT locking.
+        """Detect auto-lock candidates against the latest cached unlocked trace,
+        WITHOUT locking. Read-only: does not persist settings, touch sweep_center,
+        or start the lock. Intended for orchestration: probe, adjust the offset
+        (e.g. NLTL), and re-probe before committing to a lock via auto_lock_scan.
 
-        Same detection/criteria as auto_lock_from_scan (error_min, symmetry_min,
-        min_amplitude, optional single-side / monitor level), but it does not touch
-        sweep_center or start the lock. Returns the best candidate (AutoLockScanResult
-        dict, incl. hz_per_v in PDH mode); raises ValueError if no crossing meets the
-        criteria. Read-only — it does not persist settings. Intended for orchestration:
-        probe, adjust the offset (e.g. NLTL), and re-probe before committing to a lock.
+        Returns ``{"found", "candidate", "candidates", "reason", "frame"}``:
+        - ``candidates``: every accepted crossing (``find_auto_lock_candidates``,
+          desc score), each an ``AutoLockScanResult`` dict.
+        - ``candidate``: the best-score one (``candidates[0]``), or None.
+        - ``reason``: the detector's ``ValueError`` message when nothing
+          qualified, else None. Not raised -- "no candidate" is a normal
+          diagnostic outcome, not a hard failure.
+        - ``frame``: identity/geometry of the analysed frame (frame_id,
+          acquired_at, sweep center/amplitude, n_points,
+          modulation_frequency_hz, sideband_spacing_samples = median of the
+          candidates' sideband_offset_samples, noise_floor = MAD-based robust
+          point noise of the error trace). Always present when a frame was
+          available to analyse -- including when no candidate qualified.
+
+        Raises ``RuntimeError`` only for a hard failure that leaves no frame to
+        report at all: device not connected, or no unlocked trace stored yet.
         """
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
-        error_trace, monitor_trace = self._snapshot_auto_lock_traces()
+        error_trace, monitor_trace, frame_id, acquired_at = (
+            self._snapshot_auto_lock_traces_with_frame()
+        )
 
         with self._state_lock:
             if settings_payload is None:
@@ -2534,17 +2580,46 @@ class DeviceSession:
             self._snapshot_sweep_params()
         )
 
-        # Traces are in plot units (divided by ADC_SCALE in _snapshot_auto_lock_traces).
-        result = find_auto_lock_target(
-            error_trace_v=error_trace,
-            monitor_trace_v=monitor_trace,
-            sweep_center_v=sweep_center,
-            sweep_amplitude_v=sweep_amplitude,
-            settings=settings,
-            preferred_slope_rising=preferred_slope_rising,
-            modulation_frequency_hz=modulation_frequency_hz,
-        )
-        return result.to_dict()
+        reason: str | None = None
+        candidates: list[Any] = []
+        try:
+            # Traces are in plot units (divided by ADC_SCALE above).
+            candidates = find_auto_lock_candidates(
+                error_trace_v=error_trace,
+                monitor_trace_v=monitor_trace,
+                sweep_center_v=sweep_center,
+                sweep_amplitude_v=sweep_amplitude,
+                settings=settings,
+                preferred_slope_rising=preferred_slope_rising,
+                modulation_frequency_hz=modulation_frequency_hz,
+            )
+        except ValueError as exc:
+            reason = str(exc)
+
+        sideband_samples = [
+            c.sideband_offset_samples
+            for c in candidates
+            if c.sideband_offset_samples is not None
+        ]
+        frame = {
+            "frame_id": frame_id,
+            "acquired_at": acquired_at,
+            "sweep_center_v": sweep_center,
+            "sweep_amplitude_v": sweep_amplitude,
+            "n_points": int(len(error_trace)),
+            "modulation_frequency_hz": modulation_frequency_hz,
+            "sideband_spacing_samples": (
+                float(np.median(sideband_samples)) if sideband_samples else None
+            ),
+            "noise_floor": float(_robust_noise(np.asarray(error_trace, dtype=float))),
+        }
+        return {
+            "found": bool(candidates),
+            "candidate": candidates[0].to_dict() if candidates else None,
+            "candidates": [c.to_dict() for c in candidates],
+            "reason": reason,
+            "frame": frame,
+        }
 
 
     def _wait_for_fresh_unlocked_trace(
@@ -3549,6 +3624,8 @@ class DeviceSession:
                 np.array(plot_data[1], copy=True) if plot_data[1] is not None else None
             )
             combined_error = np.array(plot_data[2], copy=True)
+            frame_id = int(self.plot_state.last_unlocked_frame_id)
+            acquired_at = self.plot_state.last_unlocked_trace_at
 
         dual_channel = bool(self._read_param_fast("dual_channel", False))
         center = float(self._read_param_fast("sweep_center", 0.0) or 0.0)
@@ -3580,6 +3657,11 @@ class DeviceSession:
             "error_signal_1": to_volts(error_signal_1),
             "error_signal_2": to_volts(monitor_or_error_2) if dual_channel else None,
             "monitor_signal": to_volts(monitor_or_error_2) if not dual_channel else None,
+            # Additive: identity of the specific unlocked trace this snapshot
+            # was built from, so a caller (e.g. auto_lock_candidates?acquire=true)
+            # can confirm it analysed this frame and not an older cached one.
+            "frame_id": frame_id,
+            "acquired_at": acquired_at,
         }
 
     def start_autolock(self, x0: int, x1: int) -> None:
