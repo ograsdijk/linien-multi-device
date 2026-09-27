@@ -1128,3 +1128,31 @@ def test_lock_ignores_sideband_drift_during_verification_like_one_shot():
     assert lock_result["target_voltage"] == pytest.approx(0.1)
     assert len(locked) == 1
     assert session.staged_autolock_state() == {"active": False}
+
+
+def test_lock_handover_refuses_while_a_one_shot_walk_holds_the_center_lock():
+    # The final centre move + lock engage must be serialized with a one-shot
+    # walk driving the same actuator, like `step`: refuse, never interleave.
+    session = _make_session()
+    _geometry_recorder(session)
+    locked = _lock_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.2)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    token = session.staged_autolock_begin(None, 60.0)["token"]
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.2)], 0.0, 1.0, 2.0, _frame(2, 0.0, 1.0),
+        )
+    )
+
+    assert session._center_move_lock.acquire(blocking=False)
+    try:
+        with pytest.raises(StagedAutolockError) as excinfo:
+            session.staged_autolock_lock(token, 1, 1)
+        assert excinfo.value.status_code == 409
+        assert locked == []
+    finally:
+        session._center_move_lock.release()

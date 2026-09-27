@@ -4701,7 +4701,15 @@ class DeviceSession:
                         "to lock.",
                         status_code=409,
                     )
-            self._move_and_lock(final, center_v)
+            # The centre move + lock handover must not interleave with a one-shot
+            # walk driving the same actuator (same rule as `step`).
+            try:
+                with self._exclusive_center_move("staged auto-lock lock"):
+                    self._move_and_lock(final, center_v)
+            except RuntimeError as exc:
+                if "Another sweep-center move" in str(exc):
+                    raise StagedAutolockError(str(exc), status_code=409) from exc
+                raise
             timer_to_cancel: threading.Timer | None = None
             with self._state_lock:
                 active_run = self._staged_autolock
