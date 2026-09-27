@@ -77,6 +77,15 @@ def _frame(frame_id: int, center_v: float, amplitude_v: float) -> dict[str, Any]
     }
 
 
+# Every session `_make_session()` hands out, so an autouse fixture can cancel
+# any TTL timer thread a test leaves running (a test that leaves a run active
+# with a long TTL rather than aborting/locking it would otherwise leak a real
+# `threading.Timer` thread for the rest of the test session -- enough of
+# those alive at once made the precise-timing TTL-expiry tests intermittently
+# flaky under load).
+_sessions_for_cleanup: list[DeviceSession] = []
+
+
 def _make_session() -> DeviceSession:
     device = SimpleNamespace(
         key="dev-staged", name="dev-staged", host="127.0.0.1", port=18864, parameters={}
@@ -90,7 +99,18 @@ def _make_session() -> DeviceSession:
         modulation_frequency=0.0,
         lock=False,
     )
+    _sessions_for_cleanup.append(session)
     return session
+
+
+@pytest.fixture(autouse=True)
+def _cancel_leaked_run_timers():
+    yield
+    while _sessions_for_cleanup:
+        session = _sessions_for_cleanup.pop()
+        run = session._staged_autolock
+        if run is not None and run.timer is not None:
+            run.timer.cancel()
 
 
 def _geometry_recorder(session: DeviceSession) -> list[tuple[float, float]]:
@@ -141,8 +161,14 @@ def test_staged_step_follows_the_callers_selection_not_the_higher_score(monkeypa
     _restore_recorder(session)
     locked = _lock_recorder(session)
 
+    # The desired candidate's sideband (0.1) is wide enough that, after
+    # narrowing to amplitude 0.3, it clears the fix #8 lockability gate
+    # (scan_too_wide_to_lock) -- unrelated to what this test is about
+    # (selection identity/hysteresis), but needed for the final `lock()`
+    # call below to be reachable at all now that the gate exists. The decoy
+    # keeps the default (narrower) sideband; it is never selected.
     begin_candidates = [
-        _result(100, 0.180, score=0.5),  # desired (weaker)
+        _result(100, 0.180, score=0.5, sideband_offset_v=0.1),  # desired (weaker)
         _result(200, -0.410, score=0.95),  # decoy (stronger, same morphology)
     ]
 
@@ -160,7 +186,7 @@ def test_staged_step_follows_the_callers_selection_not_the_higher_score(monkeypa
     # (unpredictable) position, distinguished only by target_index -- the
     # decoy remains higher-scoring.
     post_move_candidates = [
-        _result(50, 0.191, score=0.4),  # desired, moved, weaker score
+        _result(50, 0.191, score=0.4, sideband_offset_v=0.1),  # desired, moved, weaker score
         _result(75, -0.402, score=0.97),  # decoy, still highest score
     ]
 
@@ -298,6 +324,9 @@ def test_lock_verification_ambiguous_two_candidates_refuses_to_lock(monkeypatch)
     session = _make_session()
     _geometry_recorder(session)
     locked = _lock_recorder(session)
+    # Ambiguity, not scan geometry, is under test here -- disable the fix #8
+    # lockability gate's width check.
+    session.auto_lock_scan_settings["min_signal_scan_fraction"] = 0.0
     session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
         lambda settings, after=None: (
             [_result(1, 0.1)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
@@ -356,7 +385,11 @@ def test_ttl_expiry_restores_geometry_with_no_further_calls(monkeypatch):
     result = session.staged_autolock_begin(None, 0.05)
     token = result["token"]
 
-    time.sleep(0.3)
+    # Generous margin over the 0.05 s TTL: under a loaded full-suite run
+    # (many other tests' own real threads/timers contending for the GIL), a
+    # tight margin here made this test intermittently flaky even though the
+    # timer itself always fires no earlier than requested.
+    time.sleep(1.0)
 
     assert session.staged_autolock_state() == {"active": False}
     assert restores == [(0.0, 1.0)]
@@ -553,7 +586,8 @@ def test_lock_cannot_proceed_after_the_run_has_expired():
     result = session.staged_autolock_begin(None, 0.05)
     token = result["token"]
 
-    time.sleep(0.3)
+    # See the sleep-margin note in test_ttl_expiry_restores_geometry_with_no_further_calls.
+    time.sleep(1.0)
     assert session.staged_autolock_state() == {"active": False}
     assert restores == [(0.0, 1.0)]
 
@@ -676,3 +710,421 @@ def test_width_shift_measurement_uses_the_callers_selection_not_the_best_score()
     # NOT the value the pre-fix code would have measured against the decoy:
     # |-0.402 - 0.180| / 0.7 ~= 0.831 -- would poison every later stage.
     assert run.shift_per_fraction != pytest.approx(0.582 / 0.7, rel=0.01)
+
+
+# --------------------------------------------------------------------------
+# Fix #2 / #6: `begin` falls back to the coarse detector when strict finds
+# nothing (instead of storing `[]`/"strict"), and a staged run's candidates
+# always come from the run's OWN settings/detector.
+# --------------------------------------------------------------------------
+
+
+def test_begin_falls_back_to_coarse_when_strict_finds_nothing(monkeypatch):
+    session = _make_session()
+
+    def _strict_rejects(settings, after=None):
+        raise ValueError("scan too wide for the strict detector")
+
+    coarse_candidates = [_result(1, 0.25, sideband_offset_v=0.3, score=0.6)]
+
+    def _coarse_accepts(settings, after=None):
+        return coarse_candidates, 0.0, 1.0, 3.0, {"best": True}, _frame(1, 0.0, 1.0)
+
+    monkeypatch.setattr(session, "_capture_auto_lock_candidates_strict", _strict_rejects)
+    monkeypatch.setattr(session, "_coarse_auto_lock_candidates", _coarse_accepts)
+
+    result = session.staged_autolock_begin(None, 60.0)
+
+    # Pre-fix: strict's ValueError made `begin` store `[]`/"strict" outright,
+    # never trying the coarse detector at all -- exactly the wide-scan case
+    # trajectory refinement exists for, left with nothing to step from.
+    assert result["candidates"] != []
+    assert result["candidates"][0]["target_index"] == 1
+    assert result["detector"] == "coarse"
+    assert result["detail"] is None
+    run = session._staged_autolock
+    assert run is not None
+    assert run.latest_detector == "coarse"
+    assert len(run.latest_candidates) == 1
+
+
+def test_begin_reports_when_both_detectors_find_nothing(monkeypatch):
+    import numpy as np
+
+    session = _make_session()
+
+    def _strict_rejects(settings, after=None):
+        raise ValueError("no strict crossing")
+
+    def _coarse_rejects(settings, after=None):
+        raise ValueError("no coarse crossing either")
+
+    monkeypatch.setattr(session, "_capture_auto_lock_candidates_strict", _strict_rejects)
+    monkeypatch.setattr(session, "_coarse_auto_lock_candidates", _coarse_rejects)
+    monkeypatch.setattr(
+        session,
+        "_snapshot_auto_lock_traces_with_frame",
+        lambda: (np.zeros(2048), None, 1, time.time()),
+    )
+
+    result = session.staged_autolock_begin(None, 60.0)
+    assert result["candidates"] == []
+    assert result["detail"] is not None
+    assert "no strict crossing" in result["detail"]
+    assert "no coarse crossing either" in result["detail"]
+
+
+def test_run_aware_detect_uses_run_settings_and_detector_not_endpoint_settings(
+    monkeypatch,
+):
+    """Regression for fix #2b: while a staged run is active and the current
+    geometry matches it, `auto_lock_candidates_detect` must detect with
+    `run.settings`/the run's own detector mode (never the endpoint's own
+    settings), and fold that SAME result into `run.latest_*` -- not the
+    strict-only, endpoint-settings result `auto_lock_detect` would have
+    produced, which (pre-fix) silently replaced a coarse-stage run's
+    candidates and left `latest_detector` pointing at the wrong baseline.
+    """
+    session = _make_session()
+
+    # begin() lands the run on a coarse-only frame (the strict detector
+    # rejects this wide scan).
+    def _strict_rejects(settings, after=None):
+        raise ValueError("scan too wide for the strict detector")
+
+    coarse_candidates = [_result(1, 0.25, sideband_offset_v=0.3, score=0.6)]
+
+    def _coarse_accepts(settings, after=None):
+        return coarse_candidates, 0.0, 1.0, 3.0, {"best": True}, _frame(1, 0.0, 1.0)
+
+    monkeypatch.setattr(session, "_capture_auto_lock_candidates_strict", _strict_rejects)
+    monkeypatch.setattr(session, "_coarse_auto_lock_candidates", _coarse_accepts)
+    session.staged_autolock_begin(None, 60.0)
+    run = session._staged_autolock
+    assert run is not None
+    assert run.latest_detector == "coarse"
+
+    # An `auto_lock_candidates` call arrives at the SAME geometry the run is
+    # sitting at (e.g. acquire=false, or acquire=true landing on the same
+    # frame), passing its OWN (irrelevant) settings payload. The strict
+    # detector still rejects; only the coarse path should ever be tried, and
+    # it must use `run.settings`, never `settings_payload`.
+    strict_calls: list[Any] = []
+
+    def _strict_rejects_again(settings, after=None):
+        strict_calls.append(settings)
+        raise ValueError("still too wide")
+
+    fresh_coarse_candidates = [_result(2, 0.26, sideband_offset_v=0.31, score=0.7)]
+
+    def _coarse_accepts_again(settings, after=None):
+        assert settings is run.settings, "must detect with the RUN's settings"
+        return (
+            fresh_coarse_candidates, 0.0, 1.0, 3.0, {"best": True},
+            _frame(2, 0.0, 1.0),
+        )
+
+    monkeypatch.setattr(session, "_capture_auto_lock_candidates_strict", _strict_rejects_again)
+    monkeypatch.setattr(session, "_coarse_auto_lock_candidates", _coarse_accepts_again)
+
+    endpoint_settings_payload = {"signal_type": "pdh", "half_range_sweep_v": 0.5}
+    result = session.auto_lock_candidates_detect(endpoint_settings_payload)
+
+    assert result["detector"] == "coarse"
+    assert result["candidates"][0]["target_index"] == 2
+    # Folded directly into the run -- a later `step`/`lock` on target_index 2
+    # from THIS response must find it in run.latest_candidates.
+    assert run.latest_detector == "coarse"
+    assert [c.target_index for c in run.latest_candidates] == [2]
+    assert run.latest_frame["frame_id"] == 2
+
+
+# --------------------------------------------------------------------------
+# Fix #1 / #3: refusing before any device I/O, and serialising the
+# geometry-writing parts of `step`/`lock` against a one-shot walk.
+# --------------------------------------------------------------------------
+
+
+def test_begin_precheck_refuses_while_locked_without_any_side_effect():
+    session = _make_session()
+    session.parameters.lock.value = True
+
+    with pytest.raises(RuntimeError, match="locked"):
+        session.staged_autolock_begin_precheck()
+    # No run was created and the device was never told to start sweeping.
+    assert session._staged_autolock is None
+
+
+def test_begin_precheck_refuses_while_the_center_move_lock_is_held():
+    session = _make_session()
+    assert session._center_move_lock.acquire(blocking=False)
+    try:
+        with pytest.raises(RuntimeError, match="sweep-center move"):
+            session.staged_autolock_begin_precheck()
+    finally:
+        session._center_move_lock.release()
+
+
+def test_step_refuses_with_409_while_a_one_shot_walk_holds_the_center_lock():
+    session = _make_session()
+    _geometry_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.03)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.15, sideband_offset_v=0.03)], 0.05, 0.5, 5.0, _frame(2, 0.05, 0.5)
+        )
+    )
+
+    assert session._center_move_lock.acquire(blocking=False)
+    try:
+        with pytest.raises(StagedAutolockError) as excinfo:
+            session.staged_autolock_step(token, 1, 1)
+        assert excinfo.value.status_code == 409
+        # Refused before any geometry write: the run is untouched.
+        assert session.staged_autolock_state()["stage_index"] == 0
+        assert session.staged_autolock_state()["geometry"] == {
+            "center_v": 0.0, "amplitude_v": 1.0,
+        }
+    finally:
+        session._center_move_lock.release()
+
+
+# --------------------------------------------------------------------------
+# Fix #4: a stage whose geometry write lands but whose detection then fails
+# must recover the run to the device's ACTUAL geometry, stay active, and
+# report 422 -- not leave the run pointing at stale geometry forever.
+# --------------------------------------------------------------------------
+
+
+def test_step_recovers_run_geometry_after_a_failed_stage_detection(monkeypatch):
+    session = _make_session()
+    _geometry_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.03)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+
+    # The stage's geometry write succeeds (the fake `_set_sweep_geometry`
+    # from `_geometry_recorder` updates session.parameters), but BOTH
+    # detectors then reject the new trace.
+    def _strict_rejects(settings, after=None):
+        raise ValueError("strict rejects the new trace")
+
+    def _coarse_rejects(settings, after=None):
+        raise ValueError("coarse rejects it too")
+
+    monkeypatch.setattr(session, "_capture_auto_lock_candidates_strict", _strict_rejects)
+    monkeypatch.setattr(session, "_coarse_auto_lock_candidates", _coarse_rejects)
+
+    with pytest.raises(StagedAutolockError) as excinfo:
+        session.staged_autolock_step(token, 1, 1)
+    assert excinfo.value.status_code == 422
+    assert "abort or retry" in str(excinfo.value)
+
+    # The run stays active, but its bookkeeping now reflects the device's
+    # ACTUAL (new, post-write) geometry -- not the OLD one from before this
+    # stage. Pre-fix, `run.center_v`/`amplitude_v` stayed at (0.0, 1.0) while
+    # the device had already moved, so `lock`'s geometry-unchanged check
+    # would then fail forever.
+    state = session.staged_autolock_state()
+    assert state["active"] is True
+    assert state["stage_index"] == 1
+    assert state["geometry"] != {"center_v": 0.0, "amplitude_v": 1.0}
+    assert state["geometry"] == {
+        "center_v": session.parameters.sweep_center.value,
+        "amplitude_v": session.parameters.sweep_amplitude.value,
+    }
+    run = session._staged_autolock
+    assert run.latest_candidates == []
+    assert run.pending_shift is None
+
+
+# --------------------------------------------------------------------------
+# Fix #5: the TTL-expiry timer must not abort a run a `renew` call already
+# extended, even if the OLD timer's callback fires after the renew.
+# --------------------------------------------------------------------------
+
+
+def test_expire_racing_a_renew_does_not_abort_the_extended_run():
+    session = _make_session()
+    _geometry_recorder(session)
+    restores = _restore_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+
+    # Simulate the race directly: `renew` extends `expires_at` and arms a new
+    # timer, but the OLD timer's callback -- already past its busy check --
+    # lands afterward anyway (Timer.cancel() cannot stop a thread already
+    # running). Calling the STALE callback (bound to the old expiry) must be
+    # a no-op now that `expires_at` has moved into the future.
+    session.staged_autolock_renew(token, 5.0)
+    session._staged_autolock_expire(token)
+
+    assert session.staged_autolock_state()["active"] is True
+    assert restores == []
+
+
+# --------------------------------------------------------------------------
+# Fix #7: the deferred width-shift measurement must only be consumed AFTER
+# the selection passes the identity check, not before.
+# --------------------------------------------------------------------------
+
+
+def test_a_rejected_selection_does_not_consume_the_pending_shift_measurement():
+    session = _make_session()
+    _geometry_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.03, slope_rising=True)],
+            0.0, 1.0, 2.0, _frame(1, 0.0, 1.0),
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+    session.staged_autolock_step(token, 1, 1)  # establishes identity (rising slope)
+
+    # The stage that follows produces a frame with a pending shift
+    # measurement (see StagedAutolockRun.pending_shift) and a candidate with
+    # the OPPOSITE slope -- selecting it must fail identity.
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(2, 0.2, sideband_offset_v=0.03, slope_rising=False)],
+            0.1, 0.5, 5.0, _frame(2, 0.1, 0.5),
+        )
+    )
+    session.staged_autolock_step(token, 1, 1)
+    run = session._staged_autolock
+    assert run.pending_shift is not None
+
+    with pytest.raises(StagedAutolockError):
+        session.staged_autolock_step(token, 2, 2)
+
+    # Pre-fix, `_consume_pending_shift_measurement` ran BEFORE the identity
+    # check and had already recorded a (wrong) shift_per_fraction by the time
+    # the rejection was raised -- and `max()` in `plan_refinement_step`'s
+    # caller means that bad value would stick for every later stage.
+    assert run.pending_shift is not None
+    assert run.shift_per_fraction is None
+
+
+# --------------------------------------------------------------------------
+# Fix #8: `lock` must refuse from a wide/coarse frame -- the same
+# `scan_too_wide_to_lock` rule the one-shot loop and `lockable_here` apply.
+# --------------------------------------------------------------------------
+
+
+def test_lock_refuses_from_a_frame_that_is_not_lockable_here():
+    session = _make_session()
+    _geometry_recorder(session)
+    locked = _lock_recorder(session)
+    # Default settings + a narrow sideband at amplitude 1.0 is "too wide to
+    # lock" (min_signal_scan_fraction requires the sideband to span a
+    # sixth of the half-range or more).
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.03)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+
+    with pytest.raises(StagedAutolockError) as excinfo:
+        session.staged_autolock_lock(token, 1, 1)
+    assert excinfo.value.status_code == 422
+    assert "lockable" in str(excinfo.value).lower()
+    assert locked == []
+    # The run stays active so the caller can `step` first, per the message.
+    assert session.staged_autolock_state()["active"] is True
+
+
+# --------------------------------------------------------------------------
+# Fix #9: lock-time verification must align with the one-shot's final
+# verification at unchanged geometry -- check_sideband=False, and require
+# confirmation on TWO consecutive fresh frames before ever moving/locking.
+# --------------------------------------------------------------------------
+
+
+def test_lock_refuses_when_the_second_confirmation_frame_disagrees():
+    session = _make_session()
+    _geometry_recorder(session)
+    locked = _lock_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.2)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+
+    calls = {"n": 0}
+
+    def _flaky(settings, after=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (
+                [_result(1, 0.1, sideband_offset_v=0.2)], 0.0, 1.0, 2.0, _frame(2, 0.0, 1.0),
+            )
+        # Second confirmation frame: the candidate has moved far away --
+        # not a consistent re-detection of the same crossing. Pre-fix, only
+        # ONE frame was ever taken, so this second (disagreeing) frame was
+        # never even looked at and the lock would have already succeeded.
+        return (
+            [_result(1, 0.5, sideband_offset_v=0.2)], 0.0, 1.0, 2.0, _frame(3, 0.0, 1.0),
+        )
+
+    session._capture_auto_lock_candidates_strict = _flaky  # type: ignore[method-assign]
+
+    with pytest.raises(StagedAutolockError) as excinfo:
+        session.staged_autolock_lock(token, 1, 1)
+    assert excinfo.value.status_code == 422
+    assert calls["n"] == 2, "both confirmation frames must be taken"
+    assert locked == []
+    assert session.staged_autolock_state()["active"] is True
+
+
+def test_lock_ignores_sideband_drift_during_verification_like_one_shot():
+    """`check_sideband=False` at lock-verification time, mirroring the
+    one-shot's final verification at unchanged geometry: the sideband
+    estimate a freshly-narrowed run just measured is the thing under test,
+    not a gate that can itself refuse the confirmation.
+    """
+    session = _make_session()
+    _geometry_recorder(session)
+    locked = _lock_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.2)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+
+    # Both confirmation frames report the SAME position but a wildly
+    # different sideband spacing from the established identity baseline
+    # (0.2) -- pre-fix (check_sideband defaulting True) this would be
+    # refused as an identity change even though the position is exact.
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.03)], 0.0, 1.0, 2.0, _frame(2, 0.0, 1.0),
+        )
+    )
+
+    lock_result = session.staged_autolock_lock(token, 1, 1)
+    assert lock_result["target_voltage"] == pytest.approx(0.1)
+    assert len(locked) == 1
+    assert session.staged_autolock_state() == {"active": False}
