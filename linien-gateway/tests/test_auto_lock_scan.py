@@ -8,6 +8,7 @@ from app.auto_lock_scan import (
     calibrate_auto_lock_settings,
     feature_resolution_samples,
     find_auto_lock_candidates,
+    find_coarse_auto_lock_candidates,
     find_coarse_auto_lock_target,
     find_auto_lock_target,
     _sideband_offset_pts,
@@ -1043,3 +1044,74 @@ def test_crossing_index_and_monitor_contrast_reported():
     assert best.crossing_index == pytest.approx(best.target_index, abs=1.0)
     assert best.monitor_contrast is not None
     assert best.monitor_contrast > 0.0
+
+
+# ------------------------------- find_coarse_auto_lock_candidates (fix #2) -
+#
+# find_coarse_auto_lock_target used to wrap the single best-score extrema
+# pair, so a caller who wanted a *specific* serrodyne order (several
+# identical-morphology PDH features present, strict detector rejecting the
+# frame) had nothing to choose from. find_coarse_auto_lock_candidates exposes
+# every accepted pair; find_coarse_auto_lock_target becomes its
+# backward-compatible best-score wrapper (candidates[0]).
+
+
+def test_find_coarse_auto_lock_target_matches_the_best_candidate():
+    """Regression: the backward-compatible wrapper returns candidates[0] exactly."""
+    trace = _multi_candidate_trace()
+    kwargs = _multi_candidate_kwargs(trace)
+    candidates = find_coarse_auto_lock_candidates(**kwargs)
+    target = find_coarse_auto_lock_target(**kwargs)
+    assert target == candidates[0]
+
+
+def test_coarse_candidates_include_every_accepted_feature():
+    """Two coarse-only features (well-resolved sidebands) both appear in the
+    candidate list, not just the higher-scoring one -- this is what lets a
+    staged auto-lock caller pick the desired serrodyne order even while the
+    strict detector still rejects the frame."""
+    n = 2048
+    trace = (
+        _pdh_feature(n, center=-0.5, weight=1.0, sb_off=_MULTI_CANDIDATE_SB_OFF)
+        + _pdh_feature(n, center=0.5, weight=2.5, sb_off=_MULTI_CANDIDATE_SB_OFF)
+    )
+    candidates = find_coarse_auto_lock_candidates(
+        error_trace_v=trace,
+        monitor_trace_v=None,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=_MULTI_CANDIDATE_SETTINGS,
+        preferred_slope_rising=True,
+        modulation_frequency_hz=25.0e6,
+    )
+    assert len(candidates) == 2
+    voltages = sorted(c.result.target_voltage for c in candidates)
+    assert voltages[0] == pytest.approx(-0.5, abs=0.05)
+    assert voltages[1] == pytest.approx(0.5, abs=0.05)
+    # Sorted by descending score, and the weaker (desired, lower-score)
+    # feature is still present -- never dropped in favour of the winner.
+    scores = [c.result.score for c in candidates]
+    assert scores == sorted(scores, reverse=True)
+    # Every accepted candidate carries feature_amplitude/crossing_index too
+    # (spec C1/C2 parity), not left at their AutoLockScanResult defaults.
+    for c in candidates:
+        assert c.result.feature_amplitude > 0.0
+        assert c.result.crossing_index == pytest.approx(c.result.target_index, abs=1.0)
+
+
+def test_coarse_candidates_deduplicate_the_same_crossing_across_scales():
+    """A single strong feature is found at more than one smoothing scale
+    (width in (1, 3, 5)) but must be reported once, at its best-scoring scale."""
+    n = 2048
+    trace = _pdh_feature(n, center=0.0, weight=2.0, width=0.03, sb_off=0.2)
+    candidates = find_coarse_auto_lock_candidates(
+        error_trace_v=trace,
+        monitor_trace_v=None,
+        sweep_center_v=0.0,
+        sweep_amplitude_v=1.0,
+        settings=_MULTI_CANDIDATE_SETTINGS,
+        preferred_slope_rising=True,
+        modulation_frequency_hz=25.0e6,
+    )
+    target_indices = [c.result.target_index for c in candidates]
+    assert len(target_indices) == len(set(target_indices))

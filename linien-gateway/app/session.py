@@ -38,6 +38,7 @@ from .auto_lock_scan import (
     calibrate_auto_lock_settings,
     feature_resolution_samples,
     find_auto_lock_candidates,
+    find_coarse_auto_lock_candidates,
     find_coarse_auto_lock_target,
     find_auto_lock_target,
     scan_too_wide_to_lock,
@@ -3056,13 +3057,17 @@ class DeviceSession:
     def _coarse_auto_lock_candidates(
         self, settings: AutoLockScanSettings, *, after: float | None = None
     ) -> tuple[list[Any], float, float, float, dict[str, Any], dict[str, Any]]:
-        """`_coarse_auto_lock_target`, wrapped as a one-item candidate list.
+        """Every accepted coarse extrema-pair candidate on one fresh trace.
 
-        The coarse tracker only ever produces a single best pair (see
-        `find_coarse_auto_lock_target`), so this never loses information --
-        it just lets the staged API and the shared stage runner treat coarse
-        and strict detections uniformly as "a list of candidates", and also
-        reports the frame identity the one-shot loop never needed.
+        Unlike the one-shot loop's `_coarse_auto_lock_target` (which only
+        ever surfaces the single best-score pair), the staged API must hand
+        the caller every coarse candidate the tracker accepted -- several
+        identical-morphology PDH features can be present, and the strict
+        detector rejecting the frame must not collapse the caller's choice of
+        serrodyne order down to whichever one happens to score highest (see
+        `find_coarse_auto_lock_candidates`). ``metrics`` is the best-score
+        candidate's (candidates[0]'s) metrics dict, matching what
+        `_coarse_auto_lock_target` would have reported for this frame.
         """
         if after is not None:
             timeout_s = self._unlocked_trace_timeout_s()
@@ -3074,7 +3079,7 @@ class DeviceSession:
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
             require_unlocked=True
         )
-        candidate = find_coarse_auto_lock_target(
+        candidates = find_coarse_auto_lock_candidates(
             error_trace_v=error_trace,
             monitor_trace_v=monitor_trace,
             sweep_center_v=center_v,
@@ -3084,11 +3089,11 @@ class DeviceSession:
             modulation_frequency_hz=mod_hz,
         )
         resolution = feature_resolution_samples(settings, len(error_trace), amplitude_v)
+        results = [c.result for c in candidates]
         frame = _frame_summary(
-            error_trace, frame_id, acquired_at, center_v, amplitude_v, mod_hz,
-            [candidate.result],
+            error_trace, frame_id, acquired_at, center_v, amplitude_v, mod_hz, results
         )
-        return [candidate.result], center_v, amplitude_v, resolution, candidate.metrics, frame
+        return results, center_v, amplitude_v, resolution, candidates[0].metrics, frame
 
     @dataclasses.dataclass
     class _RefinementStageOutcome:

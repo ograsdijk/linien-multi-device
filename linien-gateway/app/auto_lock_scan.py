@@ -307,23 +307,29 @@ def _robust_noise(values: np.ndarray) -> float:
     return max(1e-9, mad, quantization)
 
 
-def find_coarse_auto_lock_target(
+def _gather_coarse_auto_lock_options(
     *,
     error_trace_v: np.ndarray,
     monitor_trace_v: np.ndarray | None,
-    sweep_center_v: float,
     sweep_amplitude_v: float,
     settings: AutoLockScanSettings,
-    preferred_slope_rising: bool | None = None,
-    modulation_frequency_hz: float | None = None,
-) -> CoarseAutoLockCandidate:
-    """Find a plausible PDH/dispersive lobe pair for scan *tracking* only.
+    preferred_slope_rising: bool | None,
+) -> tuple[
+    list[tuple[float, int, float, float, float, int, float | None, float | None]],
+    np.ndarray,
+    int,
+    float,
+]:
+    """Shared candidate-gathering core of the coarse ("tracking-only") detector.
 
-    Unlike the strict crossing detector this does not rely on a five-point
-    smoother swallowing a narrow lobe. It searches adjacent extrema pairs at
-    three scales, scores their excursion against robust point noise, and, for
-    PDH, requires an opposite-slope sideband pair. Callers must still obtain
-    two strict detections before a lock can be started.
+    Returns every accepted ``(score, crossing, left, right, pair, width,
+    sideband_pts, monitor_level)`` option -- unsorted, and possibly containing
+    the same physical crossing more than once (found at more than one
+    smoothing scale) -- plus the raw (unsmoothed) trace, its length, and the
+    robust noise floor, which both `find_coarse_auto_lock_target` and
+    `find_coarse_auto_lock_candidates` need to finish building an
+    `AutoLockScanResult`. Raises the same ``ValueError`` as
+    `find_coarse_auto_lock_target` has always raised when nothing is accepted.
     """
     raw = _sanitize_trace(np.asarray(error_trace_v, dtype=float))
     n = len(raw)
@@ -481,9 +487,30 @@ def find_coarse_auto_lock_target(
                 "rejected by the monitor as being on the wrong side of its baseline."
             )
         raise ValueError("No extrema pair with robust signal-to-noise was found for tracking.")
+    return options, raw, n, noise
+
+
+def _coarse_candidate_from_option(
+    option: tuple[float, int, float, float, float, int, float | None, float | None],
+    *,
+    raw: np.ndarray,
+    n: int,
+    noise: float,
+    slope: bool,
+    sweep_center_v: float,
+    sweep_amplitude_v: float,
+    settings: AutoLockScanSettings,
+    modulation_frequency_hz: float | None,
+) -> CoarseAutoLockCandidate:
+    """Build one coarse `CoarseAutoLockCandidate` from a gathered option tuple.
+
+    Shared by `find_coarse_auto_lock_target` (best-score only) and
+    `find_coarse_auto_lock_candidates` (every accepted crossing), so the two
+    can never disagree about a shared candidate's numbers.
+    """
     (
         score, crossing, left_exc, right_exc, pair, width, sideband_pts, monitor_level
-    ) = max(options, key=lambda item: item[0])
+    ) = option
     sideband_offset_v: float | None = None
     hz_per_v: float | None = None
     if str(settings.signal_type) == "pdh" and _spacing_is_measurable(
@@ -505,6 +532,17 @@ def find_coarse_auto_lock_target(
         monitor_level=monitor_level,
         hz_per_v=hz_per_v,
         sideband_offset_v=sideband_offset_v,
+        # "Where computable" (spec C1/C2 parity): the coarse tracker already
+        # measures the lobe pair excursion and an integer crossing sample, so
+        # both are reported instead of left at their AutoLockScanResult
+        # defaults. Not sub-sample (unlike the strict detector's
+        # crossing_index): the coarse search is over discrete extrema, not an
+        # interpolated zero crossing.
+        feature_amplitude=float(pair),
+        sideband_offset_samples=(
+            float(sideband_pts) if sideband_pts is not None else None
+        ),
+        crossing_index=float(crossing),
     )
     return CoarseAutoLockCandidate(target, {
         "method": "multiscale_extrema_pair",
@@ -516,6 +554,96 @@ def find_coarse_auto_lock_target(
         "sideband_offset_v": sideband_offset_v,
         "sideband_evidence": "two_sided" if sideband_offset_v is not None else "unresolved",
     })
+
+
+def find_coarse_auto_lock_candidates(
+    *,
+    error_trace_v: np.ndarray,
+    monitor_trace_v: np.ndarray | None,
+    sweep_center_v: float,
+    sweep_amplitude_v: float,
+    settings: AutoLockScanSettings,
+    preferred_slope_rising: bool | None = None,
+    modulation_frequency_hz: float | None = None,
+) -> list[CoarseAutoLockCandidate]:
+    """Every accepted coarse extrema-pair crossing, sorted by descending score.
+
+    Unlike `find_coarse_auto_lock_target` (which only ever exposed the single
+    best-score pair), this hands the staged auto-lock API every crossing the
+    coarse tracker accepted, so a caller can choose a specific serrodyne order
+    even when the strict detector currently rejects the frame. A crossing
+    found at more than one smoothing scale (see the ``width in (1, 3, 5)``
+    search) is de-duplicated to its single best-scoring scale -- the same
+    scale `find_coarse_auto_lock_target` would have reported for it -- so the
+    two detectors never disagree about a shared crossing's numbers.
+    """
+    options, raw, n, noise = _gather_coarse_auto_lock_options(
+        error_trace_v=error_trace_v,
+        monitor_trace_v=monitor_trace_v,
+        sweep_amplitude_v=sweep_amplitude_v,
+        settings=settings,
+        preferred_slope_rising=preferred_slope_rising,
+    )
+    best_by_crossing: dict[int, tuple[float, int, float, float, float, int, float | None, float | None]] = {}
+    for option in options:
+        crossing = option[1]
+        current = best_by_crossing.get(crossing)
+        if current is None or option[0] > current[0]:
+            best_by_crossing[crossing] = option
+    # Stable sort: ties keep the order dict values were inserted in (first
+    # time that crossing was seen), which is deterministic given `options`'
+    # own deterministic generation order (width ascending, then position).
+    ordered = sorted(best_by_crossing.values(), key=lambda item: -item[0])
+    slope = bool(preferred_slope_rising) if preferred_slope_rising is not None else True
+    return [
+        _coarse_candidate_from_option(
+            option,
+            raw=raw,
+            n=n,
+            noise=noise,
+            slope=slope,
+            sweep_center_v=sweep_center_v,
+            sweep_amplitude_v=sweep_amplitude_v,
+            settings=settings,
+            modulation_frequency_hz=modulation_frequency_hz,
+        )
+        for option in ordered
+    ]
+
+
+def find_coarse_auto_lock_target(
+    *,
+    error_trace_v: np.ndarray,
+    monitor_trace_v: np.ndarray | None,
+    sweep_center_v: float,
+    sweep_amplitude_v: float,
+    settings: AutoLockScanSettings,
+    preferred_slope_rising: bool | None = None,
+    modulation_frequency_hz: float | None = None,
+) -> CoarseAutoLockCandidate:
+    """Find a plausible PDH/dispersive lobe pair for scan *tracking* only.
+
+    Unlike the strict crossing detector this does not rely on a five-point
+    smoother swallowing a narrow lobe. It searches adjacent extrema pairs at
+    three scales, scores their excursion against robust point noise, and, for
+    PDH, requires an opposite-slope sideband pair. Callers must still obtain
+    two strict detections before a lock can be started.
+
+    Backward-compatible best-score wrapper around
+    `find_coarse_auto_lock_candidates`: returns exactly its first (highest
+    score) element, raising the same ``ValueError`` messages as before when
+    nothing is accepted.
+    """
+    candidates = find_coarse_auto_lock_candidates(
+        error_trace_v=error_trace_v,
+        monitor_trace_v=monitor_trace_v,
+        sweep_center_v=sweep_center_v,
+        sweep_amplitude_v=sweep_amplitude_v,
+        settings=settings,
+        preferred_slope_rising=preferred_slope_rising,
+        modulation_frequency_hz=modulation_frequency_hz,
+    )
+    return candidates[0]
 
 
 @dataclass
