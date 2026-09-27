@@ -84,11 +84,15 @@ from .schemas import (
     SimultaneousAcquireIn,
     SimultaneousStartPsd,
     SimultaneousSweepIn,
+    StagedAutolockBeginRequest,
+    StagedAutolockLockRequest,
+    StagedAutolockRenewRequest,
+    StagedAutolockStepRequest,
     StartPsdAcquisition,
     StopTask,
 )
 from .serializers import UNSERIALIZABLE, to_jsonable
-from .session import DeviceSession
+from .session import DeviceSession, StagedAutolockError
 from .session_registry import SessionRegistry
 from .stream import WebsocketManager
 
@@ -1164,6 +1168,17 @@ async def auto_lock_candidates(
                 f"Analysed frame {analysed_id} predates the acquired frame {min_frame_id}."
             ),
         )
+    # A read-only call made while a staged auto-lock run is active still has
+    # to advance what the run considers its latest frame (spec C2), so a
+    # later `step`/`lock` can reference it by frame_id without the caller
+    # having to drive another `step`. No-op if no run is active or this
+    # frame doesn't fit the run (see staged_autolock_observe_frame).
+    frame = result.get("frame")
+    candidates = result.get("candidates")
+    if frame is not None and candidates is not None:
+        await asyncio.to_thread(
+            session.staged_autolock_observe_frame, frame, candidates
+        )
     return result
 
 
@@ -1387,6 +1402,132 @@ def calibrate_auto_lock_scan(key: str, payload: AutoLockCalibrateRequest) -> dic
         "hz_per_v": calibration.hz_per_v,
         "detail": calibration.detail,
     }
+
+
+def _staged_autolock_http_error(exc: StagedAutolockError) -> HTTPException:
+    detail: Any = str(exc)
+    return HTTPException(status_code=exc.status_code, detail=detail)
+
+
+@app.post("/api/devices/{key}/control/staged_autolock/begin")
+async def staged_autolock_begin(
+    key: str, payload: StagedAutolockBeginRequest | None = None
+) -> dict:
+    """Start a staged, step-by-step, identity-aware auto-lock refinement.
+
+    409 if a staged run is already active on this device, the device is
+    locked, or a one-shot `auto_lock_scan` is in flight (see
+    `_ensure_no_staged_autolock_run`). Acquires a fresh frame the same way
+    `auto_lock_candidates?acquire=true` does before detecting on it.
+    """
+    device = _get_device_or_404(key)
+    session = _session_for_device(device)
+    body = payload or StagedAutolockBeginRequest()
+    traces, skipped = await _trigger_and_acquire([(key, session)], None)
+    if key not in traces:
+        raise HTTPException(
+            status_code=409, detail=skipped.get(key, "Failed to acquire trace")
+        )
+    settings_payload = body.settings.model_dump() if body.settings is not None else None
+    try:
+        result = await asyncio.to_thread(
+            session.staged_autolock_begin, settings_payload, body.ttl_s
+        )
+    except StagedAutolockError as exc:
+        raise _staged_autolock_http_error(exc)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    _emit_log(
+        level=logging.INFO,
+        source="staged_autolock",
+        code="staged_autolock_begin",
+        message="Staged auto-lock run started.",
+        device_key=key,
+        details={"token": result["token"], "candidate_count": len(result["candidates"])},
+    )
+    return result
+
+
+@app.post("/api/devices/{key}/control/staged_autolock/{token}/renew")
+async def staged_autolock_renew(
+    key: str, token: str, payload: StagedAutolockRenewRequest | None = None
+) -> dict:
+    session = _get_session(key)
+    ttl_s = (payload or StagedAutolockRenewRequest()).ttl_s
+    try:
+        return await asyncio.to_thread(session.staged_autolock_renew, token, ttl_s)
+    except StagedAutolockError as exc:
+        raise _staged_autolock_http_error(exc)
+
+
+@app.get("/api/devices/{key}/control/staged_autolock/")
+async def staged_autolock_state(key: str) -> dict:
+    session = _get_session(key)
+    return await asyncio.to_thread(session.staged_autolock_state)
+
+
+@app.post("/api/devices/{key}/control/staged_autolock/{token}/step")
+async def staged_autolock_step(
+    key: str, token: str, payload: StagedAutolockStepRequest
+) -> dict:
+    session = _get_session(key)
+    try:
+        return await asyncio.to_thread(
+            session.staged_autolock_step,
+            token,
+            payload.selected.frame_id,
+            payload.selected.target_index,
+        )
+    except StagedAutolockError as exc:
+        raise _staged_autolock_http_error(exc)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/api/devices/{key}/control/staged_autolock/{token}/lock")
+async def staged_autolock_lock(
+    key: str, token: str, payload: StagedAutolockLockRequest
+) -> dict:
+    session = _get_session(key)
+    try:
+        result = await asyncio.to_thread(
+            session.staged_autolock_lock,
+            token,
+            payload.selected.frame_id,
+            payload.selected.target_index,
+        )
+    except StagedAutolockError as exc:
+        _emit_log(
+            level=logging.ERROR,
+            source="staged_autolock",
+            code="staged_autolock_lock_failed",
+            message="Staged auto-lock verification/lock failed.",
+            device_key=key,
+            details={"token": token, "error": str(exc)},
+        )
+        _enqueue_auto_lock_row(session, key, success=False)
+        raise _staged_autolock_http_error(exc)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    _emit_log(
+        level=logging.INFO,
+        source="staged_autolock",
+        code="staged_autolock_locked",
+        message="Staged auto-lock started.",
+        device_key=key,
+        details=_auto_lock_event_details(result),
+    )
+    _enqueue_auto_lock_row(session, key, success=True)
+    return result
+
+
+@app.post("/api/devices/{key}/control/staged_autolock/{token}/abort")
+async def staged_autolock_abort(key: str, token: str) -> dict:
+    session = _get_session(key)
+    try:
+        return await asyncio.to_thread(session.staged_autolock_abort, token)
+    except StagedAutolockError as exc:
+        raise _staged_autolock_http_error(exc)
 
 
 @app.get(

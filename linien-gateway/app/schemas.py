@@ -198,6 +198,41 @@ class AutoLockScanResult(BaseModel):
     refinement: Optional[dict[str, Any]] = None
 
 
+class StagedAutolockSelected(BaseModel):
+    """Locates a candidate on a specific, previously-returned frame.
+
+    The staged API never re-detects to find `target_index` -- the run keeps
+    the candidate list of the frame it belongs to (see `StagedAutolockRun` in
+    session.py) -- so `frame_id` must be the run's current latest frame or the
+    request is refused (409, stale).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    frame_id: int
+    target_index: int
+
+
+class StagedAutolockBeginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    settings: Optional[AutoLockScanSettings] = None
+    ttl_s: float = Field(default=60.0, gt=0.0, le=3600.0)
+
+
+class StagedAutolockRenewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ttl_s: float = Field(default=60.0, gt=0.0, le=3600.0)
+
+
+class StagedAutolockStepRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selected: StagedAutolockSelected
+
+
+class StagedAutolockLockRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selected: StagedAutolockSelected
+
+
 class AutoLockCalibrateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     include_monitor: bool = False

@@ -37,6 +37,13 @@ class FakeCandidatesSession:
     def set_csr_direct(self, key, value) -> None:
         self.calls.append(("set_csr_direct", key, value))
 
+    def staged_autolock_observe_frame(self, frame, candidates) -> None:
+        # No staged run in these tests; the endpoint calls this
+        # unconditionally after every detection (see C2's "read-only calls
+        # still advance the run's latest-seen frame"). Recorded so a test can
+        # assert it was called if it ever needs to.
+        self.calls.append(("staged_autolock_observe_frame", frame, candidates))
+
     def wait_for_fresh_trace(self, timeout_s=None):
         self.calls.append(("wait_for_fresh_trace", timeout_s))
         if self.capture_error:
@@ -219,6 +226,9 @@ def test_endpoint_never_calls_a_locking_or_settings_persisting_method(monkeypatc
         "set_csr_direct",
         "wait_for_fresh_trace",
         "auto_lock_detect",
+        # Advancing a staged run's latest-seen frame (see C2) is itself
+        # read-only: it never locks or persists settings.
+        "staged_autolock_observe_frame",
     }
 
 

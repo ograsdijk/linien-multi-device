@@ -576,3 +576,39 @@ class IdentityGuard:
                 f"{known_resolution:.2f} samples "
                 f"(tolerance {tolerance * 1e3:.3f} mV)."
             )
+
+    def evaluate(
+        self,
+        candidate: Any,
+        *,
+        amplitude_v: float,
+        detector: str = "strict",
+        resolution_samples: float = 0.0,
+        check_sideband: bool = True,
+    ) -> tuple[bool, str | None]:
+        """Same test as `check`, without mutating the baseline.
+
+        The staged auto-lock API has to annotate EVERY candidate on a frame
+        with identity_ok/identity_reason before the caller picks one, and it
+        must never let a candidate the caller does not select silently become
+        (or replace) the tracked identity -- that would make the annotation
+        itself an unrequested selection. Runs `check` against a scratch clone
+        that shares this guard's slope/baselines by value; only `check`,
+        called on the one candidate actually selected next, may mutate
+        `self`.
+        """
+        clone = IdentityGuard.__new__(IdentityGuard)
+        clone._slope = self._slope
+        clone._baselines = dict(self._baselines)
+        clone._trace_length = self._trace_length
+        try:
+            clone.check(
+                candidate,
+                amplitude_v=amplitude_v,
+                detector=detector,
+                resolution_samples=resolution_samples,
+                check_sideband=check_sideband,
+            )
+        except _TrackingIdentityChanged as exc:
+            return False, str(exc)
+        return True, None

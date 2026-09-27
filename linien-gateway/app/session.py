@@ -32,6 +32,7 @@ from . import device_store
 from . import schemas
 from .auto_lock_scan import (
     AutoLockCalibration,
+    AutoLockScanResult,
     AutoLockScanSettings,
     _robust_noise,
     calibrate_auto_lock_settings,
@@ -158,6 +159,76 @@ class TrajectoryRefinementAborted(RuntimeError):
 # leaves the sweep center on an arbitrary set-point.
 RELOCK_ACTION_DRAIN_TIMEOUT_S = 5.0
 
+# Default TTL for a staged auto-lock run (see StagedAutolockRun), matching the
+# spec default. A run left untouched this long auto-aborts and restores
+# geometry, so a dropped orchestrator client cannot strand the sweep narrowed.
+STAGED_AUTOLOCK_DEFAULT_TTL_S = 60.0
+STAGED_AUTOLOCK_MAX_TTL_S = 3600.0
+# Position tolerance for the `lock` stage's same-geometry consistency check,
+# in samples. Position comparison is otherwise forbidden across a geometry
+# change (see lock_refinement.py's hysteresis note); at the SAME geometry
+# (the fresh verification frame taken at the run's final, unmoved centre and
+# amplitude) it is the only invariant available, so it gets a documented,
+# generous-but-specific tolerance rather than reusing a narrower cross-
+# geometry bound by accident.
+STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES = 3.0
+
+
+class StagedAutolockError(RuntimeError):
+    """A staged auto-lock request could not be carried out.
+
+    ``status_code`` tells the route which HTTP status to answer with -- 404
+    (unknown/expired token), 409 (conflicting run/lock state), or 422 (a
+    stale frame reference, a missing candidate, a planner refusal, or a
+    failed lock-time verification). The staged path never substitutes another
+    candidate for the one the caller asked for: every one of those is reported
+    here rather than silently falling back to a different target.
+    """
+
+    def __init__(self, message: str, *, status_code: int = 422) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@dataclasses.dataclass
+class StagedAutolockRun:
+    """State for one in-progress staged (step-by-step) auto-lock run.
+
+    One run per device at a time (see DeviceSession._staged_autolock,
+    guarded by _state_lock). ``latest_frame_id``/``latest_candidates`` are the
+    candidate list of the most recent frame the run has seen -- from `begin`,
+    a `step`, or an `auto_lock_candidates?acquire=true` call made while the
+    run is active (see `staged_autolock_observe_frame`) -- so `step`/`lock`
+    can locate a selected candidate by `target_index` WITHOUT re-detecting,
+    per the spec. ``identity`` is created from the first candidate the caller
+    ever selects and is mutated only by the candidate actually chosen at each
+    subsequent stage -- never by the other candidates on a frame, which are
+    merely annotated via `IdentityGuard.evaluate` (non-mutating).
+    """
+
+    token: str
+    settings: AutoLockScanSettings
+    acceptance: AcceptanceSettings
+    restore_center_v: float
+    restore_amplitude_v: float
+    trace_length: int
+    created_at: float
+    expires_at: float
+    ttl_s: float
+    center_v: float
+    amplitude_v: float
+    latest_frame: dict[str, Any]
+    latest_detector: str
+    latest_resolution: float
+    latest_candidates: list[Any]
+    stage_index: int = 0
+    identity: Any | None = None
+    shift_per_fraction: float | None = None
+    narrow_count: int = 0
+    stages: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    timer: threading.Timer | None = None
+    locked: bool = False
+
 # Frames a verification sweep must observe before it trusts what it sees. One is
 # not enough: the freshness stamp records when a frame was PROCESSED, not when
 # the board acquired it. See _wait_for_fresh_unlocked_trace.
@@ -187,6 +258,40 @@ def _lock_error_mhz(
     if slope_v_per_mhz <= 0.0:
         return None
     return abs(error_std_v) / slope_v_per_mhz
+
+
+def _frame_summary(
+    error_trace: np.ndarray,
+    frame_id: int,
+    acquired_at: float | None,
+    center_v: float,
+    amplitude_v: float,
+    mod_hz: float | None,
+    candidates: list[Any],
+) -> dict[str, Any]:
+    """The C1 ``frame`` shape shared by `auto_lock_detect` and the staged API.
+
+    ``sideband_spacing_samples`` is the median of the candidates' own
+    per-candidate spacing (None if none resolved); ``noise_floor`` is the
+    MAD-based robust point noise of the error trace.
+    """
+    sideband_samples = [
+        c.sideband_offset_samples
+        for c in candidates
+        if c.sideband_offset_samples is not None
+    ]
+    return {
+        "frame_id": frame_id,
+        "acquired_at": acquired_at,
+        "sweep_center_v": center_v,
+        "sweep_amplitude_v": amplitude_v,
+        "n_points": int(len(error_trace)),
+        "modulation_frequency_hz": mod_hz,
+        "sideband_spacing_samples": (
+            float(np.median(sideband_samples)) if sideband_samples else None
+        ),
+        "noise_floor": float(_robust_noise(np.asarray(error_trace, dtype=float))),
+    }
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -283,6 +388,9 @@ class DeviceSession:
         # writing the old center then would drag the laser off the feature.
         # Guarded by _rpyc_lock.
         self._deferred_sweep_geometry: tuple[float, float] | None = None
+        # The single active staged (step-by-step) auto-lock run, if any.
+        # Guarded by _state_lock. See StagedAutolockRun.
+        self._staged_autolock: StagedAutolockRun | None = None
         self.param_cache: Dict[str, Any] = {}
         self.param_cache_serialized: Dict[str, Any] = {}
         self._param_metadata_cache: List[Dict[str, Any]] | None = None
@@ -2508,6 +2616,7 @@ class DeviceSession:
     def start_lock(self) -> None:
         if self.control is None:
             raise RuntimeError("Device not connected")
+        self._ensure_no_staged_autolock_run("start_lock")
         with self._rpyc_lock:
             self.control.exposed_start_lock()
 
@@ -2902,6 +3011,202 @@ class DeviceSession:
             settings, len(error_trace), amplitude_v
         ), candidate.metrics
 
+    def _capture_auto_lock_candidates_strict(
+        self,
+        settings: AutoLockScanSettings,
+        *,
+        after: float | None = None,
+    ) -> tuple[list[Any], float, float, float, dict[str, Any]]:
+        """Every strict candidate on one fresh trace, plus its frame identity.
+
+        Used by the staged API, which must hand the caller every accepted
+        crossing to choose from -- never only the best-score one -- and must
+        track which frame they came from (frame_id/acquired_at) so a later
+        stage can be refused for referencing a stale one. Raises the same
+        ``ValueError`` as `find_auto_lock_candidates` when none qualify. Does
+        not replace `_capture_auto_lock_target`, which stays the one-shot
+        loop's exact historical call (`find_auto_lock_target` is itself
+        `find_auto_lock_candidates(...)[0]`, so the two never disagree).
+        """
+        if after is not None:
+            timeout_s = self._unlocked_trace_timeout_s()
+            if not self._wait_for_fresh_unlocked_trace(after, timeout_s):
+                raise RuntimeError("No fresh sweep arrived after changing scan geometry.")
+        error_trace, monitor_trace, frame_id, acquired_at = (
+            self._snapshot_auto_lock_traces_with_frame()
+        )
+        center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
+            require_unlocked=True
+        )
+        candidates = find_auto_lock_candidates(
+            error_trace_v=error_trace,
+            monitor_trace_v=monitor_trace,
+            sweep_center_v=center_v,
+            sweep_amplitude_v=amplitude_v,
+            settings=settings,
+            preferred_slope_rising=rising,
+            modulation_frequency_hz=mod_hz,
+        )
+        resolution = feature_resolution_samples(settings, len(error_trace), amplitude_v)
+        frame = _frame_summary(
+            error_trace, frame_id, acquired_at, center_v, amplitude_v, mod_hz, candidates
+        )
+        return candidates, center_v, amplitude_v, resolution, frame
+
+    def _coarse_auto_lock_candidates(
+        self, settings: AutoLockScanSettings, *, after: float | None = None
+    ) -> tuple[list[Any], float, float, float, dict[str, Any], dict[str, Any]]:
+        """`_coarse_auto_lock_target`, wrapped as a one-item candidate list.
+
+        The coarse tracker only ever produces a single best pair (see
+        `find_coarse_auto_lock_target`), so this never loses information --
+        it just lets the staged API and the shared stage runner treat coarse
+        and strict detections uniformly as "a list of candidates", and also
+        reports the frame identity the one-shot loop never needed.
+        """
+        if after is not None:
+            timeout_s = self._unlocked_trace_timeout_s()
+            if not self._wait_for_fresh_unlocked_trace(after, timeout_s):
+                raise RuntimeError("No fresh sweep arrived after changing scan geometry.")
+        error_trace, monitor_trace, frame_id, acquired_at = (
+            self._snapshot_auto_lock_traces_with_frame()
+        )
+        center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
+            require_unlocked=True
+        )
+        candidate = find_coarse_auto_lock_target(
+            error_trace_v=error_trace,
+            monitor_trace_v=monitor_trace,
+            sweep_center_v=center_v,
+            sweep_amplitude_v=amplitude_v,
+            settings=settings,
+            preferred_slope_rising=rising,
+            modulation_frequency_hz=mod_hz,
+        )
+        resolution = feature_resolution_samples(settings, len(error_trace), amplitude_v)
+        frame = _frame_summary(
+            error_trace, frame_id, acquired_at, center_v, amplitude_v, mod_hz,
+            [candidate.result],
+        )
+        return [candidate.result], center_v, amplitude_v, resolution, candidate.metrics, frame
+
+    @dataclasses.dataclass
+    class _RefinementStageOutcome:
+        """One `plan_refinement_step` decision, executed once.
+
+        ``target`` is None for ``"done"``/``"refuse"`` (nothing was detected).
+        The ``before_*`` fields are the geometry/detector in effect BEFORE this
+        stage's write, handed back so the caller can measure the width- and
+        centre-induced shift the same way regardless of which detection path
+        produced the new target.
+        """
+
+        step: Any
+        target: Any | None
+        center_v: float
+        amplitude_v: float
+        resolution: float
+        detector: str
+        coarse_metrics: dict[str, Any] | None
+        before_v: float
+        before_amplitude: float
+        before_center: float
+        before_detector: str
+
+    def _run_refinement_stage(
+        self,
+        settings: AutoLockScanSettings,
+        *,
+        center_v: float,
+        amplitude_v: float,
+        target: Any,
+        detector: str,
+        trace_length: int,
+        shift_per_fraction: float | None,
+        geometry_settle_s: float,
+        detect_narrow: Callable[
+            [float, float, float],
+            tuple[Any, float, float, float, str, dict[str, Any] | None],
+        ],
+        detect_recenter: Callable[
+            [float, float, float],
+            tuple[Any, float, float, float, dict[str, Any] | None],
+        ],
+    ) -> "DeviceSession._RefinementStageOutcome":
+        """Plan and execute exactly one refinement stage.
+
+        THE single place that asks ``plan_refinement_step`` (the one planner)
+        what to do next and acts on it. Shared by the one-shot auto-lock loop
+        and the staged step-by-step API (see ``staged_autolock_step``): both
+        call this; they differ only in HOW they detect after the geometry
+        write, which is why detection is injected as the
+        ``detect_narrow``/``detect_recenter`` callbacks rather than hard-coded
+        here. The one-shot loop's callbacks are exactly its historical calls
+        to ``_capture_auto_lock_target``/``_coarse_auto_lock_target``, so its
+        behaviour -- and every existing test that mocks those two methods --
+        is unchanged. The staged path's callbacks return every candidate on
+        the fresh frame instead of picking one, for the caller to choose from.
+
+        Bookkeeping that the two callers do differently -- stage-log entries,
+        IdentityGuard ordering/mutation, ``shift_per_fraction`` updates,
+        ``narrow_count``, the "did it actually narrow" guard -- stays with the
+        caller; this method makes no I/O beyond the two callbacks and never
+        raises on the planner's behalf (a ``"refuse"`` step is returned, not
+        thrown).
+        """
+        step = plan_refinement_step(
+            settings,
+            center_v=center_v,
+            amplitude_v=amplitude_v,
+            target_v=float(target.target_voltage),
+            sideband_offset_v=target.sideband_offset_v,
+            detector=detector,
+            trace_length=trace_length,
+            shift_per_fraction=shift_per_fraction,
+        )
+        before_v = float(target.target_voltage)
+        before_amplitude = abs(amplitude_v)
+        before_center = float(center_v)
+        before_detector = detector
+        if step.action in ("done", "refuse"):
+            return DeviceSession._RefinementStageOutcome(
+                step=step,
+                target=None,
+                center_v=center_v,
+                amplitude_v=amplitude_v,
+                resolution=0.0,
+                detector=detector,
+                coarse_metrics=None,
+                before_v=before_v,
+                before_amplitude=before_amplitude,
+                before_center=before_center,
+                before_detector=before_detector,
+            )
+        if step.action == "recenter":
+            new_target, new_center_v, new_amplitude_v, resolution, coarse_metrics = (
+                detect_recenter(step.center_v, amplitude_v, geometry_settle_s)
+            )
+            new_detector = "coarse"
+        else:  # "narrow" or "rail_escape" -- both write geometry and detect
+            next_center = center_v if step.action == "rail_escape" else step.center_v
+            (
+                new_target, new_center_v, new_amplitude_v, resolution,
+                new_detector, coarse_metrics,
+            ) = detect_narrow(next_center, step.amplitude_v, geometry_settle_s)
+        return DeviceSession._RefinementStageOutcome(
+            step=step,
+            target=new_target,
+            center_v=new_center_v,
+            amplitude_v=new_amplitude_v,
+            resolution=resolution,
+            detector=new_detector,
+            coarse_metrics=coarse_metrics,
+            before_v=before_v,
+            before_amplitude=before_amplitude,
+            before_center=before_center,
+            before_detector=before_detector,
+        )
+
     def _trajectory_refine_auto_lock(
         self,
         settings: AutoLockScanSettings,
@@ -2975,19 +3280,46 @@ class DeviceSession:
                         "trajectory refinement stages."
                     )
                 # Ask the planner what to do next -- see plan_refinement_step's
-                # docstring for the constraint order. It makes no I/O and
-                # decides exactly one step; everything below is acting on that
-                # decision, redetecting, and recording the stage.
-                step = plan_refinement_step(
+                # docstring for the constraint order. `_run_refinement_stage`
+                # is the one place that calls it and acts on the result; the
+                # detect_narrow/detect_recenter callbacks below are exactly
+                # this loop's historical calls to `_capture_auto_lock_target`/
+                # `_coarse_auto_lock_target`, so behaviour (and every test
+                # mocking those two methods) is unchanged.
+                def _detect_narrow(next_center_v, next_amplitude_v, settle_s):
+                    moved_at = self._set_sweep_geometry(
+                        next_center_v, next_amplitude_v, settle_s=settle_s
+                    )
+                    try:
+                        t, c, a, r = self._capture_auto_lock_target(
+                            settings, after=moved_at
+                        )
+                        return t, c, a, r, "strict", None
+                    except ValueError:
+                        t, c, a, r, m = self._coarse_auto_lock_target(
+                            settings, after=moved_at
+                        )
+                        return t, c, a, r, "coarse", m
+
+                def _detect_recenter(next_center_v, next_amplitude_v, settle_s):
+                    moved_at = self._set_sweep_geometry(
+                        next_center_v, next_amplitude_v, settle_s=settle_s
+                    )
+                    return self._coarse_auto_lock_target(settings, after=moved_at)
+
+                outcome = self._run_refinement_stage(
                     settings,
                     center_v=center_v,
                     amplitude_v=amplitude_v,
-                    target_v=float(target.target_voltage),
-                    sideband_offset_v=target.sideband_offset_v,
+                    target=target,
                     detector=detector,
                     trace_length=trace_length,
                     shift_per_fraction=shift_per_fraction,
+                    geometry_settle_s=geometry_settle_s,
+                    detect_narrow=_detect_narrow,
+                    detect_recenter=_detect_recenter,
                 )
+                step = outcome.step
                 if step.action == "done":
                     break
                 if step.action == "refuse":
@@ -2998,11 +3330,9 @@ class DeviceSession:
                     # next detection actually finds; carrying a pre-move
                     # amplitude across the write would size the cut from
                     # geometry that no longer exists.
-                    moved_at = self._set_sweep_geometry(
-                        step.center_v, amplitude_v, settle_s=geometry_settle_s
-                    )
-                    target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
-                        settings, after=moved_at
+                    target, center_v, amplitude_v, resolution, coarse_metrics = (
+                        outcome.target, outcome.center_v, outcome.amplitude_v,
+                        outcome.resolution, outcome.coarse_metrics,
                     )
                     detector = "coarse"
                     identity.check(target, amplitude_v=amplitude_v, detector="coarse", resolution_samples=resolution)
@@ -3014,7 +3344,6 @@ class DeviceSession:
                     narrow_count += 1
                     continue
                 if step.action == "rail_escape":
-                    next_amplitude = step.amplitude_v
                     stages.append({
                         "kind": "rail_blocked", "center_v": center_v,
                         "amplitude_v": amplitude_v,
@@ -3022,31 +3351,17 @@ class DeviceSession:
                         "resolution_samples": resolution, "detector": detector,
                         "sideband_offset_v": target.sideband_offset_v,
                         "rail_v": step.bounds.get("rail_v", 1.0 - abs(amplitude_v)),
-                        "next_amplitude_v": next_amplitude,
+                        "next_amplitude_v": step.amplitude_v,
                         "bounds": step.bounds,
                     })
-                    next_center = center_v
-                else:  # "narrow" -- narrows and recentres in one write
-                    next_amplitude = step.amplitude_v
-                    next_center = step.center_v
-                before_v = float(target.target_voltage)
-                before_amplitude = abs(amplitude_v)
-                before_center = float(center_v)
-                before_detector = detector
-                moved_at = self._set_sweep_geometry(
-                    next_center, next_amplitude, settle_s=geometry_settle_s
+                before_v = outcome.before_v
+                before_amplitude = outcome.before_amplitude
+                before_center = outcome.before_center
+                before_detector = outcome.before_detector
+                target, center_v, amplitude_v, resolution, detector, coarse_metrics = (
+                    outcome.target, outcome.center_v, outcome.amplitude_v,
+                    outcome.resolution, outcome.detector, outcome.coarse_metrics,
                 )
-                try:
-                    target, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
-                        settings, after=moved_at
-                    )
-                    detector = "strict"
-                    coarse_metrics = None
-                except ValueError:
-                    target, center_v, amplitude_v, resolution, coarse_metrics = self._coarse_auto_lock_target(
-                        settings, after=moved_at
-                    )
-                    detector = "coarse"
                 # What the width change actually did to the apparent position.
                 width_shift_v = abs(float(target.target_voltage) - before_v)
                 width_fraction = (
@@ -3284,12 +3599,588 @@ class DeviceSession:
                 diagnostics,
             ) from exc
 
+    # ---------------------------------------------------------- staged autolock
+
+    def _ensure_no_staged_autolock_run(self, what: str) -> None:
+        with self._state_lock:
+            active = self._staged_autolock
+        if active is not None:
+            raise RuntimeError(
+                f"A staged auto-lock run is active (token {active.token}); "
+                f"{what} was refused."
+            )
+
+    def _get_staged_run_or_raise(self, token: str) -> "StagedAutolockRun":
+        """Caller must hold `_state_lock`."""
+        run = self._staged_autolock
+        if run is None:
+            raise StagedAutolockError(
+                "No staged auto-lock run is active.", status_code=404
+            )
+        if run.token != token:
+            raise StagedAutolockError(
+                "Unknown or expired staged auto-lock token.", status_code=404
+            )
+        return run
+
+    def _staged_autolock_expire(self, token: str) -> None:
+        """Timer callback: auto-abort a run whose TTL elapsed with no call."""
+        with self._state_lock:
+            run = self._staged_autolock
+            if run is None or run.token != token:
+                return
+            self._staged_autolock = None
+        restored = self._restore_sweep_geometry(
+            run.restore_center_v, run.restore_amplitude_v
+        )
+        logger.info(
+            "Staged auto-lock run %s expired after %.1f s device=%s; "
+            "geometry %s.",
+            token, run.ttl_s, getattr(self.device, "key", "?"),
+            "restored" if restored else "could not be restored",
+        )
+
+    def _staged_autolock_arm_timer(
+        self, run: "StagedAutolockRun", ttl_s: float
+    ) -> None:
+        """Replace `run`'s TTL timer. Caller must hold `_state_lock`."""
+        old_timer = run.timer
+        timer = threading.Timer(
+            max(0.001, float(ttl_s)), self._staged_autolock_expire, args=(run.token,)
+        )
+        timer.daemon = True
+        run.timer = timer
+        run.ttl_s = float(ttl_s)
+        run.expires_at = time.time() + float(ttl_s)
+        if old_timer is not None:
+            old_timer.cancel()
+        timer.start()
+
+    @staticmethod
+    def _annotate_candidates(
+        candidates: list[Any],
+        identity: IdentityGuard | None,
+        *,
+        amplitude_v: float,
+        detector: str,
+        resolution_samples: float,
+    ) -> list[dict[str, Any]]:
+        """Every candidate's dict, plus identity_ok/identity_reason.
+
+        Uses `IdentityGuard.evaluate` (non-mutating): annotating every
+        candidate on a frame must never let one the caller does not select
+        become, or replace, the tracked identity.
+        """
+        out: list[dict[str, Any]] = []
+        for candidate in candidates:
+            payload = candidate.to_dict()
+            if identity is None:
+                payload["identity_ok"] = True
+                payload["identity_reason"] = None
+            else:
+                ok, reason = identity.evaluate(
+                    candidate,
+                    amplitude_v=amplitude_v,
+                    detector=detector,
+                    resolution_samples=resolution_samples,
+                )
+                payload["identity_ok"] = ok
+                payload["identity_reason"] = reason
+            out.append(payload)
+        return out
+
+    def staged_autolock_begin(
+        self,
+        settings_payload: dict[str, Any] | None,
+        ttl_s: float,
+    ) -> dict[str, Any]:
+        """Start a staged (step-by-step) auto-lock run.
+
+        Callers must have already triggered/waited for a fresh frame (the
+        same restart-and-capture `acquire_scan` mechanism `auto_lock_scan`
+        candidates uses with `acquire=true`) before calling this -- it
+        detects on the CURRENT cached trace, exactly like
+        `auto_lock_detect(acquire=false)` does. 409 if a run is already
+        active or the device is locked.
+        """
+        if self.control is None or self.parameters is None:
+            raise RuntimeError("Device not connected")
+        self._ensure_no_staged_autolock_run("staged auto-lock begin")
+        ttl_s = min(max(float(ttl_s), 0.01), STAGED_AUTOLOCK_MAX_TTL_S)
+        with self._state_lock:
+            if settings_payload is None:
+                settings = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
+            else:
+                settings = AutoLockScanSettings.from_mapping(settings_payload)
+            acceptance = AcceptanceSettings.from_mapping(self.lock_acceptance_settings)
+        # require_unlocked mirrors the one-shot path: refuse a locked device
+        # up front rather than acquiring a frame it cannot use.
+        center_v, amplitude_v, _rising, _mod_hz = self._snapshot_sweep_params(
+            require_unlocked=True
+        )
+        try:
+            candidates, center_v, amplitude_v, resolution, frame = (
+                self._capture_auto_lock_candidates_strict(settings, after=None)
+            )
+        except ValueError:
+            error_trace, monitor_trace, frame_id, acquired_at = (
+                self._snapshot_auto_lock_traces_with_frame()
+            )
+            _c, _a, _r, mod_hz = self._snapshot_sweep_params()
+            frame = _frame_summary(
+                error_trace, frame_id, acquired_at, center_v, amplitude_v, mod_hz, []
+            )
+            candidates = []
+            resolution = feature_resolution_samples(
+                settings, len(error_trace), amplitude_v
+            )
+
+        token = uuid.uuid4().hex
+        now = time.time()
+        run = StagedAutolockRun(
+            token=token,
+            settings=settings,
+            acceptance=acceptance,
+            restore_center_v=center_v,
+            restore_amplitude_v=amplitude_v,
+            trace_length=int(frame["n_points"]),
+            created_at=now,
+            expires_at=now + ttl_s,
+            ttl_s=ttl_s,
+            center_v=center_v,
+            amplitude_v=amplitude_v,
+            latest_frame=frame,
+            latest_detector="strict",
+            latest_resolution=resolution,
+            latest_candidates=candidates,
+        )
+        with self._state_lock:
+            if self._staged_autolock is not None:
+                raise RuntimeError(
+                    "A staged auto-lock run is already active (token "
+                    f"{self._staged_autolock.token})."
+                )
+            self._staged_autolock = run
+            self._staged_autolock_arm_timer(run, ttl_s)
+        return {
+            "token": token,
+            "expires_at": run.expires_at,
+            "geometry": {"center_v": center_v, "amplitude_v": amplitude_v},
+            "frame": frame,
+            "candidates": [c.to_dict() for c in candidates],
+            "stage_index": 0,
+        }
+
+    def staged_autolock_renew(self, token: str, ttl_s: float) -> dict[str, Any]:
+        ttl_s = min(max(float(ttl_s), 0.01), STAGED_AUTOLOCK_MAX_TTL_S)
+        with self._state_lock:
+            run = self._get_staged_run_or_raise(token)
+            self._staged_autolock_arm_timer(run, ttl_s)
+            expires_at = run.expires_at
+        return {"expires_at": expires_at}
+
+    def staged_autolock_state(self) -> dict[str, Any]:
+        with self._state_lock:
+            run = self._staged_autolock
+            if run is None:
+                return {"active": False}
+            return {
+                "active": True,
+                "token": run.token,
+                "stage_index": run.stage_index,
+                "geometry": {"center_v": run.center_v, "amplitude_v": run.amplitude_v},
+                "expires_at": run.expires_at,
+                "frame": run.latest_frame,
+            }
+
+    def staged_autolock_abort(self, token: str) -> dict[str, Any]:
+        with self._state_lock:
+            run = self._get_staged_run_or_raise(token)
+            self._staged_autolock = None
+        if run.timer is not None:
+            run.timer.cancel()
+        restored = self._restore_sweep_geometry(
+            run.restore_center_v, run.restore_amplitude_v
+        )
+        return {"restored": restored}
+
+    def staged_autolock_observe_frame(
+        self, frame: dict[str, Any], candidates: list[dict[str, Any]]
+    ) -> None:
+        """Update the run's "latest seen frame" from an out-of-band read-only
+        detection (an `auto_lock_candidates?acquire=true` call made on this
+        device while a staged run is active) -- per the spec, a read-only call
+        made during a run must still advance what the run considers its
+        latest frame, so `step`/`lock` can reference it by `frame_id` without
+        the caller having to drive another `step`.
+
+        ``candidates`` are plain dicts in exactly `AutoLockScanResult.to_dict()`
+        shape (i.e. `auto_lock_detect`'s own `result["candidates"]`), so they
+        round-trip losslessly back into `AutoLockScanResult` instances -- the
+        same objects `step`/`lock` need for target_index lookup and
+        IdentityGuard checks.
+
+        No-op if no run is active, the frame is not newer than the one the
+        run already has, or this device's current geometry does not match the
+        run's (the read-only call ran at different geometry -- not this
+        run's frame). Never touches identity.
+        """
+        try:
+            frame_id = int(frame.get("frame_id"))
+        except (TypeError, ValueError):
+            return
+        with self._state_lock:
+            run = self._staged_autolock
+            if run is None:
+                return
+            if frame_id <= int(run.latest_frame.get("frame_id", -1)):
+                return
+            center_v = frame.get("sweep_center_v")
+            amplitude_v = frame.get("sweep_amplitude_v")
+            if center_v is None or amplitude_v is None:
+                return
+            if (
+                abs(float(center_v) - run.center_v) > 1e-9
+                or abs(float(amplitude_v) - run.amplitude_v) > 1e-9
+            ):
+                # Geometry moved out from under the run (someone else's
+                # acquire_scan, or a stale call); do not adopt a frame that is
+                # not at this run's current geometry.
+                return
+            try:
+                rebuilt = [AutoLockScanResult(**item) for item in candidates]
+            except (TypeError, ValueError):
+                # Malformed payload -- keep the run's existing frame rather
+                # than risk poisoning it with a partially-applied update.
+                return
+            run.latest_candidates = rebuilt
+            run.latest_frame = dict(frame)
+
+    def staged_autolock_step(
+        self, token: str, selected_frame_id: int, selected_target_index: int
+    ) -> dict[str, Any]:
+        with self._state_lock:
+            run = self._get_staged_run_or_raise(token)
+            if int(selected_frame_id) != int(run.latest_frame.get("frame_id", -1)):
+                raise StagedAutolockError(
+                    f"selected.frame_id {selected_frame_id} is stale; this run "
+                    f"has since seen frame {run.latest_frame.get('frame_id')}.",
+                    status_code=409,
+                )
+            selected = next(
+                (
+                    c for c in run.latest_candidates
+                    if int(c.target_index) == int(selected_target_index)
+                ),
+                None,
+            )
+            if selected is None:
+                raise StagedAutolockError(
+                    f"target_index {selected_target_index} is not one of the "
+                    f"candidates on frame {selected_frame_id}.",
+                    status_code=422,
+                )
+            if run.identity is None:
+                run.identity = IdentityGuard(
+                    selected, run.latest_resolution,
+                    trace_length=run.trace_length, detector=run.latest_detector,
+                )
+            else:
+                try:
+                    run.identity.check(
+                        selected,
+                        amplitude_v=run.amplitude_v,
+                        detector=run.latest_detector,
+                        resolution_samples=run.latest_resolution,
+                    )
+                except _TrackingIdentityChanged as exc:
+                    raise StagedAutolockError(str(exc), status_code=422) from exc
+            settings = run.settings
+            geometry_settle_s = max(0.0, float(run.acceptance.settle_ms) / 1000.0)
+            center_v, amplitude_v = run.center_v, run.amplitude_v
+            trace_length = run.trace_length
+            detector = run.latest_detector
+            shift_per_fraction = run.shift_per_fraction
+            narrow_count = run.narrow_count
+            self._staged_autolock_arm_timer(run, run.ttl_s)
+
+        if narrow_count >= _MAX_REFINEMENT_STAGES:
+            raise StagedAutolockError(
+                f"No lockable scan after {_MAX_REFINEMENT_STAGES} trajectory "
+                "refinement stages.",
+                status_code=422,
+            )
+
+        latest_frame_box: dict[str, Any] = {}
+        latest_candidates_box: list[Any] = []
+
+        def _detect_narrow(c, a, settle_s):
+            moved_at = self._set_sweep_geometry(c, a, settle_s=settle_s)
+            try:
+                candidates, cc, aa, r, frame = self._capture_auto_lock_candidates_strict(
+                    settings, after=moved_at
+                )
+                latest_frame_box.clear()
+                latest_frame_box.update(frame)
+                latest_candidates_box[:] = candidates
+                return candidates[0], cc, aa, r, "strict", None
+            except ValueError:
+                candidates, cc, aa, r, m, frame = self._coarse_auto_lock_candidates(
+                    settings, after=moved_at
+                )
+                latest_frame_box.clear()
+                latest_frame_box.update(frame)
+                latest_candidates_box[:] = candidates
+                return candidates[0], cc, aa, r, "coarse", m
+
+        def _detect_recenter(c, a, settle_s):
+            moved_at = self._set_sweep_geometry(c, a, settle_s=settle_s)
+            candidates, cc, aa, r, m, frame = self._coarse_auto_lock_candidates(
+                settings, after=moved_at
+            )
+            latest_frame_box.clear()
+            latest_frame_box.update(frame)
+            latest_candidates_box[:] = candidates
+            return candidates[0], cc, aa, r, m
+
+        outcome = self._run_refinement_stage(
+            settings,
+            center_v=center_v,
+            amplitude_v=amplitude_v,
+            target=selected,
+            detector=detector,
+            trace_length=trace_length,
+            shift_per_fraction=shift_per_fraction,
+            geometry_settle_s=geometry_settle_s,
+            detect_narrow=_detect_narrow,
+            detect_recenter=_detect_recenter,
+        )
+        step = outcome.step
+
+        with self._state_lock:
+            run = self._get_staged_run_or_raise(token)
+            if step.action == "refuse":
+                # The run stays active so the caller can inspect state or abort.
+                raise StagedAutolockError(step.reason, status_code=422)
+            if step.action == "done":
+                # Nothing moved: re-report the frame the caller already has,
+                # now annotated against the identity this call just
+                # established/advanced.
+                annotated = self._annotate_candidates(
+                    run.latest_candidates, run.identity,
+                    amplitude_v=run.amplitude_v, detector=run.latest_detector,
+                    resolution_samples=run.latest_resolution,
+                )
+                return {
+                    "stage_index": run.stage_index,
+                    "geometry": {"center_v": run.center_v, "amplitude_v": run.amplitude_v},
+                    "frame": run.latest_frame,
+                    "candidates": annotated,
+                    "expires_at": run.expires_at,
+                    "needs_more_refinement": False,
+                    "planner": {"action": step.action, "reason": step.reason, "bounds": step.bounds},
+                }
+            # "narrow" / "recenter" / "rail_escape": geometry moved and a fresh
+            # frame was detected -- adopt it as the run's new latest frame.
+            run.stage_index += 1
+            run.narrow_count += 1
+            run.center_v = outcome.center_v
+            run.amplitude_v = outcome.amplitude_v
+            run.latest_detector = outcome.detector
+            run.latest_resolution = outcome.resolution
+            run.latest_candidates = latest_candidates_box
+            run.latest_frame = dict(latest_frame_box)
+            # Width-induced shift bookkeeping, mirroring the one-shot loop's
+            # own measurement (see _trajectory_refine_auto_lock) so a later
+            # stage's shift-based gentling sees the same evidence a one-shot
+            # walk over the same geometry sequence would have.
+            before_amplitude = outcome.before_amplitude
+            width_fraction = (
+                1.0 - (abs(run.amplitude_v) / before_amplitude)
+                if before_amplitude > 1e-12 else 0.0
+            )
+            width_shift_v = abs(float(outcome.target.target_voltage) - outcome.before_v)
+            width_delta_v = max(0.0, before_amplitude - abs(run.amplitude_v))
+            center_delta_v = abs(float(run.center_v) - outcome.before_center)
+            if (
+                width_fraction > _REFINEMENT_MIN_MEASURABLE_FRACTION
+                and run.latest_detector == outcome.before_detector
+                and width_delta_v >= center_delta_v
+            ):
+                observed = width_shift_v / width_fraction
+                run.shift_per_fraction = (
+                    observed if run.shift_per_fraction is None
+                    else max(run.shift_per_fraction, observed)
+                )
+            needs_more_refinement = run.latest_detector == "coarse" or scan_too_wide_to_lock(
+                settings, run.amplitude_v, outcome.target.sideband_offset_v,
+                trace_points=trace_length,
+            )
+            annotated = self._annotate_candidates(
+                run.latest_candidates, run.identity,
+                amplitude_v=run.amplitude_v, detector=run.latest_detector,
+                resolution_samples=run.latest_resolution,
+            )
+            return {
+                "stage_index": run.stage_index,
+                "geometry": {"center_v": run.center_v, "amplitude_v": run.amplitude_v},
+                "frame": run.latest_frame,
+                "candidates": annotated,
+                "expires_at": run.expires_at,
+                "needs_more_refinement": bool(needs_more_refinement),
+                "planner": {"action": step.action, "reason": step.reason, "bounds": step.bounds},
+            }
+
+    def staged_autolock_lock(
+        self, token: str, selected_frame_id: int, selected_target_index: int
+    ) -> dict[str, Any]:
+        """Verify the selected candidate on a fresh frame at the SAME (final)
+        geometry, then hand off to the existing lock-engagement code path
+        (`_move_and_lock`), exactly like a one-shot auto-lock's final
+        verification + handover. Never substitutes another candidate: if the
+        strict re-detection does not find a consistent, unambiguous match for
+        the selection, this raises `StagedAutolockError` (422) and does not
+        lock; the run stays active so the caller can retry `step`/`lock` or
+        `abort`.
+        """
+        with self._state_lock:
+            run = self._get_staged_run_or_raise(token)
+            if int(selected_frame_id) != int(run.latest_frame.get("frame_id", -1)):
+                raise StagedAutolockError(
+                    f"selected.frame_id {selected_frame_id} is stale; this run "
+                    f"has since seen frame {run.latest_frame.get('frame_id')}.",
+                    status_code=409,
+                )
+            selected = next(
+                (
+                    c for c in run.latest_candidates
+                    if int(c.target_index) == int(selected_target_index)
+                ),
+                None,
+            )
+            if selected is None:
+                raise StagedAutolockError(
+                    f"target_index {selected_target_index} is not one of the "
+                    f"candidates on frame {selected_frame_id}.",
+                    status_code=422,
+                )
+            if run.identity is None:
+                run.identity = IdentityGuard(
+                    selected, run.latest_resolution,
+                    trace_length=run.trace_length, detector=run.latest_detector,
+                )
+            else:
+                try:
+                    run.identity.check(
+                        selected,
+                        amplitude_v=run.amplitude_v,
+                        detector=run.latest_detector,
+                        resolution_samples=run.latest_resolution,
+                    )
+                except _TrackingIdentityChanged as exc:
+                    raise StagedAutolockError(str(exc), status_code=422) from exc
+            settings = run.settings
+            center_v, amplitude_v = run.center_v, run.amplitude_v
+            trace_length = run.trace_length
+            restore_center_v = run.restore_center_v
+            restore_amplitude_v = run.restore_amplitude_v
+            identity = run.identity
+
+        # Strict verification at the SAME geometry -- position comparison is
+        # only ever valid here because nothing has moved since `selected` was
+        # detected.
+        try:
+            candidates, verify_center, verify_amplitude, _resolution, _frame = (
+                self._capture_auto_lock_candidates_strict(settings, after=time.time())
+            )
+        except ValueError as exc:
+            raise StagedAutolockError(
+                f"No strict candidate found at lock-verification time: {exc}",
+                status_code=422,
+            ) from exc
+        if (
+            abs(verify_center - center_v) > 1e-6
+            or abs(verify_amplitude - amplitude_v) > 1e-6
+        ):
+            raise StagedAutolockError(
+                "Sweep geometry moved before lock verification could run: "
+                f"expected center {center_v:.6f} V amplitude {amplitude_v:.6f} V, "
+                f"found {verify_center:.6f} V / {verify_amplitude:.6f} V.",
+                status_code=422,
+            )
+        tolerance_samples = STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES
+        tolerance_v = tolerance_samples * 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
+        matches = [
+            c for c in candidates
+            if c.target_slope_rising == selected.target_slope_rising
+            and abs(c.target_voltage - selected.target_voltage) <= tolerance_v
+            and identity.evaluate(
+                c, amplitude_v=amplitude_v, detector="strict", resolution_samples=0.0,
+            )[0]
+        ]
+        if not matches:
+            raise StagedAutolockError(
+                "No fresh strict candidate is consistent with the selected "
+                f"target at {selected.target_voltage:.6f} V within "
+                f"{tolerance_v * 1e3:.3f} mV ({tolerance_samples:g} samples); "
+                "refusing to lock rather than substitute a different candidate.",
+                status_code=422,
+            )
+        if len(matches) > 1:
+            raise StagedAutolockError(
+                f"{len(matches)} fresh strict candidates are within "
+                f"{tolerance_v * 1e3:.3f} mV of the selected target at "
+                f"{selected.target_voltage:.6f} V -- ambiguous; refusing to "
+                "lock rather than guess.",
+                status_code=422,
+            )
+        final = matches[0]
+        try:
+            identity.check(
+                final, amplitude_v=amplitude_v, detector="strict", resolution_samples=0.0,
+            )
+        except _TrackingIdentityChanged as exc:
+            raise StagedAutolockError(str(exc), status_code=422) from exc
+
+        refinement = {
+            "attempted": True,
+            "trigger": "staged",
+            "original_center_v": restore_center_v,
+            "original_amplitude_v": restore_amplitude_v,
+            "final_center_v": center_v,
+            "final_amplitude_v": amplitude_v,
+            "stages": [],
+            "restored": False,
+        }
+        self._move_and_lock(final, center_v)
+        timer_to_cancel: threading.Timer | None = None
+        with self._state_lock:
+            active_run = self._staged_autolock
+            if active_run is not None and active_run.token == token:
+                active_run.locked = True
+                timer_to_cancel = active_run.timer
+                self._staged_autolock = None
+                self._deferred_sweep_geometry = (
+                    float(restore_center_v), float(restore_amplitude_v),
+                )
+        if timer_to_cancel is not None:
+            timer_to_cancel.cancel()
+        if final.discriminator_slope_v_per_mhz is not None:
+            with self._state_lock:
+                self._discriminator_slope_v_per_mhz = float(
+                    final.discriminator_slope_v_per_mhz
+                )
+        payload = final.to_dict()
+        payload["refinement"] = refinement
+        payload["detail"] = "Staged auto-lock started."
+        return payload
 
     def auto_lock_from_scan(
         self, settings_payload: dict[str, Any] | None
     ) -> dict[str, Any]:
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
+        self._ensure_no_staged_autolock_run("one-shot auto-lock from scan")
 
         with self._state_lock:
             if settings_payload is None:
@@ -3669,6 +4560,7 @@ class DeviceSession:
             raise RuntimeError(f"Autolock is {AUTOMATION_TEMP_DISABLED_REASON}")
         if self.control is None:
             raise RuntimeError("Device not connected")
+        self._ensure_no_staged_autolock_run("start_autolock")
         with self._state_lock:
             if self.plot_state.last_plot_data is None:
                 raise RuntimeError("No plot data available")
