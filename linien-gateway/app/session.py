@@ -2748,6 +2748,86 @@ class DeviceSession:
             "frame": frame,
         }
 
+    def auto_lock_candidates_detect(
+        self, settings_payload: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """`auto_lock_detect`, but run-aware (fix #2b).
+
+        A staged run's `latest_candidates` must come from the run's OWN
+        detector and settings -- otherwise a coarse-stage run's candidates
+        get silently replaced by this endpoint's strict-only, request/stored
+        -settings detection (via `staged_autolock_observe_frame`), and
+        IdentityGuard ends up comparing strict against coarse baselines
+        (~1.75x apart; see `IdentityGuard`'s own baseline-separation note).
+
+        When a staged run is active, idle, and the CURRENT sweep geometry
+        matches the run's, this detects with `run.settings` and the run's
+        current detector mode (strict falling back to coarse, exactly like
+        `staged_autolock_begin` -- see `_detect_strict_then_coarse`) instead
+        of `settings_payload`, and folds the SAME candidate objects/frame/
+        detector/resolution directly into the run's `latest_*` fields, so any
+        `target_index` the caller picks from this response exists in
+        `run.latest_candidates`. `settings_payload` is ignored in that case --
+        a run's detection must never depend on what an unrelated read-only
+        caller happened to pass. At a different geometry, while the run is
+        busy, or with no active run, this is exactly `auto_lock_detect`
+        (strict only, request/stored settings) -- today's behaviour --  with
+        a `detector` key added to the result for shape consistency.
+        """
+        if self.control is None or self.parameters is None:
+            raise RuntimeError("Device not connected")
+        with self._state_lock:
+            run = self._staged_autolock
+        if run is not None:
+            try:
+                center_v, amplitude_v, _rising, _mod_hz = self._snapshot_sweep_params()
+            except Exception:  # noqa: BLE001 - fall through to the plain path
+                center_v = amplitude_v = None
+            if (
+                not run.busy
+                and center_v is not None
+                and abs(float(center_v) - run.center_v) <= 1e-9
+                and abs(float(amplitude_v) - run.amplitude_v) <= 1e-9
+            ):
+                return self._staged_run_aware_detect(run)
+        result = self.auto_lock_detect(settings_payload)
+        result.setdefault("detector", "strict")
+        return result
+
+    def _staged_run_aware_detect(self, run: "StagedAutolockRun") -> dict[str, Any]:
+        """The run-owned half of `auto_lock_candidates_detect`.
+
+        Detects with `run.settings` (never the endpoint's own settings) and
+        adopts the result into the run directly -- rather than relying on
+        `staged_autolock_observe_frame`'s round trip through
+        `AutoLockScanResult.to_dict()`/reconstruction, which exists for an
+        out-of-band caller and would otherwise be the only path folding this
+        detection back into the run.
+        """
+        candidates, center_v, amplitude_v, resolution, detector, frame, reason = (
+            self._detect_strict_then_coarse(run.settings, after=None)
+        )
+        with self._state_lock:
+            active = self._staged_autolock
+            if (
+                active is not None
+                and active.token == run.token
+                and not active.busy
+                and int(frame.get("frame_id", -1))
+                > int(active.latest_frame.get("frame_id", -1))
+            ):
+                active.latest_candidates = candidates
+                active.latest_frame = dict(frame)
+                active.latest_detector = detector
+                active.latest_resolution = resolution
+        return {
+            "found": bool(candidates),
+            "candidate": candidates[0].to_dict() if candidates else None,
+            "candidates": [c.to_dict() for c in candidates],
+            "reason": reason,
+            "frame": frame,
+            "detector": detector,
+        }
 
     def _wait_for_fresh_unlocked_trace(
         self, after: float, timeout_s: float, frames: int = VERIFY_TRACE_FRAMES
@@ -3874,6 +3954,53 @@ class DeviceSession:
             out.append(payload)
         return out
 
+    def _detect_strict_then_coarse(
+        self, settings: AutoLockScanSettings, *, after: float | None
+    ) -> tuple[list[Any], float, float, float, str, dict[str, Any], str | None]:
+        """Strict detection, falling back to the staged coarse detector when
+        strict finds nothing (fix #2). A staged run started on a wide scan --
+        the exact case trajectory refinement exists for -- has no strict
+        candidate at all; storing `[]`/`"strict"` from a bare strict attempt
+        (the old behaviour) leaves the run with nothing to `step`/`lock` from
+        and every subsequent call 422s. Only when BOTH detectors find nothing
+        does this return an empty candidate list, with a non-None `detail`
+        saying so; it never raises. Mirrors `_detect_narrow`'s per-stage
+        fallback in `staged_autolock_step`, so `begin`'s first frame behaves
+        exactly like a `step` stage would have detected it.
+
+        Returns
+        ``(candidates, center_v, amplitude_v, resolution, detector, frame, detail)``.
+        """
+        try:
+            candidates, center_v, amplitude_v, resolution, frame = (
+                self._capture_auto_lock_candidates_strict(settings, after=after)
+            )
+            return candidates, center_v, amplitude_v, resolution, "strict", frame, None
+        except ValueError as strict_exc:
+            try:
+                candidates, center_v, amplitude_v, resolution, _metrics, frame = (
+                    self._coarse_auto_lock_candidates(settings, after=after)
+                )
+                return (
+                    candidates, center_v, amplitude_v, resolution, "coarse", frame, None
+                )
+            except ValueError as coarse_exc:
+                error_trace, monitor_trace, frame_id, acquired_at = (
+                    self._snapshot_auto_lock_traces_with_frame()
+                )
+                center_v, amplitude_v, _rising, mod_hz = self._snapshot_sweep_params()
+                frame = _frame_summary(
+                    error_trace, frame_id, acquired_at, center_v, amplitude_v, mod_hz, []
+                )
+                resolution = feature_resolution_samples(
+                    settings, len(error_trace), amplitude_v
+                )
+                detail = (
+                    f"No strict candidate ({strict_exc}); no coarse candidate "
+                    f"either ({coarse_exc})."
+                )
+                return [], center_v, amplitude_v, resolution, "strict", frame, detail
+
     def staged_autolock_begin(
         self,
         settings_payload: dict[str, Any] | None,
@@ -3900,25 +4027,10 @@ class DeviceSession:
             acceptance = AcceptanceSettings.from_mapping(self.lock_acceptance_settings)
         # require_unlocked mirrors the one-shot path: refuse a locked device
         # up front rather than acquiring a frame it cannot use.
-        center_v, amplitude_v, _rising, _mod_hz = self._snapshot_sweep_params(
-            require_unlocked=True
+        self._snapshot_sweep_params(require_unlocked=True)
+        candidates, center_v, amplitude_v, resolution, detector, frame, detail = (
+            self._detect_strict_then_coarse(settings, after=None)
         )
-        try:
-            candidates, center_v, amplitude_v, resolution, frame = (
-                self._capture_auto_lock_candidates_strict(settings, after=None)
-            )
-        except ValueError:
-            error_trace, monitor_trace, frame_id, acquired_at = (
-                self._snapshot_auto_lock_traces_with_frame()
-            )
-            _c, _a, _r, mod_hz = self._snapshot_sweep_params()
-            frame = _frame_summary(
-                error_trace, frame_id, acquired_at, center_v, amplitude_v, mod_hz, []
-            )
-            candidates = []
-            resolution = feature_resolution_samples(
-                settings, len(error_trace), amplitude_v
-            )
 
         token = uuid.uuid4().hex
         now = time.time()
@@ -3935,7 +4047,7 @@ class DeviceSession:
             center_v=center_v,
             amplitude_v=amplitude_v,
             latest_frame=frame,
-            latest_detector="strict",
+            latest_detector=detector,
             latest_resolution=resolution,
             latest_candidates=candidates,
         )
@@ -3953,6 +4065,8 @@ class DeviceSession:
             "geometry": {"center_v": center_v, "amplitude_v": amplitude_v},
             "frame": frame,
             "candidates": [c.to_dict() for c in candidates],
+            "detector": detector,
+            "detail": detail,
             "stage_index": 0,
         }
 

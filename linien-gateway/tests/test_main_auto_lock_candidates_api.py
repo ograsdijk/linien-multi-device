@@ -52,6 +52,18 @@ class FakeCandidatesSession:
         self._acquired_at += 1.0
         return {"frame_id": self._frame_id, "acquired_at": self._acquired_at}
 
+    def auto_lock_candidates_acquire_precheck(self) -> None:
+        # Fix #1: the route runs this BEFORE triggering a sweep restart when
+        # acquire=true. No-op here (these tests have no staged run/lock
+        # state to refuse on); recorded so ordering/coverage can be asserted.
+        self.calls.append(("auto_lock_candidates_acquire_precheck",))
+
+    def auto_lock_candidates_detect(self, settings_payload):
+        # The route calls this (not `auto_lock_detect` directly) since fix
+        # #2b; with no staged run active it is exactly `auto_lock_detect`.
+        self.calls.append(("auto_lock_candidates_detect", settings_payload))
+        return self.auto_lock_detect(settings_payload)
+
     def auto_lock_detect(self, settings_payload):
         self.calls.append(("auto_lock_detect", settings_payload))
         if self.detect_error is not None:
@@ -222,9 +234,11 @@ def test_endpoint_never_calls_a_locking_or_settings_persisting_method(monkeypatc
     # itself performs (none here, since sweep_speed is not part of this path).
     call_names = {call[0] for call in session.calls}
     assert call_names <= {
+        "auto_lock_candidates_acquire_precheck",
         "start_sweep",
         "set_csr_direct",
         "wait_for_fresh_trace",
+        "auto_lock_candidates_detect",
         "auto_lock_detect",
         # Advancing a staged run's latest-seen frame (see C2) is itself
         # read-only: it never locks or persists settings.

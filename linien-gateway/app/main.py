@@ -1160,7 +1160,9 @@ async def auto_lock_candidates(
     try:
         # Detection reads sweep params over rpyc and runs the detector: keep it off
         # the event loop, as every other session call from an async route does.
-        result = await asyncio.to_thread(session.auto_lock_detect, settings_payload)
+        result = await asyncio.to_thread(
+            session.auto_lock_candidates_detect, settings_payload
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     # The sweep keeps running, so the analysed frame may be a newer one than the

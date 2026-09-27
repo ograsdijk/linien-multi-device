@@ -76,6 +76,7 @@ Response:
   "candidate": { "...best-score AutoLockScanResult..." },
   "candidates": [ { "...every accepted crossing, desc score..." } ],
   "reason": null,
+  "detector": "strict",
   "frame": {
     "frame_id": 123, "acquired_at": 1790000000.12,
     "sweep_center_v": 0.1, "sweep_amplitude_v": 0.5, "n_points": 2048,
@@ -94,12 +95,22 @@ lock-target *quality*), `sideband_offset_samples` (carrier→sideband spacing
 in samples, independent of a known modulation frequency), `monitor_contrast`,
 and `crossing_index` (sub-sample interpolated position). No candidates found
 → `found:false, candidate:null, candidates:[]` with `reason`; `frame` is
-still reported whenever a frame was analysed.
+still reported whenever a frame was analysed. `detector` is `"strict"` or
+`"coarse"` (see below).
 
 A call made while a staged auto-lock run is active still advances that run's
 notion of "latest frame" (`staged_autolock_observe_frame`), so a later
 `step`/`lock` can reference the frame it returned by `frame_id` without an
-extra `step` round-trip.
+extra `step` round-trip. More specifically: when the run is idle and the
+analysed frame's geometry matches the run's current geometry exactly, this
+endpoint detects with the RUN's own settings and current detector mode
+(strict, falling back to coarse — see the staged section below) instead of
+this call's own `settings_payload`/stored settings, and those same candidate
+objects become the run's `latest_candidates` directly — so a `target_index`
+picked from *this* response is guaranteed to exist in the run's candidate
+list for a following `step`/`lock`. A call at a different geometry, while
+the run is busy, or with no active run, is unaffected: plain strict-only
+detection with this call's own settings, exactly as before.
 
 ### Staged (step-by-step) auto-lock API
 
