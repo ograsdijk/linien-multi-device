@@ -13,6 +13,7 @@ bookkeeping are what's under test.
 
 from __future__ import annotations
 
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -384,3 +385,294 @@ def test_renew_extends_the_ttl_and_prevents_expiry(monkeypatch):
     time.sleep(0.2)  # past the ORIGINAL ttl, well within the renewed one
     assert session.staged_autolock_state()["active"] is True
     assert restores == []
+
+
+# --------------------------------------------------------------------------
+# Fix #1: a `busy` guard around the in-flight `step`/`lock` I/O, so the TTL
+# timer cannot restore geometry underneath it and a concurrent call cannot
+# race it.
+# --------------------------------------------------------------------------
+
+
+def _blocking_geometry_recorder(
+    session: DeviceSession,
+) -> tuple[list[tuple[float, float]], threading.Event, threading.Event]:
+    """Like `_geometry_recorder`, but the write blocks until released.
+
+    Lets a test pause a `step`/`lock` call mid-I/O (after it has set `busy`
+    and released `_state_lock`) so it can probe what a concurrent
+    call/timer-fire sees.
+    """
+    writes: list[tuple[float, float]] = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _fake(center_v, amplitude_v, *, settle_s=0.0):
+        entered.set()
+        release.wait(timeout=5.0)
+        writes.append((float(center_v), float(amplitude_v)))
+        session.parameters.sweep_center.value = float(center_v)
+        session.parameters.sweep_amplitude.value = float(amplitude_v)
+        return time.time()
+
+    session._set_sweep_geometry = _fake  # type: ignore[method-assign]
+    return writes, entered, release
+
+
+def test_ttl_expiry_during_a_slow_step_does_not_restore_mid_step_then_expires_after():
+    session = _make_session()
+    writes, entered, release = _blocking_geometry_recorder(session)
+    restores = _restore_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.03)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    # A short TTL that will elapse WHILE the step below is blocked inside its
+    # geometry write.
+    result = session.staged_autolock_begin(None, 0.05)
+    token = result["token"]
+
+    # The post-move detection the step's planner will use once it un-blocks.
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.15, sideband_offset_v=0.03)], 0.05, 0.5, 5.0, _frame(2, 0.05, 0.5)
+        )
+    )
+
+    errors: list[BaseException] = []
+    results: list[dict[str, Any]] = []
+
+    def _run_step():
+        try:
+            results.append(session.staged_autolock_step(token, 1, 1))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run_step)
+    thread.start()
+    assert entered.wait(timeout=5.0), "step never reached the geometry write"
+
+    # Let the TTL elapse while the step is still blocked inside the write.
+    time.sleep(0.15)
+    # The timer must NOT have restored geometry mid-step: the run is still
+    # active, at its ORIGINAL (pre-step) geometry, and busy.
+    state = session.staged_autolock_state()
+    assert state["active"] is True
+    assert state["busy"] is True
+    assert state["geometry"] == {"center_v": 0.0, "amplitude_v": 1.0}
+    assert restores == []
+
+    # Let the step finish.
+    release.set()
+    thread.join(timeout=5.0)
+    assert not errors, errors
+    assert len(results) == 1
+
+    # The deadline had already passed while busy, so the step's own `finally`
+    # expires the run right away and restores the ORIGINAL geometry (not the
+    # narrowed one it was mid-write to).
+    assert session.staged_autolock_state() == {"active": False}
+    assert restores == [(0.0, 1.0)]
+
+
+def test_a_concurrent_step_on_a_busy_run_is_refused_with_409():
+    session = _make_session()
+    _writes, entered, release = _blocking_geometry_recorder(session)
+    _restore_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.03)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.15, sideband_offset_v=0.03)], 0.05, 0.5, 5.0, _frame(2, 0.05, 0.5)
+        )
+    )
+
+    thread = threading.Thread(target=lambda: session.staged_autolock_step(token, 1, 1))
+    thread.start()
+    try:
+        assert entered.wait(timeout=5.0), "step never reached the geometry write"
+
+        with pytest.raises(StagedAutolockError) as excinfo:
+            session.staged_autolock_step(token, 1, 1)
+        assert excinfo.value.status_code == 409
+
+        with pytest.raises(StagedAutolockError) as lock_excinfo:
+            session.staged_autolock_lock(token, 1, 1)
+        assert lock_excinfo.value.status_code == 409
+    finally:
+        release.set()
+        thread.join(timeout=5.0)
+
+
+def test_abort_on_a_busy_run_is_refused_with_409():
+    session = _make_session()
+    _writes, entered, release = _blocking_geometry_recorder(session)
+    _restore_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.03)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.15, sideband_offset_v=0.03)], 0.05, 0.5, 5.0, _frame(2, 0.05, 0.5)
+        )
+    )
+
+    thread = threading.Thread(target=lambda: session.staged_autolock_step(token, 1, 1))
+    thread.start()
+    try:
+        assert entered.wait(timeout=5.0), "step never reached the geometry write"
+
+        with pytest.raises(StagedAutolockError) as excinfo:
+            session.staged_autolock_abort(token)
+        assert excinfo.value.status_code == 409
+    finally:
+        release.set()
+        thread.join(timeout=5.0)
+
+
+def test_lock_cannot_proceed_after_the_run_has_expired():
+    session = _make_session()
+    _geometry_recorder(session)
+    restores = _restore_recorder(session)
+    locked = _lock_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    result = session.staged_autolock_begin(None, 0.05)
+    token = result["token"]
+
+    time.sleep(0.3)
+    assert session.staged_autolock_state() == {"active": False}
+    assert restores == [(0.0, 1.0)]
+
+    with pytest.raises(StagedAutolockError) as excinfo:
+        session.staged_autolock_lock(token, 1, 1)
+    assert excinfo.value.status_code == 404
+    assert locked == []
+
+
+# --------------------------------------------------------------------------
+# Fix #3: per-candidate `lockable_here`, and the width-shift measurement
+# deferred to the CALLER's selected candidate on the new frame (never the
+# best-score one).
+# --------------------------------------------------------------------------
+
+
+def test_lockable_here_is_reported_per_candidate_not_just_for_the_selection():
+    session = _make_session()
+    _geometry_recorder(session)
+    # Two candidates at amplitude 1.0: A's sideband is too narrow for this
+    # scan width (not lockable_here), B's is wide enough (lockable_here).
+    # Selecting B makes the planner declare "done" immediately -- no further
+    # detection call needed -- so both candidates from this one frame are
+    # returned annotated together.
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [
+                _result(1, -0.2, sideband_offset_v=0.02, score=0.9),
+                _result(2, 0.2, sideband_offset_v=0.5, score=0.5),
+            ],
+            0.0, 1.0, 2.0, _frame(1, 0.0, 1.0),
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+
+    step_result = session.staged_autolock_step(token, 1, 2)
+    assert step_result["planner"]["action"] == "done"
+    by_index = {c["target_index"]: c for c in step_result["candidates"]}
+    assert by_index[1]["lockable_here"] is False
+    assert by_index[2]["lockable_here"] is True
+    # At least one candidate on the frame IS lockable -> no more refinement.
+    assert step_result["needs_more_refinement"] is False
+
+
+def test_needs_more_refinement_is_true_when_no_candidate_is_lockable_here():
+    session = _make_session()
+    _geometry_recorder(session)
+    _restore_recorder(session)
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.1, sideband_offset_v=0.03)], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+        )
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+
+    # The single candidate's sideband stays too narrow for the NEW (narrower)
+    # amplitude too, so the frame this step lands on has no lockable
+    # candidate at all.
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (
+            [_result(1, 0.12, sideband_offset_v=0.02)], 0.05, 0.5, 5.0, _frame(2, 0.05, 0.5)
+        )
+    )
+    step_result = session.staged_autolock_step(token, 1, 1)
+    assert step_result["candidates"][0]["lockable_here"] is False
+    assert step_result["needs_more_refinement"] is True
+
+
+def test_width_shift_measurement_uses_the_callers_selection_not_the_best_score():
+    """Regression for fix #3: the shift-per-fraction bookkeeping must be
+    measured against the candidate the CALLER selects on the new frame, not
+    `outcome.target` (the best-score one) -- otherwise a decoy at a wildly
+    different voltage poisons `shift_per_fraction` for every later stage.
+    """
+    session = _make_session()
+    _geometry_recorder(session)
+    _restore_recorder(session)
+
+    begin_candidates = [
+        _result(100, 0.180, score=0.5, sideband_offset_v=0.03),  # desired (weaker)
+        _result(200, -0.410, score=0.95, sideband_offset_v=0.03),  # decoy (stronger)
+    ]
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (begin_candidates, 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0))
+    )
+    result = session.staged_autolock_begin(None, 60.0)
+    token = result["token"]
+
+    # After narrowing (amplitude 1.0 -> 0.3), the desired feature moved only
+    # slightly (0.180 -> 0.191); the decoy is far away (-0.402). Both
+    # sidebands are now wide enough that selecting either would make the
+    # NEXT step's planner declare "done" with no further detection needed.
+    post_move_candidates = [
+        _result(50, 0.191, score=0.4, sideband_offset_v=0.2),  # desired, moved
+        _result(75, -0.402, score=0.97, sideband_offset_v=0.2),  # decoy, still highest score
+    ]
+    session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
+        lambda settings, after=None: (post_move_candidates, 0.05, 0.3, 9.0, _frame(2, 0.05, 0.3))
+    )
+    session.staged_autolock_step(token, 1, 100)  # select the DESIRED candidate
+
+    # The width-shift measurement from the step above is still PENDING: it
+    # has not been consumed yet, because no selection has been made on frame
+    # 2 -- see StagedAutolockRun.pending_shift.
+    assert session._staged_autolock.pending_shift is not None
+    assert session._staged_autolock.shift_per_fraction is None
+
+    # Selecting the DESIRED candidate on frame 2 consumes it.
+    session.staged_autolock_step(token, 2, 50)
+
+    run = session._staged_autolock
+    assert run is not None
+    assert run.pending_shift is None
+    assert run.shift_per_fraction is not None
+    # Expected: |0.191 - 0.180| / (1 - 0.3/1.0) ~= 0.0157 -- small, because
+    # the desired feature barely moved.
+    assert run.shift_per_fraction == pytest.approx(0.011 / 0.7, rel=1e-6)
+    # NOT the value the pre-fix code would have measured against the decoy:
+    # |-0.402 - 0.180| / 0.7 ~= 0.831 -- would poison every later stage.
+    assert run.shift_per_fraction != pytest.approx(0.582 / 0.7, rel=0.01)
