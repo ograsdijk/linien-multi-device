@@ -4246,11 +4246,6 @@ class DeviceSession:
                     f"candidates on frame {selected_frame_id}.",
                     status_code=422,
                 )
-            # The caller's selection on THIS frame is now known -- finish any
-            # width-shift measurement the stage that produced this frame
-            # deferred (see fix #3 / _consume_pending_shift_measurement),
-            # before it is used below to plan the next stage.
-            self._consume_pending_shift_measurement(run, selected)
             if run.identity is None:
                 run.identity = IdentityGuard(
                     selected, run.latest_resolution,
@@ -4266,6 +4261,13 @@ class DeviceSession:
                     )
                 except _TrackingIdentityChanged as exc:
                     raise StagedAutolockError(str(exc), status_code=422) from exc
+            # The caller's selection on THIS frame is now known to be
+            # identity-consistent -- only NOW finish any width-shift
+            # measurement the stage that produced this frame deferred (fix
+            # #7 / _consume_pending_shift_measurement). Consuming it before
+            # the identity check let a wrong pick's width-shift estimate
+            # stick (max()) even though the pick itself was then refused.
+            self._consume_pending_shift_measurement(run, selected)
             settings = run.settings
             geometry_settle_s = max(0.0, float(run.acceptance.settle_ms) / 1000.0)
             center_v, amplitude_v = run.center_v, run.amplitude_v
@@ -4444,6 +4446,73 @@ class DeviceSession:
         finally:
             self._staged_autolock_finish_busy(token)
 
+    def _staged_lock_match_candidate(
+        self,
+        settings: AutoLockScanSettings,
+        selected: Any,
+        identity: "IdentityGuard",
+        *,
+        amplitude_v: float,
+        trace_length: int,
+    ) -> tuple[Any, float, float]:
+        """One fresh strict capture, matched against `selected` (fix #9).
+
+        Unique candidate, same slope, within
+        `STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES`, and IdentityGuard-consistent
+        with `check_sideband=False` -- mirroring the one-shot's final
+        verification at unchanged geometry
+        (`_trajectory_refine_auto_lock`'s `identity.check(..., check_sideband=False)`):
+        position comparison is only ever valid when geometry has not moved,
+        which is exactly this call's situation (nothing moves between `step`
+        and `lock`), and the sideband estimate a freshly-narrowed run just
+        measured is the very thing under test here, not a gate on it.
+
+        `staged_autolock_lock` calls this TWICE -- once per confirmation
+        frame -- so a transient false match on a single noisy trace can never
+        start a lock by itself.
+
+        Returns ``(matched_candidate, verify_center_v, verify_amplitude_v)``.
+        Raises `StagedAutolockError(422)` on a strict rejection, no
+        consistent match, or an ambiguous one.
+        """
+        try:
+            candidates, verify_center, verify_amplitude, _resolution, _frame = (
+                self._capture_auto_lock_candidates_strict(settings, after=time.time())
+            )
+        except ValueError as exc:
+            raise StagedAutolockError(
+                f"No strict candidate found at lock-verification time: {exc}",
+                status_code=422,
+            ) from exc
+        tolerance_samples = STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES
+        tolerance_v = tolerance_samples * 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
+        matches = [
+            c for c in candidates
+            if c.target_slope_rising == selected.target_slope_rising
+            and abs(c.target_voltage - selected.target_voltage) <= tolerance_v
+            and identity.evaluate(
+                c, amplitude_v=amplitude_v, detector="strict",
+                resolution_samples=0.0, check_sideband=False,
+            )[0]
+        ]
+        if not matches:
+            raise StagedAutolockError(
+                "No fresh strict candidate is consistent with the selected "
+                f"target at {selected.target_voltage:.6f} V within "
+                f"{tolerance_v * 1e3:.3f} mV ({tolerance_samples:g} samples); "
+                "refusing to lock rather than substitute a different candidate.",
+                status_code=422,
+            )
+        if len(matches) > 1:
+            raise StagedAutolockError(
+                f"{len(matches)} fresh strict candidates are within "
+                f"{tolerance_v * 1e3:.3f} mV of the selected target at "
+                f"{selected.target_voltage:.6f} V -- ambiguous; refusing to "
+                "lock rather than guess.",
+                status_code=422,
+            )
+        return matches[0], verify_center, verify_amplitude
+
     def staged_autolock_lock(
         self, token: str, selected_frame_id: int, selected_target_index: int
     ) -> dict[str, Any]:
@@ -4477,14 +4546,18 @@ class DeviceSession:
                     f"candidates on frame {selected_frame_id}.",
                     status_code=422,
                 )
-            # As in `step`: the caller's selection on this frame is now known,
-            # so finish any deferred width-shift measurement from the stage
-            # that produced it (see fix #3). Harmless if `lock` is called
-            # straight after a geometry-changing `step` with no intervening
-            # `step` call -- the measurement is not used again once locked,
-            # but recording it keeps the run's bookkeeping consistent for a
-            # caller that inspects it after the fact.
-            self._consume_pending_shift_measurement(run, selected)
+            # Fix #8: never lock from a wide/coarse frame. Same rule the
+            # one-shot loop's refinement while-condition and `lockable_here`
+            # apply -- only a strict-detector frame whose scan is narrow
+            # enough for this candidate's own sideband spacing may lock.
+            if run.latest_detector != "strict" or scan_too_wide_to_lock(
+                run.settings, run.amplitude_v, selected.sideband_offset_v,
+                trace_points=run.trace_length,
+            ):
+                raise StagedAutolockError(
+                    "Not lockable at this geometry -- step first.",
+                    status_code=422,
+                )
             if run.identity is None:
                 run.identity = IdentityGuard(
                     selected, run.latest_resolution,
@@ -4500,7 +4573,17 @@ class DeviceSession:
                     )
                 except _TrackingIdentityChanged as exc:
                     raise StagedAutolockError(str(exc), status_code=422) from exc
+            # As in `step`: only NOW, once the selection is known to be
+            # identity-consistent, finish any deferred width-shift
+            # measurement from the stage that produced this frame (fix #7).
+            # Harmless if `lock` is called straight after a geometry-changing
+            # `step` with no intervening `step` call -- the measurement is
+            # not used again once locked, but recording it keeps the run's
+            # bookkeeping consistent for a caller that inspects it after the
+            # fact.
+            self._consume_pending_shift_measurement(run, selected)
             settings = run.settings
+            acceptance = run.acceptance
             center_v, amplitude_v = run.center_v, run.amplitude_v
             trace_length = run.trace_length
             restore_center_v = run.restore_center_v
@@ -4515,16 +4598,17 @@ class DeviceSession:
         try:
             # Strict verification at the SAME geometry -- position comparison
             # is only ever valid here because nothing has moved since
-            # `selected` was detected.
-            try:
-                candidates, verify_center, verify_amplitude, _resolution, _frame = (
-                    self._capture_auto_lock_candidates_strict(settings, after=time.time())
-                )
-            except ValueError as exc:
-                raise StagedAutolockError(
-                    f"No strict candidate found at lock-verification time: {exc}",
-                    status_code=422,
-                ) from exc
+            # `selected` was detected. Fix #9: align with the one-shot's
+            # final verification at unchanged geometry
+            # (`_trajectory_refine_auto_lock`) -- `check_sideband=False` (a
+            # freshly-narrowed run's sideband estimate is exactly the thing
+            # under test, so it must not gate its own confirmation), and
+            # require the selection to be confirmed on TWO consecutive fresh
+            # frames, not one, before ever calling `_move_and_lock`.
+            first, verify_center, verify_amplitude = self._staged_lock_match_candidate(
+                settings, selected, identity,
+                amplitude_v=amplitude_v, trace_length=trace_length,
+            )
             if (
                 abs(verify_center - center_v) > 1e-6
                 or abs(verify_amplitude - amplitude_v) > 1e-6
@@ -4535,39 +4619,59 @@ class DeviceSession:
                     f"found {verify_center:.6f} V / {verify_amplitude:.6f} V.",
                     status_code=422,
                 )
-            tolerance_samples = STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES
-            tolerance_v = tolerance_samples * 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
-            matches = [
-                c for c in candidates
-                if c.target_slope_rising == selected.target_slope_rising
-                and abs(c.target_voltage - selected.target_voltage) <= tolerance_v
-                and identity.evaluate(
-                    c, amplitude_v=amplitude_v, detector="strict", resolution_samples=0.0,
-                )[0]
-            ]
-            if not matches:
-                raise StagedAutolockError(
-                    "No fresh strict candidate is consistent with the selected "
-                    f"target at {selected.target_voltage:.6f} V within "
-                    f"{tolerance_v * 1e3:.3f} mV ({tolerance_samples:g} samples); "
-                    "refusing to lock rather than substitute a different candidate.",
-                    status_code=422,
-                )
-            if len(matches) > 1:
-                raise StagedAutolockError(
-                    f"{len(matches)} fresh strict candidates are within "
-                    f"{tolerance_v * 1e3:.3f} mV of the selected target at "
-                    f"{selected.target_voltage:.6f} V -- ambiguous; refusing to "
-                    "lock rather than guess.",
-                    status_code=422,
-                )
-            final = matches[0]
             try:
                 identity.check(
-                    final, amplitude_v=amplitude_v, detector="strict", resolution_samples=0.0,
+                    first, amplitude_v=amplitude_v, detector="strict",
+                    resolution_samples=0.0, check_sideband=False,
                 )
             except _TrackingIdentityChanged as exc:
                 raise StagedAutolockError(str(exc), status_code=422) from exc
+
+            second, verify_center2, verify_amplitude2 = self._staged_lock_match_candidate(
+                settings, selected, identity,
+                amplitude_v=amplitude_v, trace_length=trace_length,
+            )
+            if (
+                abs(verify_center2 - center_v) > 1e-6
+                or abs(verify_amplitude2 - amplitude_v) > 1e-6
+            ):
+                raise StagedAutolockError(
+                    "Sweep geometry moved before lock verification could run: "
+                    f"expected center {center_v:.6f} V amplitude {amplitude_v:.6f} V, "
+                    f"found {verify_center2:.6f} V / {verify_amplitude2:.6f} V.",
+                    status_code=422,
+                )
+            if second.target_slope_rising != first.target_slope_rising:
+                raise StagedAutolockError(
+                    "The two lock-verification detections disagreed on the "
+                    "discriminator slope.",
+                    status_code=422,
+                )
+            # Same acceptance-window tolerance the one-shot's final_verify
+            # uses at unchanged geometry (see `acceptance_window_v`).
+            window = acceptance_window_v(
+                acceptance, settings.half_range_sweep_v, second.sideband_offset_v
+            )
+            consistency_tolerance_v = max(
+                window.tolerance_v, 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
+            )
+            drift_v = abs(second.target_voltage - first.target_voltage)
+            if drift_v > consistency_tolerance_v:
+                raise StagedAutolockError(
+                    f"The two lock-verification detections were "
+                    f"{drift_v * 1e3:.3f} mV apart, past the "
+                    f"{consistency_tolerance_v * 1e3:.3f} mV acceptance window "
+                    "-- not consistent enough to lock.",
+                    status_code=422,
+                )
+            try:
+                identity.check(
+                    second, amplitude_v=amplitude_v, detector="strict",
+                    resolution_samples=0.0, check_sideband=False,
+                )
+            except _TrackingIdentityChanged as exc:
+                raise StagedAutolockError(str(exc), status_code=422) from exc
+            final = second
 
             refinement = {
                 "attempted": True,

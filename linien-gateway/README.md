@@ -121,23 +121,38 @@ best-score; if the chosen candidate is missing or fails `IdentityGuard`
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/api/devices/{key}/control/staged_autolock/begin` | `{settings?: AutoLockScanSettings, ttl_s: float}` | Requires the device unlocked + sweeping. Saves the current geometry for restore, acquires a fresh frame. Returns `{token, expires_at, geometry, frame, candidates, stage_index: 0}`. **409** if a staged run is already active or the device is locked. |
+| POST | `/api/devices/{key}/control/staged_autolock/begin` | `{settings?: AutoLockScanSettings, ttl_s: float}` | Requires the device unlocked + sweeping, and the sweep-center actuator free (see "Concurrency" below) — all checked *before* the restart-and-capture trigger that acquires the first frame runs, since that trigger switches the lock off. Saves the current geometry for restore. Detects strict on the fresh frame, falling back to the coarse detector when strict finds nothing (the wide-scan case trajectory refinement exists for); only when *both* find nothing are `candidates` empty. Returns `{token, expires_at, geometry, frame, candidates, detector, detail, stage_index: 0}` — `detector` is `"strict"` or `"coarse"`; `detail` is non-null only when both detectors found nothing. **409** if a staged run is already active, the device is locked, or a one-shot refinement walk holds the sweep-center actuator. |
 | POST | `/api/devices/{key}/control/staged_autolock/{token}/renew` | `{ttl_s: float}` | → `{expires_at}`. |
 | GET | `/api/devices/{key}/control/staged_autolock/` | — | Current run state, or `{"active": false}`. |
-| POST | `/api/devices/{key}/control/staged_autolock/{token}/step` | `{selected: {frame_id: int, target_index: int}}` | `frame_id` must be the most recent frame this run has returned (from `begin`/`step`, or an `auto_lock_candidates?acquire=true` call made while the run is active) — a stale `frame_id` is **409**. Plans + applies the next geometry from the selected candidate (existing planner: safe centre-move bounds, narrowing), acquires a fresh frame, and returns **every** candidate on it, each annotated `identity_ok`/`identity_reason` (`IdentityGuard.check`, evaluated **without** mutating the guard baseline unless that candidate is later actually selected) and `lockable_here` (true only when the strict detector itself produced that candidate at the current geometry — never inferred, never score-based). Response: `{stage_index, geometry, frame, candidates, expires_at, needs_more_refinement, planner}`. A planner abort is **422** `{detail}`, but the run stays active so the caller can still `abort` it (restoring geometry). |
-| POST | `/api/devices/{key}/control/staged_autolock/{token}/lock` | `{selected: {frame_id, target_index}}` | Runs the existing final strict verification on the selected candidate at the **current** (geometry-unchanged) frame — same slope, `IdentityGuard` ok, nearest crossing within a small tolerance — then the existing lock handoff. **422** and no lock if ambiguous/missing. Response is an `AutoLockScanResult`-shaped dict plus a `refinement` log. Ends the run. |
+| POST | `/api/devices/{key}/control/staged_autolock/{token}/step` | `{selected: {frame_id: int, target_index: int}}` | `frame_id` must be the most recent frame this run has returned (from `begin`/`step`, or an `auto_lock_candidates?acquire=true` call made while the run is active) — a stale `frame_id` is **409**. Plans + applies the next geometry from the selected candidate (existing planner: safe centre-move bounds, narrowing) under the same sweep-center exclusivity `begin` checks (**409** if a one-shot walk holds it), then detects strict on the fresh frame with the same strict-then-coarse fallback `begin` uses, and returns **every** candidate on it, each annotated `identity_ok`/`identity_reason` (`IdentityGuard.check`, evaluated **without** mutating the guard baseline unless that candidate is later actually selected) and `lockable_here` (true only when the strict detector itself produced that candidate at the current geometry and its own sideband spacing is not too wide for this scan — never inferred, never score-based). Response: `{stage_index, geometry, frame, candidates, expires_at, needs_more_refinement, planner}`. A planner abort is **422** `{detail}`, but the run stays active so the caller can still `abort` it (restoring geometry). If the geometry write lands but detection then fails (no candidate at the new geometry, or no fresh sweep arrived), the run's geometry/frame bookkeeping is brought back in line with the device's ACTUAL (already-moved) geometry — never left pointing at the pre-move one — `stage_index` advances, `candidates` is cleared, the run stays active, and this is **422** ("no candidate at the new geometry — abort or retry"). |
+| POST | `/api/devices/{key}/control/staged_autolock/{token}/lock` | `{selected: {frame_id, target_index}}` | **422** unless the run's current detector is `"strict"` and the selected candidate's own sideband spacing is not too wide to lock at the run's current geometry (`"not lockable at this geometry -- step first"` — the same rule `lockable_here` and the one-shot loop apply). Otherwise, runs the existing final strict verification on the selected candidate at the **current** (geometry-unchanged) frame, aligned with the one-shot's own final verification there: `check_sideband=False` (a freshly-narrowed run's own sideband estimate is the thing under test, not a gate on it), same slope, `IdentityGuard` ok, nearest crossing within a small tolerance — required on **two consecutive fresh frames**, not one, before the actuator is ever moved. Then the existing lock handoff. **422** and no lock if ambiguous/missing/inconsistent across the two frames. Response is an `AutoLockScanResult`-shaped dict plus a `refinement` log. Ends the run. |
 | POST | `/api/devices/{key}/control/staged_autolock/{token}/abort` | — | Restores the saved geometry, ends the run. `{"restored": true}`. |
 
 `StagedAutolockError.status_code` (`app/session.py`) maps every staged-API
 failure to **404** (unknown/expired token — no active run, or the token
 doesn't match one), **409** (a conflicting run/lock state — e.g. a second
-`begin`, or `start_lock`/`start_autolock` while a run is active), or **422**
-(a planner abort or a failed final-lock verification). TTL expiry
-auto-aborts (restoring geometry) even with no further calls arriving —
-either a background check or on next access. While a staged run is active:
-one-shot `auto_lock_scan`, another `begin`, and `start_lock`/`start_autolock`
-on that device are all refused with 409; read-only calls (status, telemetry,
-`auto_lock_candidates`) are always allowed.
+`begin`, `start_lock`/`start_autolock` while a run is active, or a one-shot
+walk holding the sweep-center actuator), or **422** (a planner abort, a
+failed stage detection, an unlockable geometry, or a failed final-lock
+verification). TTL expiry auto-aborts (restoring geometry) even with no
+further calls arriving — either a background check or on next access; a
+`renew` that races the old timer's callback (the callback started running
+before `renew` could cancel it) is honoured — the callback re-checks
+`expires_at` under the same lock and is a no-op once the run has already
+been extended. While a staged run is active: one-shot `auto_lock_scan`,
+another `begin`, and `start_lock`/`start_autolock` on that device are all
+refused with 409; read-only calls (status, telemetry, `auto_lock_candidates`)
+are always allowed.
+
+**Concurrency with a one-shot walk.** The one-shot refinement loop
+(`auto_lock_from_scan`) already refuses outright while a staged run exists,
+but the reverse case — a one-shot walk already in flight when `begin` is
+called — is possible, since both drive the same sweep-center actuator over
+several seconds. `begin`, and the geometry-writing part of `step`/`lock`
+(including the final `_move_and_lock` handoff), all take the same
+non-blocking `_center_move_lock` a one-shot walk holds for its whole
+duration; finding it held is a 409 ("Another sweep-center move is already
+running..."), never a queued wait.
 
 ### `IdentityGuard`
 
