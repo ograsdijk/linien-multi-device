@@ -25,7 +25,11 @@ IdentityGuard, and final-verification logic.
 
 from __future__ import annotations
 
+import json
+import math
+import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -151,6 +155,63 @@ def _run_refine(
 
 
 # --------------------------------------------------------------------------
+# Exact golden comparison. The loose assertions in each scenario document
+# intent; the golden file pins EVERYTHING the walk did -- every geometry write,
+# the ordered detector calls with the geometry each ran at, the final result
+# and the full refinement log -- as recorded from the pre-refactor
+# implementation. Regenerate ONLY deliberately, with
+# ``REFINEMENT_GOLDEN_CAPTURE=1`` against code whose behaviour is the intended
+# reference, and review the diff.
+# --------------------------------------------------------------------------
+
+
+_GOLDEN_PATH = Path(__file__).with_name("data") / "refinement_characterization_golden.json"
+
+
+def _normalize(value: Any) -> Any:
+    if isinstance(value, float):
+        return None if not math.isfinite(value) else round(value, 12)
+    if isinstance(value, (list, tuple)):
+        return [_normalize(v) for v in value]
+    if isinstance(value, dict):
+        return {
+            str(k): _normalize(v)
+            for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+            # Wall-clock values are the only nondeterministic content.
+            if not str(k).endswith(("_at", "_ts", "timestamp", "elapsed_s", "duration_s"))
+        }
+    if isinstance(value, AutoLockScanResult):
+        return _normalize(value.to_dict())
+    return value
+
+
+def _recording(session: DeviceSession, name: str, fn, calls: list):
+    def _wrapped(*args, **kwargs):
+        calls.append(
+            [
+                name,
+                float(session.parameters.sweep_center.value),
+                float(session.parameters.sweep_amplitude.value),
+            ]
+        )
+        return fn(*args, **kwargs)
+
+    return _wrapped
+
+
+def _assert_golden(scenario: str, record: dict[str, Any]) -> None:
+    record = _normalize(record)
+    if os.environ.get("REFINEMENT_GOLDEN_CAPTURE") == "1":
+        golden = json.loads(_GOLDEN_PATH.read_text()) if _GOLDEN_PATH.exists() else {}
+        golden[scenario] = record
+        _GOLDEN_PATH.parent.mkdir(exist_ok=True)
+        _GOLDEN_PATH.write_text(json.dumps(golden, indent=1, sort_keys=True) + chr(10))
+        return
+    golden = json.loads(_GOLDEN_PATH.read_text())
+    assert record == golden[scenario]
+
+
+# --------------------------------------------------------------------------
 # Scenario 1: multi-feature trace -- a weaker tracked feature must be kept
 # through narrowing even though a stronger decoy of identical PDH morphology
 # (same slope, same sideband spacing) exists elsewhere on the original wide
@@ -197,8 +258,13 @@ def test_multi_feature_trace_keeps_the_seeded_weaker_target(monkeypatch):
             {"decoy_present_at": STRONG_DECOY_V, "decoy_score": 5.0},
         )
 
-    monkeypatch.setattr(session, "_capture_auto_lock_target", _strict)
-    monkeypatch.setattr(session, "_coarse_auto_lock_target", _coarse)
+    calls: list = []
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target", _recording(session, "strict", _strict, calls)
+    )
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target", _recording(session, "coarse", _coarse, calls)
+    )
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
 
     result, refinement = _run_refine(
@@ -226,6 +292,10 @@ def test_multi_feature_trace_keeps_the_seeded_weaker_target(monkeypatch):
         "final_center_v", "final_amplitude_v", "initial_resolution_samples",
         "stages", "restored",
     }
+    _assert_golden(
+        "multi_feature",
+        {"writes": writes, "calls": calls, "result": result, "refinement": refinement},
+    )
 
 
 # --------------------------------------------------------------------------
@@ -266,8 +336,13 @@ def test_an_under_resolved_start_needs_several_narrowing_stages(monkeypatch):
             {"call": coarse_calls["n"]},
         )
 
-    monkeypatch.setattr(session, "_capture_auto_lock_target", _strict)
-    monkeypatch.setattr(session, "_coarse_auto_lock_target", _coarse)
+    calls: list = []
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target", _recording(session, "strict", _strict, calls)
+    )
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target", _recording(session, "coarse", _coarse, calls)
+    )
     monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
 
     result, refinement = _run_refine(
@@ -293,6 +368,10 @@ def test_an_under_resolved_start_needs_several_narrowing_stages(monkeypatch):
     assert stage_kinds[-1] == "final_verify"
     # Two fresh strict detections happened at the final, unchanged geometry.
     assert strict_calls["n"] >= 3
+    _assert_golden(
+        "several_narrowing_stages",
+        {"writes": writes, "calls": calls, "result": result, "refinement": refinement},
+    )
 
 
 # --------------------------------------------------------------------------
@@ -303,7 +382,7 @@ def test_an_under_resolved_start_needs_several_narrowing_stages(monkeypatch):
 
 def test_running_out_of_refinement_stages_reports_the_pinned_message(monkeypatch):
     session, control = _make_bare_session()
-    _geometry_recorder(session)
+    writes = _geometry_recorder(session)
 
     # Always rejected by strict, and the coarse tracker never converges (score
     # keeps the scan "too wide to lock"), so the walk burns its whole budget.
@@ -325,8 +404,13 @@ def test_running_out_of_refinement_stages_reports_the_pinned_message(monkeypatch
         restored["called_with"] = (c, a)
         return True
 
-    monkeypatch.setattr(session, "_capture_auto_lock_target", _strict)
-    monkeypatch.setattr(session, "_coarse_auto_lock_target", _coarse)
+    calls: list = []
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target", _recording(session, "strict", _strict, calls)
+    )
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target", _recording(session, "coarse", _coarse, calls)
+    )
     monkeypatch.setattr(session, "_restore_sweep_geometry", _restore)
 
     with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
@@ -351,4 +435,83 @@ def test_running_out_of_refinement_stages_reports_the_pinned_message(monkeypatch
         "Trajectory-aware auto-lock refinement failed: "
         "No lockable scan after 16 trajectory refinement stages. "
         "(scan geometry restored)."
+    )
+    _assert_golden(
+        "stage_budget_exhausted",
+        {
+            "writes": writes,
+            "calls": calls,
+            "message": str(excinfo.value),
+            "refinement": diagnostics,
+        },
+    )
+
+
+# --------------------------------------------------------------------------
+# Scenario 4: the apparent feature position depends on the scan geometry
+# (scan-history/hysteresis offset), so every stage re-detects it somewhere
+# new and the planner's bounded recentring is exercised on each step.
+# --------------------------------------------------------------------------
+
+
+def test_geometry_dependent_feature_position_is_tracked_stage_by_stage(monkeypatch):
+    session, control = _make_bare_session()
+    writes = _geometry_recorder(session)
+
+    def _apparent_v() -> float:
+        amp = float(session.parameters.sweep_amplitude.value)
+        center = float(session.parameters.sweep_center.value)
+        # The feature appears shifted by a history-dependent offset.
+        return 0.12 + 0.035 * amp - 0.1 * (center - 0.12)
+
+    strict_calls = {"n": 0}
+
+    def _strict(settings, traces=None, after=None):
+        strict_calls["n"] += 1
+        if float(session.parameters.sweep_amplitude.value) > 0.3:
+            raise ValueError("scan still too wide for the strict detector")
+        return (
+            _result(_apparent_v(), sideband_offset_v=SIDEBAND_V),
+            session.parameters.sweep_center.value,
+            session.parameters.sweep_amplitude.value,
+            11.0,
+        )
+
+    def _coarse(settings, after=None):
+        return (
+            _result(_apparent_v(), sideband_offset_v=SIDEBAND_V),
+            session.parameters.sweep_center.value,
+            session.parameters.sweep_amplitude.value,
+            3.0,
+            {},
+        )
+
+    calls: list = []
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_target", _recording(session, "strict", _strict, calls)
+    )
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_target", _recording(session, "coarse", _coarse, calls)
+    )
+    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+
+    outcome: dict[str, Any] = {}
+    try:
+        result, refinement = _run_refine(
+            session,
+            start_center_v=0.0,
+            start_amplitude_v=1.0,
+            initial_target=_result(0.155, sideband_offset_v=SIDEBAND_V),
+            initial_center_v=0.0,
+            initial_amplitude_v=1.0,
+            initial_resolution=1.5,
+            initial_detector="coarse",
+        )
+        outcome = {"result": result, "refinement": refinement}
+    except session_module.TrajectoryRefinementAborted as exc:
+        outcome = {"message": str(exc), "refinement": exc.refinement}
+    assert len(writes) >= 2
+    _assert_golden(
+        "geometry_dependent_position",
+        {"writes": writes, "calls": calls, **outcome},
     )
