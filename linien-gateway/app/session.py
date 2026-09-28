@@ -278,6 +278,53 @@ def _lock_error_mhz(
     return abs(error_std_v) / slope_v_per_mhz
 
 
+def _coarse_block(
+    *,
+    error_trace: np.ndarray,
+    monitor_trace: np.ndarray | None,
+    frame_id: int,
+    acquired_at: float | None,
+    center_v: float,
+    amplitude_v: float,
+    preferred_slope_rising: bool | None,
+    modulation_frequency_hz: float | None,
+    settings: "AutoLockScanSettings",
+    min_relative_score: float | None,
+    max_candidates: int | None,
+) -> dict[str, Any]:
+    """Read-only `coarse_candidates` / `coarse_frame` for `auto_lock_candidates`
+    with ``include_coarse``: the staged API's plausible coarse candidates on the
+    given frame. For serrodyne order identification only -- they are never folded
+    into a staged run, never used for `target_index`, lockability or IdentityGuard.
+    """
+    kwargs: dict[str, Any] = {}
+    if min_relative_score is not None:
+        kwargs["min_relative_score"] = float(min_relative_score)
+    if max_candidates is not None:
+        kwargs["max_candidates"] = int(max_candidates)
+    try:
+        coarse = find_plausible_coarse_candidates(
+            error_trace_v=error_trace,
+            monitor_trace_v=monitor_trace,
+            sweep_center_v=center_v,
+            sweep_amplitude_v=amplitude_v,
+            settings=settings,
+            preferred_slope_rising=preferred_slope_rising,
+            modulation_frequency_hz=modulation_frequency_hz,
+            **kwargs,
+        )
+    except ValueError:
+        coarse = []
+    results = [c.result for c in coarse]
+    return {
+        "coarse_candidates": [r.to_dict() for r in results],
+        "coarse_frame": _frame_summary(
+            error_trace, frame_id, acquired_at, center_v, amplitude_v,
+            modulation_frequency_hz, results,
+        ),
+    }
+
+
 def _frame_summary(
     error_trace: np.ndarray,
     frame_id: int,
@@ -2668,7 +2715,13 @@ class DeviceSession:
         return error_trace, monitor_trace, frame_id, acquired_at
 
     def auto_lock_detect(
-        self, settings_payload: dict[str, Any] | None, detector: str = "strict"
+        self,
+        settings_payload: dict[str, Any] | None,
+        detector: str = "strict",
+        *,
+        include_coarse: bool = False,
+        coarse_min_relative_score: float | None = None,
+        coarse_max_candidates: int | None = None,
     ) -> dict[str, Any]:
         """Detect auto-lock candidates against the latest cached unlocked trace,
         WITHOUT locking. Read-only: does not persist settings, touch sweep_center,
@@ -2698,6 +2751,11 @@ class DeviceSession:
         A caller tracking features a staged run identified (e.g. live
         serrodyne order labels) asks for the detector that run used, so the
         positions come from the same algorithm.
+
+        ``include_coarse`` adds, when the main result came from the strict
+        detector, read-only ``coarse_candidates`` + ``coarse_frame`` from the
+        coarse detector on the SAME frame (see `_coarse_block`), with optional
+        ``coarse_min_relative_score`` / ``coarse_max_candidates`` overrides.
 
         Raises ``RuntimeError`` only for a hard failure that leaves no frame to
         report at all: device not connected, or no unlocked trace stored yet.
@@ -2774,7 +2832,7 @@ class DeviceSession:
             ),
             "noise_floor": float(_robust_noise(np.asarray(error_trace, dtype=float))),
         }
-        return {
+        result = {
             "found": bool(candidates),
             "candidate": candidates[0].to_dict() if candidates else None,
             "candidates": [c.to_dict() for c in candidates],
@@ -2782,9 +2840,25 @@ class DeviceSession:
             "frame": frame,
             "detector": used,
         }
+        if include_coarse and used == "strict":
+            result.update(_coarse_block(
+                error_trace=error_trace, monitor_trace=monitor_trace, frame_id=frame_id,
+                acquired_at=acquired_at, center_v=sweep_center, amplitude_v=sweep_amplitude,
+                preferred_slope_rising=preferred_slope_rising,
+                modulation_frequency_hz=modulation_frequency_hz, settings=settings,
+                min_relative_score=coarse_min_relative_score,
+                max_candidates=coarse_max_candidates,
+            ))
+        return result
 
     def auto_lock_candidates_detect(
-        self, settings_payload: dict[str, Any] | None, detector: str = "strict"
+        self,
+        settings_payload: dict[str, Any] | None,
+        detector: str = "strict",
+        *,
+        include_coarse: bool = False,
+        coarse_min_relative_score: float | None = None,
+        coarse_max_candidates: int | None = None,
     ) -> dict[str, Any]:
         """`auto_lock_detect`, but run-aware (fix #2b).
 
@@ -2810,7 +2884,15 @@ class DeviceSession:
         a `detector` key added to the result for shape consistency; `detector`
         (``"strict"``/``"coarse"``/``"auto"``, see `auto_lock_detect`) picks a
         different detection for that path only. A run's own detection ignores it.
+        ``include_coarse`` (see `auto_lock_detect`) works on both paths; on the
+        run's path the coarse block is computed right after the run's own
+        detection (reported in ``coarse_frame``) and is never folded into the run.
         """
+        coarse_opts = {
+            "include_coarse": include_coarse,
+            "coarse_min_relative_score": coarse_min_relative_score,
+            "coarse_max_candidates": coarse_max_candidates,
+        }
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
         with self._state_lock:
@@ -2826,12 +2908,19 @@ class DeviceSession:
                 and abs(float(center_v) - run.center_v) <= 1e-9
                 and abs(float(amplitude_v) - run.amplitude_v) <= 1e-9
             ):
-                return self._staged_run_aware_detect(run)
-        result = self.auto_lock_detect(settings_payload, detector=detector)
+                return self._staged_run_aware_detect(run, **coarse_opts)
+        result = self.auto_lock_detect(settings_payload, detector=detector, **coarse_opts)
         result.setdefault("detector", "strict")
         return result
 
-    def _staged_run_aware_detect(self, run: "StagedAutolockRun") -> dict[str, Any]:
+    def _staged_run_aware_detect(
+        self,
+        run: "StagedAutolockRun",
+        *,
+        include_coarse: bool = False,
+        coarse_min_relative_score: float | None = None,
+        coarse_max_candidates: int | None = None,
+    ) -> dict[str, Any]:
         """The run-owned half of `auto_lock_candidates_detect`.
 
         Detects with `run.settings` (never the endpoint's own settings) and
@@ -2857,7 +2946,7 @@ class DeviceSession:
                 active.latest_frame = dict(frame)
                 active.latest_detector = detector
                 active.latest_resolution = resolution
-        return {
+        result = {
             "found": bool(candidates),
             "candidate": candidates[0].to_dict() if candidates else None,
             "candidates": [c.to_dict() for c in candidates],
@@ -2865,6 +2954,22 @@ class DeviceSession:
             "frame": frame,
             "detector": detector,
         }
+        if include_coarse and detector == "strict":
+            # Read-only: computed after the run's own detection, NEVER stored in
+            # the run (its candidates / detector / IdentityGuard baselines stay
+            # strict-only). `coarse_frame` says which frame it analysed.
+            error_trace, monitor_trace, frame_id, acquired_at = (
+                self._snapshot_auto_lock_traces_with_frame()
+            )
+            c_v, a_v, rising, mod_hz = self._snapshot_sweep_params()
+            result.update(_coarse_block(
+                error_trace=error_trace, monitor_trace=monitor_trace, frame_id=frame_id,
+                acquired_at=acquired_at, center_v=c_v, amplitude_v=a_v,
+                preferred_slope_rising=rising, modulation_frequency_hz=mod_hz,
+                settings=run.settings, min_relative_score=coarse_min_relative_score,
+                max_candidates=coarse_max_candidates,
+            ))
+        return result
 
     def _wait_for_fresh_unlocked_trace(
         self, after: float, timeout_s: float, frames: int = VERIFY_TRACE_FRAMES

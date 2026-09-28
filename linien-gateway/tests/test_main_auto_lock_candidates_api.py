@@ -58,11 +58,12 @@ class FakeCandidatesSession:
         # state to refuse on); recorded so ordering/coverage can be asserted.
         self.calls.append(("auto_lock_candidates_acquire_precheck",))
 
-    def auto_lock_candidates_detect(self, settings_payload, detector="strict"):
+    def auto_lock_candidates_detect(self, settings_payload, detector="strict", **coarse_opts):
         # The route calls this (not `auto_lock_detect` directly) since fix
         # #2b; with no staged run active it is exactly `auto_lock_detect`.
         self.calls.append(("auto_lock_candidates_detect", settings_payload))
         self.detector = detector
+        self.coarse_opts = coarse_opts
         return self.auto_lock_detect(settings_payload)
 
     def auto_lock_detect(self, settings_payload, detector="strict"):
@@ -291,3 +292,31 @@ def test_unknown_detector_is_rejected(monkeypatch):
         "/api/devices/dev/control/auto_lock_candidates", params={"detector": "bogus"}
     )
     assert response.status_code == 422
+
+
+def test_include_coarse_and_its_overrides_are_passed_through(monkeypatch):
+    session = FakeCandidatesSession()
+    _patch(monkeypatch, session)
+    client = TestClient(main.app)
+    client.post("/api/devices/dev/control/auto_lock_candidates")
+    assert session.coarse_opts == {
+        "include_coarse": False, "coarse_min_relative_score": None, "coarse_max_candidates": None,
+    }
+    response = client.post(
+        "/api/devices/dev/control/auto_lock_candidates",
+        params={"include_coarse": "true", "coarse_min_relative_score": 0.1,
+                "coarse_max_candidates": 16},
+    )
+    assert response.status_code == 200
+    assert session.coarse_opts == {
+        "include_coarse": True, "coarse_min_relative_score": 0.1, "coarse_max_candidates": 16,
+    }
+
+
+def test_coarse_overrides_are_validated(monkeypatch):
+    session = FakeCandidatesSession()
+    _patch(monkeypatch, session)
+    client = TestClient(main.app)
+    for params in ({"coarse_min_relative_score": 0}, {"coarse_max_candidates": 0}):
+        r = client.post("/api/devices/dev/control/auto_lock_candidates", params=params)
+        assert r.status_code == 422

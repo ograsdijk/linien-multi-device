@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import math
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any, List, Literal
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -1119,6 +1120,9 @@ async def auto_lock_candidates(
     acquire: bool = False,
     timeout_s: float | None = None,
     detector: Literal["strict", "coarse", "auto"] = "strict",
+    include_coarse: bool = False,
+    coarse_min_relative_score: float | None = Query(default=None, gt=0.0, le=1.0),
+    coarse_max_candidates: int | None = Query(default=None, ge=1, le=64),
 ) -> dict:
     """Detect lockable target(s) on the current scan WITHOUT locking.
 
@@ -1135,6 +1139,11 @@ async def auto_lock_candidates(
     `detector` picks the detection when no staged run owns it: `strict` (default),
     `coarse`, or `auto` (strict falling back to coarse, as a staged run does); the
     response's `detector` says which one produced `candidates`.
+    `include_coarse=true` adds read-only `coarse_candidates` + `coarse_frame` (the
+    coarse detector's plausible candidates) when `candidates` came from the strict
+    detector -- for serrodyne order identification only: never stored in a staged
+    run, never valid for `target_index`/lockability. `coarse_min_relative_score` /
+    `coarse_max_candidates` override the coarse detector's cut-offs for that block.
     Lets an orchestrator probe for an error signal (e.g. while stepping the NLTL offset)
     before committing to a lock via auto_lock_scan. Read-only: never locks, never moves
     the sweep center/amplitude (beyond the sweep restart `acquire=true` already does
@@ -1165,7 +1174,14 @@ async def auto_lock_candidates(
         # Detection reads sweep params over rpyc and runs the detector: keep it off
         # the event loop, as every other session call from an async route does.
         result = await asyncio.to_thread(
-            session.auto_lock_candidates_detect, settings_payload, detector
+            functools.partial(
+                session.auto_lock_candidates_detect,
+                settings_payload,
+                detector,
+                include_coarse=include_coarse,
+                coarse_min_relative_score=coarse_min_relative_score,
+                coarse_max_candidates=coarse_max_candidates,
+            )
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))

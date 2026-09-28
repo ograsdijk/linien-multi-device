@@ -51,7 +51,7 @@ Two additions on top of that unchanged path let an external caller
 morphologically-identical PDH features on one scan corresponds to a specific
 NLTL serrodyne order, without ever locking on the wrong one.
 
-### `POST /api/devices/{key}/control/auto_lock_candidates?acquire=&timeout_s=&detector=`
+### `POST /api/devices/{key}/control/auto_lock_candidates?acquire=&timeout_s=&detector=&include_coarse=`
 
 Read-only detection, never locks and never moves the sweep center/amplitude
 beyond the sweep restart `acquire=true` itself performs to capture a fresh
@@ -76,6 +76,16 @@ frame; never persists settings. Body: optional `AutoLockScanSettings`.
   detector the run used: otherwise a wide scan that only the coarse detector
   resolves returns no candidates at all once the run has ended. While a staged
   run owns the detection (active, idle, same geometry) it is ignored.
+- `include_coarse=true` (optional `coarse_min_relative_score` in (0, 1],
+  `coarse_max_candidates` 1–64): when `candidates` came from the strict
+  detector, also returns `coarse_candidates` + `coarse_frame`, the coarse
+  detector's plausible candidates. Outside a staged run they are computed on
+  the same frame; inside one, right after the run's own detection
+  (`coarse_frame.frame_id` says which frame). **Read-only, for serrodyne order
+  identification only**: never folded into a staged run and never valid for
+  `step`/`lock` `target_index`, `lockable_here` or IdentityGuard. Strict
+  detection calibrated for a lockable target misses weak serrodyne orders (e.g.
+  n = −2 at ~20 % of the main one), which coarse still finds.
 
 Response:
 
