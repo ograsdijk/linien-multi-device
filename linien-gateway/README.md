@@ -51,7 +51,7 @@ Two additions on top of that unchanged path let an external caller
 morphologically-identical PDH features on one scan corresponds to a specific
 NLTL serrodyne order, without ever locking on the wrong one.
 
-### `POST /api/devices/{key}/control/auto_lock_candidates?acquire=&timeout_s=`
+### `POST /api/devices/{key}/control/auto_lock_candidates?acquire=&timeout_s=&detector=`
 
 Read-only detection, never locks and never moves the sweep center/amplitude
 beyond the sweep restart `acquire=true` itself performs to capture a fresh
@@ -67,6 +67,15 @@ frame; never persists settings. Body: optional `AutoLockScanSettings`.
   trigger runs, since that trigger switches the lock off; this is refused
   even while a staged run is active, since it is otherwise legitimate for
   the orchestrator to probe with `acquire=true` during a run.
+- `detector=strict` (default) | `coarse` | `auto`: which detector to run when no
+  staged run owns the detection. `auto` is strict falling back to coarse, as a
+  staged run does; `coarse` is the staged API's plausible coarse candidates only.
+  All analyse the same frame, and the response's `detector` says which one
+  produced `candidates`. A caller tracking features that a staged run
+  identified (e.g. the orchestrator's live serrodyne order labels) asks for the
+  detector the run used: otherwise a wide scan that only the coarse detector
+  resolves returns no candidates at all once the run has ended. While a staged
+  run owns the detection (active, idle, same geometry) it is ignored.
 
 Response:
 

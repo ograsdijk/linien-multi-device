@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Literal
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
@@ -1118,6 +1118,7 @@ async def auto_lock_candidates(
     payload: AutoLockScanSettings | None = None,
     acquire: bool = False,
     timeout_s: float | None = None,
+    detector: Literal["strict", "coarse", "auto"] = "strict",
 ) -> dict:
     """Detect lockable target(s) on the current scan WITHOUT locking.
 
@@ -1131,6 +1132,9 @@ async def auto_lock_candidates(
     atomically triggers a NEW frame (the same restart-and-capture mechanism as
     `acquire_scan`) and detects on exactly that frame; with the default `acquire=false`
     it detects on the latest cached frame. `timeout_s` only applies to `acquire=true`.
+    `detector` picks the detection when no staged run owns it: `strict` (default),
+    `coarse`, or `auto` (strict falling back to coarse, as a staged run does); the
+    response's `detector` says which one produced `candidates`.
     Lets an orchestrator probe for an error signal (e.g. while stepping the NLTL offset)
     before committing to a lock via auto_lock_scan. Read-only: never locks, never moves
     the sweep center/amplitude (beyond the sweep restart `acquire=true` already does
@@ -1161,7 +1165,7 @@ async def auto_lock_candidates(
         # Detection reads sweep params over rpyc and runs the detector: keep it off
         # the event loop, as every other session call from an async route does.
         result = await asyncio.to_thread(
-            session.auto_lock_candidates_detect, settings_payload
+            session.auto_lock_candidates_detect, settings_payload, detector
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))

@@ -58,13 +58,14 @@ class FakeCandidatesSession:
         # state to refuse on); recorded so ordering/coverage can be asserted.
         self.calls.append(("auto_lock_candidates_acquire_precheck",))
 
-    def auto_lock_candidates_detect(self, settings_payload):
+    def auto_lock_candidates_detect(self, settings_payload, detector="strict"):
         # The route calls this (not `auto_lock_detect` directly) since fix
         # #2b; with no staged run active it is exactly `auto_lock_detect`.
         self.calls.append(("auto_lock_candidates_detect", settings_payload))
+        self.detector = detector
         return self.auto_lock_detect(settings_payload)
 
-    def auto_lock_detect(self, settings_payload):
+    def auto_lock_detect(self, settings_payload, detector="strict"):
         self.calls.append(("auto_lock_detect", settings_payload))
         if self.detect_error is not None:
             raise self.detect_error
@@ -266,3 +267,27 @@ def test_acquire_true_rejects_an_analysed_frame_older_than_the_acquired_one(monk
     )
     assert response.status_code == 409
     assert "predates" in response.json()["detail"]
+
+
+def test_detector_defaults_to_strict_and_is_passed_through(monkeypatch):
+    session = FakeCandidatesSession()
+    _patch(monkeypatch, session)
+    client = TestClient(main.app)
+
+    assert client.post("/api/devices/dev/control/auto_lock_candidates").status_code == 200
+    assert session.detector == "strict"
+    response = client.post(
+        "/api/devices/dev/control/auto_lock_candidates", params={"detector": "coarse"}
+    )
+    assert response.status_code == 200
+    assert session.detector == "coarse"
+
+
+def test_unknown_detector_is_rejected(monkeypatch):
+    session = FakeCandidatesSession()
+    _patch(monkeypatch, session)
+    client = TestClient(main.app)
+    response = client.post(
+        "/api/devices/dev/control/auto_lock_candidates", params={"detector": "bogus"}
+    )
+    assert response.status_code == 422

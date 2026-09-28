@@ -2668,7 +2668,7 @@ class DeviceSession:
         return error_trace, monitor_trace, frame_id, acquired_at
 
     def auto_lock_detect(
-        self, settings_payload: dict[str, Any] | None
+        self, settings_payload: dict[str, Any] | None, detector: str = "strict"
     ) -> dict[str, Any]:
         """Detect auto-lock candidates against the latest cached unlocked trace,
         WITHOUT locking. Read-only: does not persist settings, touch sweep_center,
@@ -2688,10 +2688,22 @@ class DeviceSession:
           candidates' sideband_offset_samples, noise_floor = MAD-based robust
           point noise of the error trace). Always present when a frame was
           available to analyse -- including when no candidate qualified.
+        - ``detector``: which detector produced ``candidates``.
+
+        ``detector`` selects the detection: ``"strict"`` (the default and the
+        historical behaviour), ``"coarse"`` (the staged API's plausible coarse
+        candidates only), or ``"auto"`` (strict, falling back to coarse when
+        strict finds nothing -- what a staged run does, see
+        `_detect_strict_then_coarse`). All three analyse the same cached frame.
+        A caller tracking features a staged run identified (e.g. live
+        serrodyne order labels) asks for the detector that run used, so the
+        positions come from the same algorithm.
 
         Raises ``RuntimeError`` only for a hard failure that leaves no frame to
         report at all: device not connected, or no unlocked trace stored yet.
         """
+        if detector not in ("strict", "coarse", "auto"):
+            raise ValueError(f"unknown detector {detector!r}")
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
         error_trace, monitor_trace, frame_id, acquired_at = (
@@ -2709,19 +2721,41 @@ class DeviceSession:
 
         reason: str | None = None
         candidates: list[Any] = []
-        try:
-            # Traces are in plot units (divided by ADC_SCALE above).
-            candidates = find_auto_lock_candidates(
-                error_trace_v=error_trace,
-                monitor_trace_v=monitor_trace,
-                sweep_center_v=sweep_center,
-                sweep_amplitude_v=sweep_amplitude,
-                settings=settings,
-                preferred_slope_rising=preferred_slope_rising,
-                modulation_frequency_hz=modulation_frequency_hz,
-            )
-        except ValueError as exc:
-            reason = str(exc)
+        used = "strict"
+        if detector in ("strict", "auto"):
+            try:
+                # Traces are in plot units (divided by ADC_SCALE above).
+                candidates = find_auto_lock_candidates(
+                    error_trace_v=error_trace,
+                    monitor_trace_v=monitor_trace,
+                    sweep_center_v=sweep_center,
+                    sweep_amplitude_v=sweep_amplitude,
+                    settings=settings,
+                    preferred_slope_rising=preferred_slope_rising,
+                    modulation_frequency_hz=modulation_frequency_hz,
+                )
+            except ValueError as exc:
+                reason = str(exc)
+        if detector == "coarse" or (detector == "auto" and not candidates):
+            strict_reason = reason
+            try:
+                coarse = find_plausible_coarse_candidates(
+                    error_trace_v=error_trace,
+                    monitor_trace_v=monitor_trace,
+                    sweep_center_v=sweep_center,
+                    sweep_amplitude_v=sweep_amplitude,
+                    settings=settings,
+                    preferred_slope_rising=preferred_slope_rising,
+                    modulation_frequency_hz=modulation_frequency_hz,
+                )
+                candidates = [c.result for c in coarse]
+                reason = None if candidates else "No plausible coarse candidate on this frame."
+            except ValueError as exc:
+                reason = str(exc)
+            if candidates:
+                used = "coarse"
+            elif strict_reason is not None:
+                reason = f"No strict candidate ({strict_reason}); no coarse candidate ({reason})."
 
         sideband_samples = [
             c.sideband_offset_samples
@@ -2746,10 +2780,11 @@ class DeviceSession:
             "candidates": [c.to_dict() for c in candidates],
             "reason": reason,
             "frame": frame,
+            "detector": used,
         }
 
     def auto_lock_candidates_detect(
-        self, settings_payload: dict[str, Any] | None
+        self, settings_payload: dict[str, Any] | None, detector: str = "strict"
     ) -> dict[str, Any]:
         """`auto_lock_detect`, but run-aware (fix #2b).
 
@@ -2772,7 +2807,9 @@ class DeviceSession:
         caller happened to pass. At a different geometry, while the run is
         busy, or with no active run, this is exactly `auto_lock_detect`
         (strict only, request/stored settings) -- today's behaviour --  with
-        a `detector` key added to the result for shape consistency.
+        a `detector` key added to the result for shape consistency; `detector`
+        (``"strict"``/``"coarse"``/``"auto"``, see `auto_lock_detect`) picks a
+        different detection for that path only. A run's own detection ignores it.
         """
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
@@ -2790,7 +2827,7 @@ class DeviceSession:
                 and abs(float(amplitude_v) - run.amplitude_v) <= 1e-9
             ):
                 return self._staged_run_aware_detect(run)
-        result = self.auto_lock_detect(settings_payload)
+        result = self.auto_lock_detect(settings_payload, detector=detector)
         result.setdefault("detector", "strict")
         return result
 
