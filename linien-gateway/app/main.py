@@ -1011,15 +1011,18 @@ async def start_sweep_simultaneous(body: SimultaneousSweepIn) -> dict:
 
 
 async def _trigger_and_acquire(
-    connected: list[tuple[str, DeviceSession]], timeout_s: float | None
+    connected: list[tuple[str, DeviceSession]],
+    timeout_s: float | None,
+    skip_frames: int = 1,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Stop, synchronously restart, then capture one trace per device.
 
     Phase 1 parks every device's sweep at center (the "stop"). Phase 2 fires a
     synchronized ``logic_sweep_run`` 0->1 edge across all of them (the "start at
     roughly the same time"). Phase 3 captures each device's next complete sweep
-    frame. Devices keep sweeping afterward. Per-device failures land in
-    ``skipped`` rather than failing the whole batch.
+    frame, after discarding ``skip_frames`` fresh frames (see
+    ``wait_for_fresh_trace``). Devices keep sweeping afterward. Per-device
+    failures land in ``skipped`` rather than failing the whole batch.
     """
     traces: dict[str, Any] = {}
     skipped: dict[str, str] = {}
@@ -1049,7 +1052,7 @@ async def _trigger_and_acquire(
     async def _capture(key: str, session: DeviceSession):
         try:
             return key, await asyncio.to_thread(
-                session.wait_for_fresh_trace, timeout_s
+                session.wait_for_fresh_trace, timeout_s, skip_frames
             )
         except (ValueError, RuntimeError) as exc:
             return key, exc
@@ -1123,6 +1126,8 @@ async def auto_lock_candidates(
     include_coarse: bool = False,
     coarse_min_relative_score: float | None = Query(default=None, gt=0.0, le=1.0),
     coarse_max_candidates: int | None = Query(default=None, ge=1, le=64),
+    skip_frames: int = Query(default=1, ge=1, le=4),
+    include_trace: bool = False,
 ) -> dict:
     """Detect lockable target(s) on the current scan WITHOUT locking.
 
@@ -1144,6 +1149,13 @@ async def auto_lock_candidates(
     detector -- for serrodyne order identification only: never stored in a staged
     run, never valid for `target_index`/lockability. `coarse_min_relative_score` /
     `coarse_max_candidates` override the coarse detector's cut-offs for that block.
+    `skip_frames` (acquire=true only) discards that many fresh frames after the
+    sweep restart before capturing; a caller that just changed something the
+    trace depends on (e.g. NLTL power) passes 2 so a frame already in flight
+    when the request arrived can never be the one analysed.
+    `include_trace=true` adds `trace` -- the combined-error trace (volts) of
+    exactly the analysed frame, with its frame_id and sweep geometry -- so a
+    caller measuring on the raw trace uses the same frame as the detection.
     Lets an orchestrator probe for an error signal (e.g. while stepping the NLTL offset)
     before committing to a lock via auto_lock_scan. Read-only: never locks, never moves
     the sweep center/amplitude (beyond the sweep restart `acquire=true` already does
@@ -1164,7 +1176,9 @@ async def auto_lock_candidates(
             await asyncio.to_thread(session.auto_lock_candidates_acquire_precheck)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        traces, skipped = await _trigger_and_acquire([(key, session)], timeout_s)
+        traces, skipped = await _trigger_and_acquire(
+            [(key, session)], timeout_s, skip_frames
+        )
         if key not in traces:
             raise HTTPException(
                 status_code=409, detail=skipped.get(key, "Failed to acquire trace")
@@ -1211,7 +1225,30 @@ async def auto_lock_candidates(
         await asyncio.to_thread(
             session.staged_autolock_observe_frame, frame, candidates
         )
+    if include_trace:
+        result["trace"] = await _analysed_frame_trace(session, frame)
     return result
+
+
+async def _analysed_frame_trace(session: DeviceSession, frame: dict | None) -> dict:
+    """The combined-error trace of exactly the frame a detection analysed; 409
+    if it is unknown or has already aged out of the per-frame buffer."""
+    frame_id = (frame or {}).get("frame_id")
+    if frame_id is None:
+        raise HTTPException(status_code=409, detail="Analysed frame has no frame_id.")
+    trace = await asyncio.to_thread(session.unlocked_trace_for_frame, int(frame_id))
+    if trace is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Trace of analysed frame {frame_id} is no longer cached.",
+        )
+    return {
+        "frame_id": int(frame_id),
+        "sweep_center": frame.get("sweep_center_v"),
+        "sweep_amplitude": frame.get("sweep_amplitude_v"),
+        "n_points": len(trace),
+        "combined_error": trace,
+    }
 
 
 def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:

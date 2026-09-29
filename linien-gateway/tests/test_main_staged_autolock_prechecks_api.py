@@ -46,7 +46,7 @@ class FakePrecheckSession:
     def set_csr_direct(self, *a) -> None:
         self.calls.append(("set_csr_direct", *a))
 
-    def wait_for_fresh_trace(self, timeout_s=None):
+    def wait_for_fresh_trace(self, timeout_s=None, skip_frames=1):
         self.calls.append(("wait_for_fresh_trace", timeout_s))
         return {"frame_id": 1, "acquired_at": 1.0}
 

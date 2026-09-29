@@ -5158,8 +5158,8 @@ class DeviceSession:
         with self._rpyc_lock:
             self.control.exposed_set_csr_direct(key, value)
 
-    def _default_trace_timeout(self) -> float:
-        """Timeout for capturing one complete sweep trace.
+    def _default_trace_timeout(self, frames: int = 2) -> float:
+        """Timeout for capturing `frames` complete sweep frames.
 
         On hardware each delivered frame spans one full sweep, so at slow
         sweep speeds a fresh frame only arrives once per sweep period
@@ -5172,7 +5172,7 @@ class DeviceSession:
         except (TypeError, ValueError):
             speed = 8
         period = (2 ** max(0, min(15, speed))) / 3800.0
-        return max(3.0, min(30.0, 2.5 * period + 1.0))
+        return max(3.0, min(30.0, (max(1, frames) + 0.5) * period + 1.0))
 
     def wait_for_fresh_trace(
         self, timeout_s: float | None = None, skip_frames: int = 1
@@ -5186,9 +5186,9 @@ class DeviceSession:
         """
         if self.parameters is None or self.control is None:
             raise RuntimeError("Device not connected")
-        if timeout_s is None:
-            timeout_s = self._default_trace_timeout()
         needed = max(1, skip_frames + 1)
+        if timeout_s is None:
+            timeout_s = self._default_trace_timeout(needed)
         with self._state_lock:
             last_ts = self.last_plot_timestamp
         seen = 0
@@ -5203,6 +5203,16 @@ class DeviceSession:
                     return self._build_trace_snapshot(ts)
             time.sleep(0.02)
         raise RuntimeError("Timed out waiting for a sweep trace")
+
+    def unlocked_trace_for_frame(self, frame_id: int) -> list[float] | None:
+        """The combined-error trace of unlocked frame `frame_id` in plot units
+        (volts, like `_build_trace_snapshot`), or None once it has aged out of
+        the short per-frame buffer."""
+        with self._state_lock:
+            for fid, trace in self.plot_state.recent_unlocked_traces:
+                if fid == frame_id:
+                    return (np.asarray(trace, dtype=float) / V).tolist()
+        return None
 
     def _build_trace_snapshot(self, captured_at: float | None) -> Dict[str, Any]:
         """Build a JSON-able single-scan trace from the cached unlocked frame."""

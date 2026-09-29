@@ -1,8 +1,9 @@
 ﻿from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from math import log10
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 import time
 
 import numpy as np
@@ -38,6 +39,10 @@ SUMMARY_SERIES_KEYS: frozenset[str] = frozenset(
 )
 
 
+# How many recent unlocked traces PlotState keeps addressable by frame_id.
+RECENT_UNLOCKED_TRACES = 8
+
+
 @dataclass
 class PlotState:
     control_history: Dict[str, List[float]] = field(
@@ -66,6 +71,12 @@ class PlotState:
     # both together always sees a consistent (frame_id, acquired_at) pair for
     # whichever frame is currently cached.
     last_unlocked_frame_id: int = 0
+    # The last few unlocked combined-error traces, keyed by their frame_id, so a
+    # caller can fetch the exact trace a detection analysed even after newer
+    # frames have replaced `last_plot_data`.
+    recent_unlocked_traces: Deque[Tuple[int, np.ndarray]] = field(
+        default_factory=lambda: deque(maxlen=RECENT_UNLOCKED_TRACES)
+    )
     autolock_ref_spectrum: Optional[np.ndarray] = None
     last_lock_state: Optional[bool] = None
     # Cached scaled history series for the full-detail path. Rebuilding
@@ -366,6 +377,7 @@ def build_plot_frame(
         state.last_monitor_signal = monitor_signal
         state.last_unlocked_trace_at = time.time()
         state.last_unlocked_frame_id += 1
+        state.recent_unlocked_traces.append((state.last_unlocked_frame_id, combined_error))
 
         state.combined_error_cache.append(combined_error)
         state.combined_error_cache = state.combined_error_cache[-20:]

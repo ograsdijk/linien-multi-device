@@ -27,6 +27,8 @@ class FakeCandidatesSession:
         self._frame_id = 1
         self._acquired_at = 100.0
         self.detect_error: Exception | None = None
+        self.skip_frames: int | None = None
+        self.evicted_frames: set[int] = set()
 
     def set_param(self, name, value, write_registers) -> None:
         self.calls.append(("set_param", name, value, write_registers))
@@ -44,13 +46,18 @@ class FakeCandidatesSession:
         # assert it was called if it ever needs to.
         self.calls.append(("staged_autolock_observe_frame", frame, candidates))
 
-    def wait_for_fresh_trace(self, timeout_s=None):
+    def wait_for_fresh_trace(self, timeout_s=None, skip_frames=1):
         self.calls.append(("wait_for_fresh_trace", timeout_s))
+        self.skip_frames = skip_frames
         if self.capture_error:
             raise RuntimeError(self.capture_error)
         self._frame_id += 1
         self._acquired_at += 1.0
         return {"frame_id": self._frame_id, "acquired_at": self._acquired_at}
+
+    def unlocked_trace_for_frame(self, frame_id):
+        self.calls.append(("unlocked_trace_for_frame", frame_id))
+        return None if frame_id in self.evicted_frames else [0.0, 0.5, -0.5]
 
     def auto_lock_candidates_acquire_precheck(self) -> None:
         # Fix #1: the route runs this BEFORE triggering a sweep restart when
@@ -246,6 +253,59 @@ def test_endpoint_never_calls_a_locking_or_settings_persisting_method(monkeypatc
         # read-only: it never locks or persists settings.
         "staged_autolock_observe_frame",
     }
+
+
+def test_skip_frames_defaults_to_one_and_is_passed_to_the_capture(monkeypatch):
+    session = FakeCandidatesSession()
+    _patch(monkeypatch, session)
+    client = TestClient(main.app)
+    url = "/api/devices/dev/control/auto_lock_candidates"
+
+    assert client.post(url, params={"acquire": "true"}).status_code == 200
+    assert session.skip_frames == 1
+    assert client.post(url, params={"acquire": "true", "skip_frames": 2}).status_code == 200
+    assert session.skip_frames == 2
+    for bad in (0, 5):
+        assert client.post(url, params={"acquire": "true", "skip_frames": bad}).status_code == 422
+
+
+def test_include_trace_returns_the_trace_of_exactly_the_analysed_frame(monkeypatch):
+    session = FakeCandidatesSession()
+    _patch(monkeypatch, session)
+    client = TestClient(main.app)
+
+    body = client.post(
+        "/api/devices/dev/control/auto_lock_candidates",
+        params={"acquire": "true", "include_trace": "true"},
+    ).json()
+    assert body["trace"] == {
+        "frame_id": body["frame"]["frame_id"],
+        "sweep_center": 0.0,
+        "sweep_amplitude": 1.0,
+        "n_points": 3,
+        "combined_error": [0.0, 0.5, -0.5],
+    }
+    assert ("unlocked_trace_for_frame", body["frame"]["frame_id"]) in session.calls
+
+
+def test_include_trace_is_omitted_by_default(monkeypatch):
+    session = FakeCandidatesSession()
+    _patch(monkeypatch, session)
+    client = TestClient(main.app)
+    body = client.post("/api/devices/dev/control/auto_lock_candidates").json()
+    assert "trace" not in body
+
+
+def test_include_trace_409_when_the_analysed_frame_aged_out(monkeypatch):
+    session = FakeCandidatesSession()
+    session.evicted_frames = {1}
+    _patch(monkeypatch, session)
+    client = TestClient(main.app)
+    response = client.post(
+        "/api/devices/dev/control/auto_lock_candidates", params={"include_trace": "true"}
+    )
+    assert response.status_code == 409
+    assert "no longer cached" in response.json()["detail"]
 
 
 def test_acquire_true_rejects_an_analysed_frame_older_than_the_acquired_one(monkeypatch):

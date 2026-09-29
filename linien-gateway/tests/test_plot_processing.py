@@ -125,3 +125,25 @@ def test_unlocked_frame_id_increments_monotonically_per_stored_trace():
     build_plot_frame(to_plot=locked_to_plot, params={**_UNLOCKED_PARAMS, "lock": True}, state=state)
     assert state.last_unlocked_frame_id == 2
 
+
+
+def test_recent_unlocked_traces_are_keyed_by_frame_id_and_bounded():
+    """Each stored unlocked frame's combined error is addressable by its
+    frame_id (so a caller gets exactly the trace a detection analysed), and
+    only the last RECENT_UNLOCKED_TRACES are kept."""
+    from app.plot_processing import RECENT_UNLOCKED_TRACES
+
+    state = PlotState()
+    for i in range(RECENT_UNLOCKED_TRACES + 2):
+        to_plot = {
+            "error_signal_1": np.array([i, i + 1, i + 2, i + 3]),
+            "monitor_signal": np.array([0, 1, 1, 0]),
+        }
+        build_plot_frame(to_plot, {**_UNLOCKED_PARAMS, "dual_channel": False}, state)
+
+    ids = [fid for fid, _trace in state.recent_unlocked_traces]
+    last = state.last_unlocked_frame_id
+    assert ids == list(range(last - RECENT_UNLOCKED_TRACES + 1, last + 1))
+    newest_id, newest_trace = state.recent_unlocked_traces[-1]
+    assert newest_id == last
+    np.testing.assert_array_equal(newest_trace, state.last_plot_data[2])

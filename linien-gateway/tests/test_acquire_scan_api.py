@@ -44,7 +44,7 @@ class FakeTraceSession:
     def set_csr_direct(self, key, value) -> None:
         self._record("set_csr_direct", key, value)
 
-    def wait_for_fresh_trace(self, timeout_s=None):
+    def wait_for_fresh_trace(self, timeout_s=None, skip_frames=1):
         if self.capture_error:
             raise RuntimeError(self.capture_error)
         return dict(TRACE)
