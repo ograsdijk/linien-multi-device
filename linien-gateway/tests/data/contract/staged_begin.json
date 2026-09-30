@@ -1,0 +1,73 @@
+{
+ "candidates": [
+  {
+   "crossing_index": 331.9585623,
+   "discriminator_slope_v_per_mhz": 0.1267913205,
+   "feature_amplitude": 0.5580059228,
+   "hz_per_v": 160313725.5,
+   "left_excursion": 0.2521037385,
+   "monitor_contrast": null,
+   "monitor_level": null,
+   "pair_excursion": 0.5364298819,
+   "right_excursion": 0.2843261433,
+   "score": 0.5994558165,
+   "sideband_offset_samples": 25.5,
+   "sideband_offset_v": 0.09980430528,
+   "symmetry": 0.8866709744,
+   "target_index": 332,
+   "target_slope_rising": true,
+   "target_voltage": 0.299250733
+  },
+  {
+   "crossing_index": 376.1071883,
+   "discriminator_slope_v_per_mhz": 0.071422451,
+   "feature_amplitude": 0.3474075707,
+   "hz_per_v": 173957446.8,
+   "left_excursion": 0.1934207469,
+   "monitor_contrast": null,
+   "monitor_level": null,
+   "pair_excursion": 0.334443909,
+   "right_excursion": 0.1410231621,
+   "score": 0.3696996995,
+   "sideband_offset_samples": 23.5,
+   "sideband_offset_v": 0.09197651663,
+   "symmetry": 0.7291004937,
+   "target_index": 376,
+   "target_slope_rising": true,
+   "target_voltage": 0.4720437898
+  }
+ ],
+ "detail": null,
+ "detector": "strict",
+ "expires_at": 0.0,
+ "frame": {
+  "acquired_at": 0.0,
+  "frame_id": 2,
+  "modulation_frequency_hz": 16000000.0,
+  "n_points": 512,
+  "noise_floor": 4.423019632e-05,
+  "sideband_spacing_samples": 24.5,
+  "sweep_amplitude_v": 1.0,
+  "sweep_center_v": 0.0
+ },
+ "geometry": {
+  "amplitude_v": 1.0,
+  "center_v": 0.0
+ },
+ "hysteresis": {
+  "delta_lower_v": 0.0,
+  "h_per_volt": 0.085,
+  "new_geometry": {
+   "amplitude_v": 1.0,
+   "center_v": 0.0
+  },
+  "old_geometry": {
+   "amplitude_v": 1.0,
+   "center_v": 0.0
+  },
+  "predicted_shift_v": 0.0,
+  "tolerance_v": 0.015
+ },
+ "stage_index": 0,
+ "token": "TOKEN"
+}

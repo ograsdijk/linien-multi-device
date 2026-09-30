@@ -1,0 +1,17 @@
+{
+ "detail": {
+  "hysteresis_window": {
+   "applied_window_v": 0.03055614652,
+   "base_tolerance_v": 0.01855614652,
+   "candidate_v": 0.4140556691,
+   "cap_source": "sideband_spacing",
+   "cap_window_v": 0.07221135029,
+   "extra_tolerance_applied_v": 0.012,
+   "extra_tolerance_capped": false,
+   "extra_tolerance_requested_v": 0.012,
+   "predicted_v": 0.2415917169,
+   "sideband_offset_v": 0.09026418787
+  },
+  "message": "Tracking candidate is outside the hysteresis window: it is at +0.4141 V but the feature that was at +0.2617 V is predicted at +0.2416 V (shift -20.2 mV for a +237.1 mV lower-endpoint change), +172.5 mV away against a tolerance of 30.6 mV."
+ }
+}

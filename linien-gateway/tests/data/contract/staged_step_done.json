@@ -1,0 +1,93 @@
+{
+ "candidates": [
+  {
+   "crossing_index": 255.5140858,
+   "discriminator_slope_v_per_mhz": 0.1402154154,
+   "feature_amplitude": 0.5594222571,
+   "hz_per_v": 159726495.7,
+   "identity_ok": true,
+   "identity_reason": null,
+   "left_excursion": 0.2578119316,
+   "lockable_here": true,
+   "monitor_contrast": null,
+   "monitor_level": null,
+   "pair_excursion": 0.5530732815,
+   "right_excursion": 0.2952613499,
+   "score": 0.6175262644,
+   "sideband_offset_samples": 45.5,
+   "sideband_offset_v": 0.1001712329,
+   "symmetry": 0.8731651865,
+   "target_index": 256,
+   "target_slope_rising": true,
+   "target_voltage": 0.2416227277
+  },
+  {
+   "crossing_index": 333.8369596,
+   "discriminator_slope_v_per_mhz": 0.07604989273,
+   "feature_amplitude": 0.3471599879,
+   "hz_per_v": 177257452.6,
+   "identity_ok": true,
+   "identity_reason": null,
+   "left_excursion": 0.1980776577,
+   "lockable_here": false,
+   "monitor_contrast": null,
+   "monitor_level": null,
+   "pair_excursion": 0.3432827566,
+   "right_excursion": 0.1452050989,
+   "score": 0.3795840313,
+   "sideband_offset_samples": 41.0,
+   "sideband_offset_v": 0.09026418787,
+   "symmetry": 0.7330715666,
+   "target_index": 334,
+   "target_slope_rising": true,
+   "target_voltage": 0.4140556691
+  }
+ ],
+ "expires_at": 0.0,
+ "frame": {
+  "acquired_at": 0.0,
+  "frame_id": 4,
+  "modulation_frequency_hz": 16000000.0,
+  "n_points": 512,
+  "noise_floor": 0.0003869936189,
+  "sideband_spacing_samples": 43.25,
+  "sweep_amplitude_v": 0.5625,
+  "sweep_center_v": 0.2415917169
+ },
+ "geometry": {
+  "amplitude_v": 0.5625,
+  "center_v": 0.2415917169
+ },
+ "hysteresis": {
+  "applied_window_v": 0.01855614652,
+  "delta_lower_v": 0.0,
+  "h_per_volt": 0.085,
+  "new_geometry": {
+   "amplitude_v": 0.5625,
+   "center_v": 0.2415917169
+  },
+  "old_geometry": {
+   "amplitude_v": 0.5625,
+   "center_v": 0.2415917169
+  },
+  "predicted_shift_v": 0.0,
+  "selection_window": {
+   "applied_window_v": 0.01855614652,
+   "base_tolerance_v": 0.01855614652,
+   "cap_source": "sideband_spacing",
+   "cap_window_v": 0.0801369863,
+   "extra_tolerance_applied_v": 0.0,
+   "extra_tolerance_capped": false,
+   "extra_tolerance_requested_v": 0.0,
+   "sideband_offset_v": 0.1001712329
+  },
+  "tolerance_v": 0.015
+ },
+ "needs_more_refinement": false,
+ "planner": {
+  "action": "done",
+  "bounds": {},
+  "reason": "goal met: strict detector accepts this scan"
+ },
+ "stage_index": 2
+}

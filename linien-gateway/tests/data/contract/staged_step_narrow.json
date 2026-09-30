@@ -1,0 +1,92 @@
+{
+ "candidates": [
+  {
+   "crossing_index": 279.253982,
+   "discriminator_slope_v_per_mhz": 0.1346821645,
+   "feature_amplitude": 0.5597983648,
+   "hz_per_v": 157990338.2,
+   "identity_ok": true,
+   "identity_reason": null,
+   "left_excursion": 0.2592471799,
+   "lockable_here": false,
+   "monitor_contrast": null,
+   "monitor_level": null,
+   "pair_excursion": 0.5493950835,
+   "right_excursion": 0.2901479037,
+   "score": 0.6142068785,
+   "sideband_offset_samples": 34.5,
+   "sideband_offset_v": 0.1012720157,
+   "symmetry": 0.8935000962,
+   "target_index": 279,
+   "target_slope_rising": true,
+   "target_voltage": 0.2617432139
+  },
+  {
+   "crossing_index": 338.0372638,
+   "discriminator_slope_v_per_mhz": 0.07300169455,
+   "feature_amplitude": 0.349899404,
+   "hz_per_v": 178710382.5,
+   "identity_ok": false,
+   "identity_reason": "Tracking candidate is outside the hysteresis window: it is at +0.4343 V but the feature that was at +0.2993 V is predicted at +0.2617 V (shift -37.6 mV for a +442.0 mV lower-endpoint change), +172.6 mV away against a tolerance of 21.6 mV.",
+   "left_excursion": 0.1993353703,
+   "lockable_here": false,
+   "monitor_contrast": null,
+   "monitor_level": null,
+   "pair_excursion": 0.3436916483,
+   "right_excursion": 0.1443562779,
+   "score": 0.3797807177,
+   "sideband_offset_samples": 30.5,
+   "sideband_offset_v": 0.08953033268,
+   "symmetry": 0.7241879736,
+   "target_index": 338,
+   "target_slope_rising": true,
+   "target_voltage": 0.4342968786
+  }
+ ],
+ "expires_at": 0.0,
+ "frame": {
+  "acquired_at": 0.0,
+  "frame_id": 3,
+  "modulation_frequency_hz": 16000000.0,
+  "n_points": 512,
+  "noise_floor": 0.0001434063717,
+  "sideband_spacing_samples": 32.5,
+  "sweep_amplitude_v": 0.75,
+  "sweep_center_v": 0.1920152825
+ },
+ "geometry": {
+  "amplitude_v": 0.75,
+  "center_v": 0.1920152825
+ },
+ "hysteresis": {
+  "applied_window_v": null,
+  "delta_lower_v": 0.4420152825,
+  "h_per_volt": 0.085,
+  "new_geometry": {
+   "amplitude_v": 0.75,
+   "center_v": 0.1920152825
+  },
+  "old_geometry": {
+   "amplitude_v": 1.0,
+   "center_v": 0.0
+  },
+  "predicted_shift_v": -0.03757129901,
+  "selection_window": null,
+  "tolerance_v": 0.02163022924
+ },
+ "needs_more_refinement": true,
+ "planner": {
+  "action": "narrow",
+  "bounds": {
+   "centre_budget_v": 0.1920152825,
+   "goal_v": 0.511,
+   "hysteresis_uncertainty_v": 0.007593328107,
+   "predicted_target_v": 0.261679434,
+   "rail_v": 0.25,
+   "scheduled_v": 0.75,
+   "shift_capped_v": 0.75
+  },
+  "reason": "scheduled narrowing"
+ },
+ "stage_index": 1
+}
