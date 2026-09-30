@@ -293,6 +293,15 @@ export type AutoLockScanSettings = {
   min_amplitude: number;
   smooth_window_pts: number;
   monitor_threshold: number;
+  // Piezo hysteresis model: a feature's apparent position shifts by
+  // -hysteresis_per_volt_lower * dL sweep volts after a geometry change, dL
+  // being the change in the LOWER scan endpoint (centre - amplitude). A
+  // tracked candidate must land within hysteresis_tolerance_per_volt * |dL| +
+  // hysteresis_floor_v of the predicted position. Floor is sweep volts here
+  // (the UI shows mV).
+  hysteresis_per_volt_lower: number;
+  hysteresis_tolerance_per_volt: number;
+  hysteresis_floor_v: number;
 };
 
 export type LockAcceptanceSettings = {

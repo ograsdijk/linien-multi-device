@@ -35,6 +35,9 @@ const DEFAULT_AUTO_LOCK_SETTINGS: AutoLockScanSettings = {
   min_amplitude: 0.01,
   smooth_window_pts: 5,
   monitor_threshold: 0.1,
+  hysteresis_per_volt_lower: 0.085,
+  hysteresis_tolerance_per_volt: 0.015,
+  hysteresis_floor_v: 0.015,
 };
 
 type LockingPanelProps = {
@@ -317,6 +320,68 @@ export const LockingPanel = memo(function LockingPanel({
                   toRoundedIntOr(value, DEFAULT_AUTO_LOCK_SETTINGS.smooth_window_pts, 1)
                 }
                 onCommit={(value) => setAutoLockNumber('smooth_window_pts', value)}
+              />
+            </Group>
+            <Text size="xs" fw={600} c="dimmed">
+              Hysteresis
+            </Text>
+            <Group grow>
+              <DeferredNumberInput
+                label="Shift per V (lower endpoint)"
+                value={autoLockSettings.hysteresis_per_volt_lower}
+                min={0}
+                max={0.5}
+                step={0.005}
+                decimalScale={3}
+                onCommit={(value) =>
+                  setAutoLockNumber(
+                    'hysteresis_per_volt_lower',
+                    toClampedNumberOr(
+                      value,
+                      DEFAULT_AUTO_LOCK_SETTINGS.hysteresis_per_volt_lower,
+                      0,
+                      0.5
+                    )
+                  )
+                }
+              />
+              <DeferredNumberInput
+                label="Tolerance per V"
+                value={autoLockSettings.hysteresis_tolerance_per_volt}
+                min={0}
+                step={0.005}
+                decimalScale={3}
+                onCommit={(value) =>
+                  setAutoLockNumber(
+                    'hysteresis_tolerance_per_volt',
+                    Math.max(
+                      0,
+                      toFiniteNumberOr(
+                        value,
+                        DEFAULT_AUTO_LOCK_SETTINGS.hysteresis_tolerance_per_volt
+                      )
+                    )
+                  )
+                }
+              />
+              <DeferredNumberInput
+                label="Floor (mV)"
+                value={Math.round(autoLockSettings.hysteresis_floor_v * 1e6) / 1e3}
+                min={0}
+                step={1}
+                decimalScale={1}
+                onCommit={(value) =>
+                  setAutoLockNumber(
+                    'hysteresis_floor_v',
+                    Math.max(
+                      0,
+                      toFiniteNumberOr(
+                        value,
+                        DEFAULT_AUTO_LOCK_SETTINGS.hysteresis_floor_v * 1e3
+                      )
+                    ) / 1e3
+                  )
+                }
               />
             </Group>
             <Group grow>
