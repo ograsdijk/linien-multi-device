@@ -168,7 +168,7 @@ class AutoLockScanSettings(BaseModel):
         ),
     )
     hysteresis_floor_v: float = Field(
-        default=0.005, ge=0.0, le=1.0,
+        default=0.015, ge=0.0, le=1.0,
         description="Constant part of the hysteresis prediction tolerance, sweep volts.",
     )
     single_error_min: float = Field(

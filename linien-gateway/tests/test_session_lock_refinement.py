@@ -1492,7 +1492,11 @@ def test_a_rail_blocked_narrowing_never_cuts_below_the_safe_floor(monkeypatch):
     # the centre closes part of the gap in the same write, so a smaller
     # amplitude is legitimately safe.
     for center, amplitude in narrowed:
-        residual = abs(target - center)
+        # Judged where the hysteresis model says the feature lands after this
+        # write (-h * the lower-endpoint change since the start at 0.2 / 0.8),
+        # which is what the planner now protects.
+        landing = target - 0.085 * ((center - amplitude) - (0.2 - 0.8))
+        residual = abs(landing - center)
         assert residual <= 0.9 * amplitude + 1e-9, (
             f"cut to +/-{amplitude:.4f} V around {center:.4f} V, leaving the "
             f"target {residual:.4f} V out -- cropped out of its own window"

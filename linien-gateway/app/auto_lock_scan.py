@@ -123,8 +123,12 @@ class AutoLockScanSettings:
     # detector/noise floor. Must stay well under the sideband spacing (20-60 mV
     # on these devices), because a slip onto an adjacent crossing is the failure
     # this window exists to refuse.
+    # The 15 mV floor is sized from recorded autolock walks (multi-second stages on a
+    # drifting laser: ~7 mV rms of non-slip residual), where 5 mV refused 25 of 65
+    # genuine stages; it still refuses every recorded slip (>= 21.7 mV). A quiet
+    # laser can run lower.
     hysteresis_tolerance_per_volt: float = 0.015
-    hysteresis_floor_v: float = 0.005
+    hysteresis_floor_v: float = 0.015
 
     def __post_init__(self) -> None:
         # Same bounds as the pydantic schema, so a mapping that bypasses the HTTP

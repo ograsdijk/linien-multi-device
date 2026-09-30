@@ -194,13 +194,14 @@ for the rest of the walk. Nothing is learned any more; `h` is a per-device
 setting.
 
 **Settings** (`AutoLockScanSettings`, persisted with the device like the
-calibration fields; engine dataclass and pydantic schema in parity):
+calibration fields; engine dataclass and pydantic schema in parity; the web UI
+has a "Hysteresis" group in the "Auto-lock from scan" section):
 
 | Field | Default | Bounds | Meaning |
 |---|---|---|---|
 | `hysteresis_per_volt_lower` | 0.085 | 0 <= h <= 0.5 | `h` above. 0 turns pre-compensation off (the tolerance window still applies, around "no shift"). |
 | `hysteresis_tolerance_per_volt` | 0.015 | >= 0 | Tolerance growth per volt of `|dL|`. |
-| `hysteresis_floor_v` | 0.005 | >= 0 | Constant part of the tolerance. |
+| `hysteresis_floor_v` | 0.015 | >= 0 | Constant part of the tolerance (15 mV; a quiet laser can be set lower per device). Shown as "Floor (mV)" in the UI, stored in volts. |
 
 `tolerance_v = hysteresis_tolerance_per_volt * |dL| + hysteresis_floor_v`.
 
@@ -213,27 +214,35 @@ exact fixed point of `c = target - h * ((c - a_new) - (c_old - a_old))`, i.e.
 (`precompensated_center_v`), then clamped by `bounded_recenter_v` with every
 existing bound unchanged (centre-step allowance, minimum safe amplitude, rails,
 `max_center_step_signal_widths`). The crop guard judges the *predicted landing*
-position, and the width-cut gentling uses the model's `h * amplitude` per unit
-width fraction where it used the latched measurement.
+position. The per-stage movement allowance (centre budget and width-cut
+gentling) is charged only the model's **uncertainty**, `tol * |dL|`, not the
+predicted shift `h * dL`: pre-compensation already aims at the predicted
+landing, so charging the shift again double-counts it (an earlier version cut
+the first centre step by three quarters that way). The constant floor is not
+charged either (no smaller move avoids it), and the uncertainty may claim at
+most half the allowance so a narrow-signal device can still creep.
 
 **Identity check.** After every geometry change the continuing target must be
 within `tolerance_v` of `previous target + predicted_shift_v`, in addition to
 `IdentityGuard`'s slope and sideband checks (`hysteresis_window_violation`).
-A candidate outside the window is an identity failure:
+Where that is *enforced* is a code-level distinction, not a setting:
 
-- staged API: the `step`/`lock` call that *selects* it is **422**
-  ("Tracking candidate is outside the hysteresis window ..."); the run stays
-  active and the prediction stays pending, so a corrected selection on the same
-  frame is judged against it. Every candidate on a step's frame is already
-  annotated `identity_ok: false` when outside.
-- one-shot walk: the detected target is checked and the walk aborts as
-  `failure_kind == "identity"` (geometry restored), exactly as a slope/sideband
-  identity failure. The one-shot walk only ever sees its detector's single
-  best-score candidate, so unlike the staged API it cannot choose another
-  candidate inside the window.
+- **Staged API (enforced):** the `step`/`lock` call that *selects* a candidate
+  outside the window is **422** ("Tracking candidate is outside the hysteresis
+  window ..."); the run stays active and the prediction stays pending, so a
+  corrected selection on the same frame is judged against it. Every candidate on
+  a step's frame is already annotated `identity_ok: false` when outside.
+  Identify-lock depends on this.
+- **Plain one-shot walk (auto-lock from scan; log-only):** the walk keeps its
+  original end-result behaviour and does **not** abort. Each stage's
+  `hysteresis` record carries `outside_window` and `window_violation` (the
+  message it would have been refused with), and pre-compensation stays on. It
+  only ever sees its detector's single best-score candidate, so it could not
+  choose another one inside the window anyway.
 
 **Diagnostics.** Each narrow/recenter stage of the walk's `refinement.stages`
-carries `hysteresis: {..., before_v, measured_shift_v, residual_v}`; a staged run
+carries `hysteresis: {..., before_v, measured_shift_v, residual_v,
+outside_window, window_violation}`; a staged run
 records the same per selection (`run.stages`, returned as the `refinement.stages`
 of a successful `lock`). Diagnostic only: nothing feeds back into planning.
 
@@ -245,7 +254,7 @@ carries (`schemas.StagedAutolockHysteresis`):
   "h_per_volt": 0.085,
   "delta_lower_v": 0.75,          // dL of THIS step (0.0 if geometry unchanged)
   "predicted_shift_v": -0.06375,  // -h * dL
-  "tolerance_v": 0.01625,         // tol * |dL| + floor
+  "tolerance_v": 0.02625,         // tol * |dL| + floor
   "old_geometry": {"center_v": 0.0,  "amplitude_v": 1.0},
   "new_geometry": {"center_v": 0.05, "amplitude_v": 0.3}
 }
@@ -269,13 +278,27 @@ the Absorption laser), with the default settings:
 | All 90 autolock stage pairs | 90 | 65 within 20 mV (7.4 mV rms), 25 at 20-60 mV | 40/90; all 25 slips refused |
 
 Every recorded residual of 20 mV or more (25 of 25; the largest is 60.6 mV)
-is refused by the default window. The controlled characterization data is what the defaults were sized
-for. The autolock runs have a wider core (about 7 mV rms, multi-second stages
-on a drifting laser) than the 5 mV floor: **with the defaults the check would
-also refuse 25 of those 65 non-slip stage pairs**. A floor of about 0.015 V
-(`hysteresis_floor_v`) accepts 62/65 of them and still refuses all 25 slips
-(the smallest is 21.7 mV, so the margin is thin); raise it per device from
-its own residuals, keeping it well under the sideband spacing.
+is refused by a 5 mV floor, but that floor also refused 25 of the 65 non-slip
+autolock stage pairs (multi-second stages on a drifting laser have about 7 mV
+rms of ordinary residual). The default floor is therefore **15 mV**: it accepts
+62/65 of them and still refuses all 25 slips (the smallest is 21.7 mV, so the
+margin is thin). A quiet laser can run lower; size it per device from its own
+residuals, well under the sideband spacing.
+
+**Stage counts versus the pre-model planner** (simulated hysteretic device,
+-0.085 * dL plus 3-6 mV model error per write, strict detector at amplitude
+<= 0.5 V; the three full-range starts and a 32-start spread, 4 noise seeds and
+2 adjacent-crossing slips of +/-25 mV each): mean stages 5.2 -> 4.8 on the
+spread and 8.2 -> 6.3 on the full-range starts, never more in any paired run.
+
+### Saving settings merges
+
+`PUT /api/devices/{key}/auto-lock-scan-settings`, `control/auto_lock_scan`,
+staged `begin` and `auto_lock_candidates` merge the fields **present in the
+request** onto the device's stored settings; absent fields keep their stored
+values instead of resetting to defaults (an older client that does not know
+the hysteresis fields, or `min_signal_scan_fraction` and
+`max_center_step_signal_widths`, no longer wipes them).
 
 ### `IdentityGuard`
 

@@ -88,7 +88,7 @@ def test_the_hysteresis_block_has_the_documented_shape():
     assert block["h_per_volt"] == pytest.approx(0.085)
     assert block["delta_lower_v"] == pytest.approx(0.75)
     assert block["predicted_shift_v"] == pytest.approx(-0.06375)
-    assert block["tolerance_v"] == pytest.approx(0.015 * 0.75 + 0.005)
+    assert block["tolerance_v"] == pytest.approx(0.015 * 0.75 + 0.015)
     assert block["old_geometry"] == {"center_v": 0.0, "amplitude_v": 1.0}
     assert block["new_geometry"] == {"center_v": 0.05, "amplitude_v": 0.3}
 
@@ -196,7 +196,10 @@ def test_a_candidate_at_the_predicted_position_is_accepted_and_a_slip_is_not():
     predicted_v = 0.180 + block["predicted_shift_v"]  # 0.11625
     assert hysteresis_window_violation(block, 0.180, predicted_v) is None
     assert hysteresis_window_violation(block, 0.180, predicted_v + 0.010) is None
-    for sideband_spacing_v in (0.020, 0.040, 0.060):
+    # Tolerance here is 15 mV + 0.015 * 0.75 V = 26 mV: slips sit past it at
+    # 30 mV and up (the recorded ones, >= 21.7 mV, came at smaller dL, where the
+    # tolerance is 15-18 mV).
+    for sideband_spacing_v in (0.030, 0.040, 0.060):
         for sign in (+1.0, -1.0):
             reason = hysteresis_window_violation(
                 block, 0.180, predicted_v + sign * sideband_spacing_v
@@ -288,7 +291,7 @@ def test_begin_carries_the_hysteresis_block_with_no_endpoint_change(staged):
     schemas.StagedAutolockHysteresis.model_validate(block)
     assert block["delta_lower_v"] == 0.0
     assert block["predicted_shift_v"] == 0.0
-    assert block["tolerance_v"] == pytest.approx(0.005)  # the floor
+    assert block["tolerance_v"] == pytest.approx(0.015)  # the floor
     assert block["h_per_volt"] == pytest.approx(0.085)
     assert block["old_geometry"] == block["new_geometry"] == {
         "center_v": 0.0, "amplitude_v": 1.0,
@@ -317,7 +320,7 @@ def test_a_narrowing_step_reports_its_own_endpoint_change(staged):
     assert block["new_geometry"] == {"center_v": 0.05, "amplitude_v": 0.3}
     assert block["delta_lower_v"] == pytest.approx(0.75)
     assert block["predicted_shift_v"] == pytest.approx(-H * 0.75)
-    assert block["tolerance_v"] == pytest.approx(0.015 * 0.75 + 0.005)
+    assert block["tolerance_v"] == pytest.approx(0.015 * 0.75 + 0.015)
     assert block["h_per_volt"] == pytest.approx(H)
 
 
@@ -330,7 +333,7 @@ def test_a_done_step_reports_no_endpoint_change(staged):
     block = step["hysteresis"]
     assert block["delta_lower_v"] == 0.0
     assert block["predicted_shift_v"] == 0.0
-    assert block["tolerance_v"] == pytest.approx(0.005)
+    assert block["tolerance_v"] == pytest.approx(0.015)
     assert block["old_geometry"] == block["new_geometry"]
 
 
@@ -430,15 +433,22 @@ def _walk(session):
     )
 
 
-def test_the_walk_refuses_a_target_one_sideband_off_the_prediction():
-    session = _walk_session(slip_v=0.028)
+def test_the_walk_only_logs_a_target_one_sideband_off_the_prediction():
+    """LOG-ONLY in the plain one-shot walk: a slipped stage is recorded (and
+    flagged as one the window would have refused) but does not abort the walk,
+    whose end-result behaviour is what it was before the model. The staged API
+    enforces the same window -- see the slip tests above."""
+    session = _walk_session(slip_v=0.040)
     with pytest.raises(session_module.TrajectoryRefinementAborted) as excinfo:
-        _walk(session)
-    assert excinfo.value.failure_kind == "identity"
-    assert "hysteresis window" in excinfo.value.refinement["failure"]
-    # The refused stage is on the record, with what was measured.
-    record = excinfo.value.refinement["stages"][-1]["hysteresis"]
-    assert record["residual_v"] == pytest.approx(0.028)
+        _walk(session)  # ends on the stage budget: the strict stub never accepts
+    assert "hysteresis window" not in excinfo.value.refinement["failure"]
+    assert excinfo.value.failure_kind != "identity"
+    narrows = [s for s in excinfo.value.refinement["stages"] if s["kind"] == "narrow"]
+    assert len(narrows) > 1, "the walk should have carried on past the slip"
+    first = narrows[0]["hysteresis"]
+    assert first["outside_window"] is True
+    assert first["residual_v"] == pytest.approx(0.040)
+    assert "hysteresis window" in first["window_violation"]
 
 
 def test_the_walk_records_measured_against_predicted_on_every_stage():
@@ -452,10 +462,12 @@ def test_the_walk_records_measured_against_predicted_on_every_stage():
     for stage in stages:
         record = stage["hysteresis"]
         assert abs(record["residual_v"]) < 1e-9  # simulated device follows the model
+        assert record["outside_window"] is False
+        assert record["window_violation"] is None
         assert record["predicted_shift_v"] == pytest.approx(
             record["measured_shift_v"]
         )
-        assert record["tolerance_v"] >= 0.005
+        assert record["tolerance_v"] >= 0.015
         assert "shift_per_fraction_v" not in stage
 
 
@@ -466,7 +478,7 @@ def test_defaults_match_the_measured_model():
     settings = AutoLockScanSettings()
     assert settings.hysteresis_per_volt_lower == pytest.approx(0.085)
     assert settings.hysteresis_tolerance_per_volt == pytest.approx(0.015)
-    assert settings.hysteresis_floor_v == pytest.approx(0.005)
+    assert settings.hysteresis_floor_v == pytest.approx(0.015)
 
 
 @pytest.mark.parametrize(
@@ -544,3 +556,69 @@ def test_updating_settings_round_trips_the_hysteresis_fields():
     )
     assert updated["hysteresis_per_volt_lower"] == 0.09
     assert session.get_auto_lock_scan_settings()["hysteresis_per_volt_lower"] == 0.09
+
+
+# ------------------------------------------- partial saves merge onto stored
+
+
+def test_a_partial_update_keeps_the_stored_fields_it_does_not_mention():
+    stored = schemas.AutoLockScanSettings(
+        hysteresis_per_volt_lower=0.083, hysteresis_floor_v=0.003,
+        min_signal_scan_fraction=0.2, max_center_step_signal_widths=2.0,
+    ).model_dump()
+    session = _session_with_stored(stored)
+    updated = session.update_auto_lock_scan_settings({"half_range_sweep_v": 0.11})
+    assert updated["half_range_sweep_v"] == 0.11
+    assert updated["hysteresis_per_volt_lower"] == 0.083
+    assert updated["hysteresis_floor_v"] == 0.003
+    assert updated["min_signal_scan_fraction"] == 0.2
+    assert updated["max_center_step_signal_widths"] == 2.0
+    # ...and it is what the session now holds, not just what was returned.
+    assert session.get_auto_lock_scan_settings() == updated
+
+
+def test_a_field_present_in_the_request_does_change():
+    session = _session_with_stored(
+        schemas.AutoLockScanSettings(hysteresis_per_volt_lower=0.083).model_dump()
+    )
+    updated = session.update_auto_lock_scan_settings(
+        {"hysteresis_per_volt_lower": 0.09}
+    )
+    assert updated["hysteresis_per_volt_lower"] == 0.09
+
+
+def test_the_settings_api_merges_a_partial_put_onto_the_stored_settings(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+
+    stored = schemas.AutoLockScanSettings(
+        hysteresis_per_volt_lower=0.083, min_signal_scan_fraction=0.2
+    ).model_dump()
+    session = _session_with_stored(stored)
+    device = SimpleNamespace(key="dev-store", name="dev-store", parameters={})
+    monkeypatch.setattr(main.device_store, "get_device", lambda _key: device)
+    monkeypatch.setattr(main.device_store, "save_device", lambda _d: None)
+    monkeypatch.setattr(main.device_config_store, "set_config", lambda *a, **k: {})
+    monkeypatch.setattr(main, "_session_for_device", lambda _d: session)
+    monkeypatch.setattr(main, "_publish_config_update", lambda *a, **k: None)
+    client = TestClient(main.app)
+
+    # What an older UI posts: everything it knows about, none of the newer fields.
+    response = client.put(
+        "/api/devices/dev-store/auto-lock-scan-settings",
+        json={"half_range_sweep_v": 0.1, "smooth_window_pts": 9},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["half_range_sweep_v"] == 0.1 and body["smooth_window_pts"] == 9
+    assert body["hysteresis_per_volt_lower"] == 0.083
+    assert body["min_signal_scan_fraction"] == 0.2
+    assert session.auto_lock_scan_settings["hysteresis_per_volt_lower"] == 0.083
+
+
+def test_a_partial_staged_begin_settings_body_merges_too(staged):
+    staged.update_auto_lock_scan_settings({"hysteresis_per_volt_lower": 0.09})
+    _detect(staged, [_result(1, 0.18)], 0.0, 1.0, 1)
+    block = staged.staged_autolock_begin({"smooth_window_pts": 7}, 60.0)["hysteresis"]
+    assert block["h_per_volt"] == pytest.approx(0.09)

@@ -207,17 +207,20 @@ def test_a_target_421_mv_outside_the_next_window__fails_if_the_centring_check_is
 # width change must be followed by a strictly gentler one.
 
 def test_a_measured_136_mv_per_fraction_shift_gentles_the_next_cut():
-    # The hysteresis model gives a shift of h * amplitude per unit fraction of
-    # width change; h is chosen so the second stage (amplitude 0.3 V) sees the
-    # 0.136 V per unit fraction this field case measured. The first stage is
-    # planned with the model off (h = 0): the base schedule, "no shift known".
+    # What is charged against the allowance is the model's UNCERTAINTY, tol *
+    # amplitude per unit fraction of width change (the predicted shift is
+    # compensated, not charged). The tolerance is chosen so the second stage
+    # (amplitude 0.3 V) sees the 0.136 V per unit fraction this field case
+    # measured. The first stage is planned with the model off (h = tol = 0):
+    # the base schedule, "no shift known".
     no_shift = _settings(
         half_range_sweep_v=0.0001, min_signal_scan_fraction=0.0,
         max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.0,
+        hysteresis_tolerance_per_volt=0.0,
     )
     settings = _settings(
         half_range_sweep_v=0.0001, min_signal_scan_fraction=0.0,
-        max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.136 / 0.3,
+        max_center_step_signal_widths=1.0, hysteresis_tolerance_per_volt=0.136 / 0.3,
     )
     first = plan_refinement_step(
         no_shift, center_v=0.4, amplitude_v=0.6, target_v=0.4,
@@ -242,17 +245,20 @@ def test_a_measured_136_mv_per_fraction_shift__fails_if_the_shift_cap_is_ignored
     real (shift-capped) result against what the schedule alone would have
     picked for the second stage -- they must differ, and the schedule-alone
     figure must not be gentler."""
-    # The hysteresis model gives a shift of h * amplitude per unit fraction of
-    # width change; h is chosen so the second stage (amplitude 0.3 V) sees the
-    # 0.136 V per unit fraction this field case measured. The first stage is
-    # planned with the model off (h = 0): the base schedule, "no shift known".
+    # What is charged against the allowance is the model's UNCERTAINTY, tol *
+    # amplitude per unit fraction of width change (the predicted shift is
+    # compensated, not charged). The tolerance is chosen so the second stage
+    # (amplitude 0.3 V) sees the 0.136 V per unit fraction this field case
+    # measured. The first stage is planned with the model off (h = tol = 0):
+    # the base schedule, "no shift known".
     no_shift = _settings(
         half_range_sweep_v=0.0001, min_signal_scan_fraction=0.0,
         max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.0,
+        hysteresis_tolerance_per_volt=0.0,
     )
     settings = _settings(
         half_range_sweep_v=0.0001, min_signal_scan_fraction=0.0,
-        max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.136 / 0.3,
+        max_center_step_signal_widths=1.0, hysteresis_tolerance_per_volt=0.136 / 0.3,
     )
     first = plan_refinement_step(
         no_shift, center_v=0.4, amplitude_v=0.6, target_v=0.4,

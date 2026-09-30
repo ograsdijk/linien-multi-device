@@ -1163,7 +1163,9 @@ async def auto_lock_candidates(
     """
     device = _get_device_or_404(key)
     session = _session_for_device(device)
-    settings_payload = payload.model_dump() if payload is not None else None
+    settings_payload = (
+        payload.model_dump(exclude_unset=True) if payload is not None else None
+    )
     min_frame_id: int | None = None
     if acquire:
         # Refuse a locked device BEFORE triggering a sweep restart: the
@@ -1281,7 +1283,9 @@ def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:
 def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
     device = _get_device_or_404(key)
     session = _session_for_device(device)
-    settings_payload = session.update_auto_lock_scan_settings(payload.model_dump())
+    settings_payload = session.update_auto_lock_scan_settings(
+        payload.model_dump(exclude_unset=True)
+    )
     _persist_config_block(device, CONFIG_AUTO_LOCK_SCAN, settings_payload)
     _publish_config_update(device.key, CONFIG_AUTO_LOCK_SCAN, settings_payload)
     _emit_log(
@@ -1507,7 +1511,10 @@ async def staged_autolock_begin(
         raise HTTPException(
             status_code=409, detail=skipped.get(key, "Failed to acquire trace")
         )
-    settings_payload = body.settings.model_dump() if body.settings is not None else None
+    settings_payload = (
+        body.settings.model_dump(exclude_unset=True)
+        if body.settings is not None else None
+    )
     try:
         result = await asyncio.to_thread(
             session.staged_autolock_begin, settings_payload, body.ttl_s
@@ -1637,7 +1644,9 @@ def get_auto_lock_scan_settings(key: str) -> dict:
 def update_auto_lock_scan_settings(key: str, payload: AutoLockScanSettings) -> dict:
     device = _get_device_or_404(key)
     session = _session_for_device(device)
-    settings_payload = session.update_auto_lock_scan_settings(payload.model_dump())
+    settings_payload = session.update_auto_lock_scan_settings(
+        payload.model_dump(exclude_unset=True)
+    )
     _persist_config_block(device, CONFIG_AUTO_LOCK_SCAN, settings_payload)
     _publish_config_update(device.key, CONFIG_AUTO_LOCK_SCAN, settings_payload)
     return settings_payload

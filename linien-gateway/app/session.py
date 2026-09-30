@@ -7,7 +7,7 @@ import pickle
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict
 from copy import deepcopy
@@ -1390,9 +1390,24 @@ class DeviceSession:
         with self._state_lock:
             return dict(self.auto_lock_scan_settings)
 
+    def _merged_auto_lock_scan_settings(
+        self, payload: Mapping[str, Any]
+    ) -> AutoLockScanSettings:
+        """``payload`` laid over this device's stored settings. Caller holds
+        `_state_lock`.
+
+        A partial request (an older UI that does not know a field, or an API
+        client posting one field) changes only the fields it contains; the rest
+        keep their stored per-device values instead of resetting to defaults --
+        which would silently discard a calibrated hysteresis model.
+        """
+        return AutoLockScanSettings.from_mapping(
+            {**self.auto_lock_scan_settings, **payload}
+        )
+
     def update_auto_lock_scan_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._state_lock:
-            settings = AutoLockScanSettings.from_mapping(payload)
+            settings = self._merged_auto_lock_scan_settings(payload)
             self.auto_lock_scan_settings = settings.__dict__.copy()
             return dict(self.auto_lock_scan_settings)
 
@@ -2776,7 +2791,7 @@ class DeviceSession:
             if settings_payload is None:
                 settings = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
             else:
-                settings = AutoLockScanSettings.from_mapping(settings_payload)
+                settings = self._merged_auto_lock_scan_settings(settings_payload)
         sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz = (
             self._snapshot_sweep_params()
         )
@@ -3474,24 +3489,21 @@ class DeviceSession:
             outcome.center_v, outcome.amplitude_v,
         )
         measured = float(new_target_v) - float(outcome.before_v)
+        violation = hysteresis_window_violation(
+            block, float(outcome.before_v), float(new_target_v)
+        )
         return {
             **block,
             "before_v": float(outcome.before_v),
             "measured_shift_v": measured,
             "residual_v": measured - block["predicted_shift_v"],
+            # LOG-ONLY in the one-shot walk: the window is enforced by the
+            # staged API (a caller-chosen identity), but the plain auto-lock
+            # walk keeps its original end-result behaviour and only records
+            # whether the stage would have been refused.
+            "outside_window": violation is not None,
+            "window_violation": violation,
         }
-
-    @staticmethod
-    def _check_hysteresis_window(
-        record: dict[str, Any], outcome: Any, target: Any
-    ) -> None:
-        """Raise `_TrackingIdentityChanged` when the walk's new target is not
-        within tolerance of the position the old one is predicted to move to."""
-        reason = hysteresis_window_violation(
-            record, float(outcome.before_v), float(target.target_voltage)
-        )
-        if reason is not None:
-            raise _TrackingIdentityChanged(reason)
 
     def _trajectory_refine_auto_lock(
         self,
@@ -3555,9 +3567,10 @@ class DeviceSession:
             # by, so an unbounded width change is the bigger move of the two.
             # The shift is -h * dL for the change dL in the lower scan endpoint
             # (settings.hysteresis_per_volt_lower): the planner pre-compensates
-            # the commanded centre with it, and each stage below is identity-
-            # checked against the position it predicts. Each stage records
-            # measured vs predicted, for the operator and for re-fitting h.
+            # the commanded centre with it. Each stage records measured vs
+            # predicted and whether it would have been refused by the window
+            # the staged API enforces -- LOG-ONLY here, so this walk's
+            # end-result behaviour is what it was before the model.
             while detector == "coarse" or scan_too_wide_to_lock(
                 settings, amplitude_v, target.sideband_offset_v,
                 trace_points=trace_length,
@@ -3625,7 +3638,6 @@ class DeviceSession:
                     hysteresis = self._hysteresis_stage_record(
                         settings, outcome, float(target.target_voltage)
                     )
-                    self._check_hysteresis_window(hysteresis, outcome, target)
                     identity.check(target, amplitude_v=amplitude_v, detector="coarse", resolution_samples=resolution)
                     stages.append({"kind": "recenter", "center_v": center_v,
                                    "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
@@ -3671,9 +3683,6 @@ class DeviceSession:
                     "hysteresis": hysteresis,
                     "bounds": step.bounds,
                 })
-                # Position first: a candidate off the predicted position is a
-                # different crossing whatever its slope and spacing say.
-                self._check_hysteresis_window(hysteresis, outcome, target)
                 identity.check(target, amplitude_v=amplitude_v, detector=detector, resolution_samples=resolution)
                 # Checked after the identity guard: if the walk has lost the
                 # feature, that is the more specific diagnosis. A narrowing that
@@ -4210,7 +4219,7 @@ class DeviceSession:
             if settings_payload is None:
                 settings = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
             else:
-                settings = AutoLockScanSettings.from_mapping(settings_payload)
+                settings = self._merged_auto_lock_scan_settings(settings_payload)
             acceptance = AcceptanceSettings.from_mapping(self.lock_acceptance_settings)
         # require_unlocked mirrors the one-shot path: refuse a locked device
         # up front rather than acquiring a frame it cannot use.
@@ -4939,7 +4948,7 @@ class DeviceSession:
                     self.auto_lock_scan_settings
                 )
             else:
-                settings = AutoLockScanSettings.from_mapping(settings_payload)
+                settings = self._merged_auto_lock_scan_settings(settings_payload)
                 self.auto_lock_scan_settings = settings.__dict__.copy()
         with self._state_lock:
             acceptance = AcceptanceSettings.from_mapping(self.lock_acceptance_settings)

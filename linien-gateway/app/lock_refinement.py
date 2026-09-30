@@ -348,8 +348,8 @@ def min_safe_amplitude_v(
 
     Two effects race. A smaller window brings its own edge closer to the
     target, and the width change moves the target as well (the planner passes
-    ``shift_per_fraction = h * amplitude``: the hysteresis model's shift for
-    a full-width cut at a fixed centre). Solve for the SMALLEST amplitude that still
+    ``shift_per_fraction = tol * amplitude``: the hysteresis model's uncertainty
+    for a full-width cut at a fixed centre). Solve for the SMALLEST amplitude that still
     contains the target after the shift reaching it causes -- the floor a
     caller may narrow down to, not a ceiling it may narrow past. (This
     docstring used to say "widest, not smallest" from before the function
@@ -414,9 +414,9 @@ def plan_refinement_step(
        and ``max_lockable_amplitude_v``. Met, and the detector already
        strict, means the walk is done.
     2. Schedule -- this stage's desired cut (coarse vs. gentle factor).
-    3. Shift allowance -- gentle the cut so the predicted width-induced shift
-       (``h * amplitude`` per unit fraction, from the settings' hysteresis
-       model) stays within ``center_step_allowance_v``.
+    3. Shift allowance -- gentle the cut so the hysteresis model's UNCERTAINTY
+       for it (``tol * |dL|``; the predicted shift itself is compensated, not
+       charged) stays within ``center_step_allowance_v``.
     4. Centring -- target outside half the *next* window -> recenter via
        ``bounded_recenter_v``, aimed at the centre that puts the target on
        the centre AFTER the predicted hysteresis shift
@@ -469,14 +469,21 @@ def plan_refinement_step(
     # never move the feature further than the distance to a neighbour in one
     # go, whichever way it is moved.
     step_allowance = center_step_allowance_v(settings, amplitude_v, sideband_offset_v)
-    # Shift of a full-width cut at a fixed centre, per unit width fraction: the
-    # model's h * (a_old - a_new) = h * a_old * (1 - a_new / a_old). Derived,
-    # not measured -- a measured coefficient was max-latched and one
-    # contaminated reading inflated it for the rest of the walk.
+    # What can surprise the planner is not the predicted shift -- the centre is
+    # aimed at where the feature will LAND -- but the model's error, which grows
+    # with the lower-endpoint change: tol * |dL|. That, per unit width fraction
+    # of a cut at a fixed centre (dL = a_old * fraction), is what the allowance
+    # is charged. The constant floor is detector noise that no smaller move
+    # avoids, so it is not charged: charging it made the allowance impossible
+    # to meet on a narrow-signal device and pinned every cut at the gentlest
+    # factor. (Charging the full predicted shift h * dL, as an earlier version
+    # of this planner did, double-counts what the pre-compensation already
+    # removes and shrank the very first centre step by three quarters.)
     h = float(settings.hysteresis_per_volt_lower)
-    shift_per_fraction = h * abs(float(amplitude_v))
-    if shift_per_fraction > 1e-9:
-        gentlest = 1.0 - (step_allowance / shift_per_fraction)
+    tol_per_volt = float(settings.hysteresis_tolerance_per_volt)
+    uncertainty_per_fraction = tol_per_volt * abs(float(amplitude_v))
+    if uncertainty_per_fraction > 1e-9:
+        gentlest = 1.0 - (step_allowance / uncertainty_per_fraction)
         factor = min(_REFINEMENT_MAX_NARROW_FACTOR, max(factor, gentlest))
     shift_capped_v = amplitude_v * factor
 
@@ -517,10 +524,18 @@ def plan_refinement_step(
     # (`precompensated_center_v`); the clamp below is unchanged and still
     # decides how much of it one stage may take.
     def _combine(next_amp: float) -> tuple[float, float, float, float]:
-        width_fraction = max(0.0, 1.0 - (next_amp / amplitude_v))
-        width_shift = shift_per_fraction * width_fraction
-        budget = max(0.0, step_allowance - width_shift)
         aim = precompensated_center_v(center_v, amplitude_v, next_amp, target_v, h)
+        # The prediction error of the write being planned, evaluated at the
+        # unclamped aim (the centre actually commanded can only be closer to
+        # the old one, so this is an upper bound on |dL|).
+        width_shift = tol_per_volt * abs(
+            lower_endpoint_change_v(center_v, amplitude_v, aim, next_amp)
+        )
+        # The model's error may claim at most half the allowance: a stage that
+        # could never move the centre because the uncertainty exceeds a tiny
+        # allowance (a narrow-signal device) would stall where the plain
+        # bounded step creeps.
+        budget = step_allowance - min(width_shift, 0.5 * step_allowance)
         centre = bounded_recenter_v(
             center_v,
             aim,
@@ -542,7 +557,7 @@ def plan_refinement_step(
     bounds = {
         **bounds,
         "centre_budget_v": centre_budget,
-        "predicted_width_shift_v": predicted_width_shift,
+        "hysteresis_uncertainty_v": predicted_width_shift,
         "predicted_target_v": landing_v,
         "rail_v": 1.0 - abs(next_amplitude),
     }
@@ -555,10 +570,10 @@ def plan_refinement_step(
     # itself causes: the target is judged where it will land.
     residual_offset = landing_v - combined_center
     if abs(residual_offset) > _INNER_WINDOW_FRACTION * next_amplitude:
-        # min_safe_amplitude_v adds the width-induced shift itself, so it is
-        # handed the geometric gap, not the already-shifted one.
+        # The gap is already the predicted landing's; min_safe_amplitude_v adds
+        # only the model's uncertainty for the deeper cut it is solving for.
         safe = min_safe_amplitude_v(
-            amplitude_v, target_v - combined_center, shift_per_fraction,
+            amplitude_v, residual_offset, uncertainty_per_fraction,
             target_amplitude,
         )
         if safe is None:
@@ -597,7 +612,7 @@ def plan_refinement_step(
                 **bounds,
                 "crop_floor_v": safe,
                 "centre_budget_v": centre_budget,
-                "predicted_width_shift_v": predicted_width_shift,
+                "hysteresis_uncertainty_v": predicted_width_shift,
                 "predicted_target_v": landing_v,
                 "rail_v": 1.0 - abs(next_amplitude),
             }
