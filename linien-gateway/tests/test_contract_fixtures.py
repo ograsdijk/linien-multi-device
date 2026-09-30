@@ -54,6 +54,14 @@ def test_the_committed_fixtures_match_what_the_gateway_produces(generated):
         assert contract_fixtures.render(json.loads(path.read_text())) == path.read_text(), name
 
 
+def test_generation_scrubs_runtime_clock_jitter():
+    first = contract_fixtures.generate()
+    second = contract_fixtures.generate()
+    assert {name: contract_fixtures.render(body) for name, body in first.items()} == {
+        name: contract_fixtures.render(body) for name, body in second.items()
+    }
+
+
 def test_the_fixtures_cover_the_documented_contract(generated):
     for name in ("staged_begin", "staged_step_narrow", "staged_step_narrow_second",
                  "staged_step_done"):
@@ -68,3 +76,11 @@ def test_the_fixtures_cover_the_documented_contract(generated):
     # Nothing time- or run-dependent survives in the files.
     assert generated["staged_begin"]["token"] == "TOKEN"
     assert generated["staged_begin"]["frame"]["acquired_at"] == 0.0
+    # Runtime verification timing diagnostics remain in the contract. Their
+    # values are zeroed because host scheduling jitter is not deterministic.
+    lock_stages = generated["staged_lock"]["refinement"]["stages"]
+    verification = lock_stages[2]
+    assert verification["observation_interval_s"] == 0.0
+    assert verification["time_since_last_geometry_change_s"] == 0.0
+    assert verification["first_observed_at"] == 0.0
+    assert verification["last_geometry_change_at"] == 0.0

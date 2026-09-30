@@ -1441,7 +1441,7 @@ def test_a_rail_pinned_walk_narrows_instead_of_stalling(monkeypatch):
 
     narrowed = [w for w in widths if w < 0.8 - 1e-9]
     assert narrowed, "pinned at the rail and never changed the width"
-    assert narrowed[0] < 0.6  # a useful cut, moving the rail outward
+    assert narrowed[0] <= 0.6 + 1e-9  # guarded cut, moving the rail outward
 
 
 def test_a_centre_on_the_rail_is_recognised_despite_float_noise():
@@ -1728,6 +1728,7 @@ def test_a_slow_drift_measured_over_seconds_still_locks(monkeypatch):
     session = _drift_session(monkeypatch, drift_mv=3.326, interval_s=1.5)
     result, refinement = _drift_walk(session)
     assert refinement["stages"][-1]["kind"] == "final_verify"
+    assert refinement["stages"][-1]["acceptance_passed"] is True
     assert result.target_voltage == pytest.approx(0.5091693630289127 + 3.326e-3)
 
 
@@ -1739,7 +1740,12 @@ def test_the_same_displacement_over_a_short_interval_does_not(monkeypatch):
         _drift_walk(session)
     failure = excinfo.value.refinement["failure"]
     assert "drifting at 33.26 mV/s" in failure
-    assert "during the 300 ms handover" in failure
+    assert "under the configured 300 ms" in failure
+    final_verify = excinfo.value.refinement["stages"][-1]
+    assert final_verify["acceptance_passed"] is False
+    assert final_verify["acceptance_policy"] == "one_shot_configured_handover_rate_projection"
+    assert final_verify["handover_duration_source"] == "configured_assumption_not_measured"
+    assert final_verify["time_since_last_geometry_change_s"] is not None
     assert excinfo.value.failure_kind == "position"
 
 

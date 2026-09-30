@@ -58,7 +58,20 @@ _SIG_DIGITS = 10
 
 # Placeholders for the values that change every run.
 _TOKEN = "TOKEN"
-_TIME_KEYS = {"expires_at": 0.0, "acquired_at": 0.0}
+_TIME_KEYS = {
+    "expires_at": 0.0,
+    "acquired_at": 0.0,
+    "first_observed_at": 0.0,
+    "second_observed_at": 0.0,
+    "last_geometry_change_at": 0.0,
+}
+# These values are measured from successive host-clock calls. They are useful
+# runtime diagnostics, but their few-millisecond scheduling jitter is not part
+# of the response contract. Keep the fields while replacing only their values.
+_TIMING_DIAGNOSTIC_KEYS = {
+    "observation_interval_s": 0.0,
+    "time_since_last_geometry_change_s": 0.0,
+}
 
 
 class _Manager:
@@ -153,7 +166,8 @@ def _scrub(value: Any) -> Any:
     rounded to ``_SIG_DIGITS`` significant digits."""
     if isinstance(value, dict):
         return {
-            k: (_TIME_KEYS[k] if k in _TIME_KEYS and v is not None
+            k: (_TIMING_DIAGNOSTIC_KEYS[k] if k in _TIMING_DIAGNOSTIC_KEYS
+                else _TIME_KEYS[k] if k in _TIME_KEYS and v is not None
                 else _TOKEN if k == "token" else _scrub(v))
             for k, v in value.items()
         }

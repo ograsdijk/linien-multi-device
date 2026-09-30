@@ -88,6 +88,8 @@
   "action": "narrow",
   "bounds": {
    "centre_budget_v": 0.1839438535,
+   "edge_fraction": 0.09297057521,
+   "edge_guard_active": 0.0,
    "goal_v": 0.511,
    "hysteresis_uncertainty_v": 0.003556146517,
    "predicted_target_v": 0.2415917169,

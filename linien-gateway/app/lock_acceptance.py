@@ -41,9 +41,10 @@ class AcceptanceSettings:
     # resolve a sideband offset (dispersive mode).
     max_correction_span: float = 4.0
     # How long the mechanics take to stop creeping after a sweep-geometry write.
-    # Both sweep axes are actuators, so the refinement walk waits this out
-    # before believing the trace it reads back, and the final drift gate uses it
-    # as the handover interval a measured drift is charged against.
+    # Both sweep axes are actuators, so refinement waits this long before
+    # trusting the next trace. The one-shot final gate also uses it as a
+    # configured handover-duration estimate; physical lock-engagement time is
+    # not measured by the gateway call path.
     settle_ms: int = 300
 
     @classmethod
@@ -68,6 +69,66 @@ def capture_tolerance_v(
     """
     width = abs(float(half_range_sweep_v))
     return max(0.0, float(settings.capture_fraction)) * width
+
+
+def final_pair_diagnostics(
+    *,
+    first_voltage_v: float,
+    second_voltage_v: float,
+    first_observed_at: float,
+    second_observed_at: float,
+    capture_tolerance_v: float,
+    last_geometry_change_at: float | None,
+    geometry_change_timestamp_source: str = "gateway_register_write_completion",
+    policy: str,
+    configured_handover_s: float | None = None,
+) -> dict[str, Any]:
+    """Describe a final same-geometry confirmation pair.
+
+    ``observed_at`` is host time immediately after each fresh detection
+    returns, not the detector's acquisition timestamp. The caller supplies its
+    existing acceptance policy. A configured handover duration is explicitly
+    labelled as an assumption because this path does not measure physical lock
+    engagement time.
+    """
+    signed_drift_v = float(second_voltage_v) - float(first_voltage_v)
+    interval_s = max(0.0, float(second_observed_at) - float(first_observed_at))
+    drift_rate_v_s = signed_drift_v / interval_s if interval_s > 1e-9 else None
+    last_move_age_s = (
+        None
+        if last_geometry_change_at is None
+        else max(0.0, float(first_observed_at) - float(last_geometry_change_at))
+    )
+    diagnostics: dict[str, Any] = {
+        "kind": "final_verify",
+        "first_target_voltage_v": float(first_voltage_v),
+        "second_target_voltage_v": float(second_voltage_v),
+        "first_observed_at": float(first_observed_at),
+        "second_observed_at": float(second_observed_at),
+        "observation_interval_s": interval_s,
+        "signed_drift_v": signed_drift_v,
+        "drift_rate_v_s": drift_rate_v_s,
+        "capture_tolerance_v": float(capture_tolerance_v),
+        "last_geometry_change_at": (
+            None if last_geometry_change_at is None else float(last_geometry_change_at)
+        ),
+        "time_since_last_geometry_change_s": last_move_age_s,
+        "geometry_change_timestamp_source": (
+            None if last_geometry_change_at is None else geometry_change_timestamp_source
+        ),
+        "acceptance_policy": policy,
+        "pair_displacement_within_capture_window": (
+            abs(signed_drift_v) <= float(capture_tolerance_v)
+        ),
+    }
+    if configured_handover_s is not None:
+        diagnostics["configured_handover_s"] = float(configured_handover_s)
+        diagnostics["handover_duration_source"] = "configured_assumption_not_measured"
+        diagnostics["predicted_motion_during_configured_handover_v"] = (
+            None if drift_rate_v_s is None
+            else abs(drift_rate_v_s) * max(0.0, float(configured_handover_s))
+        )
+    return diagnostics
 
 
 def rejection_bound_v(

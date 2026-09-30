@@ -6,8 +6,28 @@ from app.lock_acceptance import (
     AcceptanceSettings,
     acceptance_window_v,
     capture_tolerance_v,
+    final_pair_diagnostics,
     rejection_bound_v,
 )
+
+
+def test_final_pair_diagnostics_keep_signed_drift_and_label_configured_handover():
+    result = final_pair_diagnostics(
+        first_voltage_v=0.510,
+        second_voltage_v=0.508,
+        first_observed_at=10.0,
+        second_observed_at=11.5,
+        capture_tolerance_v=0.003,
+        last_geometry_change_at=8.0,
+        policy="one_shot_configured_handover_rate_projection",
+        configured_handover_s=0.3,
+    )
+    assert result["signed_drift_v"] == pytest.approx(-0.002)
+    assert result["drift_rate_v_s"] == pytest.approx(-0.002 / 1.5)
+    assert result["time_since_last_geometry_change_s"] == pytest.approx(2.0)
+    assert result["handover_duration_source"] == "configured_assumption_not_measured"
+    assert result["predicted_motion_during_configured_handover_v"] == pytest.approx(0.0004)
+    assert result["pair_displacement_within_capture_window"] is True
 
 
 def _settings(**overrides) -> AcceptanceSettings:

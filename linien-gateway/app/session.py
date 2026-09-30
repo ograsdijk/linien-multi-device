@@ -50,6 +50,7 @@ from .lock_acceptance import (
     AcceptanceSettings,
     acceptance_window_v,
     capture_tolerance_v,
+    final_pair_diagnostics,
 )
 from .lock_refinement import (
     _MAX_REFINEMENT_STAGES,
@@ -246,6 +247,8 @@ class StagedAutolockRun:
     identity: Any | None = None
     narrow_count: int = 0
     stages: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    last_geometry_change_at: float | None = None
+    last_geometry_change_timestamp_source: str = "initial_geometry_unknown"
     timer: threading.Timer | None = None
     locked: bool = False
     # Set under `_state_lock` at the start of a `step`/`lock` call (which then
@@ -469,6 +472,7 @@ class DeviceSession:
         # refinement walk moves the actuator for seconds; interleaved runs would
         # each measure offsets the other caused.
         self._center_move_lock = threading.Lock()
+        self._last_sweep_geometry_write_completed_at: float | None = None
         # (center_v, amplitude_v) to put back when the sweep next starts, after
         # a refined auto-lock narrowed it. Deferred rather than written at lock
         # time: while locked, sweep_center is the lock's operating point, and
@@ -3146,7 +3150,7 @@ class DeviceSession:
         self,
         result: Any,
         sweep_center: float,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Put the center on the detected target and start the lock.
 
         Split out of auto_lock_from_scan so the whole move-and-handover runs
@@ -3155,10 +3159,21 @@ class DeviceSession:
         current_center = self._current_sweep_center()
         if current_center is not None:
             sweep_center = current_center
+        command_started_at = time.time()
         with self._rpyc_lock:
             self.parameters.sweep_center.value = float(result.target_voltage)
             self.control.exposed_write_registers()
+            write_completed_at = time.time()
             self.control.exposed_start_lock()
+            start_lock_returned_at = time.time()
+        return {
+            "command_started_at": command_started_at,
+            "register_write_completed_at": write_completed_at,
+            "start_lock_returned_at": start_lock_returned_at,
+            "register_write_duration_s": max(0.0, write_completed_at - command_started_at),
+            "start_lock_call_duration_s": max(0.0, start_lock_returned_at - write_completed_at),
+            "timing_scope": "gateway_host_calls_not_physical_lock_engagement",
+        }
 
 
     def _set_sweep_geometry(
@@ -3177,6 +3192,7 @@ class DeviceSession:
             self.parameters.sweep_center.value = float(center_v)
             self.parameters.sweep_amplitude.value = float(amplitude_v)
             self.control.exposed_write_registers()
+            self._last_sweep_geometry_write_completed_at = time.time()
         if settle_s > 0.0:
             time.sleep(float(settle_s))
         return time.time()
@@ -3524,6 +3540,8 @@ class DeviceSession:
         detection that already succeeded, because it can only discard it.
         """
         stages: list[dict[str, Any]] = []
+        last_geometry_change_at: dict[str, float | None] = {"value": None}
+        last_geometry_change_source = {"value": "gateway_register_write_completion"}
         target, center_v, amplitude_v, resolution = (
             initial_target, initial_center_v, initial_amplitude_v, initial_resolution
         )
@@ -3583,6 +3601,12 @@ class DeviceSession:
                     moved_at = self._set_sweep_geometry(
                         next_center_v, next_amplitude_v, settle_s=settle_s
                     )
+                    write_at = self._last_sweep_geometry_write_completed_at
+                    last_geometry_change_at["value"] = write_at if write_at is not None else moved_at
+                    last_geometry_change_source["value"] = (
+                        "gateway_register_write_completion"
+                        if write_at is not None else "post_settle_freshness_timestamp_fallback"
+                    )
                     try:
                         t, c, a, r = self._capture_auto_lock_target(
                             settings, after=moved_at
@@ -3597,6 +3621,12 @@ class DeviceSession:
                 def _detect_recenter(next_center_v, next_amplitude_v, settle_s):
                     moved_at = self._set_sweep_geometry(
                         next_center_v, next_amplitude_v, settle_s=settle_s
+                    )
+                    write_at = self._last_sweep_geometry_write_completed_at
+                    last_geometry_change_at["value"] = write_at if write_at is not None else moved_at
+                    last_geometry_change_source["value"] = (
+                        "gateway_register_write_completion"
+                        if write_at is not None else "post_settle_freshness_timestamp_fallback"
                     )
                     return self._coarse_auto_lock_target(settings, after=moved_at)
 
@@ -3730,14 +3760,11 @@ class DeviceSession:
                 strict_one, amplitude_v=amplitude_v, resolution_samples=resolution, check_sideband=False
             )
             verify_after = time.time()
-            one_at = time.time()
+            one_at = verify_after
             strict_two, verify_center, verify_amplitude, _ = self._capture_auto_lock_target(
                 settings, after=verify_after
             )
             two_at = time.time()
-            identity.check(
-                strict_two, amplitude_v=amplitude_v, resolution_samples=resolution, check_sideband=False
-            )
             # One definition of "the feature moved too far", taken from the
             # acceptance settings rather than a second inline literal that
             # silently diverges from capture_fraction when anyone changes it.
@@ -3748,6 +3775,38 @@ class DeviceSession:
             tolerance = max(
                 window.tolerance_v, 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
             )
+            final_diagnostics = final_pair_diagnostics(
+                first_voltage_v=strict_one.target_voltage,
+                second_voltage_v=strict_two.target_voltage,
+                first_observed_at=one_at,
+                second_observed_at=two_at,
+                capture_tolerance_v=tolerance,
+                last_geometry_change_at=last_geometry_change_at["value"],
+                geometry_change_timestamp_source=last_geometry_change_source["value"],
+                policy="one_shot_configured_handover_rate_projection",
+                configured_handover_s=max(0.0, float(acceptance.settle_ms) / 1000.0),
+            )
+            final_diagnostics.update({
+                "center_v": center_v,
+                "amplitude_v": amplitude_v,
+                "resolution_samples": resolution,
+                "detector": "strict",
+                "sideband_offset_v": strict_two.sideband_offset_v,
+                "verify_center_v": verify_center,
+                "verify_amplitude_v": verify_amplitude,
+                "acceptance_passed": False,
+            })
+            # Append before any rejection so failed attempts retain their
+            # measured pair, drift rate and age since the last geometry move.
+            stages.append(final_diagnostics)
+            try:
+                identity.check(
+                    strict_two, amplitude_v=amplitude_v,
+                    resolution_samples=resolution, check_sideband=False,
+                )
+            except _TrackingIdentityChanged:
+                final_diagnostics["failure"] = "final detection failed IdentityGuard"
+                raise
             # Four distinct failures. They used to share one message with no
             # numbers in it, which says nothing about which one fired.
             if abs(verify_center - center_v) > 1e-6:
@@ -3788,28 +3847,29 @@ class DeviceSession:
                     f"past the {neighbour_bound * 1e3:.3f} mV neighbour bound: "
                     "they are not the same crossing."
                 )
-            # 2. Is it slow enough to hand over? What matters is not how far the
-            #    feature moved while being verified, but how far it will move
-            #    between the last detection and the lock engaging -- the settle
-            #    the handover already waits. Comparing a multi-second drift
-            #    against a capture window the handover never spans is what made
-            #    this unsatisfiable.
-            interval_s = max(0.0, two_at - one_at)
+            # 2. Preserve the established one-shot rate gate using the
+            #    configured settle_ms as an estimate. The gateway has no
+            #    measurement of physical lock-engagement duration; diagnostics
+            #    label this duration as an assumption for later lab review.
+            interval_s = float(final_diagnostics["observation_interval_s"])
             handover_s = max(0.0, float(acceptance.settle_ms) / 1000.0)
             if interval_s > 1e-3:
                 drift_rate_v_s = drift_v / interval_s
                 predicted_v = drift_rate_v_s * handover_s
+                final_diagnostics["predicted_motion_during_configured_handover_v"] = predicted_v
                 if predicted_v > tolerance:
                     raise ValueError(
                         f"The feature is drifting at {drift_rate_v_s * 1e3:.2f} mV/s "
                         f"({drift_v * 1e3:.3f} mV between two detections "
                         f"{interval_s:.2f} s apart), so it moves "
-                        f"{predicted_v * 1e3:.3f} mV during the {handover_s * 1e3:.0f} ms "
+                        f"{predicted_v * 1e3:.3f} mV under the configured {handover_s * 1e3:.0f} ms "
                         f"handover -- outside the {tolerance * 1e3:.3f} mV capture "
                         f"window (capture_fraction {float(acceptance.capture_fraction):g} "
                         f"x feature half-width "
-                        f"{float(settings.half_range_sweep_v) * 1e3:.3f} mV). "
-                        "Shorten settle_ms, or stabilise the laser."
+                        f"{float(settings.half_range_sweep_v) * 1e3:.3f} mV). The "
+                        "configured interval is an estimate, not a measured "
+                        "lock-engagement duration; inspect the recorded timing "
+                        "before changing the threshold."
                     )
             elif drift_v > tolerance:
                 # No usable interval to derive a rate from: fall back to the
@@ -3820,12 +3880,9 @@ class DeviceSession:
                     f"(capture_fraction {float(acceptance.capture_fraction):g} x feature "
                     f"half-width {float(settings.half_range_sweep_v) * 1e3:.3f} mV)."
                 )
-            stages.append({
-                "kind": "final_verify", "center_v": center_v, "amplitude_v": amplitude_v,
-                "target_voltage": strict_two.target_voltage, "resolution_samples": resolution,
-                "detector": "strict", "sideband_offset_v": strict_two.sideband_offset_v,
-                "consistent": True,
-            })
+            final_diagnostics["acceptance_passed"] = True
+            final_diagnostics["target_voltage"] = strict_two.target_voltage
+            final_diagnostics["consistent"] = True
             return strict_two, {
                 "attempted": True,
                 "trigger": "under_resolved",
@@ -4344,6 +4401,9 @@ class DeviceSession:
                 "expires_at": run.expires_at,
                 "frame": run.latest_frame,
                 "busy": run.busy,
+                "stages": [dict(stage) for stage in run.stages],
+                "last_geometry_change_at": run.last_geometry_change_at,
+                "last_geometry_change_timestamp_source": run.last_geometry_change_timestamp_source,
             }
 
     def staged_autolock_abort(self, token: str) -> dict[str, Any]:
@@ -4547,10 +4607,18 @@ class DeviceSession:
             # write succeeded but detection then failed" (fix #4 -- 422, run
             # recovered to the device's ACTUAL geometry).
             geometry_written = {"done": False}
+            geometry_changed_at: dict[str, float | None] = {"value": None}
+            geometry_timestamp_source = {"value": "gateway_register_write_completion"}
 
             def _detect_narrow(c, a, settle_s):
                 moved_at = self._set_sweep_geometry(c, a, settle_s=settle_s)
                 geometry_written["done"] = True
+                write_at = self._last_sweep_geometry_write_completed_at
+                geometry_changed_at["value"] = write_at if write_at is not None else moved_at
+                geometry_timestamp_source["value"] = (
+                    "gateway_register_write_completion"
+                    if write_at is not None else "post_settle_freshness_timestamp_fallback"
+                )
                 try:
                     candidates, cc, aa, r, frame = self._capture_auto_lock_candidates_strict(
                         settings, after=moved_at
@@ -4571,6 +4639,12 @@ class DeviceSession:
             def _detect_recenter(c, a, settle_s):
                 moved_at = self._set_sweep_geometry(c, a, settle_s=settle_s)
                 geometry_written["done"] = True
+                write_at = self._last_sweep_geometry_write_completed_at
+                geometry_changed_at["value"] = write_at if write_at is not None else moved_at
+                geometry_timestamp_source["value"] = (
+                    "gateway_register_write_completion"
+                    if write_at is not None else "post_settle_freshness_timestamp_fallback"
+                )
                 candidates, cc, aa, r, m, frame = self._coarse_auto_lock_candidates(
                     settings, after=moved_at
                 )
@@ -4661,6 +4735,8 @@ class DeviceSession:
                 run.latest_resolution = outcome.resolution
                 run.latest_candidates = latest_candidates_box
                 run.latest_frame = dict(latest_frame_box)
+                run.last_geometry_change_at = geometry_changed_at["value"]
+                run.last_geometry_change_timestamp_source = geometry_timestamp_source["value"]
                 # The hysteresis window is applied to the caller's SELECTION on
                 # this frame (the next step/lock), not to `outcome.target`: that
                 # is only the best-score candidate, which may be a different
@@ -4713,7 +4789,6 @@ class DeviceSession:
         self,
         settings: AutoLockScanSettings,
         selected: Any,
-        identity: "IdentityGuard",
         *,
         amplitude_v: float,
         trace_length: int,
@@ -4721,8 +4796,8 @@ class DeviceSession:
         """One fresh strict capture, matched against `selected` (fix #9).
 
         Unique candidate, same slope, within
-        `STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES`, and IdentityGuard-consistent
-        with `check_sideband=False` -- mirroring the one-shot's final
+        `STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES` and same slope -- mirroring
+        the one-shot's final
         verification at unchanged geometry
         (`_trajectory_refine_auto_lock`'s `identity.check(..., check_sideband=False)`):
         position comparison is only ever valid when geometry has not moved,
@@ -4753,10 +4828,6 @@ class DeviceSession:
             c for c in candidates
             if c.target_slope_rising == selected.target_slope_rising
             and abs(c.target_voltage - selected.target_voltage) <= tolerance_v
-            and identity.evaluate(
-                c, amplitude_v=amplitude_v, detector="strict",
-                resolution_samples=0.0, check_sideband=False,
-            )[0]
         ]
         if not matches:
             raise StagedAutolockError(
@@ -4877,9 +4948,10 @@ class DeviceSession:
             # require the selection to be confirmed on TWO consecutive fresh
             # frames, not one, before ever calling `_move_and_lock`.
             first, verify_center, verify_amplitude = self._staged_lock_match_candidate(
-                settings, selected, identity,
+                settings, selected,
                 amplitude_v=amplitude_v, trace_length=trace_length,
             )
+            first_observed_at = time.time()
             if (
                 abs(verify_center - center_v) > 1e-6
                 or abs(verify_amplitude - amplitude_v) > 1e-6
@@ -4890,34 +4962,11 @@ class DeviceSession:
                     f"found {verify_center:.6f} V / {verify_amplitude:.6f} V.",
                     status_code=422,
                 )
-            try:
-                identity.check(
-                    first, amplitude_v=amplitude_v, detector="strict",
-                    resolution_samples=0.0, check_sideband=False,
-                )
-            except _TrackingIdentityChanged as exc:
-                raise StagedAutolockError(str(exc), status_code=422) from exc
-
             second, verify_center2, verify_amplitude2 = self._staged_lock_match_candidate(
-                settings, selected, identity,
+                settings, selected,
                 amplitude_v=amplitude_v, trace_length=trace_length,
             )
-            if (
-                abs(verify_center2 - center_v) > 1e-6
-                or abs(verify_amplitude2 - amplitude_v) > 1e-6
-            ):
-                raise StagedAutolockError(
-                    "Sweep geometry moved before lock verification could run: "
-                    f"expected center {center_v:.6f} V amplitude {amplitude_v:.6f} V, "
-                    f"found {verify_center2:.6f} V / {verify_amplitude2:.6f} V.",
-                    status_code=422,
-                )
-            if second.target_slope_rising != first.target_slope_rising:
-                raise StagedAutolockError(
-                    "The two lock-verification detections disagreed on the "
-                    "discriminator slope.",
-                    status_code=422,
-                )
+            second_observed_at = time.time()
             # Same acceptance-window tolerance the one-shot's final_verify
             # uses at unchanged geometry (see `acceptance_window_v`).
             window = acceptance_window_v(
@@ -4927,22 +4976,78 @@ class DeviceSession:
                 window.tolerance_v, 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
             )
             drift_v = abs(second.target_voltage - first.target_voltage)
+            final_diagnostics = final_pair_diagnostics(
+                first_voltage_v=first.target_voltage,
+                second_voltage_v=second.target_voltage,
+                first_observed_at=first_observed_at,
+                second_observed_at=second_observed_at,
+                capture_tolerance_v=consistency_tolerance_v,
+                last_geometry_change_at=run.last_geometry_change_at,
+                geometry_change_timestamp_source=run.last_geometry_change_timestamp_source,
+                policy="staged_displacement_within_capture_window",
+            )
+            final_diagnostics.update({
+                "center_v": center_v,
+                "amplitude_v": amplitude_v,
+                "detector": "strict",
+                "resolution_samples": 0.0,
+                "verify_center_v": verify_center2,
+                "verify_amplitude_v": verify_amplitude2,
+                "acceptance_passed": False,
+            })
+            stage_records.append(final_diagnostics)
+            with self._state_lock:
+                active_run = self._staged_autolock
+                if active_run is not None and active_run.token == token:
+                    active_run.stages.append(final_diagnostics)
+            if (
+                abs(verify_center2 - center_v) > 1e-6
+                or abs(verify_amplitude2 - amplitude_v) > 1e-6
+            ):
+                final_diagnostics["failure"] = "sweep geometry changed during final verification"
+                raise StagedAutolockError(
+                    "Sweep geometry moved before lock verification could run: "
+                    f"expected center {center_v:.6f} V amplitude {amplitude_v:.6f} V, "
+                    f"found {verify_center2:.6f} V / {verify_amplitude2:.6f} V.",
+                    status_code=422,
+                    details={"verification": final_diagnostics},
+                )
+            if second.target_slope_rising != first.target_slope_rising:
+                final_diagnostics["failure"] = "final detections disagreed on slope"
+                raise StagedAutolockError(
+                    "The two lock-verification detections disagreed on the "
+                    "discriminator slope.",
+                    status_code=422,
+                    details={"verification": final_diagnostics},
+                )
             if drift_v > consistency_tolerance_v:
+                final_diagnostics["failure"] = "final pair displacement exceeded capture window"
                 raise StagedAutolockError(
                     f"The two lock-verification detections were "
                     f"{drift_v * 1e3:.3f} mV apart, past the "
                     f"{consistency_tolerance_v * 1e3:.3f} mV acceptance window "
                     "-- not consistent enough to lock.",
                     status_code=422,
+                    details={"verification": final_diagnostics},
                 )
             try:
+                identity.check(
+                    first, amplitude_v=amplitude_v, detector="strict",
+                    resolution_samples=0.0, check_sideband=False,
+                )
                 identity.check(
                     second, amplitude_v=amplitude_v, detector="strict",
                     resolution_samples=0.0, check_sideband=False,
                 )
             except _TrackingIdentityChanged as exc:
-                raise StagedAutolockError(str(exc), status_code=422) from exc
+                final_diagnostics["failure"] = "final detection failed IdentityGuard"
+                raise StagedAutolockError(
+                    str(exc), status_code=422,
+                    details={"verification": final_diagnostics},
+                ) from exc
             final = second
+            final_diagnostics["acceptance_passed"] = True
+            final_diagnostics["consistent"] = True
 
             refinement = {
                 "attempted": True,
@@ -4976,7 +5081,7 @@ class DeviceSession:
             # walk driving the same actuator (same rule as `step`).
             try:
                 with self._exclusive_center_move("staged auto-lock lock"):
-                    self._move_and_lock(final, center_v)
+                    handover_timing = self._move_and_lock(final, center_v)
             except RuntimeError as exc:
                 if "Another sweep-center move" in str(exc):
                     raise StagedAutolockError(str(exc), status_code=409) from exc
@@ -5000,6 +5105,7 @@ class DeviceSession:
                     )
             payload = final.to_dict()
             payload["refinement"] = refinement
+            payload["handover_command_timing"] = handover_timing
             payload["detail"] = "Staged auto-lock started."
             # The window that judged the selection (None: nothing pending).
             payload["hysteresis"] = _selection_window_fields(selection_window)
@@ -5120,10 +5226,11 @@ class DeviceSession:
                         refinement["fell_back_to_direct"] = True
                         result = direct
                         refinement_failed = True
+            handover_timing: dict[str, Any] | None = None
             try:
                 # The refinement final verification leaves geometry untouched,
                 # so the handover starts from the exact verified scan.
-                self._move_and_lock(result, sweep_center)
+                handover_timing = self._move_and_lock(result, sweep_center)
             except Exception as exc:
                 if refinement is not None:
                     self._restore_sweep_geometry(sweep_center, sweep_amplitude)
@@ -5159,6 +5266,8 @@ class DeviceSession:
         payload = result.to_dict()
         if refinement is not None:
             payload["refinement"] = refinement
+        if handover_timing is not None:
+            payload["handover_command_timing"] = handover_timing
         payload["detail"] = "Auto-lock started from scan."
         return payload
 

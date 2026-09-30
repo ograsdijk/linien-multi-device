@@ -1269,6 +1269,9 @@ def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:
         "target_index": result.get("target_index"),
         "score": result.get("score"),
     }
+    handover_timing = result.get("handover_command_timing")
+    if isinstance(handover_timing, dict):
+        details["handover_command_timing"] = handover_timing
     refinement = result.get("refinement")
     if isinstance(refinement, dict):
         details.update({
@@ -1278,6 +1281,25 @@ def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:
             "refinement_final_center_v": refinement.get("final_center_v"),
             "refinement_final_amplitude_v": refinement.get("final_amplitude_v"),
         })
+        stages = refinement.get("stages")
+        final_verification = next(
+            (stage for stage in reversed(stages or [])
+             if isinstance(stage, dict) and stage.get("kind") == "final_verify"),
+            None,
+        )
+        if isinstance(final_verification, dict):
+            keys = (
+                "acceptance_policy", "acceptance_passed",
+                "first_target_voltage_v", "second_target_voltage_v",
+                "signed_drift_v", "drift_rate_v_s", "observation_interval_s",
+                "capture_tolerance_v", "time_since_last_geometry_change_s",
+                "geometry_change_timestamp_source", "configured_handover_s",
+                "handover_duration_source",
+            )
+            details["final_verification"] = {
+                key: final_verification[key] for key in keys
+                if key in final_verification
+            }
     return details
 
 
@@ -1620,7 +1642,15 @@ async def staged_autolock_lock(
             code="staged_autolock_lock_failed",
             message="Staged auto-lock verification/lock failed.",
             device_key=key,
-            details={"token": token, "error": str(exc)},
+            details={
+                "token": token,
+                "error": str(exc),
+                **(
+                    {"verification": exc.details["verification"]}
+                    if isinstance(exc.details, dict) and "verification" in exc.details
+                    else {}
+                ),
+            },
         )
         _enqueue_auto_lock_row(session, key, success=False)
         raise _staged_autolock_http_error(exc)

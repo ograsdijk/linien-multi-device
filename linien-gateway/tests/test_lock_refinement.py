@@ -19,12 +19,14 @@ from types import SimpleNamespace
 import pytest
 
 from app.auto_lock_scan import AutoLockScanSettings
+from app.auto_lock_scan import scan_too_wide_to_lock
 from app.lock_refinement import (
     IdentityGuard,
     _TrackingIdentityChanged,
     bounded_recenter_v,
     min_safe_amplitude_v,
     plan_refinement_step,
+    predicted_shift_v,
 )
 
 
@@ -89,12 +91,12 @@ def test_rail_pinned_offset_floors_the_amplitude_near_0_533_v__fails_on_min():
         center_v=0.2, amplitude_v=0.8, target_v=0.2 + 0.4795,
         sideband_offset_v=0.032, detector="coarse", trace_length=2048,
     )
-    schedule_v = step.bounds["shift_capped_v"]  # 0.4 V, what min() would pick
+    schedule_v = 0.8 * 0.5  # frozen far-from-goal schedule, before edge guard
     safe = min_safe_amplitude_v(0.8, 0.4795, None, step.bounds["goal_v"])
     buggy = min(schedule_v, safe)
     assert buggy == pytest.approx(schedule_v)
-    assert buggy < 0.4795 / 0.9  # crops the target out of the window it picks
-    assert step.amplitude_v != pytest.approx(buggy)  # the real planner disagrees
+    assert buggy <= 0.4795 / 0.9 + 1e-12  # crops the target out of the window it picks
+    assert step.amplitude_v > buggy  # edge guard plus crop floor preserve the feature
 
 
 # ------------------------------------------------------------ field case 2
@@ -122,6 +124,99 @@ def test_a_centre_on_the_rail_is_recognised_despite_float_noise():
         rail_amplitude_v=0.4,
     )
     assert loosened > 0.2
+
+
+@pytest.mark.parametrize("direction", [-1.0, 1.0])
+def test_edge_guard_gentles_narrowing_at_both_scan_edges(direction):
+    settings = _settings(
+        half_range_sweep_v=0.02,
+        min_signal_scan_fraction=0.25,
+        hysteresis_per_volt_lower=0.0,
+    )
+    edge = plan_refinement_step(
+        settings,
+        center_v=0.0,
+        amplitude_v=0.8,
+        target_v=direction * 0.6,
+        sideband_offset_v=0.04,
+        detector="coarse",
+        trace_length=2048,
+    )
+    interior = plan_refinement_step(
+        settings,
+        center_v=0.0,
+        amplitude_v=0.8,
+        target_v=0.0,
+        sideband_offset_v=0.04,
+        detector="coarse",
+        trace_length=2048,
+    )
+    assert edge.bounds["edge_guard_active"] == 1.0
+    assert edge.bounds["edge_fraction"] == pytest.approx(0.75)
+    assert edge.bounds["scheduled_v"] == pytest.approx(0.68)
+    assert direction * edge.center_v > 0.0
+    assert abs(direction * 0.6 - edge.center_v) < 0.6
+    predicted = edge.bounds["predicted_target_v"]
+    assert abs(predicted - edge.center_v) <= 0.9 * edge.amplitude_v
+    # Simulate the measured 12.5% edge-related gain jump from the captured
+    # detector trace. The feature remains inside the scan despite the model's
+    # prediction error on either edge.
+    actual_target = direction * 0.6 + 1.125 * predicted_shift_v(
+        0.0, 0.8, edge.center_v, edge.amplitude_v,
+        settings.hysteresis_per_volt_lower,
+    )
+    assert abs(actual_target - edge.center_v) <= 0.9 * edge.amplitude_v
+    assert interior.bounds["edge_guard_active"] == 0.0
+    assert interior.bounds["scheduled_v"] == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize(
+    "center,amplitude,target,frozen_stages",
+    [
+        (0.0, 1.0, 0.8, 12),
+        (0.0, 1.0, -0.8, 14),
+        (0.0, 1.0, 0.9, 14),
+        (0.0, 1.0, -0.9, 18),  # frozen planner also exhausts the 16-stage budget
+        (0.4, 0.6, 0.805, 5),
+        (-0.4, 0.6, -0.805, 6),
+    ],
+)
+def test_edge_degraded_sweep_stays_in_view_with_bounded_stage_overhead(
+    center, amplitude, target, frozen_stages
+):
+    settings = _settings(half_range_sweep_v=0.00127)
+    stage_count = 0
+    crop_safe = True
+    while stage_count < 16 and (
+        stage_count == 0
+        or scan_too_wide_to_lock(settings, amplitude, 0.03, trace_points=2048)
+    ):
+        step = plan_refinement_step(
+            settings,
+            center_v=center,
+            amplitude_v=amplitude,
+            target_v=target,
+            sideband_offset_v=0.03,
+            detector="coarse" if stage_count == 0 else "strict",
+            trace_length=2048,
+        )
+        if step.action in ("done", "refuse"):
+            break
+        predicted = predicted_shift_v(
+            center, amplitude, step.center_v, step.amplitude_v,
+            settings.hysteresis_per_volt_lower,
+        )
+        edge_gain = 1.125 if abs(target - center) / amplitude > 0.6 else 1.0
+        actual_target = target + edge_gain * predicted
+        crop_safe &= abs(actual_target - step.center_v) <= 0.9 * step.amplitude_v + 1e-9
+        center, amplitude, target = step.center_v, step.amplitude_v, actual_target
+        stage_count += 1
+
+    # Frozen counts come from the pre-edge planner replay on these same
+    # start geometries. The known -0.9 V case already exceeds the 16-stage
+    # budget in that planner and remains a safe refusal here.
+    assert stage_count <= min(frozen_stages + 2, 16)
+    assert crop_safe
 
 
 def test_a_centre_on_the_rail_is_recognised_despite_float_noise__fails_on_exact_compare():
@@ -156,7 +251,7 @@ def test_a_target_421_mv_outside_the_next_window_recentres_not_narrows():
     )
     scheduled = step.bounds["shift_capped_v"]
     outside_by = abs(target_v - center_v) - 0.5 * scheduled
-    assert outside_by == pytest.approx(0.421, abs=0.001)
+    assert outside_by == pytest.approx(0.316, abs=0.001)
     # The step must not commit to the scheduled cut while the target is that
     # far out. It may now narrow, but only together with a centre move and
     # only to a width that still contains the target -- the crop the original

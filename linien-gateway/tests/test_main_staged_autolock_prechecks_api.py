@@ -12,6 +12,7 @@ active run restarted the sweep underneath that run.
 from fastapi.testclient import TestClient
 
 import app.main as main
+from app.session import StagedAutolockError
 
 
 class FakePrecheckSession:
@@ -97,6 +98,37 @@ def test_begin_succeeds_when_the_precheck_allows_it(monkeypatch):
     precheck_index = session.calls.index(("staged_autolock_begin_precheck",))
     trigger_index = next(i for i, c in enumerate(session.calls) if c[0] == "start_sweep")
     assert precheck_index < trigger_index
+
+
+def test_staged_lock_failure_log_keeps_verification_diagnostics(monkeypatch):
+    verification = {
+        "kind": "final_verify",
+        "signed_drift_v": -0.002,
+        "time_since_last_geometry_change_s": 1.25,
+        "acceptance_passed": False,
+    }
+
+    class FailedLockSession:
+        def staged_autolock_lock(self, *_args):
+            raise StagedAutolockError(
+                "final pair outside capture window",
+                status_code=422,
+                details={"verification": verification},
+            )
+
+    log_records = []
+    monkeypatch.setattr(main, "_get_session", lambda _key: FailedLockSession())
+    monkeypatch.setattr(
+        main, "_emit_log", lambda **kwargs: log_records.append(kwargs)
+    )
+    monkeypatch.setattr(main, "_enqueue_auto_lock_row", lambda *_args, **_kwargs: None)
+    client = TestClient(main.app)
+    response = client.post(
+        "/api/devices/dev/control/staged_autolock/token/lock",
+        json={"selected": {"frame_id": 1, "target_index": 2}},
+    )
+    assert response.status_code == 422
+    assert log_records[0]["details"]["verification"] == verification
 
 
 def test_acquire_true_refuses_locked_device_before_ever_triggering_a_sweep(monkeypatch):

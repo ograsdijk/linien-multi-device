@@ -46,6 +46,7 @@ import app.session as session_module
 from app.auto_lock_scan import AutoLockScanResult, AutoLockScanSettings
 from app.lock_acceptance import AcceptanceSettings
 from app.session import DeviceSession
+from app.lock_refinement import predicted_shift_v
 
 
 class _RecordingManager:
@@ -175,6 +176,78 @@ def _run_refine(
     )
 
 
+def test_move_and_lock_reports_host_command_timing_without_claiming_physical_engagement(
+    monkeypatch,
+):
+    session, control = _make_bare_session()
+    ticks = iter([100.0, 100.02, 100.07])
+    monkeypatch.setattr(session_module.time, "time", lambda: next(ticks))
+    timing = session._move_and_lock(_result(0.12), 0.0)
+    assert control.lock_started is True
+    assert timing["register_write_duration_s"] == pytest.approx(0.02)
+    assert timing["start_lock_call_duration_s"] == pytest.approx(0.05)
+    assert timing["timing_scope"] == "gateway_host_calls_not_physical_lock_engagement"
+
+
+def test_geometry_write_completion_timestamp_precedes_freshness_timestamp(monkeypatch):
+    session, _control = _make_bare_session()
+    ticks = iter([100.0, 100.25])
+    monkeypatch.setattr(session_module.time, "time", lambda: next(ticks))
+    freshness_at = session._set_sweep_geometry(0.1, 0.5)
+    assert session._last_sweep_geometry_write_completed_at == pytest.approx(100.0)
+    assert freshness_at == pytest.approx(100.25)
+
+
+@pytest.mark.parametrize("direction", [-1.0, 1.0])
+def test_edge_degraded_walk_recentres_and_converges_without_cropping(monkeypatch, direction):
+    session, _control = _make_bare_session()
+    writes = _geometry_recorder(session)
+    settings = AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings)
+    settings.half_range_sweep_v = 0.02
+    acceptance = AcceptanceSettings.from_mapping(session.lock_acceptance_settings)
+    previous = {"center": 0.0, "amplitude": 0.8, "target": direction * 0.65}
+    observed: list[tuple[float, float, float]] = []
+
+    def _detect(_settings, traces=None, after=None):
+        center = float(session.parameters.sweep_center.value)
+        amplitude = float(session.parameters.sweep_amplitude.value)
+        predicted = predicted_shift_v(
+            previous["center"], previous["amplitude"], center, amplitude,
+            settings.hysteresis_per_volt_lower,
+        )
+        # Model the measured edge gain jump: when the old feature was outside
+        # the central 60%, its realized geometry response is 12.5% larger than
+        # the nominal hysteresis prediction.
+        gain = 1.125 if abs(previous["target"] - previous["center"]) / previous["amplitude"] > 0.6 else 1.0
+        target_v = previous["target"] + gain * predicted
+        previous.update(center=center, amplitude=amplitude, target=target_v)
+        observed.append((target_v, center, amplitude))
+        return _result(target_v, sideband_offset_v=0.04), center, amplitude, 10.5
+
+    monkeypatch.setattr(session, "_capture_auto_lock_target", _detect)
+    monkeypatch.setattr(
+        session,
+        "_coarse_auto_lock_target",
+        lambda _settings, after=None: (*_detect(_settings, after=after), {}),
+    )
+    result, refinement = session._trajectory_refine_auto_lock(
+        settings,
+        acceptance,
+        0.0,
+        0.8,
+        initial_target=_result(direction * 0.65, sideband_offset_v=0.04),
+        initial_center_v=0.0,
+        initial_amplitude_v=0.8,
+        initial_resolution=2.0,
+        initial_detector="coarse",
+        trace_length=2048,
+    )
+    assert len(writes) <= 9  # frozen stage-count baseline 7 plus two edge stages
+    assert refinement["stages"][-1]["kind"] == "final_verify"
+    assert abs(result.target_voltage - refinement["final_center_v"]) <= 0.6 * refinement["final_amplitude_v"]
+    assert all(abs(target - center) <= 0.9 * amplitude for target, center, amplitude in observed)
+
+
 # --------------------------------------------------------------------------
 # Exact golden comparison. The loose assertions in each scenario document
 # intent; the golden file pins EVERYTHING the walk did -- every geometry write,
@@ -200,6 +273,11 @@ def _normalize(value: Any) -> Any:
             for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
             # Wall-clock values are the only nondeterministic content.
             if not str(k).endswith(("_at", "_ts", "timestamp", "elapsed_s", "duration_s"))
+            and str(k) not in {
+                "observation_interval_s", "drift_rate_v_s",
+                "predicted_motion_during_configured_handover_v",
+                "time_since_last_geometry_change_s",
+            }
         }
     if isinstance(value, AutoLockScanResult):
         return _normalize(value.to_dict())
@@ -229,6 +307,18 @@ def _assert_golden(scenario: str, record: dict[str, Any]) -> None:
         _GOLDEN_PATH.write_text(json.dumps(golden, indent=1, sort_keys=True) + chr(10))
         return
     golden = json.loads(_GOLDEN_PATH.read_text())
+    frozen_counts = {
+        "geometry_dependent_position": 7,
+        "multi_feature": 7,
+        "several_narrowing_stages": 7,
+        "stage_budget_exhausted": 17,
+    }
+    if scenario in frozen_counts:
+        stage_count = len(record.get("refinement", {}).get("stages", []))
+        assert stage_count <= frozen_counts[scenario] + 2, (
+            f"edge protection added too many stages: frozen={frozen_counts[scenario]}, "
+            f"current={stage_count}"
+        )
     assert record == golden[scenario]
 
 

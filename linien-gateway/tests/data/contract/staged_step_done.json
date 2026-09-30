@@ -86,7 +86,10 @@
  "needs_more_refinement": false,
  "planner": {
   "action": "done",
-  "bounds": {},
+  "bounds": {
+   "edge_fraction": 5.513015611e-05,
+   "edge_guard_active": 0.0
+  },
   "reason": "goal met: strict detector accepts this scan"
  },
  "stage_index": 2

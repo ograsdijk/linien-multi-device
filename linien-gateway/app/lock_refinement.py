@@ -56,6 +56,9 @@ _MAX_REFINEMENT_STAGES = 16
 # position is this sensitive to width is one the walk should give up on rather
 # than creep after.
 _REFINEMENT_MAX_NARROW_FACTOR = 0.9
+# Intermediate factor used by the edge guard before the adaptive model
+# uncertainty proves that preserving still more width is necessary.
+_REFINEMENT_EDGE_NARROW_FACTOR = 0.85
 # Width changes below this fraction cannot measure the shift they cause: the
 # detector's own scatter swamps it and the ratio explodes.
 _REFINEMENT_MIN_MEASURABLE_FRACTION = 0.05
@@ -63,6 +66,9 @@ _REFINEMENT_MIN_MEASURABLE_FRACTION = 0.05
 # window" when the rails force a narrowing that has not been centred first.
 # Below 1 so the edge is not the acceptance criterion.
 _WINDOW_KEEP_FRACTION = 0.9
+# The edge guard leaves extra crop margin for the measured ~12.5% edge gain
+# change in the simulated detector response.
+_EDGE_WINDOW_KEEP_FRACTION = 0.86
 # Below this, a commanded centre move is no move at all -- the rails have pinned
 # it and stepping again would spin.
 _CENTER_MOVE_EPSILON_V = 1e-6
@@ -78,6 +84,8 @@ _NARROW_SCHEDULE_EPSILON_V = 1e-9
 # stage recentres rather than narrows. Applied against the PROSPECTIVE next
 # amplitude before narrowing, and against the CURRENT amplitude right after.
 _INNER_WINDOW_FRACTION = 0.5
+# The central 60% of the full scan spans +/- 0.6 of its half-range.
+_EDGE_GUARD_FRACTION = 0.6
 # Tolerance on the sideband spacing across a geometry change, as a fraction of
 # the standing identity. Generous while the wide trace is under-resolved --
 # the spacing itself is biased by resolution, not just noisy.
@@ -400,6 +408,7 @@ def min_safe_amplitude_v(
     offset_v: float,
     uncertainty_per_fraction: float | None,
     floor_v: float,
+    keep_fraction: float = _WINDOW_KEEP_FRACTION,
 ) -> float | None:
     """Smallest amplitude that still leaves the target inside the window.
 
@@ -426,19 +435,20 @@ def min_safe_amplitude_v(
     amplitude = abs(float(amplitude_v))
     offset = abs(float(offset_v))
     spf = max(0.0, float(uncertainty_per_fraction or 0.0))
+    keep = min(1.0, max(0.0, float(keep_fraction)))
     if amplitude <= 1e-12:
         return None
     # Solved, not iterated. The requirement is
     #
-    #     c >= (offset + spf * (1 - c / amplitude)) / _WINDOW_KEEP_FRACTION
+    #     c >= (offset + spf * (1 - c / amplitude)) / keep
     #
     # whose right side falls as c rises, so the smallest admissible c is the
     # single crossing point -- available in closed form:
     #
-    #     c* = (offset + spf) / (_WINDOW_KEEP_FRACTION + spf / amplitude)
+    #     c* = (offset + spf) / (keep + spf / amplitude)
     #
     # This was a five-round fixed-point iteration, which is a contraction only
-    # while spf < _WINDOW_KEEP_FRACTION * amplitude. On an actuator whose
+    # while spf < keep * amplitude. On an actuator whose
     # apparent feature position is more sensitive to width than that -- the
     # field case was spf 0.289 V per unit fraction at amplitude 0.212 V, a
     # contraction factor of 1.5 -- the iteration does not converge. It settles
@@ -451,10 +461,10 @@ def min_safe_amplitude_v(
     # Past the crossing the shift term is gone and the requirement is the flat
     # c >= offset / _WINDOW_KEEP_FRACTION, so when that alone exceeds the
     # current amplitude nothing narrower can hold the target either.
-    if offset >= _WINDOW_KEEP_FRACTION * amplitude:
+    if keep <= 0.0 or offset >= keep * amplitude:
         return None
     candidate = max(
-        float(floor_v), (offset + spf) / (_WINDOW_KEEP_FRACTION + spf / amplitude)
+        float(floor_v), (offset + spf) / (keep + spf / amplitude)
     )
     if candidate >= amplitude:
         return None
@@ -475,31 +485,42 @@ def plan_refinement_step(
 
     Applies the constraints in a fixed, documented order, each exactly once:
 
-    1. Goal -- the widest amplitude satisfying both the detector sample floor
+    1. Edge guard -- when refinement is needed and the target is outside the
+       central 60% of the scan, preserve more width near either edge and
+       recenter alone first when one bounded step reaches the central region.
+       A strict-lockable scan is already done; its selected feature is handed
+       directly to the normal lock-centering path.
+    2. Goal -- the widest amplitude satisfying both the detector sample floor
        and ``max_lockable_amplitude_v``. Met, and the detector already
-       strict, means the walk is done.
-    2. Schedule -- this stage's desired cut (coarse vs. gentle factor).
-    3. Shift allowance -- gentle the cut so the hysteresis model's UNCERTAINTY
+       strict, means no further narrowing is needed.
+    3. Schedule -- this stage's desired cut (coarse vs. gentle factor).
+    4. Shift allowance -- gentle the cut so the hysteresis model's UNCERTAINTY
        for it (``tol * |dL|``; the predicted shift itself is compensated, not
        charged) stays within ``center_step_allowance_v``.
-    4. Centring -- target outside half the *next* window -> recenter via
+    5. Centring -- target outside half the *next* window -> recenter via
        ``bounded_recenter_v``, aimed at the centre that puts the target on
        the centre AFTER the predicted hysteresis shift
        (``precompensated_center_v``), so every bound applies to the compensated
        centre and the crop guard judges where the target will LAND.
-    5. Rail escape -- a bounded recentre cannot progress -> the amplitude is
+    6. Rail escape -- a bounded recentre cannot progress -> the amplitude is
        floored by ``min_safe_amplitude_v`` so narrowing moves the rail
        outward instead of stalling.
-    6. Crop guard -- never return an amplitude below that floor.
+    7. Crop guard -- never return an amplitude below that floor.
 
     Pure: makes no I/O and mutates nothing. The caller (``session.py``) acts
     on the returned step, re-detects, and calls this again for the next one.
     """
+    edge_fraction = abs(float(target_v) - float(center_v)) / max(
+        abs(float(amplitude_v)), 1e-12
+    )
+    edge_guard_active = edge_fraction > _EDGE_GUARD_FRACTION
     if detector == "strict" and not scan_too_wide_to_lock(
         settings, amplitude_v, sideband_offset_v, trace_points=trace_length
     ):
         return RefinementStep(
-            "done", center_v, amplitude_v, "goal met: strict detector accepts this scan"
+            "done", center_v, amplitude_v,
+            "goal met: strict detector accepts this scan",
+            {"edge_fraction": edge_fraction, "edge_guard_active": float(edge_guard_active)},
         )
 
     # Two floors, whichever is wider: the amplitude that gives the detector
@@ -528,6 +549,13 @@ def plan_refinement_step(
         if amplitude_v > _REFINEMENT_GENTLE_APPROACH * target_amplitude
         else _REFINEMENT_NARROW_FACTOR
     )
+    # Preserve more of the current field of view when the target is in either
+    # outer 20% of the scan. The centre is still pre-compensated and moved in
+    # the same register write; the gentler cut gives that bounded centre move
+    # room to pull the feature inward before another narrowing. This is based
+    # on the target's position in the live scan, not a preferred voltage.
+    if edge_guard_active:
+        factor = max(factor, _REFINEMENT_EDGE_NARROW_FACTOR)
     scheduled_v = amplitude_v * factor
 
     # Hold the width-induced shift to the same allowance a centre step gets:
@@ -560,7 +588,46 @@ def plan_refinement_step(
         "goal_v": target_amplitude,
         "scheduled_v": scheduled_v,
         "shift_capped_v": shift_capped_v,
+        "edge_fraction": edge_fraction,
+        "edge_guard_active": float(edge_guard_active),
     }
+
+    if edge_guard_active:
+        # If one existing bounded move can bring the target into the central
+        # 60% without changing scan width, spend this stage on recentring first.
+        # More distant edge targets still use the shared combined move below,
+        # with the gentler cut preserving room for bounded centring.
+        edge_aim = precompensated_center_v(
+            center_v, amplitude_v, amplitude_v, target_v, h
+        )
+        edge_center = bounded_recenter_v(
+            center_v,
+            edge_aim,
+            amplitude_v,
+            signal_width_v=signal_width,
+            max_signal_widths=settings.max_center_step_signal_widths,
+            rail_amplitude_v=amplitude_v,
+            step_budget_v=step_allowance,
+        )
+        if (
+            abs(edge_center - center_v) > _CENTER_MOVE_EPSILON_V
+            and abs(float(target_v) - edge_center)
+            <= _EDGE_GUARD_FRACTION * abs(float(amplitude_v))
+        ):
+            return RefinementStep(
+                "recenter",
+                edge_center,
+                amplitude_v,
+                "one bounded move can bring the target inside the central 60%; recenter first",
+                {
+                    **bounds,
+                    "centre_budget_v": step_allowance,
+                    "predicted_target_v": target_v + predicted_shift_v(
+                        center_v, amplitude_v, edge_center, amplitude_v, h
+                    ),
+                    "rail_v": 1.0 - abs(amplitude_v),
+                },
+            )
 
     if next_amplitude >= amplitude_v - _NARROW_SCHEDULE_EPSILON_V:
         return RefinementStep(
@@ -640,6 +707,10 @@ def plan_refinement_step(
         safe = min_safe_amplitude_v(
             amplitude_v, residual_offset, uncertainty_per_fraction,
             target_amplitude,
+            keep_fraction=(
+                _EDGE_WINDOW_KEEP_FRACTION if edge_guard_active
+                else _WINDOW_KEEP_FRACTION
+            ),
         )
         if safe is None:
             # Nothing this stage can do keeps the feature in view: the centre is

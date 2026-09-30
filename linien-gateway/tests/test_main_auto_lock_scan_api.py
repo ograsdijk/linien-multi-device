@@ -335,6 +335,11 @@ def test_the_real_engine_payload_passes_response_validation(monkeypatch):
             self.last_payload = payload
             body = engine_result.to_dict()
             body["detail"] = "Auto-lock started from scan."
+            body["handover_command_timing"] = {
+                "register_write_duration_s": 0.01,
+                "start_lock_call_duration_s": 0.02,
+                "timing_scope": "gateway_host_calls_not_physical_lock_engagement",
+            }
             return body
 
     session = EngineSession()
@@ -357,6 +362,31 @@ def test_the_real_engine_payload_passes_response_validation(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["discriminator_slope_v_per_mhz"] == 0.5
+    assert response.json()["handover_command_timing"]["register_write_duration_s"] == 0.01
+
+
+def test_auto_lock_event_details_include_final_verification_and_command_timing():
+    details = main._auto_lock_event_details({
+        "target_voltage": 0.2,
+        "handover_command_timing": {"start_lock_call_duration_s": 0.02},
+        "refinement": {
+            "trigger": "under_resolved",
+            "stages": [{
+                "kind": "final_verify",
+                "acceptance_policy": "one_shot_configured_handover_rate_projection",
+                "acceptance_passed": True,
+                "signed_drift_v": -0.001,
+                "drift_rate_v_s": -0.002,
+                "time_since_last_geometry_change_s": 0.5,
+                "handover_duration_source": "configured_assumption_not_measured",
+            }],
+        },
+    })
+    assert details["handover_command_timing"]["start_lock_call_duration_s"] == 0.02
+    assert details["final_verification"]["signed_drift_v"] == -0.001
+    assert details["final_verification"]["handover_duration_source"] == (
+        "configured_assumption_not_measured"
+    )
 
 
 

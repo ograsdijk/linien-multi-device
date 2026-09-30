@@ -226,6 +226,9 @@ class AutoLockScanResult(BaseModel):
     # operators can see when scan-history motion, rather than a bad lock point,
     # drove the refinement.
     refinement: Optional[dict[str, Any]] = None
+    # Host-side duration of the final register write/start-lock RPC calls.
+    # This does not claim to measure physical lock engagement.
+    handover_command_timing: Optional[dict[str, Any]] = None
 
 
 class StagedAutolockSelected(BaseModel):
@@ -414,7 +417,8 @@ class LockAcceptanceSettings(BaseModel):
         default=300, ge=0, le=60000,
         description=(
             "Dwell after a sweep-geometry write before the trace is believed, and "
-            "the handover interval a measured drift is charged against."
+            "the configured duration used by one-shot drift projection. Physical "
+            "lock-engagement duration is not measured by the gateway."
         ),
     )
 

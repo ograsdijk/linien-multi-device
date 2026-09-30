@@ -3,6 +3,7 @@
  "detail": "Staged auto-lock started.",
  "discriminator_slope_v_per_mhz": 0.1402154154,
  "feature_amplitude": 0.5594222571,
+ "handover_command_timing": null,
  "hysteresis": {
   "applied_window_v": 0.03055614652,
   "selection_window": {
@@ -90,6 +91,30 @@
     },
     "kind": "narrow",
     "stage_index": 2
+   },
+   {
+    "acceptance_passed": true,
+    "acceptance_policy": "staged_displacement_within_capture_window",
+    "amplitude_v": 0.5625,
+    "capture_tolerance_v": 0.01,
+    "center_v": 0.2415917169,
+    "consistent": true,
+    "detector": "strict",
+    "drift_rate_v_s": 0.0,
+    "first_observed_at": 0.0,
+    "first_target_voltage_v": 0.2416227277,
+    "geometry_change_timestamp_source": "post_settle_freshness_timestamp_fallback",
+    "kind": "final_verify",
+    "last_geometry_change_at": 0.0,
+    "observation_interval_s": 0.0,
+    "pair_displacement_within_capture_window": true,
+    "resolution_samples": 0.0,
+    "second_observed_at": 0.0,
+    "second_target_voltage_v": 0.2416227277,
+    "signed_drift_v": 0.0,
+    "time_since_last_geometry_change_s": 0.0,
+    "verify_amplitude_v": 0.5625,
+    "verify_center_v": 0.2415917169
    }
   ],
   "trigger": "staged"

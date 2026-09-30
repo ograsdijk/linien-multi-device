@@ -22,6 +22,7 @@ import pytest
 
 import app.session as session_module
 from app.auto_lock_scan import AutoLockScanResult, AutoLockScanSettings
+from app.lock_refinement import predicted_shift_v
 from app.session import DeviceSession, StagedAutolockError
 
 
@@ -221,6 +222,118 @@ def test_staged_step_follows_the_callers_selection_not_the_higher_score(monkeypa
     assert session.staged_autolock_state() == {"active": False}
     # Never wrote geometry anywhere near the decoy's voltage.
     assert all(abs(c - (-0.4)) > 0.1 for c, _a in writes)
+
+
+@pytest.mark.parametrize("target_v", [-0.6, 0.6])
+def test_staged_step_applies_edge_guard_symmetrically(monkeypatch, target_v):
+    session = _make_session()
+    session.parameters.sweep_amplitude.value = 0.8
+    settings = {
+        "half_range_sweep_v": 0.02,
+        "hysteresis_per_volt_lower": 0.0,
+        "hysteresis_tolerance_per_volt": 0.0,
+        "hysteresis_floor_v": 0.0,
+    }
+    selected = _result(10, target_v, sideband_offset_v=0.04)
+    frame = _frame(1, 0.0, 0.8)
+    monkeypatch.setattr(
+        session, "_capture_auto_lock_candidates_strict",
+        lambda _settings, after=None: (_ for _ in ()).throw(ValueError("coarse seed")),
+    )
+    monkeypatch.setattr(
+        session, "_coarse_auto_lock_candidates",
+        lambda _settings, after=None: ([selected], 0.0, 0.8, 1.0, {}, frame),
+    )
+    result = session.staged_autolock_begin(settings, 60.0)
+    writes = _geometry_recorder(session)
+
+    def _strict(_settings, after=None):
+        center = float(session.parameters.sweep_center.value)
+        amplitude = float(session.parameters.sweep_amplitude.value)
+        return [selected], center, amplitude, 20.0, _frame(2, center, amplitude)
+
+    monkeypatch.setattr(session, "_capture_auto_lock_candidates_strict", _strict)
+    step = session.staged_autolock_step(result["token"], 1, 10)
+    assert step["planner"]["bounds"]["edge_guard_active"] == 1.0
+    assert step["planner"]["bounds"]["scheduled_v"] == pytest.approx(0.68)
+    assert len(writes) == 1
+    assert target_v * writes[0][0] > 0.0
+    assert writes[0][1] == pytest.approx(0.68)
+
+
+@pytest.mark.parametrize("direction", [-1.0, 1.0])
+def test_staged_edge_degraded_run_converges_and_locks_without_cropping(
+    monkeypatch, direction
+):
+    session = _make_session()
+    session.parameters.sweep_amplitude.value = 0.8
+    selected = _result(10, direction * 0.65, sideband_offset_v=0.04)
+    first_frame = _frame(1, 0.0, 0.8)
+    previous = {"center": 0.0, "amplitude": 0.8, "target": direction * 0.65}
+    frame_id = {"value": 1}
+    observed: list[tuple[float, float, float]] = []
+    locked = _lock_recorder(session)
+
+    monkeypatch.setattr(
+        session,
+        "_capture_auto_lock_candidates_strict",
+        lambda _settings, after=None: (_ for _ in ()).throw(ValueError("coarse seed")),
+    )
+    monkeypatch.setattr(
+        session,
+        "_coarse_auto_lock_candidates",
+        lambda _settings, after=None: ([selected], 0.0, 0.8, 2.0, {}, first_frame),
+    )
+    run = session.staged_autolock_begin(
+        {"half_range_sweep_v": 0.02}, 60.0
+    )
+    writes = _geometry_recorder(session)
+    settings = session._staged_autolock.settings
+
+    def _detect():
+        center = float(session.parameters.sweep_center.value)
+        amplitude = float(session.parameters.sweep_amplitude.value)
+        predicted = predicted_shift_v(
+            previous["center"], previous["amplitude"], center, amplitude,
+            settings.hysteresis_per_volt_lower,
+        )
+        edge_gain = (
+            1.125
+            if abs(previous["target"] - previous["center"]) / previous["amplitude"] > 0.6
+            else 1.0
+        )
+        target_v = previous["target"] + edge_gain * predicted
+        previous.update(center=center, amplitude=amplitude, target=target_v)
+        observed.append((target_v, center, amplitude))
+        frame_id["value"] += 1
+        result = _result(10, target_v, sideband_offset_v=0.04)
+        return result, center, amplitude, 12.0, _frame(frame_id["value"], center, amplitude)
+
+    def _strict(_settings, after=None):
+        candidate, center, amplitude, resolution, frame = _detect()
+        return [candidate], center, amplitude, resolution, frame
+
+    def _coarse(_settings, after=None):
+        candidate, center, amplitude, resolution, frame = _detect()
+        return [candidate], center, amplitude, resolution, {}, frame
+
+    monkeypatch.setattr(session, "_capture_auto_lock_candidates_strict", _strict)
+    monkeypatch.setattr(session, "_coarse_auto_lock_candidates", _coarse)
+    selected_frame_id = 1
+    for _ in range(16):
+        step = session.staged_autolock_step(run["token"], selected_frame_id, 10)
+        assert step["frame"]["frame_id"] > selected_frame_id
+        selected_frame_id = step["frame"]["frame_id"]
+        if not step["needs_more_refinement"]:
+            break
+    else:
+        pytest.fail("edge-degraded staged planner did not converge within its stage budget")
+
+    lock_result = session.staged_autolock_lock(run["token"], selected_frame_id, 10)
+    assert lock_result["target_voltage"] == pytest.approx(previous["target"])
+    assert len(locked) == 1
+    assert len(writes) <= 9
+    assert all(abs(target - center) <= 0.9 * amplitude for target, center, amplitude in observed)
 
 
 # --------------------------------------------------------------------------
