@@ -38,6 +38,7 @@ const DEFAULT_AUTO_LOCK_SETTINGS: AutoLockScanSettings = {
   hysteresis_per_volt_lower: 0.085,
   hysteresis_tolerance_per_volt: 0.015,
   hysteresis_floor_v: 0.015,
+  hysteresis_max_extra_tolerance_v: 0.03,
 };
 
 type LockingPanelProps = {
@@ -378,6 +379,27 @@ export const LockingPanel = memo(function LockingPanel({
                       toFiniteNumberOr(
                         value,
                         DEFAULT_AUTO_LOCK_SETTINGS.hysteresis_floor_v * 1e3
+                      )
+                    ) / 1e3
+                  )
+                }
+              />
+              <DeferredNumberInput
+                label="Max extra tolerance (mV)"
+                value={
+                  Math.round(autoLockSettings.hysteresis_max_extra_tolerance_v * 1e6) / 1e3
+                }
+                min={0}
+                step={1}
+                decimalScale={1}
+                onCommit={(value) =>
+                  setAutoLockNumber(
+                    'hysteresis_max_extra_tolerance_v',
+                    Math.max(
+                      0,
+                      toFiniteNumberOr(
+                        value,
+                        DEFAULT_AUTO_LOCK_SETTINGS.hysteresis_max_extra_tolerance_v * 1e3
                       )
                     ) / 1e3
                   )

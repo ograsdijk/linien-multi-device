@@ -171,6 +171,15 @@ class AutoLockScanSettings(BaseModel):
         default=0.015, ge=0.0, le=1.0,
         description="Constant part of the hysteresis prediction tolerance, sweep volts.",
     )
+    hysteresis_max_extra_tolerance_v: float = Field(
+        default=0.03, ge=0.0, le=1.0,
+        description=(
+            "Ceiling on the extra window a staged step/lock caller may add via "
+            "`selected.extra_tolerance_v`, sweep volts, used only when no "
+            "sideband spacing is known at the frame (with one, the window is "
+            "capped at 0.8 * spacing instead)."
+        ),
+    )
     single_error_min: float = Field(
         default=0.1, ge=0.0, le=4.0,
         description="Min stronger single lobe when single-side allowed (plot units).",
@@ -231,6 +240,10 @@ class StagedAutolockSelected(BaseModel):
     model_config = ConfigDict(extra="forbid")
     frame_id: int
     target_index: int
+    # Extra hysteresis-window allowance the caller wants on top of the base
+    # `tolerance_v` (e.g. laser drift between frames). Capped server-side, see
+    # StagedAutolockHysteresis. 0 (default) enforces the base window exactly.
+    extra_tolerance_v: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
 
 
 class StagedAutolockGeometry(BaseModel):
@@ -253,6 +266,16 @@ class StagedAutolockHysteresis(BaseModel):
     nothing: ``delta_lower_v`` and ``predicted_shift_v`` are 0.0 and
     ``tolerance_v`` is just the floor. Documentation and contract test only:
     the staged endpoints return plain dicts of this shape.
+
+    ``tolerance_v`` is the BASE tolerance, and is what the per-candidate
+    ``identity_ok`` annotation uses (it cannot know the caller's extra). The
+    window actually enforced on a selection is ``tolerance_v +
+    selected.extra_tolerance_v``, capped for slip safety: at ``0.8 *
+    sideband_offset_v`` (total window) when a spacing is known at the frame,
+    else at ``tolerance_v + hysteresis_max_extra_tolerance_v``. It never drops
+    below ``tolerance_v``. The response of the step that judged a selection
+    reports it as ``applied_window_v`` (null when that call judged nothing:
+    the first step of a run) and in full as ``selection_window``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -262,6 +285,10 @@ class StagedAutolockHysteresis(BaseModel):
     tolerance_v: float
     old_geometry: StagedAutolockGeometry
     new_geometry: StagedAutolockGeometry
+    # Only on `step` responses: the window enforced on the selection that
+    # call consumed (see the class docstring), and its breakdown.
+    applied_window_v: Optional[float] = None
+    selection_window: Optional[dict[str, Any]] = None
 
 
 class StagedAutolockBeginRequest(BaseModel):

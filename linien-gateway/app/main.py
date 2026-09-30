@@ -1479,6 +1479,9 @@ def calibrate_auto_lock_scan(key: str, payload: AutoLockCalibrateRequest) -> dic
 
 def _staged_autolock_http_error(exc: StagedAutolockError) -> HTTPException:
     detail: Any = str(exc)
+    if exc.details:
+        # e.g. a hysteresis-window refusal, with the window it applied.
+        detail = {"message": str(exc), **exc.details}
     return HTTPException(status_code=exc.status_code, detail=detail)
 
 
@@ -1562,7 +1565,14 @@ async def staged_autolock_step(
     predicted to have moved it to (422 otherwise, see the `hysteresis` block
     -- `StagedAutolockHysteresis`). The response carries that block for THIS
     step's own geometry change; the candidates on the new frame are annotated
-    `identity_ok: false` when outside the window.
+    `identity_ok: false` when outside the window (base tolerance: the
+    annotation cannot know the caller's extra).
+
+    `selected.extra_tolerance_v` (>= 0, default 0) widens the enforced window
+    to `tolerance_v + extra`, capped at 0.8 x the sideband spacing when one is
+    known (else at `hysteresis_max_extra_tolerance_v` of extra). The response's
+    `hysteresis.applied_window_v` / `selection_window` report what was applied;
+    a refusal's `detail` is `{"message", "hysteresis_window": {...}}`.
     """
     session = _get_session(key)
     try:
@@ -1571,6 +1581,7 @@ async def staged_autolock_step(
             token,
             payload.selected.frame_id,
             payload.selected.target_index,
+            payload.selected.extra_tolerance_v,
         )
     except StagedAutolockError as exc:
         raise _staged_autolock_http_error(exc)
@@ -1595,6 +1606,7 @@ async def staged_autolock_lock(
             token,
             payload.selected.frame_id,
             payload.selected.target_index,
+            payload.selected.extra_tolerance_v,
         )
     except StagedAutolockError as exc:
         _emit_log(

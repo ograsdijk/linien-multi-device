@@ -125,7 +125,7 @@ def test_step_route_maps_a_raw_value_error_to_422_not_500(monkeypatch):
     class RawValueErrorSession:
         control = object()
 
-        def staged_autolock_step(self, token, frame_id, target_index):
+        def staged_autolock_step(self, token, frame_id, target_index, extra_tolerance_v=0.0):
             raise ValueError("no candidate at the new geometry")
 
     session = RawValueErrorSession()

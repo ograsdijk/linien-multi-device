@@ -24,6 +24,11 @@ import pytest
 import app.session as session_module
 from app.auto_lock_scan import AutoLockScanResult, AutoLockScanSettings
 from app.lock_acceptance import AcceptanceSettings
+from app.lock_refinement import (
+    bounded_recenter_v,
+    center_step_allowance_v,
+    min_safe_amplitude_v,
+)
 from app.session import DeviceSession
 
 FEATURE_V = 0.20
@@ -975,7 +980,7 @@ def test_losing_the_feature_while_narrowing_does_not_fall_back(monkeypatch):
 # walk never recovered: the next coarse detection came back 255 mV away.
 
 def _recenter(center, target, amplitude):
-    return DeviceSession._bounded_recenter_v(center, target, amplitude)
+    return bounded_recenter_v(center, target, amplitude)
 
 
 def test_the_rail_clamp_cannot_exceed_the_step_bound():
@@ -1267,10 +1272,10 @@ def test_the_centre_step_is_bounded_by_the_signal_not_the_scan_width():
     """0.25 x a 0.6 V half-range is 150 mV -- 4.6 sideband spacings on this
     device, enough for one step to vault over a neighbouring feature. The scan
     width is an operator setting; the distance to the next feature is not."""
-    scan_width_bound = DeviceSession._bounded_recenter_v(0.2, 1.0, 0.6)
+    scan_width_bound = bounded_recenter_v(0.2, 1.0, 0.6)
     assert scan_width_bound == pytest.approx(0.35)  # 150 mV
 
-    signal_bound = DeviceSession._bounded_recenter_v(
+    signal_bound = bounded_recenter_v(
         0.2, 1.0, 0.6, signal_width_v=2 * 0.0325, max_signal_widths=1.0
     )
     assert signal_bound == pytest.approx(0.2 + 0.065)  # one signal width
@@ -1279,14 +1284,14 @@ def test_the_centre_step_is_bounded_by_the_signal_not_the_scan_width():
 def test_the_scan_width_rule_still_caps_a_huge_signal_width():
     """Whichever is tighter: a broad signal must not license a bigger step than
     the scan-width rule allowed."""
-    moved = DeviceSession._bounded_recenter_v(
+    moved = bounded_recenter_v(
         0.0, 1.0, 0.4, signal_width_v=0.9, max_signal_widths=4.0
     )
     assert moved == pytest.approx(0.1)  # 0.25 x 0.4, not 4 x 0.9
 
 
 def test_an_unmeasured_signal_width_falls_back_to_the_scan_rule():
-    moved = DeviceSession._bounded_recenter_v(
+    moved = bounded_recenter_v(
         0.0, 1.0, 0.6, signal_width_v=None, max_signal_widths=1.0
     )
     assert moved == pytest.approx(0.15)
@@ -1304,63 +1309,67 @@ def test_the_allowance_is_the_same_for_a_width_change_and_a_centre_step():
     settings = AutoLockScanSettings.from_mapping(
         {"signal_type": "pdh", "max_center_step_signal_widths": 1.0}
     )
-    allowance = DeviceSession._center_step_allowance_v(settings, 0.6, 0.0325)
+    allowance = center_step_allowance_v(settings, 0.6, 0.0325)
     assert allowance == pytest.approx(0.065)  # one signal width, not 0.25 x 0.6
 
-    step = DeviceSession._bounded_recenter_v(
+    step = bounded_recenter_v(
         0.0, 1.0, 0.6, signal_width_v=2 * 0.0325, max_signal_widths=1.0
     )
     assert step == pytest.approx(allowance)
 
 
-def test_a_narrowing_that_moves_the_feature_too_far_gentles_the_next_one(monkeypatch):
-    """The field numbers: a 50% width cut moved the target 73 mV against a
-    65 mV allowance, so the next cut must be gentler than 50%."""
-    session, _board = _make_session(
-        monkeypatch, _no_error, approach={"enabled": False}
-    )
-    session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
-    # Pinned, not inherited: this test is about how one cut sizes the next, so
-    # the goal must not move when the default lock width is retuned.
-    session.auto_lock_scan_settings["min_signal_scan_fraction"] = 0.25
-    widths: list[float] = []
-    monkeypatch.setattr(
-        session, "_set_sweep_geometry",
-        lambda c, a, settle_s=0.0: (widths.append(a), time.time())[1],
-    )
-    monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
-    # Each capture reports the geometry it was asked for, and a target that has
-    # moved 73 mV per 50% width cut -- 146 mV per unit fraction.
-    state = {"target": 0.5457}
+def test_a_wide_hysteresis_tolerance_gentles_the_walks_first_cut(monkeypatch):
+    """Nothing is learned between stages any more: the walk gentles a cut only
+    when the model's UNCERTAINTY for it (tol * amplitude per unit width
+    fraction) exceeds the centre-step allowance. Same field geometry, run twice:
+    the default tolerance leaves the 50% schedule alone, a wide one
+    (0.5 per V: 0.3 V of uncertainty per unit fraction against a 65 mV allowance)
+    forces a strictly gentler first cut."""
 
-    def _capture(settings, traces=None, after=None):
-        amplitude = widths[-1]
-        state["target"] -= 0.1464 * (1.0 - amplitude / 0.6) if amplitude < 0.6 else 0.0
-        return _result(state["target"], 0.0325), 0.4, amplitude, 0.001778 * 2047 / (2 * amplitude)
-
-    monkeypatch.setattr(session, "_capture_auto_lock_target", _capture)
-
-    try:
-        session._trajectory_refine_auto_lock(
-            AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
-            AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
-            0.4, 0.6,
-            initial_target=_result(0.5457, 0.0325),
-            initial_center_v=0.4, initial_amplitude_v=0.6,
-            initial_resolution=3.03,
-            initial_detector="strict", trace_length=2048,
+    def first_cut(tolerance_per_volt: float | None) -> float:
+        session, _board = _make_session(
+            monkeypatch, _no_error, approach={"enabled": False}
         )
-    except session_module.TrajectoryRefinementAborted:
-        pass  # convergence is not what this asserts
+        session.auto_lock_scan_settings["half_range_sweep_v"] = FIELD_HALF_RANGE_V
+        # Pinned, not inherited: the goal must not move when the default lock
+        # width is retuned.
+        session.auto_lock_scan_settings["min_signal_scan_fraction"] = 0.25
+        if tolerance_per_volt is not None:
+            session.auto_lock_scan_settings[
+                "hysteresis_tolerance_per_volt"
+            ] = tolerance_per_volt
+        widths: list[float] = []
+        monkeypatch.setattr(
+            session, "_set_sweep_geometry",
+            lambda c, a, settle_s=0.0: (widths.append(a), time.time())[1],
+        )
+        monkeypatch.setattr(session, "_restore_sweep_geometry", lambda c, a: True)
+        # Each capture reports the geometry it was asked for; the target sits
+        # where the model predicts it, so no stage is refused on position.
+        monkeypatch.setattr(
+            session, "_capture_auto_lock_target",
+            lambda settings, traces=None, after=None: (
+                _result(0.5457, 0.0325), 0.4, widths[-1],
+                0.001778 * 2047 / (2 * widths[-1]),
+            ),
+        )
+        try:
+            session._trajectory_refine_auto_lock(
+                AutoLockScanSettings.from_mapping(session.auto_lock_scan_settings),
+                AcceptanceSettings.from_mapping(session.lock_acceptance_settings),
+                0.4, 0.6,
+                initial_target=_result(0.5457, 0.0325),
+                initial_center_v=0.4, initial_amplitude_v=0.6,
+                initial_resolution=3.03,
+                initial_detector="strict", trace_length=2048,
+            )
+        except session_module.TrajectoryRefinementAborted:
+            pass  # convergence is not what this asserts
+        assert widths
+        return 1.0 - widths[0] / 0.6
 
-    assert len(widths) >= 2
-    first_cut = 1.0 - widths[0] / 0.6
-    second_cut = 1.0 - widths[1] / widths[0]
-    assert first_cut == pytest.approx(0.5)      # the model's shift is inside the allowance
-    assert second_cut < first_cut, (
-        f"kept cutting {second_cut:.0%} after a {first_cut:.0%} cut moved the "
-        "feature past its allowance"
-    )
+    assert first_cut(None) == pytest.approx(0.5)
+    assert first_cut(0.5) < 0.5 - 0.05
 
 
 # --------------------------------------------- the sweep rails (field case)
@@ -1373,8 +1382,8 @@ def test_a_narrowing_that_moves_the_feature_too_far_gentles_the_next_one(monkeyp
 # outward with the amplitude.
 
 def test_the_minimum_safe_amplitude_keeps_the_target_in_view():
-    safe = DeviceSession._min_safe_amplitude_v(
-        amplitude_v=0.8, offset_v=0.39, shift_per_fraction=0.136, floor_v=0.128
+    safe = min_safe_amplitude_v(
+        amplitude_v=0.8, offset_v=0.39, uncertainty_per_fraction=0.136, floor_v=0.128
     )
     assert safe is not None
     assert 0.45 < safe < 0.55              # a real cut, not a token one
@@ -1383,8 +1392,8 @@ def test_the_minimum_safe_amplitude_keeps_the_target_in_view():
 
 
 def test_no_narrowing_is_safe_when_the_target_is_beyond_the_whole_scan():
-    assert DeviceSession._min_safe_amplitude_v(
-        amplitude_v=0.8, offset_v=0.95, shift_per_fraction=0.136, floor_v=0.128
+    assert min_safe_amplitude_v(
+        amplitude_v=0.8, offset_v=0.95, uncertainty_per_fraction=0.136, floor_v=0.128
     ) is None
 
 
@@ -1439,7 +1448,7 @@ def test_a_centre_on_the_rail_is_recognised_despite_float_noise():
     """1.0 - 0.8 is 0.19999999999999996; a centre reading back as 0.2 is on the
     rail, not past it. An exact comparison let 4e-17 decide whether the rails
     applied at all."""
-    pinned = DeviceSession._bounded_recenter_v(
+    pinned = bounded_recenter_v(
         0.2, 0.59, 0.8, signal_width_v=0.064, max_signal_widths=1.0
     )
     assert pinned == pytest.approx(1.0 - 0.8, abs=1e-12)

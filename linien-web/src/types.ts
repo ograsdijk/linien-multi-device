@@ -302,6 +302,9 @@ export type AutoLockScanSettings = {
   hysteresis_per_volt_lower: number;
   hysteresis_tolerance_per_volt: number;
   hysteresis_floor_v: number;
+  // Cap on the extra window a staged step/lock caller may ask for
+  // (`extra_tolerance_v`) when no sideband spacing is known; sweep volts.
+  hysteresis_max_extra_tolerance_v: number;
 };
 
 export type LockAcceptanceSettings = {
@@ -358,7 +361,6 @@ export type AutoLockScanResult = {
       next_amplitude_v?: number;
       width_shift_v?: number;
       center_shift_v?: number;
-      shift_per_fraction_v?: number | null;
     }>;
     restored?: boolean;
     failure?: string;

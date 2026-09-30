@@ -380,25 +380,6 @@ def test_a_shift_coefficient_past_the_contraction_limit_still_has_a_safe_cut():
     assert shifted <= 0.9 * safe + 1e-9
 
 
-def test_a_shift_coefficient_past_the_contraction_limit__fails_when_iterated():
-    """The pre-fix arithmetic, verbatim, on the same numbers."""
-    candidate = max(_DIVERGENT_FLOOR_V, 1e-9)
-    for _ in range(5):
-        fraction = max(0.0, 1.0 - (candidate / _DIVERGENT_AMPLITUDE_V))
-        candidate = max(
-            (_DIVERGENT_OFFSET_V + _DIVERGENT_SHIFT_PER_FRACTION * fraction) / 0.9,
-            _DIVERGENT_FLOOR_V,
-        )
-    assert candidate >= _DIVERGENT_AMPLITUDE_V, "iteration would have returned a cut"
-    # ... and one more round flips the answer, which is the whole objection.
-    fraction = max(0.0, 1.0 - (candidate / _DIVERGENT_AMPLITUDE_V))
-    candidate = max(
-        (_DIVERGENT_OFFSET_V + _DIVERGENT_SHIFT_PER_FRACTION * fraction) / 0.9,
-        _DIVERGENT_FLOOR_V,
-    )
-    assert candidate < _DIVERGENT_AMPLITUDE_V
-
-
 def test_an_offset_past_the_keep_fraction_of_the_span_has_no_safe_cut():
     """The flat branch: no shift at all, but the target is simply too far out."""
     assert min_safe_amplitude_v(0.2, 0.19, 0.0, 0.01) is None

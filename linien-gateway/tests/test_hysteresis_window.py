@@ -363,6 +363,203 @@ def test_an_adjacent_crossing_slip_is_refused_on_the_next_step(staged):
     staged.staged_autolock_step(token, 2, 10)
 
 
+# ------------------------------------------- the caller's extra allowance
+#
+# Frame 2 of `_narrowed` follows a 0.75 V lower-endpoint change: predicted
+# position 0.11625 V, base tolerance 0.015 * 0.75 + 0.015 = 26.25 mV.
+
+BASE_TOL = 0.015 * 0.75 + 0.015
+PREDICTED = 0.180 - H * 0.75
+
+
+def _narrowed(staged, frame_2, *, keep_frame_spacing=True, first_sideband=0.05):
+    """A run one narrowing step in, with ``frame_2`` as the pending frame."""
+    _detect(staged, [_result(1, 0.180, sideband=first_sideband)], 0.0, 1.0, 1)
+    token = staged.staged_autolock_begin(None, 60.0)["token"]
+    _detect(staged, frame_2, 0.05, 0.3, 2)
+    staged.staged_autolock_step(token, 1, 1)
+    if not keep_frame_spacing:
+        staged._staged_autolock.latest_frame["sideband_spacing_samples"] = None
+    return token
+
+
+def _pick_frame3(staged, token, target_index, extra):
+    # A done frame after the pick, so the accepted step has something to detect.
+    _detect(staged, [_result(20, PREDICTED, sideband=0.5)], 0.05, 0.3, 3)
+    return staged.staged_autolock_step(token, 2, target_index, extra)
+
+
+def test_a_selection_inside_the_callers_extra_window_is_accepted(staged):
+    token = _narrowed(staged, [_result(10, PREDICTED + 0.035, sideband=0.05)])
+    # 35 mV off: outside the 26.25 mV base window, inside 26.25 + 12 mV.
+    step = _pick_frame3(staged, token, 10, 0.012)
+    window = step["hysteresis"]["selection_window"]
+    assert step["hysteresis"]["applied_window_v"] == pytest.approx(BASE_TOL + 0.012)
+    assert window["extra_tolerance_requested_v"] == pytest.approx(0.012)
+    assert window["extra_tolerance_applied_v"] == pytest.approx(0.012)
+    assert window["extra_tolerance_capped"] is False
+    schemas.StagedAutolockHysteresis.model_validate(step["hysteresis"])
+    # The measured-vs-predicted record keeps the window that judged it.
+    record = staged._staged_autolock.stages[-1]["hysteresis"]
+    assert record["selection_window"]["applied_window_v"] == pytest.approx(BASE_TOL + 0.012)
+
+
+def test_a_selection_beyond_the_extra_window_is_refused_with_the_window_reported(staged):
+    token = _narrowed(staged, [_result(10, PREDICTED + 0.045, sideband=0.05)])
+    with pytest.raises(StagedAutolockError, match="hysteresis window") as excinfo:
+        staged.staged_autolock_step(token, 2, 10, 0.012)
+    assert excinfo.value.status_code == 422
+    window = excinfo.value.details["hysteresis_window"]
+    assert window["applied_window_v"] == pytest.approx(BASE_TOL + 0.012)
+    assert window["extra_tolerance_requested_v"] == pytest.approx(0.012)
+    assert window["extra_tolerance_applied_v"] == pytest.approx(0.012)
+    assert window["extra_tolerance_capped"] is False
+    assert window["candidate_v"] == pytest.approx(PREDICTED + 0.045)
+    assert window["predicted_v"] == pytest.approx(PREDICTED)
+    # The message quotes the window that was applied, not the base tolerance.
+    assert f"{(BASE_TOL + 0.012) * 1e3:.1f} mV" in str(excinfo.value)
+
+
+def test_without_an_extra_the_base_window_is_enforced_unchanged(staged):
+    token = _narrowed(staged, [_result(10, PREDICTED + 0.035, sideband=0.05)])
+    with pytest.raises(StagedAutolockError) as excinfo:
+        staged.staged_autolock_step(token, 2, 10)
+    window = excinfo.value.details["hysteresis_window"]
+    assert window["applied_window_v"] == pytest.approx(BASE_TOL)
+    assert window["extra_tolerance_requested_v"] == 0.0
+    assert window["extra_tolerance_capped"] is False
+
+
+def test_the_annotation_uses_the_base_tolerance_only(staged):
+    """`identity_ok` cannot know the caller's extra: a candidate a 12 mV extra
+    would accept is still annotated false."""
+    _detect(staged, [_result(1, 0.180, sideband=0.05)], 0.0, 1.0, 1)
+    token = staged.staged_autolock_begin(None, 60.0)["token"]
+    _detect(staged, [_result(10, PREDICTED + 0.035, sideband=0.05)], 0.05, 0.3, 2)
+    step = staged.staged_autolock_step(token, 1, 1)
+    assert step["candidates"][0]["identity_ok"] is False
+    assert step["hysteresis"]["tolerance_v"] == pytest.approx(BASE_TOL)
+    # The first step judged nothing.
+    assert step["hysteresis"]["applied_window_v"] is None
+    assert step["hysteresis"]["selection_window"] is None
+
+
+def test_a_known_sideband_spacing_caps_the_whole_window_at_80_percent(staged):
+    token = _narrowed(staged, [_result(10, PREDICTED + 0.010, sideband=0.05)])
+    run = staged._staged_autolock
+    with staged._state_lock:
+        window = staged._check_pending_hysteresis(run, run.latest_candidates[0], 0.05)
+    assert window["applied_window_v"] == pytest.approx(0.8 * 0.05)
+    assert window["extra_tolerance_applied_v"] == pytest.approx(0.8 * 0.05 - BASE_TOL)
+    assert window["extra_tolerance_requested_v"] == pytest.approx(0.05)
+    assert window["extra_tolerance_capped"] is True
+    assert window["cap_source"] == "sideband_spacing"
+    # A slip of one spacing is outside the capped window whatever was asked.
+    slip = _result(11, PREDICTED + 0.050, sideband=0.05)
+    with staged._state_lock, pytest.raises(StagedAutolockError):
+        staged._check_pending_hysteresis(run, slip, 10.0)
+
+
+def test_the_cap_never_shrinks_the_window_below_the_base_tolerance(staged):
+    _narrowed(staged, [_result(10, PREDICTED, sideband=0.03)])  # 0.8 * 30 mV < base
+    run = staged._staged_autolock
+    with staged._state_lock:
+        window = staged._check_pending_hysteresis(run, run.latest_candidates[0], 0.05)
+    assert window["applied_window_v"] == pytest.approx(BASE_TOL)
+    assert window["extra_tolerance_applied_v"] == 0.0
+    assert window["extra_tolerance_capped"] is True
+
+
+def test_the_spacing_comes_from_the_selection_then_the_best_candidate_then_the_frame(staged):
+    _narrowed(
+        staged,
+        [_result(10, PREDICTED, sideband=0.5), _result(11, PREDICTED + 0.2, sideband=0.6)],
+    )
+    run = staged._staged_autolock
+    pick = _result(12, PREDICTED, sideband=0.4)
+    assert staged._selection_sideband_offset_v(run, pick) == 0.4
+    nameless = _result(12, PREDICTED, sideband=None)
+    assert staged._selection_sideband_offset_v(run, nameless) == 0.5  # best candidate
+    run.latest_candidates[0].sideband_offset_v = None
+    # The frame's 50 samples at 2 * 0.3 V / 2047 samples.
+    assert staged._selection_sideband_offset_v(run, nameless) == pytest.approx(
+        50.0 * 2.0 * 0.3 / 2047
+    )
+    run.latest_frame["sideband_spacing_samples"] = None
+    assert staged._selection_sideband_offset_v(run, nameless) is None
+
+
+def test_without_a_known_spacing_the_extra_is_capped_by_the_setting(staged):
+    _narrowed(
+        staged, [_result(10, PREDICTED, sideband=None)], keep_frame_spacing=False
+    )
+    run = staged._staged_autolock
+    pick = run.latest_candidates[0]
+    with staged._state_lock:
+        window = staged._check_pending_hysteresis(run, pick, 0.05)
+    assert window["cap_source"] == "max_extra_setting"
+    assert window["extra_tolerance_applied_v"] == pytest.approx(0.03)  # the default
+    assert window["applied_window_v"] == pytest.approx(BASE_TOL + 0.03)
+    assert window["extra_tolerance_capped"] is True
+    run.settings = AutoLockScanSettings.from_mapping(
+        {**run.settings.__dict__, "hysteresis_max_extra_tolerance_v": 0.01}
+    )
+    with staged._state_lock:
+        window = staged._check_pending_hysteresis(run, pick, 0.05)
+    assert window["extra_tolerance_applied_v"] == pytest.approx(0.01)
+    with staged._state_lock:  # a request under the cap is applied whole
+        window = staged._check_pending_hysteresis(run, pick, 0.004)
+    assert window["extra_tolerance_applied_v"] == pytest.approx(0.004)
+    assert window["extra_tolerance_capped"] is False
+
+
+def test_lock_takes_the_same_extra_window(staged):
+    token = _narrowed(staged, [_result(10, PREDICTED + 0.035, sideband=0.5)])
+    staged._move_and_lock = lambda *a, **k: None  # type: ignore[method-assign]
+    with pytest.raises(StagedAutolockError, match="hysteresis window"):
+        staged.staged_autolock_lock(token, 2, 10)
+    # With the extra the window check passes; whatever fails later is not it.
+    try:
+        staged.staged_autolock_lock(token, 2, 10, 0.012)
+    except StagedAutolockError as exc:
+        assert "hysteresis window" not in str(exc)
+
+
+def test_the_route_passes_the_extra_and_reports_the_window_in_the_422_detail(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+
+    seen: list[Any] = []
+
+    class Session:
+        control = object()
+
+        def staged_autolock_step(self, token, frame_id, target_index, extra_tolerance_v=0.0):
+            seen.append(extra_tolerance_v)
+            raise StagedAutolockError(
+                "outside", status_code=422,
+                details={"hysteresis_window": {"applied_window_v": 0.04}},
+            )
+
+    monkeypatch.setattr(main, "_get_session", lambda key: Session())
+    client = TestClient(main.app)
+    url = "/api/devices/dev/control/staged_autolock/tok/step"
+    response = client.post(
+        url, json={"selected": {"frame_id": 1, "target_index": 1, "extra_tolerance_v": 0.012}}
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "message": "outside", "hysteresis_window": {"applied_window_v": 0.04},
+    }
+    client.post(url, json={"selected": {"frame_id": 1, "target_index": 1}})
+    assert seen == [0.012, 0.0]
+    bad = client.post(
+        url, json={"selected": {"frame_id": 1, "target_index": 1, "extra_tolerance_v": -0.001}}
+    )
+    assert bad.status_code == 422 and len(seen) == 2
+
+
 def test_lock_straight_after_a_step_refuses_a_slipped_selection(staged):
     _detect(staged, [_result(1, 0.180, sideband=0.5)], 0.0, 1.0, 1)
     token = staged.staged_autolock_begin(None, 60.0)["token"]
@@ -479,6 +676,7 @@ def test_defaults_match_the_measured_model():
     assert settings.hysteresis_per_volt_lower == pytest.approx(0.085)
     assert settings.hysteresis_tolerance_per_volt == pytest.approx(0.015)
     assert settings.hysteresis_floor_v == pytest.approx(0.015)
+    assert settings.hysteresis_max_extra_tolerance_v == pytest.approx(0.03)
 
 
 @pytest.mark.parametrize(
@@ -490,6 +688,8 @@ def test_defaults_match_the_measured_model():
         ("hysteresis_tolerance_per_volt", -0.001),
         ("hysteresis_floor_v", -0.001),
         ("hysteresis_floor_v", float("inf")),
+        ("hysteresis_max_extra_tolerance_v", -0.001),
+        ("hysteresis_max_extra_tolerance_v", float("nan")),
     ],
 )
 def test_the_engine_refuses_out_of_range_hysteresis_settings(field, bad):

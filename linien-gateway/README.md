@@ -143,8 +143,8 @@ best-score; if the chosen candidate is missing or fails `IdentityGuard`
 | POST | `/api/devices/{key}/control/staged_autolock/begin` | `{settings?: AutoLockScanSettings, ttl_s: float}` | Requires the device unlocked + sweeping, and the sweep-center actuator free (see "Concurrency" below) — all checked *before* the restart-and-capture trigger that acquires the first frame runs, since that trigger switches the lock off. Saves the current geometry for restore. Detects strict on the fresh frame, falling back to the coarse detector when strict finds nothing (the wide-scan case trajectory refinement exists for); only when *both* find nothing are `candidates` empty. Returns `{token, expires_at, geometry, frame, candidates, detector, detail, stage_index: 0, hysteresis}` (`hysteresis` per "Piezo-hysteresis model" below, with `delta_lower_v: 0.0`) — `detector` is `"strict"` or `"coarse"`; `detail` is non-null only when both detectors found nothing. **409** if a staged run is already active, the device is locked, or a one-shot refinement walk holds the sweep-center actuator. |
 | POST | `/api/devices/{key}/control/staged_autolock/{token}/renew` | `{ttl_s: float}` | → `{expires_at}`. |
 | GET | `/api/devices/{key}/control/staged_autolock/` | — | Current run state, or `{"active": false}`. |
-| POST | `/api/devices/{key}/control/staged_autolock/{token}/step` | `{selected: {frame_id: int, target_index: int}}` | `frame_id` must be the most recent frame this run has returned (from `begin`/`step`, or an `auto_lock_candidates?acquire=true` call made while the run is active) — a stale `frame_id` is **409**. Plans + applies the next geometry from the selected candidate (existing planner: safe centre-move bounds, narrowing) under the same sweep-center exclusivity `begin` checks (**409** if a one-shot walk holds it), then detects strict on the fresh frame with the same strict-then-coarse fallback `begin` uses, and returns **every** candidate on it, each annotated `identity_ok`/`identity_reason` (`IdentityGuard.check`, evaluated **without** mutating the guard baseline unless that candidate is later actually selected) and `lockable_here` (true only when the strict detector itself produced that candidate at the current geometry and its own sideband spacing is not too wide for this scan — never inferred, never score-based). Response: `{stage_index, geometry, frame, candidates, expires_at, needs_more_refinement, planner, hysteresis}`. The selected candidate must sit within the previous step's predicted window (**422** otherwise, see "Piezo-hysteresis model"); candidates outside it are annotated `identity_ok: false` with an `identity_reason` naming the numbers. A planner abort is **422** `{detail}`, but the run stays active so the caller can still `abort` it (restoring geometry). If the geometry write lands but detection then fails (no candidate at the new geometry, or no fresh sweep arrived), the run's geometry/frame bookkeeping is brought back in line with the device's ACTUAL (already-moved) geometry — never left pointing at the pre-move one — `stage_index` advances, `candidates` is cleared, the run stays active, and this is **422** ("no candidate at the new geometry — abort or retry"). |
-| POST | `/api/devices/{key}/control/staged_autolock/{token}/lock` | `{selected: {frame_id, target_index}}` | **422** unless the run's current detector is `"strict"` and the selected candidate's own sideband spacing is not too wide to lock at the run's current geometry (`"not lockable at this geometry -- step first"` — the same rule `lockable_here` and the one-shot loop apply). Otherwise, runs the existing final strict verification on the selected candidate at the **current** (geometry-unchanged) frame, aligned with the one-shot's own final verification there: `check_sideband=False` (a freshly-narrowed run's own sideband estimate is the thing under test, not a gate on it), same slope, `IdentityGuard` ok, nearest crossing within a small tolerance — required on **two consecutive fresh frames**, not one, before the actuator is ever moved. Then the existing lock handoff. **422** and no lock if ambiguous/missing/inconsistent across the two frames. Response is an `AutoLockScanResult`-shaped dict plus a `refinement` log. Ends the run. |
+| POST | `/api/devices/{key}/control/staged_autolock/{token}/step` | `{selected: {frame_id: int, target_index: int, extra_tolerance_v?: float >= 0}}` | `frame_id` must be the most recent frame this run has returned (from `begin`/`step`, or an `auto_lock_candidates?acquire=true` call made while the run is active) — a stale `frame_id` is **409**. Plans + applies the next geometry from the selected candidate (existing planner: safe centre-move bounds, narrowing) under the same sweep-center exclusivity `begin` checks (**409** if a one-shot walk holds it), then detects strict on the fresh frame with the same strict-then-coarse fallback `begin` uses, and returns **every** candidate on it, each annotated `identity_ok`/`identity_reason` (`IdentityGuard.check`, evaluated **without** mutating the guard baseline unless that candidate is later actually selected) and `lockable_here` (true only when the strict detector itself produced that candidate at the current geometry and its own sideband spacing is not too wide for this scan — never inferred, never score-based). Response: `{stage_index, geometry, frame, candidates, expires_at, needs_more_refinement, planner, hysteresis}`. The selected candidate must sit within the previous step's predicted window, widened by `selected.extra_tolerance_v` and capped (**422** otherwise, whose `detail` is then `{message, hysteresis_window}`; see "Piezo-hysteresis model"); candidates outside it are annotated `identity_ok: false` with an `identity_reason` naming the numbers. A planner abort is **422** `{detail}`, but the run stays active so the caller can still `abort` it (restoring geometry). If the geometry write lands but detection then fails (no candidate at the new geometry, or no fresh sweep arrived), the run's geometry/frame bookkeeping is brought back in line with the device's ACTUAL (already-moved) geometry — never left pointing at the pre-move one — `stage_index` advances, `candidates` is cleared, the run stays active, and this is **422** ("no candidate at the new geometry — abort or retry"). |
+| POST | `/api/devices/{key}/control/staged_autolock/{token}/lock` | `{selected: {frame_id, target_index, extra_tolerance_v?}}` | **422** unless the run's current detector is `"strict"` and the selected candidate's own sideband spacing is not too wide to lock at the run's current geometry (`"not lockable at this geometry -- step first"` — the same rule `lockable_here` and the one-shot loop apply). Otherwise, runs the existing final strict verification on the selected candidate at the **current** (geometry-unchanged) frame, aligned with the one-shot's own final verification there: `check_sideband=False` (a freshly-narrowed run's own sideband estimate is the thing under test, not a gate on it), same slope, `IdentityGuard` ok, nearest crossing within a small tolerance — required on **two consecutive fresh frames**, not one, before the actuator is ever moved. Then the existing lock handoff. **422** and no lock if ambiguous/missing/inconsistent across the two frames. Response is an `AutoLockScanResult`-shaped dict plus a `refinement` log and `hysteresis: {applied_window_v, selection_window}` (the window that judged the selection; both null when nothing was pending). The same hysteresis window (with `extra_tolerance_v`) is enforced before the verification. Ends the run. |
 | POST | `/api/devices/{key}/control/staged_autolock/{token}/abort` | — | Restores the saved geometry, ends the run. `{"restored": true}`. |
 
 `StagedAutolockError.status_code` (`app/session.py`) maps every staged-API
@@ -187,7 +187,7 @@ lasers: `h` = 0.083-0.086, symmetric for narrowing and widening, about 98% of
 it present in the first frame, residual sigma 3-6 mV. The model fails when the
 feature is within about 50 mV of the lower scan edge (`c - a`), and its real
 failure mode is a slip onto an adjacent crossing, about one sideband spacing
-(20-60 mV) away. It replaces the old `shift_per_fraction` bookkeeping, which
+(20-60 mV) away. It replaced the old bookkeeping (`shift_per_fraction`), which
 learned `|delta target| / (1 - a_new/a_old)` (the wrong variable: it scales
 with amplitude), threw the sign away and max-latched one contaminated reading
 for the rest of the walk. Nothing is learned any more; `h` is a per-device
@@ -202,6 +202,7 @@ has a "Hysteresis" group in the "Auto-lock from scan" section):
 | `hysteresis_per_volt_lower` | 0.085 | 0 <= h <= 0.5 | `h` above. 0 turns pre-compensation off (the tolerance window still applies, around "no shift"). |
 | `hysteresis_tolerance_per_volt` | 0.015 | >= 0 | Tolerance growth per volt of `|dL|`. |
 | `hysteresis_floor_v` | 0.015 | >= 0 | Constant part of the tolerance (15 mV; a quiet laser can be set lower per device). Shown as "Floor (mV)" in the UI, stored in volts. |
+| `hysteresis_max_extra_tolerance_v` | 0.03 | >= 0 | Ceiling on the caller's extra window (below) when no sideband spacing is known. Shown as "Max extra tolerance (mV)" in the UI, stored in volts. |
 
 `tolerance_v = hysteresis_tolerance_per_volt * |dL| + hysteresis_floor_v`.
 
@@ -259,6 +260,37 @@ carries (`schemas.StagedAutolockHysteresis`):
   "new_geometry": {"center_v": 0.05, "amplitude_v": 0.3}
 }
 ```
+
+**The caller's extra allowance (`extra_tolerance_v`).** A caller that chooses
+its selection by pattern matching may accept a wider window than the model's
+own (laser drift between frames, edge widening). `step` and `lock` therefore
+accept `selected.extra_tolerance_v` (>= 0, default 0), and the window enforced
+on the selection is
+
+    applied_window_v = max(tolerance_v, min(tolerance_v + extra, cap))
+
+with `cap = 0.8 * sideband_spacing` (a cap on the TOTAL window, so a slip of one
+spacing is never inside it) when a spacing is known at the frame, and
+`cap = tolerance_v + hysteresis_max_extra_tolerance_v` otherwise. The spacing is
+the most reliable one available: the selected candidate's own
+`sideband_offset_v`, else the best candidate's, else the frame's
+`sideband_spacing_samples` converted to volts at the run's amplitude. The window
+never drops below the base `tolerance_v` (a spacing under 1.25x the base
+tolerance cannot shrink it), and `extra = 0` is exactly the base behaviour.
+The per-candidate `identity_ok` annotation always uses the base tolerance: it
+is computed before the caller's extra is known.
+
+The `hysteresis` block of a `step` response (and `hysteresis` of a `lock`
+response) reports what THIS call enforced on its own selection, next to the
+block's prediction for the geometry change it just made:
+`applied_window_v` and `selection_window` (`applied_window_v`,
+`base_tolerance_v`, `extra_tolerance_requested_v`, `extra_tolerance_applied_v`,
+`extra_tolerance_capped`, `cap_window_v`, `cap_source`
+(`"sideband_spacing"`/`"max_extra_setting"`), `sideband_offset_v`); both are
+null when nothing was pending (the first step of a run). A refused selection's
+422 `detail` is `{"message": ..., "hysteresis_window": {...selection_window,
+"candidate_v", "predicted_v"}}`. The window also rides on the stage's
+diagnostic record as `selection_window`.
 
 `begin` and a `done` step (nothing moved) report `delta_lower_v` and
 `predicted_shift_v` of 0.0, `tolerance_v` equal to the floor, and identical old

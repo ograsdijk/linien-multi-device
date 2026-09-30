@@ -129,6 +129,11 @@ class AutoLockScanSettings:
     # laser can run lower.
     hysteresis_tolerance_per_volt: float = 0.015
     hysteresis_floor_v: float = 0.015
+    # Ceiling on the EXTRA window a staged step/lock caller may ask for
+    # (`selected.extra_tolerance_v`: e.g. laser drift between frames) when no
+    # sideband spacing is known to cap it by instead. With a known spacing the
+    # window is capped at 0.8 * spacing, so this does not apply.
+    hysteresis_max_extra_tolerance_v: float = 0.03
 
     def __post_init__(self) -> None:
         # Same bounds as the pydantic schema, so a mapping that bypasses the HTTP
@@ -138,6 +143,7 @@ class AutoLockScanSettings:
             ("hysteresis_per_volt_lower", 0.5),
             ("hysteresis_tolerance_per_volt", None),
             ("hysteresis_floor_v", None),
+            ("hysteresis_max_extra_tolerance_v", None),
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0 or (

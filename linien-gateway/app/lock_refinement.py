@@ -20,6 +20,7 @@ once, and records every one of them in ``RefinementStep.bounds``.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -192,8 +193,59 @@ def hysteresis_block(
     }
 
 
+# Slip safety: however much extra a caller asks for, the whole window stays
+# under this fraction of the sideband spacing, so a slip onto the adjacent
+# crossing (one spacing away) can never fall inside it.
+HYSTERESIS_WINDOW_MAX_SPACING_FRACTION = 0.8
+
+
+def hysteresis_selection_window(
+    base_tolerance_v: float,
+    extra_requested_v: float,
+    sideband_offset_v: float | None,
+    max_extra_v: float,
+) -> dict[str, Any]:
+    """The window enforced on a caller's selection: base tolerance plus the
+    caller's requested extra, capped.
+
+    With a known sideband spacing the TOTAL is capped at ``0.8 * spacing``;
+    without one the extra is capped at ``max_extra_v``
+    (``hysteresis_max_extra_tolerance_v``). The window never drops below
+    ``base_tolerance_v``, so ``extra == 0`` is exactly the base behaviour.
+    """
+    base = float(base_tolerance_v)
+    requested = max(0.0, float(extra_requested_v))
+    spacing = (
+        float(sideband_offset_v)
+        if sideband_offset_v is not None and math.isfinite(float(sideband_offset_v))
+        and float(sideband_offset_v) > 0.0
+        else None
+    )
+    if spacing is not None:
+        cap_window = HYSTERESIS_WINDOW_MAX_SPACING_FRACTION * spacing
+        cap_source = "sideband_spacing"
+    else:
+        cap_window = base + max(0.0, float(max_extra_v))
+        cap_source = "max_extra_setting"
+    window = max(base, min(base + requested, cap_window))
+    applied = window - base
+    return {
+        "applied_window_v": window,
+        "base_tolerance_v": base,
+        "extra_tolerance_requested_v": requested,
+        "extra_tolerance_applied_v": applied,
+        "extra_tolerance_capped": applied < requested - 1e-12,
+        "cap_window_v": cap_window,
+        "cap_source": cap_source,
+        "sideband_offset_v": spacing,
+    }
+
+
 def hysteresis_window_violation(
-    block: dict[str, Any], before_v: float, candidate_v: float
+    block: dict[str, Any],
+    before_v: float,
+    candidate_v: float,
+    tolerance_v: float | None = None,
 ) -> str | None:
     """Why ``candidate_v`` is not the feature that was at ``before_v``, or None.
 
@@ -202,9 +254,12 @@ def hysteresis_window_violation(
     and sideband spacing match: on a PDH scan every adjacent crossing looks
     like the tracked one, and a slip of one sideband spacing (20-60 mV) is
     precisely the failure the position is the only witness to.
+
+    ``tolerance_v`` overrides the block's base tolerance (the staged API's
+    caller-widened window, see ``hysteresis_selection_window``).
     """
     predicted_v = float(before_v) + float(block["predicted_shift_v"])
-    tolerance_v = float(block["tolerance_v"])
+    tolerance_v = float(block["tolerance_v"] if tolerance_v is None else tolerance_v)
     miss_v = float(candidate_v) - predicted_v
     if abs(miss_v) <= tolerance_v:
         return None
@@ -330,7 +385,7 @@ def center_step_allowance_v(
 def min_safe_amplitude_v(
     amplitude_v: float,
     offset_v: float,
-    shift_per_fraction: float | None,
+    uncertainty_per_fraction: float | None,
     floor_v: float,
 ) -> float | None:
     """Smallest amplitude that still leaves the target inside the window.
@@ -348,19 +403,16 @@ def min_safe_amplitude_v(
 
     Two effects race. A smaller window brings its own edge closer to the
     target, and the width change moves the target as well (the planner passes
-    ``shift_per_fraction = tol * amplitude``: the hysteresis model's uncertainty
-    for a full-width cut at a fixed centre). Solve for the SMALLEST amplitude that still
-    contains the target after the shift reaching it causes -- the floor a
-    caller may narrow down to, not a ceiling it may narrow past. (This
-    docstring used to say "widest, not smallest" from before the function
-    was renamed from ``_widest_safe_narrowing_v`` -- backwards against the
-    function it described, and the same misreading that once had a caller
-    take ``min()`` of this floor against the schedule instead of ``max()``.)
+    ``uncertainty_per_fraction = tol * amplitude``: the hysteresis model's
+    uncertainty for a full-width cut at a fixed centre). Solve for the SMALLEST
+    amplitude that still contains the target after the shift reaching it
+    causes -- the floor a caller may narrow down to, not a ceiling it may
+    narrow past.
     ``None`` when no cut is safe.
     """
     amplitude = abs(float(amplitude_v))
     offset = abs(float(offset_v))
-    spf = max(0.0, float(shift_per_fraction or 0.0))
+    spf = max(0.0, float(uncertainty_per_fraction or 0.0))
     if amplitude <= 1e-12:
         return None
     # Solved, not iterated. The requirement is

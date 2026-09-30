@@ -55,11 +55,9 @@ from .lock_refinement import (
     _MAX_REFINEMENT_STAGES,
     _TrackingIdentityChanged,
     IdentityGuard,
-    bounded_recenter_v,
-    center_step_allowance_v,
     hysteresis_block,
+    hysteresis_selection_window,
     hysteresis_window_violation,
-    min_safe_amplitude_v,
     plan_refinement_step,
 )
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
@@ -177,6 +175,16 @@ STAGED_AUTOLOCK_MAX_TTL_S = 3600.0
 STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES = 3.0
 
 
+def _selection_window_fields(window: dict[str, Any] | None) -> dict[str, Any]:
+    """The `applied_window_v`/`selection_window` keys of a step response's
+    `hysteresis` block: what THIS call enforced on the caller's selection
+    (both None when it judged nothing -- the first step of a run)."""
+    return {
+        "applied_window_v": None if window is None else window["applied_window_v"],
+        "selection_window": window,
+    }
+
+
 class StagedAutolockError(RuntimeError):
     """A staged auto-lock request could not be carried out.
 
@@ -188,9 +196,18 @@ class StagedAutolockError(RuntimeError):
     here rather than silently falling back to a different target.
     """
 
-    def __init__(self, message: str, *, status_code: int = 422) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 422,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        # Structured context for the HTTP detail (a hysteresis-window refusal
+        # reports the window it applied). None: the detail is just the message.
+        self.details = details
 
 
 @dataclasses.dataclass
@@ -3131,44 +3148,6 @@ class DeviceSession:
             self.control.exposed_start_lock()
 
 
-    # The three static helpers below used to hold this arithmetic directly.
-    # It now lives in lock_refinement.py (moved unchanged) alongside the rest
-    # of the trajectory-refinement planning; these delegates exist only so
-    # existing callers -- production and test alike -- keep working unchanged.
-    @staticmethod
-    def _min_safe_amplitude_v(
-        amplitude_v: float,
-        offset_v: float,
-        shift_per_fraction: float | None,
-        floor_v: float,
-    ) -> float | None:
-        return min_safe_amplitude_v(amplitude_v, offset_v, shift_per_fraction, floor_v)
-
-    @staticmethod
-    def _center_step_allowance_v(
-        settings: AutoLockScanSettings,
-        amplitude_v: float,
-        sideband_offset_v: float | None,
-    ) -> float:
-        return center_step_allowance_v(settings, amplitude_v, sideband_offset_v)
-
-    @staticmethod
-    def _bounded_recenter_v(
-        center_v: float,
-        target_v: float,
-        amplitude_v: float,
-        *,
-        signal_width_v: float | None = None,
-        max_signal_widths: float = 0.0,
-    ) -> float:
-        return bounded_recenter_v(
-            center_v,
-            target_v,
-            amplitude_v,
-            signal_width_v=signal_width_v,
-            max_signal_widths=max_signal_widths,
-        )
-
     def _set_sweep_geometry(
         self, center_v: float, amplitude_v: float, *, settle_s: float = 0.0
     ) -> float:
@@ -3972,34 +3951,93 @@ class DeviceSession:
 
     @staticmethod
     def _pending_hysteresis_violation(
-        run: "StagedAutolockRun", candidate: Any
+        run: "StagedAutolockRun", candidate: Any, tolerance_v: float | None = None
     ) -> str | None:
         """Why ``candidate`` is not the previously selected feature after the
         geometry change that produced the run's current frame, or None.
 
         None too when the current frame was not produced by a geometry change.
-        Non-mutating: it also annotates every candidate on the frame.
+        Non-mutating: it also annotates every candidate on the frame, with the
+        BASE tolerance (``tolerance_v`` None) -- the annotation cannot know the
+        extra a caller will ask for on the selection.
         """
         pending = run.pending_shift
         if pending is None:
             return None
         return hysteresis_window_violation(
             pending["hysteresis"], float(pending["before_v"]),
-            float(candidate.target_voltage),
+            float(candidate.target_voltage), tolerance_v,
+        )
+
+    @staticmethod
+    def _selection_sideband_offset_v(
+        run: "StagedAutolockRun", selected: Any
+    ) -> float | None:
+        """The sideband spacing (sweep volts) that caps the selection window.
+
+        Most reliable first: the selected candidate's own measured
+        ``sideband_offset_v`` (the spacing of the very feature being judged),
+        then the best candidate's (``latest_candidates[0]``), then the frame's
+        median ``sideband_spacing_samples`` converted to volts at the run's
+        geometry. None when none is known.
+        """
+        for candidate in (selected, run.latest_candidates[0] if run.latest_candidates else None):
+            offset = getattr(candidate, "sideband_offset_v", None)
+            if offset is not None and float(offset) > 0.0:
+                return float(offset)
+        samples = run.latest_frame.get("sideband_spacing_samples")
+        n_points = int(run.latest_frame.get("n_points") or run.trace_length or 0)
+        if samples is not None and float(samples) > 0.0 and n_points > 1:
+            return float(samples) * 2.0 * abs(run.amplitude_v) / (n_points - 1)
+        return None
+
+    def _pending_selection_window(
+        self, run: "StagedAutolockRun", selected: Any, extra_tolerance_v: float
+    ) -> dict[str, Any] | None:
+        """The window enforced on ``selected`` (base tolerance + the caller's
+        capped extra), or None when the current frame has no pending prediction.
+        Caller must hold `_state_lock`."""
+        pending = run.pending_shift
+        if pending is None:
+            return None
+        return hysteresis_selection_window(
+            float(pending["hysteresis"]["tolerance_v"]),
+            extra_tolerance_v,
+            self._selection_sideband_offset_v(run, selected),
+            run.settings.hysteresis_max_extra_tolerance_v,
         )
 
     def _check_pending_hysteresis(
-        self, run: "StagedAutolockRun", selected: Any
-    ) -> None:
-        """Refuse (422) a selection outside the hysteresis window. Caller must
-        hold `_state_lock`. The pending prediction is kept, so a corrected
+        self, run: "StagedAutolockRun", selected: Any, extra_tolerance_v: float = 0.0
+    ) -> dict[str, Any] | None:
+        """Refuse (422) a selection outside the hysteresis window and return the
+        window it was judged against (None: nothing pending). Caller must hold
+        `_state_lock`. The pending prediction is kept, so a corrected
         selection on the same frame is still judged against it."""
-        reason = self._pending_hysteresis_violation(run, selected)
+        window = self._pending_selection_window(run, selected, extra_tolerance_v)
+        if window is None:
+            return None
+        reason = self._pending_hysteresis_violation(
+            run, selected, window["applied_window_v"]
+        )
         if reason is not None:
-            raise StagedAutolockError(reason, status_code=422)
+            raise StagedAutolockError(
+                reason,
+                status_code=422,
+                details={"hysteresis_window": {
+                    **window,
+                    "candidate_v": float(selected.target_voltage),
+                    "predicted_v": float(run.pending_shift["before_v"])
+                    + float(run.pending_shift["hysteresis"]["predicted_shift_v"]),
+                }},
+            )
+        return window
 
     def _consume_pending_hysteresis(
-        self, run: "StagedAutolockRun", selected: Any
+        self,
+        run: "StagedAutolockRun",
+        selected: Any,
+        window: dict[str, Any] | None = None,
     ) -> None:
         """Record the measured-vs-predicted shift of the stage that produced the
         current frame, now that the caller's selection on it is known and has
@@ -4024,6 +4062,7 @@ class DeviceSession:
                 "before_v": float(pending["before_v"]),
                 "measured_shift_v": measured,
                 "residual_v": measured - block["predicted_shift_v"],
+                **({"selection_window": window} if window is not None else {}),
             },
         })
 
@@ -4413,7 +4452,11 @@ class DeviceSession:
         ) from exc
 
     def staged_autolock_step(
-        self, token: str, selected_frame_id: int, selected_target_index: int
+        self,
+        token: str,
+        selected_frame_id: int,
+        selected_target_index: int,
+        extra_tolerance_v: float = 0.0,
     ) -> dict[str, Any]:
         with self._state_lock:
             run = self._get_idle_staged_run_or_raise(token)
@@ -4436,6 +4479,7 @@ class DeviceSession:
                     f"candidates on frame {selected_frame_id}.",
                     status_code=422,
                 )
+            selection_window: dict[str, Any] | None = None
             if run.identity is None:
                 run.identity = IdentityGuard(
                     selected, run.latest_resolution,
@@ -4445,7 +4489,9 @@ class DeviceSession:
                 # Position first, as in the one-shot walk: outside the
                 # hysteresis window is a different crossing whatever its slope
                 # and sideband spacing say.
-                self._check_pending_hysteresis(run, selected)
+                selection_window = self._check_pending_hysteresis(
+                    run, selected, extra_tolerance_v
+                )
                 try:
                     run.identity.check(
                         selected,
@@ -4459,7 +4505,7 @@ class DeviceSession:
             # identity-consistent -- only NOW record the measured-vs-predicted
             # diagnostic of the stage that produced this frame. Recording it
             # before the checks would attribute a refused pick's shift to it.
-            self._consume_pending_hysteresis(run, selected)
+            self._consume_pending_hysteresis(run, selected, selection_window)
             settings = run.settings
             geometry_settle_s = max(0.0, float(run.acceptance.settle_ms) / 1000.0)
             center_v, amplitude_v = run.center_v, run.amplitude_v
@@ -4575,10 +4621,13 @@ class DeviceSession:
                         "needs_more_refinement": not any_lockable,
                         "planner": {"action": step.action, "reason": step.reason, "bounds": step.bounds},
                         # Nothing moved: dL = 0, no shift, tolerance = the floor.
-                        "hysteresis": hysteresis_block(
-                            settings, run.center_v, run.amplitude_v,
-                            run.center_v, run.amplitude_v,
-                        ),
+                        "hysteresis": {
+                            **hysteresis_block(
+                                settings, run.center_v, run.amplitude_v,
+                                run.center_v, run.amplitude_v,
+                            ),
+                            **_selection_window_fields(selection_window),
+                        },
                     }
                 # "narrow" / "recenter" / "rail_escape": geometry moved and a
                 # fresh frame was detected -- adopt it as the run's new latest
@@ -4640,7 +4689,9 @@ class DeviceSession:
                     "expires_at": run.expires_at,
                     "needs_more_refinement": not any_lockable,
                     "planner": {"action": step.action, "reason": step.reason, "bounds": step.bounds},
-                    "hysteresis": hysteresis,
+                    "hysteresis": {
+                        **hysteresis, **_selection_window_fields(selection_window),
+                    },
                 }
         finally:
             self._staged_autolock_finish_busy(token)
@@ -4713,7 +4764,11 @@ class DeviceSession:
         return matches[0], verify_center, verify_amplitude
 
     def staged_autolock_lock(
-        self, token: str, selected_frame_id: int, selected_target_index: int
+        self,
+        token: str,
+        selected_frame_id: int,
+        selected_target_index: int,
+        extra_tolerance_v: float = 0.0,
     ) -> dict[str, Any]:
         """Verify the selected candidate on a fresh frame at the SAME (final)
         geometry, then hand off to the existing lock-engagement code path
@@ -4757,6 +4812,7 @@ class DeviceSession:
                     "Not lockable at this geometry -- step first.",
                     status_code=422,
                 )
+            selection_window: dict[str, Any] | None = None
             if run.identity is None:
                 run.identity = IdentityGuard(
                     selected, run.latest_resolution,
@@ -4766,7 +4822,9 @@ class DeviceSession:
                 # As in `step`: the hysteresis window first. `lock` straight
                 # after a geometry-changing `step` must not hand a slipped
                 # selection to the lock engagement.
-                self._check_pending_hysteresis(run, selected)
+                selection_window = self._check_pending_hysteresis(
+                    run, selected, extra_tolerance_v
+                )
                 try:
                     run.identity.check(
                         selected,
@@ -4780,7 +4838,7 @@ class DeviceSession:
             # identity-consistent, record the measured-vs-predicted diagnostic
             # of the stage that produced this frame, so the refinement record
             # below carries it.
-            self._consume_pending_hysteresis(run, selected)
+            self._consume_pending_hysteresis(run, selected, selection_window)
             settings = run.settings
             acceptance = run.acceptance
             center_v, amplitude_v = run.center_v, run.amplitude_v
@@ -4930,6 +4988,8 @@ class DeviceSession:
             payload = final.to_dict()
             payload["refinement"] = refinement
             payload["detail"] = "Staged auto-lock started."
+            # The window that judged the selection (None: nothing pending).
+            payload["hysteresis"] = _selection_window_fields(selection_window)
             return payload
         finally:
             # No-op if `lock` already succeeded and cleared the run above.
