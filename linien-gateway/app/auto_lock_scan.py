@@ -23,6 +23,7 @@ dip) that confirms the lock sits on the right feature.
 from __future__ import annotations
 
 import dataclasses
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -104,6 +105,42 @@ class AutoLockScanSettings:
     # neighbour while still crossing a wide scan in a handful of stages. Ignored
     # when no sideband spacing has been measured.
     max_center_step_signal_widths: float = 1.0
+    # Signed piezo-hysteresis model, per device. After a scan-geometry change a
+    # feature's apparent position in sweep volts shifts by
+    #
+    #     -hysteresis_per_volt_lower * dL,   dL = change in the LOWER scan
+    #                                             endpoint (centre - amplitude)
+    #
+    # Measured on two DFB seed lasers at 0.083-0.086 (residual sigma 3-6 mV),
+    # symmetric for narrowing and widening, ~98% present in the first frame;
+    # upper-endpoint changes barely matter. The refinement planner pre-compensates
+    # the centre it commands with it and the identity check refuses a candidate
+    # that is not within tolerance of the predicted position. 0 disables the
+    # compensation (the tolerance window still applies around "no shift").
+    hysteresis_per_volt_lower: float = 0.085
+    # Prediction tolerance is `tolerance_per_volt * |dL| + floor_v`: the model
+    # error grows with how far the lower endpoint moved, on top of a constant
+    # detector/noise floor. Must stay well under the sideband spacing (20-60 mV
+    # on these devices), because a slip onto an adjacent crossing is the failure
+    # this window exists to refuse.
+    hysteresis_tolerance_per_volt: float = 0.015
+    hysteresis_floor_v: float = 0.005
+
+    def __post_init__(self) -> None:
+        # Same bounds as the pydantic schema, so a mapping that bypasses the HTTP
+        # boundary cannot feed the planner a nonsensical model. 0.5 is a sanity
+        # bound, an order of magnitude above anything measured.
+        for name, upper in (
+            ("hysteresis_per_volt_lower", 0.5),
+            ("hysteresis_tolerance_per_volt", None),
+            ("hysteresis_floor_v", None),
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0 or (
+                upper is not None and value > upper
+            ):
+                bound = f"between 0 and {upper}" if upper is not None else ">= 0"
+                raise ValueError(f"{name} must be finite and {bound}, got {value!r}.")
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "AutoLockScanSettings":

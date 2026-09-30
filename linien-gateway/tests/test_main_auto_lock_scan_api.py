@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main
@@ -60,6 +61,10 @@ def test_auto_lock_scan_endpoint_passes_payload(monkeypatch):
         "monitor_threshold": 0.1,
         "min_signal_scan_fraction": 0.25,
         "max_center_step_signal_widths": 1.0,
+        # Non-default, so a settings field dropped on the way through fails here.
+        "hysteresis_per_volt_lower": 0.09,
+        "hysteresis_tolerance_per_volt": 0.02,
+        "hysteresis_floor_v": 0.004,
     }
     response = client.post("/api/devices/test-device/control/auto_lock_scan", json=payload)
     assert response.status_code == 200
@@ -354,3 +359,28 @@ def test_the_real_engine_payload_passes_response_validation(monkeypatch):
     assert response.json()["discriminator_slope_v_per_mhz"] == 0.5
 
 
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("hysteresis_per_volt_lower", -0.01),
+        ("hysteresis_per_volt_lower", 0.51),  # past the h <= 0.5 sanity bound
+        ("hysteresis_tolerance_per_volt", -0.001),
+        ("hysteresis_floor_v", -0.001),
+    ],
+)
+def test_auto_lock_scan_endpoint_rejects_out_of_range_hysteresis(
+    monkeypatch, field, value
+):
+    dummy = DummyAutoLockSession()
+    device = type("Device", (), {"key": "test-device", "name": "test-device", "parameters": {}})()
+    monkeypatch.setattr(main.device_store, "get_device", lambda _key: device)
+    monkeypatch.setattr(main, "_session_for_device", lambda _device: dummy)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/devices/test-device/control/auto_lock_scan", json={field: value}
+    )
+    assert response.status_code == 422
+    assert dummy.last_payload is None

@@ -150,6 +150,27 @@ class AutoLockScanSettings(BaseModel):
             "Ignored when no sideband spacing was measured."
         ),
     )
+    hysteresis_per_volt_lower: float = Field(
+        default=0.085, ge=0.0, le=0.5,
+        description=(
+            "Piezo hysteresis: after a scan-geometry change a feature's apparent "
+            "position shifts by -h * dL sweep volts, dL being the change in the "
+            "LOWER scan endpoint (centre - amplitude). Used to pre-compensate "
+            "refinement centre moves and to identity-check the tracked candidate. "
+            "0 disables the compensation."
+        ),
+    )
+    hysteresis_tolerance_per_volt: float = Field(
+        default=0.015, ge=0.0, le=1.0,
+        description=(
+            "Prediction tolerance per volt of lower-endpoint change; the accepted "
+            "window around the predicted position is this * |dL| + hysteresis_floor_v."
+        ),
+    )
+    hysteresis_floor_v: float = Field(
+        default=0.005, ge=0.0, le=1.0,
+        description="Constant part of the hysteresis prediction tolerance, sweep volts.",
+    )
     single_error_min: float = Field(
         default=0.1, ge=0.0, le=4.0,
         description="Min stronger single lobe when single-side allowed (plot units).",
