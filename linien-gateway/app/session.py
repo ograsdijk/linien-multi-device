@@ -473,6 +473,9 @@ class DeviceSession:
         # each measure offsets the other caused.
         self._center_move_lock = threading.Lock()
         self._last_sweep_geometry_write_completed_at: float | None = None
+        # Diagnostic context is thread-local because auto-lock requests can run
+        # concurrently on different devices while sharing the process.
+        self._refinement_detection_diagnostics = threading.local()
         # (center_v, amplitude_v) to put back when the sweep next starts, after
         # a refined auto-lock narrowed it. Deferred rather than written at lock
         # time: while locked, sweep_center is the lock's operating point, and
@@ -2755,6 +2758,94 @@ class DeviceSession:
         )
         return error_trace, monitor_trace, frame_id, acquired_at
 
+    @contextmanager
+    def _collect_refinement_detection_frames(self):
+        """Collect the exact frames used by detections in one planner stage."""
+        local = getattr(self, "_refinement_detection_diagnostics", None)
+        if local is None:
+            local = self._refinement_detection_diagnostics = threading.local()
+        previous = getattr(local, "frames", None)
+        previous_geometry = getattr(
+            local, "geometry", None
+        )
+        frames: list[dict[str, Any]] = []
+        local.frames = frames
+        try:
+            yield frames
+        finally:
+            if previous is None:
+                local.__dict__.pop("frames", None)
+                local.__dict__.pop("geometry", None)
+            else:
+                local.frames = previous
+                local.geometry = previous_geometry
+
+    def _set_refinement_detection_geometry(
+        self, *, center_v: float, amplitude_v: float, freshness_after: float
+    ) -> None:
+        local = getattr(self, "_refinement_detection_diagnostics", None)
+        if local is None:
+            local = self._refinement_detection_diagnostics = threading.local()
+        local.geometry = {
+            "commanded_center_v": float(center_v),
+            "commanded_amplitude_v": float(amplitude_v),
+            "geometry_write_completed_at": self._last_sweep_geometry_write_completed_at,
+            "freshness_threshold_at": float(freshness_after),
+            "timestamp_source": "gateway_host_epoch_time",
+        }
+
+    def _record_refinement_detection_frame(
+        self,
+        *,
+        error_trace: np.ndarray,
+        frame_id: int,
+        acquired_at: float | None,
+        center_v: float,
+        amplitude_v: float,
+        detector: str,
+        monitor_trace: np.ndarray | None = None,
+        preferred_slope_rising: bool | None = None,
+        modulation_frequency_hz: float | None = None,
+    ) -> dict[str, Any] | None:
+        local = getattr(self, "_refinement_detection_diagnostics", None)
+        frames = getattr(local, "frames", None) if local is not None else None
+        if frames is None:
+            return None
+        captured_at = time.time()
+        geometry = dict(
+            getattr(self._refinement_detection_diagnostics, "geometry", {}) or {}
+        )
+        write_at = geometry.get("geometry_write_completed_at")
+        frame = {
+            "detector": detector,
+            "frame": {
+                "frame_id": int(frame_id),
+                "acquired_at": acquired_at,
+                "timestamp_source": "gateway_plot_processing_receipt_time",
+                "captured_at": captured_at,
+                "capture_delay_s": (
+                    captured_at - float(acquired_at) if acquired_at is not None else None
+                ),
+                "sweep_center_v": float(center_v),
+                "sweep_amplitude_v": float(amplitude_v),
+                "n_points": int(len(error_trace)),
+                "modulation_frequency_hz": modulation_frequency_hz,
+                "preferred_slope_rising": preferred_slope_rising,
+            },
+            "geometry": geometry,
+            "seconds_from_geometry_write_to_frame": (
+                float(acquired_at) - float(write_at)
+                if acquired_at is not None and write_at is not None else None
+            ),
+            "error_trace_v": np.asarray(error_trace, dtype=float).tolist(),
+            "monitor_trace_v": (
+                np.asarray(monitor_trace, dtype=float).tolist()
+                if monitor_trace is not None else None
+            ),
+        }
+        frames.append(frame)
+        return frame
+
     def auto_lock_detect(
         self,
         settings_payload: dict[str, Any] | None,
@@ -3231,20 +3322,38 @@ class DeviceSession:
                 raise RuntimeError("No fresh sweep arrived after changing scan geometry.")
         if traces is not None:
             error_trace, monitor_trace = traces
+            frame_id, acquired_at = -1, None
         else:
-            error_trace, monitor_trace = self._snapshot_auto_lock_traces()
+            error_trace, monitor_trace, frame_id, acquired_at = (
+                self._snapshot_auto_lock_traces_with_frame()
+            )
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
             require_unlocked=True
         )
-        result = find_auto_lock_target(
-            error_trace_v=error_trace,
-            monitor_trace_v=monitor_trace,
-            sweep_center_v=center_v,
-            sweep_amplitude_v=amplitude_v,
-            settings=settings,
-            preferred_slope_rising=rising,
-            modulation_frequency_hz=mod_hz,
-        )
+        diagnostic = None
+        if traces is None:
+            diagnostic = self._record_refinement_detection_frame(
+                error_trace=error_trace, frame_id=frame_id, acquired_at=acquired_at,
+                center_v=center_v, amplitude_v=amplitude_v, detector="strict",
+                monitor_trace=monitor_trace, preferred_slope_rising=rising,
+                modulation_frequency_hz=mod_hz,
+            )
+        try:
+            result = find_auto_lock_target(
+                error_trace_v=error_trace,
+                monitor_trace_v=monitor_trace,
+                sweep_center_v=center_v,
+                sweep_amplitude_v=amplitude_v,
+                settings=settings,
+                preferred_slope_rising=rising,
+                modulation_frequency_hz=mod_hz,
+            )
+        except ValueError as exc:
+            if diagnostic is not None:
+                diagnostic["detector_error"] = str(exc)
+            raise
+        if diagnostic is not None:
+            diagnostic["candidate"] = result.to_dict()
         return result, center_v, amplitude_v, feature_resolution_samples(
             settings, len(error_trace), amplitude_v
         )
@@ -3261,19 +3370,35 @@ class DeviceSession:
             timeout_s = self._unlocked_trace_timeout_s()
             if not self._wait_for_fresh_unlocked_trace(after, timeout_s):
                 raise RuntimeError("No fresh sweep arrived after changing scan geometry.")
-        error_trace, monitor_trace = self._snapshot_auto_lock_traces()
+        error_trace, monitor_trace, frame_id, acquired_at = (
+            self._snapshot_auto_lock_traces_with_frame()
+        )
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
             require_unlocked=True
         )
-        candidate = find_coarse_auto_lock_target(
-            error_trace_v=error_trace,
-            monitor_trace_v=monitor_trace,
-            sweep_center_v=center_v,
-            sweep_amplitude_v=amplitude_v,
-            settings=settings,
-            preferred_slope_rising=rising,
+        diagnostic = self._record_refinement_detection_frame(
+            error_trace=error_trace, frame_id=frame_id, acquired_at=acquired_at,
+            center_v=center_v, amplitude_v=amplitude_v, detector="coarse",
+            monitor_trace=monitor_trace, preferred_slope_rising=rising,
             modulation_frequency_hz=mod_hz,
         )
+        try:
+            candidate = find_coarse_auto_lock_target(
+                error_trace_v=error_trace,
+                monitor_trace_v=monitor_trace,
+                sweep_center_v=center_v,
+                sweep_amplitude_v=amplitude_v,
+                settings=settings,
+                preferred_slope_rising=rising,
+                modulation_frequency_hz=mod_hz,
+            )
+        except ValueError as exc:
+            if diagnostic is not None:
+                diagnostic["detector_error"] = str(exc)
+            raise
+        if diagnostic is not None:
+            diagnostic["candidate"] = candidate.result.to_dict()
+            diagnostic["metrics"] = candidate.metrics
         return candidate.result, center_v, amplitude_v, feature_resolution_samples(
             settings, len(error_trace), amplitude_v
         ), candidate.metrics
@@ -3305,15 +3430,28 @@ class DeviceSession:
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
             require_unlocked=True
         )
-        candidates = find_auto_lock_candidates(
-            error_trace_v=error_trace,
-            monitor_trace_v=monitor_trace,
-            sweep_center_v=center_v,
-            sweep_amplitude_v=amplitude_v,
-            settings=settings,
-            preferred_slope_rising=rising,
+        diagnostic = self._record_refinement_detection_frame(
+            error_trace=error_trace, frame_id=frame_id, acquired_at=acquired_at,
+            center_v=center_v, amplitude_v=amplitude_v, detector="strict_candidates",
+            monitor_trace=monitor_trace, preferred_slope_rising=rising,
             modulation_frequency_hz=mod_hz,
         )
+        try:
+            candidates = find_auto_lock_candidates(
+                error_trace_v=error_trace,
+                monitor_trace_v=monitor_trace,
+                sweep_center_v=center_v,
+                sweep_amplitude_v=amplitude_v,
+                settings=settings,
+                preferred_slope_rising=rising,
+                modulation_frequency_hz=mod_hz,
+            )
+        except ValueError as exc:
+            if diagnostic is not None:
+                diagnostic["detector_error"] = str(exc)
+            raise
+        if diagnostic is not None:
+            diagnostic["candidates"] = [c.to_dict() for c in candidates]
         resolution = feature_resolution_samples(settings, len(error_trace), amplitude_v)
         frame = _frame_summary(
             error_trace, frame_id, acquired_at, center_v, amplitude_v, mod_hz, candidates
@@ -3345,17 +3483,31 @@ class DeviceSession:
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
             require_unlocked=True
         )
-        candidates = find_plausible_coarse_candidates(
-            error_trace_v=error_trace,
-            monitor_trace_v=monitor_trace,
-            sweep_center_v=center_v,
-            sweep_amplitude_v=amplitude_v,
-            settings=settings,
-            preferred_slope_rising=rising,
+        diagnostic = self._record_refinement_detection_frame(
+            error_trace=error_trace, frame_id=frame_id, acquired_at=acquired_at,
+            center_v=center_v, amplitude_v=amplitude_v, detector="coarse_candidates",
+            monitor_trace=monitor_trace, preferred_slope_rising=rising,
             modulation_frequency_hz=mod_hz,
         )
-        if not candidates:
-            raise ValueError("No plausible coarse candidate on this frame.")
+        try:
+            candidates = find_plausible_coarse_candidates(
+                error_trace_v=error_trace,
+                monitor_trace_v=monitor_trace,
+                sweep_center_v=center_v,
+                sweep_amplitude_v=amplitude_v,
+                settings=settings,
+                preferred_slope_rising=rising,
+                modulation_frequency_hz=mod_hz,
+            )
+            if not candidates:
+                raise ValueError("No plausible coarse candidate on this frame.")
+        except ValueError as exc:
+            if diagnostic is not None:
+                diagnostic["detector_error"] = str(exc)
+            raise
+        if diagnostic is not None:
+            diagnostic["candidates"] = [c.result.to_dict() for c in candidates]
+            diagnostic["metrics"] = candidates[0].metrics
         resolution = feature_resolution_samples(settings, len(error_trace), amplitude_v)
         results = [c.result for c in candidates]
         frame = _frame_summary(
@@ -3385,6 +3537,7 @@ class DeviceSession:
         before_amplitude: float
         before_center: float
         before_detector: str
+        detection_frames: list[dict[str, Any]] = dataclasses.field(default_factory=list)
 
     def _run_refinement_stage(
         self,
@@ -3453,17 +3606,24 @@ class DeviceSession:
                 before_center=before_center,
                 before_detector=before_detector,
             )
-        if step.action == "recenter":
-            new_target, new_center_v, new_amplitude_v, resolution, coarse_metrics = (
-                detect_recenter(step.center_v, amplitude_v, geometry_settle_s)
-            )
-            new_detector = "coarse"
-        else:  # "narrow" or "rail_escape" -- both write geometry and detect
-            next_center = center_v if step.action == "rail_escape" else step.center_v
-            (
-                new_target, new_center_v, new_amplitude_v, resolution,
-                new_detector, coarse_metrics,
-            ) = detect_narrow(next_center, step.amplitude_v, geometry_settle_s)
+        try:
+            with self._collect_refinement_detection_frames() as detection_frames:
+                if step.action == "recenter":
+                    new_target, new_center_v, new_amplitude_v, resolution, coarse_metrics = (
+                        detect_recenter(step.center_v, amplitude_v, geometry_settle_s)
+                    )
+                    new_detector = "coarse"
+                else:  # "narrow" or "rail_escape" -- both write geometry and detect
+                    next_center = center_v if step.action == "rail_escape" else step.center_v
+                    (
+                        new_target, new_center_v, new_amplitude_v, resolution,
+                        new_detector, coarse_metrics,
+                    ) = detect_narrow(next_center, step.amplitude_v, geometry_settle_s)
+        except Exception as exc:
+            # Preserve exact trace metadata for the caller's failed-stage log.
+            setattr(exc, "_refinement_detection_frames", detection_frames)
+            setattr(exc, "_refinement_action", step.action)
+            raise
         return DeviceSession._RefinementStageOutcome(
             step=step,
             target=new_target,
@@ -3476,6 +3636,7 @@ class DeviceSession:
             before_amplitude=before_amplitude,
             before_center=before_center,
             before_detector=before_detector,
+            detection_frames=detection_frames,
         )
 
     @staticmethod
@@ -3607,6 +3768,10 @@ class DeviceSession:
                         "gateway_register_write_completion"
                         if write_at is not None else "post_settle_freshness_timestamp_fallback"
                     )
+                    self._set_refinement_detection_geometry(
+                        center_v=next_center_v, amplitude_v=next_amplitude_v,
+                        freshness_after=moved_at,
+                    )
                     try:
                         t, c, a, r = self._capture_auto_lock_target(
                             settings, after=moved_at
@@ -3628,19 +3793,35 @@ class DeviceSession:
                         "gateway_register_write_completion"
                         if write_at is not None else "post_settle_freshness_timestamp_fallback"
                     )
+                    self._set_refinement_detection_geometry(
+                        center_v=next_center_v, amplitude_v=amplitude_v,
+                        freshness_after=moved_at,
+                    )
                     return self._coarse_auto_lock_target(settings, after=moved_at)
 
-                outcome = self._run_refinement_stage(
-                    settings,
-                    center_v=center_v,
-                    amplitude_v=amplitude_v,
-                    target=target,
-                    detector=detector,
-                    trace_length=trace_length,
-                    geometry_settle_s=geometry_settle_s,
-                    detect_narrow=_detect_narrow,
-                    detect_recenter=_detect_recenter,
-                )
+                try:
+                    outcome = self._run_refinement_stage(
+                        settings,
+                        center_v=center_v,
+                        amplitude_v=amplitude_v,
+                        target=target,
+                        detector=detector,
+                        trace_length=trace_length,
+                        geometry_settle_s=geometry_settle_s,
+                        detect_narrow=_detect_narrow,
+                        detect_recenter=_detect_recenter,
+                    )
+                except Exception as exc:
+                    stages.append({
+                        "kind": "detection_failed",
+                        "stage_index": narrow_count + 1,
+                        "action": getattr(exc, "_refinement_action", None),
+                        "failure": str(exc),
+                        "detection_frames": getattr(
+                            exc, "_refinement_detection_frames", []
+                        ),
+                    })
+                    raise
                 step = outcome.step
                 if step.action == "done":
                     break
@@ -3666,7 +3847,8 @@ class DeviceSession:
                                    "resolution_samples": resolution, "detector": "coarse",
                                    "sideband_offset_v": target.sideband_offset_v,
                                    "metrics": coarse_metrics, "bounds": step.bounds,
-                                   "hysteresis": hysteresis})
+                                   "hysteresis": hysteresis,
+                                   "detection_frames": outcome.detection_frames})
                     narrow_count += 1
                     continue
                 if step.action == "rail_escape":
@@ -3704,6 +3886,7 @@ class DeviceSession:
                     "center_shift_v": center_delta_v,
                     "hysteresis": hysteresis,
                     "bounds": step.bounds,
+                    "detection_frames": outcome.detection_frames,
                 })
                 identity.check(target, amplitude_v=amplitude_v, detector=detector, resolution_samples=resolution)
                 # Checked after the identity guard: if the walk has lost the
@@ -3736,19 +3919,27 @@ class DeviceSession:
 
             # The coarse result only guides geometry. Demand two fresh strict
             # detections at the final unchanged geometry before the handover.
-            try:
-                strict_one, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
-                    settings, after=time.time()
+            with self._collect_refinement_detection_frames() as first_final_frames:
+                self._set_refinement_detection_geometry(
+                    center_v=center_v, amplitude_v=amplitude_v,
+                    freshness_after=last_geometry_change_at["value"] or time.time(),
                 )
-            except (ValueError, RuntimeError) as first_final_error:
-                # A geometry transition can have a short thermal/piezo tail.
-                # Retry once after a real settle interval before declaring the
-                # feature lost; never reuse the rejected frame.
-                time.sleep(0.3)
-                stages.append({"kind": "settle_retry", "detail": str(first_final_error)})
-                strict_one, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
-                    settings, after=time.time()
-                )
+                try:
+                    strict_one, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
+                        settings, after=time.time()
+                    )
+                except (ValueError, RuntimeError) as first_final_error:
+                    # A geometry transition can have a short thermal/piezo tail.
+                    # Retry once after a real settle interval before declaring the
+                    # feature lost; never reuse the rejected frame.
+                    time.sleep(0.3)
+                    stages.append({
+                        "kind": "settle_retry", "detail": str(first_final_error),
+                        "detection_frames": first_final_frames,
+                    })
+                    strict_one, center_v, amplitude_v, resolution = self._capture_auto_lock_target(
+                        settings, after=time.time()
+                    )
             # Sideband spacing is a derived quantity with its own measurement
             # noise. It earns its keep ACROSS geometry changes, where the target
             # voltage legitimately moves and another invariant is needed. These
@@ -3761,10 +3952,25 @@ class DeviceSession:
             )
             verify_after = time.time()
             one_at = verify_after
-            strict_two, verify_center, verify_amplitude, _ = self._capture_auto_lock_target(
-                settings, after=verify_after
-            )
+            with self._collect_refinement_detection_frames() as second_final_frames:
+                self._set_refinement_detection_geometry(
+                    center_v=center_v, amplitude_v=amplitude_v,
+                    freshness_after=verify_after,
+                )
+                strict_two, verify_center, verify_amplitude, _ = self._capture_auto_lock_target(
+                    settings, after=verify_after
+                )
             two_at = time.time()
+
+            def _successful_frame_time(frames: list[dict[str, Any]]) -> float | None:
+                for frame in reversed(frames):
+                    acquired_at = frame.get("frame", {}).get("acquired_at")
+                    if acquired_at is not None and "detector_error" not in frame:
+                        return float(acquired_at)
+                return None
+
+            receipt_one_at = _successful_frame_time(first_final_frames)
+            receipt_two_at = _successful_frame_time(second_final_frames)
             # One definition of "the feature moved too far", taken from the
             # acceptance settings rather than a second inline literal that
             # silently diverges from capture_fraction when anyone changes it.
@@ -3795,6 +4001,17 @@ class DeviceSession:
                 "verify_center_v": verify_center,
                 "verify_amplitude_v": verify_amplitude,
                 "acceptance_passed": False,
+                "detection_frames": first_final_frames + second_final_frames,
+                "gateway_frame_receipt_interval_s": (
+                    receipt_two_at - receipt_one_at
+                    if receipt_one_at is not None and receipt_two_at is not None else None
+                ),
+                "geometry_write_to_first_frame_receipt_s": next((
+                    frame.get("seconds_from_geometry_write_to_frame")
+                    for frame in first_final_frames
+                    if frame.get("seconds_from_geometry_write_to_frame") is not None
+                    and "detector_error" not in frame
+                ), None),
             })
             # Append before any rejection so failed attempts retain their
             # measured pair, drift rate and age since the last geometry move.
@@ -4406,6 +4623,22 @@ class DeviceSession:
                 "last_geometry_change_timestamp_source": run.last_geometry_change_timestamp_source,
             }
 
+    def _staged_frame_trace(self, frame: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the raw volts trace for the exact frame a staged step used."""
+        frame_id = frame.get("frame_id")
+        if frame_id is None:
+            return None
+        trace = self.unlocked_trace_for_frame(int(frame_id))
+        if trace is None:
+            return None
+        return {
+            "frame_id": int(frame_id),
+            "sweep_center": frame.get("sweep_center_v"),
+            "sweep_amplitude": frame.get("sweep_amplitude_v"),
+            "n_points": len(trace),
+            "combined_error": trace,
+        }
+
     def staged_autolock_abort(self, token: str) -> dict[str, Any]:
         with self._state_lock:
             run = self._get_idle_staged_run_or_raise(token)
@@ -4619,6 +4852,9 @@ class DeviceSession:
                     "gateway_register_write_completion"
                     if write_at is not None else "post_settle_freshness_timestamp_fallback"
                 )
+                self._set_refinement_detection_geometry(
+                    center_v=c, amplitude_v=a, freshness_after=moved_at,
+                )
                 try:
                     candidates, cc, aa, r, frame = self._capture_auto_lock_candidates_strict(
                         settings, after=moved_at
@@ -4644,6 +4880,9 @@ class DeviceSession:
                 geometry_timestamp_source["value"] = (
                     "gateway_register_write_completion"
                     if write_at is not None else "post_settle_freshness_timestamp_fallback"
+                )
+                self._set_refinement_detection_geometry(
+                    center_v=c, amplitude_v=a, freshness_after=moved_at,
                 )
                 candidates, cc, aa, r, m, frame = self._coarse_auto_lock_candidates(
                     settings, after=moved_at
@@ -4703,6 +4942,7 @@ class DeviceSession:
                         "stage_index": run.stage_index,
                         "geometry": {"center_v": run.center_v, "amplitude_v": run.amplitude_v},
                         "frame": run.latest_frame,
+                        "trace": self._staged_frame_trace(run.latest_frame),
                         "candidates": annotated,
                         "expires_at": run.expires_at,
                         "needs_more_refinement": not any_lockable,
@@ -4774,6 +5014,7 @@ class DeviceSession:
                     "stage_index": run.stage_index,
                     "geometry": {"center_v": run.center_v, "amplitude_v": run.amplitude_v},
                     "frame": run.latest_frame,
+                    "trace": self._staged_frame_trace(run.latest_frame),
                     "candidates": annotated,
                     "expires_at": run.expires_at,
                     "needs_more_refinement": not any_lockable,

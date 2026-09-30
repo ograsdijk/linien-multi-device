@@ -1765,3 +1765,52 @@ def test_two_detections_past_the_neighbour_bound_are_a_different_crossing(monkey
         _drift_walk(session)
     assert "not the same crossing" in excinfo.value.refinement["failure"]
     assert excinfo.value.failure_kind == "identity"
+
+
+def test_failed_detection_retains_exact_frame_for_replay(monkeypatch):
+    session, _board = _make_session(monkeypatch, _no_error)
+    error = np.array([0.1, -0.2, 0.3])
+    monitor = np.array([0.4, 0.5, 0.6])
+    monkeypatch.setattr(session, "_snapshot_auto_lock_traces_with_frame",
+                        lambda: (error, monitor, 42, 101.0))
+    monkeypatch.setattr(session, "_snapshot_sweep_params",
+                        lambda **kwargs: (0.2, 0.4, False, 1e7))
+    session._last_sweep_geometry_write_completed_at = 100.0
+
+    def reject(**kwargs):
+        raise ValueError("no extrema in exact frame")
+
+    monkeypatch.setattr(session_module, "find_auto_lock_target", reject)
+    with session._collect_refinement_detection_frames() as frames:
+        session._set_refinement_detection_geometry(
+            center_v=0.2, amplitude_v=0.4, freshness_after=100.5,
+        )
+        with pytest.raises(ValueError, match="no extrema"):
+            session._capture_auto_lock_target(AutoLockScanSettings())
+    assert len(frames) == 1
+    frame = frames[0]
+    assert frame["frame"]["frame_id"] == 42
+    assert frame["frame"]["acquired_at"] == 101.0
+    assert frame["frame"]["preferred_slope_rising"] is False
+    assert frame["error_trace_v"] == error.tolist()
+    assert frame["monitor_trace_v"] == monitor.tolist()
+    assert frame["seconds_from_geometry_write_to_frame"] == 1.0
+    assert frame["detector_error"] == "no extrema in exact frame"
+    assert getattr(session._refinement_detection_diagnostics, "frames", None) is None
+
+
+def test_staged_trace_is_from_analysed_frame_not_current_frame(monkeypatch):
+    session, _board = _make_session(monkeypatch, _no_error)
+    requested = []
+
+    def cached(frame_id):
+        requested.append(frame_id)
+        return [0.1, -0.2, 0.3] if frame_id == 42 else None
+
+    monkeypatch.setattr(session, "unlocked_trace_for_frame", cached)
+    frame = {"frame_id": 42, "sweep_center_v": 0.2, "sweep_amplitude_v": 0.4}
+    trace = session._staged_frame_trace(frame)
+    assert requested == [42]
+    assert trace == {"frame_id": 42, "sweep_center": 0.2, "sweep_amplitude": 0.4,
+                     "n_points": 3, "combined_error": [0.1, -0.2, 0.3]}
+    assert session._staged_frame_trace({"frame_id": 43}) is None

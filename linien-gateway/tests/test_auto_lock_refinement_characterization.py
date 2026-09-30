@@ -277,6 +277,8 @@ def _normalize(value: Any) -> Any:
                 "observation_interval_s", "drift_rate_v_s",
                 "predicted_motion_during_configured_handover_v",
                 "time_since_last_geometry_change_s",
+                "detection_frames", "gateway_frame_receipt_interval_s",
+                "geometry_write_to_first_frame_receipt_s",
             }
         }
     if isinstance(value, AutoLockScanResult):
