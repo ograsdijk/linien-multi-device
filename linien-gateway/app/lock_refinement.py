@@ -156,6 +156,19 @@ def hysteresis_tolerance_v(
     return float(tol_per_volt) * abs(float(delta_lower_v)) + float(floor_v)
 
 
+def hysteresis_settings_block(settings: AutoLockScanSettings) -> dict[str, float]:
+    """The device's effective hysteresis settings, in the read-only
+    ``hysteresis_settings`` shape of an ``auto_lock_candidates`` response: what
+    a caller needs to predict ``-h * dL`` itself for a geometry change made
+    outside a staged run."""
+    return {
+        "h_per_volt": float(settings.hysteresis_per_volt_lower),
+        "tolerance_per_volt": float(settings.hysteresis_tolerance_per_volt),
+        "floor_v": float(settings.hysteresis_floor_v),
+        "max_extra_tolerance_v": float(settings.hysteresis_max_extra_tolerance_v),
+    }
+
+
 def hysteresis_block(
     settings: AutoLockScanSettings,
     old_center_v: float,

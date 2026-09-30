@@ -1136,6 +1136,11 @@ async def auto_lock_candidates(
     the best-score one, and `frame` reports the identity/geometry of the analysed frame
     (frame_id, acquired_at, sweep center/amplitude, n_points, modulation_frequency_hz,
     sideband_spacing_samples, noise_floor).
+    `hysteresis_settings` {h_per_volt, tolerance_per_volt, floor_v,
+    max_extra_tolerance_v} is the device's effective auto-lock hysteresis model (the
+    active staged run's settings, else stored settings merged with the request body),
+    so a caller can predict `-h_per_volt * dL` for a geometry change made outside a
+    staged run. Read-only; the staged `hysteresis` block is unchanged.
 
     With no body, uses the device's stored auto-lock-scan settings. With `acquire=true`,
     atomically triggers a NEW frame (the same restart-and-capture mechanism as

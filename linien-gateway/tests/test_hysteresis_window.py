@@ -822,3 +822,64 @@ def test_a_partial_staged_begin_settings_body_merges_too(staged):
     _detect(staged, [_result(1, 0.18)], 0.0, 1.0, 1)
     block = staged.staged_autolock_begin({"smooth_window_pts": 7}, 60.0)["hysteresis"]
     assert block["h_per_volt"] == pytest.approx(0.09)
+
+
+# --- read-only `hysteresis_settings` on auto_lock_candidates ----------------
+
+_SETTINGS_KEYS = {"h_per_volt", "tolerance_per_volt", "floor_v", "max_extra_tolerance_v"}
+
+
+def _plain_detect(session: DeviceSession) -> None:
+    """No staged run: `auto_lock_candidates_detect` takes the plain path."""
+    session.auto_lock_detect = (  # type: ignore[method-assign]
+        lambda payload, detector="strict", **kw: {
+            "found": False, "candidate": None, "candidates": [], "reason": "x",
+            "frame": None,
+        }
+    )
+
+
+def test_plain_path_reports_the_stored_hysteresis_settings(staged):
+    _plain_detect(staged)
+    block = staged.auto_lock_candidates_detect(None)["hysteresis_settings"]
+    assert set(block) == _SETTINGS_KEYS
+    assert block == {
+        "h_per_volt": 0.085, "tolerance_per_volt": 0.015, "floor_v": 0.015,
+        "max_extra_tolerance_v": 0.03,
+    }
+    schemas.AutoLockCandidatesHysteresisSettings.model_validate(block)
+
+
+def test_plain_path_reflects_a_per_device_override_and_the_request_payload(staged):
+    _plain_detect(staged)
+    staged.update_auto_lock_scan_settings({
+        "hysteresis_per_volt_lower": 0.09, "hysteresis_floor_v": 0.004,
+        "hysteresis_max_extra_tolerance_v": 0.02,
+    })
+    block = staged.auto_lock_candidates_detect(None)["hysteresis_settings"]
+    assert block == {
+        "h_per_volt": 0.09, "tolerance_per_volt": 0.015, "floor_v": 0.004,
+        "max_extra_tolerance_v": 0.02,
+    }
+    # A request payload lays over the stored values, without persisting.
+    block = staged.auto_lock_candidates_detect(
+        {"hysteresis_tolerance_per_volt": 0.03}
+    )["hysteresis_settings"]
+    assert block["tolerance_per_volt"] == 0.03
+    assert block["h_per_volt"] == 0.09
+    assert staged.get_auto_lock_scan_settings()["hysteresis_tolerance_per_volt"] == 0.015
+
+
+def test_staged_run_aware_path_reports_the_runs_settings(staged):
+    staged.update_auto_lock_scan_settings({"hysteresis_per_volt_lower": 0.09})
+    _detect(staged, [_result(1, 0.18)], 0.0, 1.0, 1)
+    staged.staged_autolock_begin(None, 60.0)
+    run = staged._staged_autolock
+    assert run is not None
+    # The endpoint's own payload is ignored on this path, as for detection.
+    _detect(staged, [_result(1, 0.18)], 0.0, 1.0, 2)
+    result = staged.auto_lock_candidates_detect({"hysteresis_per_volt_lower": 0.2})
+    assert result["hysteresis_settings"] == {
+        "h_per_volt": 0.09, "tolerance_per_volt": 0.015, "floor_v": 0.015,
+        "max_extra_tolerance_v": 0.03,
+    }

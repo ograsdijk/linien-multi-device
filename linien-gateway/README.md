@@ -76,6 +76,16 @@ frame; never persists settings. Body: optional `AutoLockScanSettings`.
   detector the run used: otherwise a wide scan that only the coarse detector
   resolves returns no candidates at all once the run has ended. While a staged
   run owns the detection (active, idle, same geometry) it is ignored.
+- Every response carries a read-only `hysteresis_settings` block,
+  `{h_per_volt, tolerance_per_volt, floor_v, max_extra_tolerance_v}` (the device's
+  `hysteresis_per_volt_lower`, `hysteresis_tolerance_per_volt`,
+  `hysteresis_floor_v` and `hysteresis_max_extra_tolerance_v`): the effective
+  settings a staged run would use -- the active run's own while it owns the
+  detection, else stored settings merged with the request body. A caller that
+  changes the sweep geometry outside a staged run predicts the shift as
+  `-h_per_volt * dL` (`dL` = change in `center - amplitude`) with tolerance
+  `tolerance_per_volt * |dL| + floor_v`. The staged `hysteresis` block is
+  unchanged.
 - `include_coarse=true` (optional `coarse_min_relative_score` in (0, 1],
   `coarse_max_candidates` 1–64): when `candidates` came from the strict
   detector, also returns `coarse_candidates` + `coarse_frame`, the coarse

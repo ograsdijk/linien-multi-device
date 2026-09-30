@@ -252,6 +252,24 @@ class StagedAutolockGeometry(BaseModel):
     amplitude_v: float
 
 
+class AutoLockCandidatesHysteresisSettings(BaseModel):
+    """The read-only `hysteresis_settings` block on every `auto_lock_candidates`
+    response: the device's effective auto-lock hysteresis model (the active
+    staged run's settings, else stored settings merged with the request body),
+    so a caller can predict ``-h_per_volt * delta_lower_v`` for a geometry change
+    made outside a staged run. Field for field ``hysteresis_per_volt_lower``,
+    ``hysteresis_tolerance_per_volt``, ``hysteresis_floor_v`` and
+    ``hysteresis_max_extra_tolerance_v`` of `AutoLockScanSettings`. Documentation
+    and contract test only: the endpoint returns a plain dict of this shape.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    h_per_volt: float
+    tolerance_per_volt: float
+    floor_v: float
+    max_extra_tolerance_v: float
+
+
 class StagedAutolockHysteresis(BaseModel):
     """The `hysteresis` block on every staged `begin`/`step` response.
 

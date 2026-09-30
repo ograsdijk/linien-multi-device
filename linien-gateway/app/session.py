@@ -56,6 +56,7 @@ from .lock_refinement import (
     _TrackingIdentityChanged,
     IdentityGuard,
     hysteresis_block,
+    hysteresis_settings_block,
     hysteresis_selection_window,
     hysteresis_window_violation,
     plan_refinement_step,
@@ -2920,6 +2921,8 @@ class DeviceSession:
         a `detector` key added to the result for shape consistency; `detector`
         (``"strict"``/``"coarse"``/``"auto"``, see `auto_lock_detect`) picks a
         different detection for that path only. A run's own detection ignores it.
+        Both paths add a read-only ``hysteresis_settings`` block: the settings
+        the detection used (the run's, or stored merged with ``settings_payload``).
         ``include_coarse`` (see `auto_lock_detect`) works on both paths; on the
         run's path the coarse block is computed right after the run's own
         detection (reported in ``coarse_frame``) and is never folded into the run.
@@ -2947,6 +2950,15 @@ class DeviceSession:
                 return self._staged_run_aware_detect(run, **coarse_opts)
         result = self.auto_lock_detect(settings_payload, detector=detector, **coarse_opts)
         result.setdefault("detector", "strict")
+        # Same effective settings `auto_lock_detect` just used: stored, with the
+        # request payload laid over them.
+        with self._state_lock:
+            effective = (
+                AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
+                if settings_payload is None
+                else self._merged_auto_lock_scan_settings(settings_payload)
+            )
+        result["hysteresis_settings"] = hysteresis_settings_block(effective)
         return result
 
     def _staged_run_aware_detect(
@@ -2989,6 +3001,7 @@ class DeviceSession:
             "reason": reason,
             "frame": frame,
             "detector": detector,
+            "hysteresis_settings": hysteresis_settings_block(run.settings),
         }
         if include_coarse and detector == "strict":
             # Read-only: computed after the run's own detection, NEVER stored in
