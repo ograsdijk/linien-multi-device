@@ -233,6 +233,37 @@ class StagedAutolockSelected(BaseModel):
     target_index: int
 
 
+class StagedAutolockGeometry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    center_v: float
+    amplitude_v: float
+
+
+class StagedAutolockHysteresis(BaseModel):
+    """The `hysteresis` block on every staged `begin`/`step` response.
+
+    The signed piezo-hysteresis prediction for THIS step's geometry change: a
+    feature's apparent position shifts by ``predicted_shift_v = -h_per_volt *
+    delta_lower_v``, ``delta_lower_v`` being the change in the LOWER scan
+    endpoint ``(center_v - amplitude_v)`` from ``old_geometry`` to
+    ``new_geometry``. The caller's next selection must lie within
+    ``tolerance_v = hysteresis_tolerance_per_volt * |delta_lower_v| +
+    hysteresis_floor_v`` of ``previous target + predicted_shift_v`` or the
+    next `step`/`lock` refuses it (422). ``begin`` and a ``done`` step moved
+    nothing: ``delta_lower_v`` and ``predicted_shift_v`` are 0.0 and
+    ``tolerance_v`` is just the floor. Documentation and contract test only:
+    the staged endpoints return plain dicts of this shape.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    h_per_volt: float
+    delta_lower_v: float
+    predicted_shift_v: float
+    tolerance_v: float
+    old_geometry: StagedAutolockGeometry
+    new_geometry: StagedAutolockGeometry
+
+
 class StagedAutolockBeginRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     settings: Optional[AutoLockScanSettings] = None

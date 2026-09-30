@@ -8,11 +8,17 @@ including a multi-feature trace (a weaker tracked feature coexisting with a
 stronger decoy of identical PDH morphology) and an under-resolved start that
 needs several narrowing stages before the strict detector accepts.
 
-They are written and committed against the UNMODIFIED
-``_trajectory_refine_auto_lock`` / stage-runner-free implementation, and must
-keep passing, unchanged, after it is refactored to route each stage through a
-shared, selector-parameterised stage runner. Any diff in this file alongside
-the refactor commit is itself a regression.
+They were written and committed against the UNMODIFIED
+``_trajectory_refine_auto_lock`` / stage-runner-free implementation, and had to
+keep passing, unchanged, across the refactor that routes each stage through a
+shared, selector-parameterised stage runner.
+
+The signed piezo-hysteresis model (see ``lock_refinement.predicted_shift_v``)
+changed the walk INTENTIONALLY: the planner pre-compensates the commanded centre
+for the shift ``-h * dL`` and every stage is identity-checked against the
+position that shift predicts. The simulated detections below therefore move the
+way the device does (``_apparent``), where they used to stand still, and the
+golden record was regenerated once for that change.
 
 Mocking follows the style already used by
 ``tests/test_session_lock_refinement.py``'s ``_make_session``/
@@ -90,6 +96,21 @@ def _result(
         hz_per_v=None,
         sideband_offset_v=sideband_offset_v,
     )
+
+
+# The measured piezo hysteresis (AutoLockScanSettings.hysteresis_per_volt_lower):
+# a feature's apparent position moves by -H * (change in the lower scan
+# endpoint, centre - amplitude). The scenarios all start at (0, 1.0).
+_H = 0.085
+_START_LOWER_V = 0.0 - 1.0
+
+
+def _apparent(session: DeviceSession, at_start_v: float) -> float:
+    """Where a feature seen at ``at_start_v`` at the start geometry appears now."""
+    lower_v = float(session.parameters.sweep_center.value) - abs(
+        float(session.parameters.sweep_amplitude.value)
+    )
+    return at_start_v - _H * (lower_v - _START_LOWER_V)
 
 
 def _make_bare_session() -> tuple[DeviceSession, _FakeControl]:
@@ -243,7 +264,7 @@ def test_multi_feature_trace_keeps_the_seeded_weaker_target(monkeypatch):
         if strict_calls["n"] == 1:
             raise ValueError("scan still too wide for the strict detector")
         return (
-            _result(WEAK_FEATURE_V, sideband_offset_v=SIDEBAND_V),
+            _result(_apparent(session, WEAK_FEATURE_V), sideband_offset_v=SIDEBAND_V),
             session.parameters.sweep_center.value,
             session.parameters.sweep_amplitude.value,
             10.5,
@@ -251,7 +272,7 @@ def test_multi_feature_trace_keeps_the_seeded_weaker_target(monkeypatch):
 
     def _coarse(settings, after=None):
         return (
-            _result(WEAK_FEATURE_V, sideband_offset_v=SIDEBAND_V),
+            _result(_apparent(session, WEAK_FEATURE_V), sideband_offset_v=SIDEBAND_V),
             session.parameters.sweep_center.value,
             session.parameters.sweep_amplitude.value,
             4.0,
@@ -280,7 +301,7 @@ def test_multi_feature_trace_keeps_the_seeded_weaker_target(monkeypatch):
 
     # Pinned: the walk never wrote a geometry anywhere near the decoy.
     assert all(abs(c) < 0.9 for c, _a in writes)
-    assert result.target_voltage == pytest.approx(WEAK_FEATURE_V)
+    assert result.target_voltage == pytest.approx(_apparent(session, WEAK_FEATURE_V))
     stage_kinds = [s.get("kind") for s in refinement["stages"]]
     assert stage_kinds[0] == "initial"
     assert "narrow" in stage_kinds
@@ -318,7 +339,7 @@ def test_an_under_resolved_start_needs_several_narrowing_stages(monkeypatch):
         if strict_calls["n"] < 3:
             raise ValueError("scan still too wide for the strict detector")
         return (
-            _result(TARGET_V, sideband_offset_v=SIDEBAND_V),
+            _result(_apparent(session, TARGET_V), sideband_offset_v=SIDEBAND_V),
             session.parameters.sweep_center.value,
             session.parameters.sweep_amplitude.value,
             12.0,
@@ -329,7 +350,7 @@ def test_an_under_resolved_start_needs_several_narrowing_stages(monkeypatch):
     def _coarse(settings, after=None):
         coarse_calls["n"] += 1
         return (
-            _result(TARGET_V, sideband_offset_v=SIDEBAND_V),
+            _result(_apparent(session, TARGET_V), sideband_offset_v=SIDEBAND_V),
             session.parameters.sweep_center.value,
             session.parameters.sweep_amplitude.value,
             3.0,
@@ -356,7 +377,7 @@ def test_an_under_resolved_start_needs_several_narrowing_stages(monkeypatch):
         initial_detector="coarse",
     )
 
-    assert result.target_voltage == pytest.approx(TARGET_V)
+    assert result.target_voltage == pytest.approx(_apparent(session, TARGET_V))
     # More than one amplitude write happened -- several real narrowing stages.
     amplitudes = [a for _c, a in writes]
     assert len(amplitudes) >= 2
@@ -391,7 +412,8 @@ def test_running_out_of_refinement_stages_reports_the_pinned_message(monkeypatch
 
     def _coarse(settings, after=None):
         return (
-            _result(0.5, sideband_offset_v=0.001),  # tiny sideband -> stays "too wide"
+            # tiny sideband -> stays "too wide"
+            _result(_apparent(session, 0.5), sideband_offset_v=0.001),
             session.parameters.sweep_center.value,
             session.parameters.sweep_amplitude.value,
             1.0,
@@ -459,10 +481,9 @@ def test_geometry_dependent_feature_position_is_tracked_stage_by_stage(monkeypat
     writes = _geometry_recorder(session)
 
     def _apparent_v() -> float:
-        amp = float(session.parameters.sweep_amplitude.value)
-        center = float(session.parameters.sweep_center.value)
-        # The feature appears shifted by a history-dependent offset.
-        return 0.12 + 0.035 * amp - 0.1 * (center - 0.12)
+        # The feature appears shifted by the history-dependent hysteresis
+        # offset: -h * (change in the lower scan endpoint).
+        return _apparent(session, 0.155)
 
     strict_calls = {"n": 0}
 

@@ -52,13 +52,12 @@ def _target(sideband_offset_v, *, slope_rising=True):
 def test_rail_pinned_offset_floors_the_amplitude_near_0_533_v():
     settings = _settings(
         half_range_sweep_v=0.128, min_signal_scan_fraction=0.25,
-        max_center_step_signal_widths=1.0,
+        max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.0,
     )
     step = plan_refinement_step(
         settings,
         center_v=0.2, amplitude_v=0.8, target_v=0.2 + 0.4795,
         sideband_offset_v=0.032, detector="coarse", trace_length=2048,
-        shift_per_fraction=None,
     )
     # The centre sits on the rail for the CURRENT width (1 - 0.8 = 0.2), but a
     # stage that narrows also moves the rail outward, so it narrows and
@@ -83,13 +82,12 @@ def test_rail_pinned_offset_floors_the_amplitude_near_0_533_v__fails_on_min():
     the floor needed to keep the target in view."""
     settings = _settings(
         half_range_sweep_v=0.128, min_signal_scan_fraction=0.25,
-        max_center_step_signal_widths=1.0,
+        max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.0,
     )
     step = plan_refinement_step(
         settings,
         center_v=0.2, amplitude_v=0.8, target_v=0.2 + 0.4795,
         sideband_offset_v=0.032, detector="coarse", trace_length=2048,
-        shift_per_fraction=None,
     )
     schedule_v = step.bounds["shift_capped_v"]  # 0.4 V, what min() would pick
     safe = min_safe_amplitude_v(0.8, 0.4795, None, step.bounds["goal_v"])
@@ -148,14 +146,13 @@ def test_a_centre_on_the_rail_is_recognised_despite_float_noise__fails_on_exact_
 def test_a_target_421_mv_outside_the_next_window_recentres_not_narrows():
     settings = _settings(
         half_range_sweep_v=0.08, min_signal_scan_fraction=0.325,
-        max_center_step_signal_widths=1.0,
+        max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.0,
     )
     center_v, amplitude_v, target_v = 0.0, 0.6, 0.571
     step = plan_refinement_step(
         settings,
         center_v=center_v, amplitude_v=amplitude_v, target_v=target_v,
         sideband_offset_v=0.0325, detector="coarse", trace_length=2048,
-        shift_per_fraction=None,
     )
     scheduled = step.bounds["shift_capped_v"]
     outside_by = abs(target_v - center_v) - 0.5 * scheduled
@@ -179,14 +176,13 @@ def test_a_target_421_mv_outside_the_next_window__fails_if_the_centring_check_is
     target still 421 mV outside the window the narrow produces."""
     settings = _settings(
         half_range_sweep_v=0.08, min_signal_scan_fraction=0.325,
-        max_center_step_signal_widths=1.0,
+        max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.0,
     )
     center_v, amplitude_v, target_v = 0.0, 0.6, 0.571
     step = plan_refinement_step(
         settings,
         center_v=center_v, amplitude_v=amplitude_v, target_v=target_v,
         sideband_offset_v=0.0325, detector="coarse", trace_length=2048,
-        shift_per_fraction=None,
     )
     scheduled = step.bounds["shift_capped_v"]  # what an unconditional narrow uses
     # The bug: narrow to the scheduled width around the UNMOVED centre. The
@@ -211,19 +207,25 @@ def test_a_target_421_mv_outside_the_next_window__fails_if_the_centring_check_is
 # width change must be followed by a strictly gentler one.
 
 def test_a_measured_136_mv_per_fraction_shift_gentles_the_next_cut():
+    # The hysteresis model gives a shift of h * amplitude per unit fraction of
+    # width change; h is chosen so the second stage (amplitude 0.3 V) sees the
+    # 0.136 V per unit fraction this field case measured. The first stage is
+    # planned with the model off (h = 0): the base schedule, "no shift known".
+    no_shift = _settings(
+        half_range_sweep_v=0.0001, min_signal_scan_fraction=0.0,
+        max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.0,
+    )
     settings = _settings(
         half_range_sweep_v=0.0001, min_signal_scan_fraction=0.0,
-        max_center_step_signal_widths=1.0,
+        max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.136 / 0.3,
     )
     first = plan_refinement_step(
-        settings, center_v=0.4, amplitude_v=0.6, target_v=0.4,
+        no_shift, center_v=0.4, amplitude_v=0.6, target_v=0.4,
         sideband_offset_v=0.0325, detector="coarse", trace_length=2048,
-        shift_per_fraction=None,
     )
     second = plan_refinement_step(
         settings, center_v=0.4, amplitude_v=first.amplitude_v, target_v=0.4,
         sideband_offset_v=0.0325, detector="coarse", trace_length=2048,
-        shift_per_fraction=0.136,
     )
     first_cut = 1.0 - first.amplitude_v / 0.6
     second_cut = 1.0 - second.amplitude_v / first.amplitude_v
@@ -240,19 +242,25 @@ def test_a_measured_136_mv_per_fraction_shift__fails_if_the_shift_cap_is_ignored
     real (shift-capped) result against what the schedule alone would have
     picked for the second stage -- they must differ, and the schedule-alone
     figure must not be gentler."""
+    # The hysteresis model gives a shift of h * amplitude per unit fraction of
+    # width change; h is chosen so the second stage (amplitude 0.3 V) sees the
+    # 0.136 V per unit fraction this field case measured. The first stage is
+    # planned with the model off (h = 0): the base schedule, "no shift known".
+    no_shift = _settings(
+        half_range_sweep_v=0.0001, min_signal_scan_fraction=0.0,
+        max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.0,
+    )
     settings = _settings(
         half_range_sweep_v=0.0001, min_signal_scan_fraction=0.0,
-        max_center_step_signal_widths=1.0,
+        max_center_step_signal_widths=1.0, hysteresis_per_volt_lower=0.136 / 0.3,
     )
     first = plan_refinement_step(
-        settings, center_v=0.4, amplitude_v=0.6, target_v=0.4,
+        no_shift, center_v=0.4, amplitude_v=0.6, target_v=0.4,
         sideband_offset_v=0.0325, detector="coarse", trace_length=2048,
-        shift_per_fraction=None,
     )
     second = plan_refinement_step(
         settings, center_v=0.4, amplitude_v=first.amplitude_v, target_v=0.4,
         sideband_offset_v=0.0325, detector="coarse", trace_length=2048,
-        shift_per_fraction=0.136,
     )
     schedule_only_v = second.bounds["scheduled_v"]  # ignores the shift cap
     assert schedule_only_v < second.amplitude_v  # the bug would narrow further
@@ -392,7 +400,12 @@ def test_an_offset_past_the_keep_fraction_of_the_span_has_no_safe_cut():
 
 
 def test_a_refusal_names_the_step_allowance_when_the_rails_are_far_away():
-    settings = _settings(half_range_sweep_v=0.001524, max_center_step_signal_widths=1.0)
+    # The largest h the settings admit: the stress this case wants, a shift
+    # coefficient (h * amplitude) that dominates the step allowance.
+    settings = _settings(
+        half_range_sweep_v=0.001524, max_center_step_signal_widths=1.0,
+        hysteresis_per_volt_lower=0.5,
+    )
     step = plan_refinement_step(
         settings,
         center_v=0.4047675963415047,
@@ -401,7 +414,6 @@ def test_a_refusal_names_the_step_allowance_when_the_rails_are_far_away():
         sideband_offset_v=0.030142045807807445,
         detector="strict",
         trace_length=2048,
-        shift_per_fraction=_DIVERGENT_SHIFT_PER_FRACTION,
     )
     if step.action == "refuse":
         assert "sweep rails" not in step.reason, step.reason

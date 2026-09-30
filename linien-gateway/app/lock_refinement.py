@@ -114,6 +114,137 @@ class RefinementStep:
     bounds: dict[str, float] = field(default_factory=dict)
 
 
+def lower_endpoint_change_v(
+    old_center_v: float,
+    old_amplitude_v: float,
+    new_center_v: float,
+    new_amplitude_v: float,
+) -> float:
+    """``dL``: the change in the LOWER scan endpoint, ``(c - a)``, in sweep volts."""
+    return (float(new_center_v) - abs(float(new_amplitude_v))) - (
+        float(old_center_v) - abs(float(old_amplitude_v))
+    )
+
+
+def predicted_shift_v(
+    old_center: float,
+    old_amplitude: float,
+    new_center: float,
+    new_amplitude: float,
+    h: float,
+) -> float:
+    """Signed apparent-position shift of a feature across a geometry change.
+
+    ``-h * dL`` with ``dL`` the change in the LOWER scan endpoint (see
+    ``AutoLockScanSettings.hysteresis_per_volt_lower``). The sign is kept: a
+    rising lower endpoint (narrowing from below, or moving the centre up) moves
+    the feature DOWN, and the identity check compares against a signed
+    position, so an ``abs()`` here would accept the mirror-image slip.
+    """
+    # "+ 0.0" turns a -0.0 (h * 0) into 0.0 so it serialises as a plain zero.
+    return 0.0 - float(h) * lower_endpoint_change_v(
+        old_center, old_amplitude, new_center, new_amplitude
+    )
+
+
+def hysteresis_tolerance_v(
+    delta_lower_v: float, tol_per_volt: float, floor_v: float
+) -> float:
+    """Half-width of the window around the predicted position that still counts
+    as the same feature: ``tol * |dL| + floor``."""
+    return float(tol_per_volt) * abs(float(delta_lower_v)) + float(floor_v)
+
+
+def hysteresis_block(
+    settings: AutoLockScanSettings,
+    old_center_v: float,
+    old_amplitude_v: float,
+    new_center_v: float,
+    new_amplitude_v: float,
+) -> dict[str, Any]:
+    """The model's prediction for one geometry change, in the staged API's
+    ``hysteresis`` shape (see docs/staged_autolock in the gateway README).
+
+    ``old == new`` (a ``begin`` or a ``done`` step: nothing moved) gives
+    ``delta_lower_v == 0``, a zero shift and a tolerance of just the floor.
+    """
+    h = float(settings.hysteresis_per_volt_lower)
+    delta_lower = lower_endpoint_change_v(
+        old_center_v, old_amplitude_v, new_center_v, new_amplitude_v
+    )
+    return {
+        "h_per_volt": h,
+        "delta_lower_v": delta_lower,
+        "predicted_shift_v": predicted_shift_v(
+            old_center_v, old_amplitude_v, new_center_v, new_amplitude_v, h
+        ),
+        "tolerance_v": hysteresis_tolerance_v(
+            delta_lower,
+            settings.hysteresis_tolerance_per_volt,
+            settings.hysteresis_floor_v,
+        ),
+        "old_geometry": {
+            "center_v": float(old_center_v), "amplitude_v": float(old_amplitude_v),
+        },
+        "new_geometry": {
+            "center_v": float(new_center_v), "amplitude_v": float(new_amplitude_v),
+        },
+    }
+
+
+def hysteresis_window_violation(
+    block: dict[str, Any], before_v: float, candidate_v: float
+) -> str | None:
+    """Why ``candidate_v`` is not the feature that was at ``before_v``, or None.
+
+    The continuing target must sit within ``tolerance_v`` of ``before_v +
+    predicted_shift_v``. A candidate outside is refused however well its slope
+    and sideband spacing match: on a PDH scan every adjacent crossing looks
+    like the tracked one, and a slip of one sideband spacing (20-60 mV) is
+    precisely the failure the position is the only witness to.
+    """
+    predicted_v = float(before_v) + float(block["predicted_shift_v"])
+    tolerance_v = float(block["tolerance_v"])
+    miss_v = float(candidate_v) - predicted_v
+    if abs(miss_v) <= tolerance_v:
+        return None
+    return (
+        "Tracking candidate is outside the hysteresis window: it is at "
+        f"{float(candidate_v):+.4f} V but the feature that was at "
+        f"{float(before_v):+.4f} V is predicted at {predicted_v:+.4f} V "
+        f"(shift {float(block['predicted_shift_v']) * 1e3:+.1f} mV for a "
+        f"{float(block['delta_lower_v']) * 1e3:+.1f} mV lower-endpoint change), "
+        f"{miss_v * 1e3:+.1f} mV away against a tolerance of "
+        f"{tolerance_v * 1e3:.1f} mV."
+    )
+
+
+def precompensated_center_v(
+    old_center_v: float,
+    old_amplitude_v: float,
+    new_amplitude_v: float,
+    target_v: float,
+    h: float,
+) -> float:
+    """The centre that, after the predicted shift, lands the target ON it.
+
+    The shift depends on the new centre through ``dL``, so this is the fixed
+    point of ``c = target - h * ((c - a_new) - (c_old - a_old))``, which is
+    linear and solved exactly:
+
+        c = (target + h * (a_new + c_old - a_old)) / (1 + h)
+
+    Unbounded: the caller still clamps it with ``bounded_recenter_v``, so every
+    step, signal-width and rail limit applies to the compensated centre exactly
+    as it did to the uncompensated one.
+    """
+    h = float(h)
+    lower_old = float(old_center_v) - abs(float(old_amplitude_v))
+    return (float(target_v) + h * (abs(float(new_amplitude_v)) + lower_old)) / (
+        1.0 + h
+    )
+
+
 def bounded_recenter_v(
     center_v: float,
     target_v: float,
@@ -216,8 +347,9 @@ def min_safe_amplitude_v(
     is then the only way forward, even though the target is not yet centred.
 
     Two effects race. A smaller window brings its own edge closer to the
-    target, and the width change moves the target as well (measured as
-    ``shift_per_fraction``). Solve for the SMALLEST amplitude that still
+    target, and the width change moves the target as well (the planner passes
+    ``shift_per_fraction = h * amplitude``: the hysteresis model's shift for
+    a full-width cut at a fixed centre). Solve for the SMALLEST amplitude that still
     contains the target after the shift reaching it causes -- the floor a
     caller may narrow down to, not a ceiling it may narrow past. (This
     docstring used to say "widest, not smallest" from before the function
@@ -273,7 +405,6 @@ def plan_refinement_step(
     sideband_offset_v: float | None,
     detector: str,
     trace_length: int,
-    shift_per_fraction: float | None,
 ) -> RefinementStep:
     """Decide the next thing the refinement walk should do, and nothing else.
 
@@ -284,9 +415,13 @@ def plan_refinement_step(
        strict, means the walk is done.
     2. Schedule -- this stage's desired cut (coarse vs. gentle factor).
     3. Shift allowance -- gentle the cut so the predicted width-induced shift
-       stays within ``center_step_allowance_v``.
+       (``h * amplitude`` per unit fraction, from the settings' hysteresis
+       model) stays within ``center_step_allowance_v``.
     4. Centring -- target outside half the *next* window -> recenter via
-       ``bounded_recenter_v``.
+       ``bounded_recenter_v``, aimed at the centre that puts the target on
+       the centre AFTER the predicted hysteresis shift
+       (``precompensated_center_v``), so every bound applies to the compensated
+       centre and the crop guard judges where the target will LAND.
     5. Rail escape -- a bounded recentre cannot progress -> the amplitude is
        floored by ``min_safe_amplitude_v`` so narrowing moves the rail
        outward instead of stalling.
@@ -334,7 +469,13 @@ def plan_refinement_step(
     # never move the feature further than the distance to a neighbour in one
     # go, whichever way it is moved.
     step_allowance = center_step_allowance_v(settings, amplitude_v, sideband_offset_v)
-    if shift_per_fraction and shift_per_fraction > 1e-9:
+    # Shift of a full-width cut at a fixed centre, per unit width fraction: the
+    # model's h * (a_old - a_new) = h * a_old * (1 - a_new / a_old). Derived,
+    # not measured -- a measured coefficient was max-latched and one
+    # contaminated reading inflated it for the rest of the walk.
+    h = float(settings.hysteresis_per_volt_lower)
+    shift_per_fraction = h * abs(float(amplitude_v))
+    if shift_per_fraction > 1e-9:
         gentlest = 1.0 - (step_allowance / shift_per_fraction)
         factor = min(_REFINEMENT_MAX_NARROW_FACTOR, max(factor, gentlest))
     shift_capped_v = amplitude_v * factor
@@ -369,22 +510,40 @@ def plan_refinement_step(
     # only what is left of the stage's single movement allowance after the
     # predicted width-induced shift has claimed its share, so a combined stage
     # perturbs the feature no more than the single-axis stage it replaces.
-    width_fraction = max(0.0, 1.0 - (next_amplitude / amplitude_v))
-    predicted_width_shift = (shift_per_fraction or 0.0) * width_fraction
-    centre_budget = max(0.0, step_allowance - predicted_width_shift)
-    combined_center = bounded_recenter_v(
-        center_v,
-        target_v,
-        amplitude_v,
-        signal_width_v=signal_width,
-        max_signal_widths=settings.max_center_step_signal_widths,
-        rail_amplitude_v=next_amplitude,
-        step_budget_v=centre_budget,
+    #
+    # The centre is aimed at where the target will be AFTER the hysteresis
+    # shift, not where it is now. The shift depends on the new centre and width
+    # through the lower endpoint, so the aim is the exact fixed point
+    # (`precompensated_center_v`); the clamp below is unchanged and still
+    # decides how much of it one stage may take.
+    def _combine(next_amp: float) -> tuple[float, float, float, float]:
+        width_fraction = max(0.0, 1.0 - (next_amp / amplitude_v))
+        width_shift = shift_per_fraction * width_fraction
+        budget = max(0.0, step_allowance - width_shift)
+        aim = precompensated_center_v(center_v, amplitude_v, next_amp, target_v, h)
+        centre = bounded_recenter_v(
+            center_v,
+            aim,
+            amplitude_v,
+            signal_width_v=signal_width,
+            max_signal_widths=settings.max_center_step_signal_widths,
+            rail_amplitude_v=next_amp,
+            step_budget_v=budget,
+        )
+        # Where the target is predicted to sit in the new window.
+        landing = target_v + predicted_shift_v(
+            center_v, amplitude_v, centre, next_amp, h
+        )
+        return centre, landing, width_shift, budget
+
+    combined_center, landing_v, predicted_width_shift, centre_budget = _combine(
+        next_amplitude
     )
     bounds = {
         **bounds,
         "centre_budget_v": centre_budget,
         "predicted_width_shift_v": predicted_width_shift,
+        "predicted_target_v": landing_v,
         "rail_v": 1.0 - abs(next_amplitude),
     }
 
@@ -392,11 +551,15 @@ def plan_refinement_step(
     # moved, not the gap before it. Measuring it before the move is what forced
     # the old rail-escape path to floor the amplitude so hard that the feature
     # was parked at 90% of the new half-range, tripping the next stage's
-    # centring rule immediately.
-    residual_offset = target_v - combined_center
+    # centring rule immediately. "Left" includes the hysteresis shift the move
+    # itself causes: the target is judged where it will land.
+    residual_offset = landing_v - combined_center
     if abs(residual_offset) > _INNER_WINDOW_FRACTION * next_amplitude:
+        # min_safe_amplitude_v adds the width-induced shift itself, so it is
+        # handed the geometric gap, not the already-shifted one.
         safe = min_safe_amplitude_v(
-            amplitude_v, residual_offset, shift_per_fraction, target_amplitude
+            amplitude_v, target_v - combined_center, shift_per_fraction,
+            target_amplitude,
         )
         if safe is None:
             # Nothing this stage can do keeps the feature in view: the centre is
@@ -427,23 +590,15 @@ def plan_refinement_step(
             # Narrow less, and recompute the centre against the looser rail and
             # the smaller width-induced shift that a gentler cut implies.
             next_amplitude = min(amplitude_v, safe)
-            width_fraction = max(0.0, 1.0 - (next_amplitude / amplitude_v))
-            predicted_width_shift = (shift_per_fraction or 0.0) * width_fraction
-            centre_budget = max(0.0, step_allowance - predicted_width_shift)
-            combined_center = bounded_recenter_v(
-                center_v,
-                target_v,
-                amplitude_v,
-                signal_width_v=signal_width,
-                max_signal_widths=settings.max_center_step_signal_widths,
-                rail_amplitude_v=next_amplitude,
-                step_budget_v=centre_budget,
+            combined_center, landing_v, predicted_width_shift, centre_budget = (
+                _combine(next_amplitude)
             )
             bounds = {
                 **bounds,
                 "crop_floor_v": safe,
                 "centre_budget_v": centre_budget,
                 "predicted_width_shift_v": predicted_width_shift,
+                "predicted_target_v": landing_v,
                 "rail_v": 1.0 - abs(next_amplitude),
             }
         if next_amplitude >= amplitude_v - _NARROW_SCHEDULE_EPSILON_V:

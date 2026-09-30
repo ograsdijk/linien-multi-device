@@ -1487,7 +1487,9 @@ async def staged_autolock_begin(
     409 if a staged run is already active on this device, the device is
     locked, or a one-shot `auto_lock_scan` is in flight (see
     `_ensure_no_staged_autolock_run`). Acquires a fresh frame the same way
-    `auto_lock_candidates?acquire=true` does before detecting on it.
+    `auto_lock_candidates?acquire=true` does before detecting on it. The
+    response carries a `hysteresis` block (`StagedAutolockHysteresis`) with
+    `delta_lower_v == 0.0`, so the device's model settings are visible.
     """
     device = _get_device_or_404(key)
     session = _session_for_device(device)
@@ -1547,6 +1549,14 @@ async def staged_autolock_state(key: str) -> dict:
 async def staged_autolock_step(
     key: str, token: str, payload: StagedAutolockStepRequest
 ) -> dict:
+    """Plan and apply one staged refinement step from the selected candidate.
+
+    The selection must be the feature the PREVIOUS step's geometry change is
+    predicted to have moved it to (422 otherwise, see the `hysteresis` block
+    -- `StagedAutolockHysteresis`). The response carries that block for THIS
+    step's own geometry change; the candidates on the new frame are annotated
+    `identity_ok: false` when outside the window.
+    """
     session = _get_session(key)
     try:
         return await asyncio.to_thread(

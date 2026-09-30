@@ -53,11 +53,12 @@ from .lock_acceptance import (
 )
 from .lock_refinement import (
     _MAX_REFINEMENT_STAGES,
-    _REFINEMENT_MIN_MEASURABLE_FRACTION,
     _TrackingIdentityChanged,
     IdentityGuard,
     bounded_recenter_v,
     center_step_allowance_v,
+    hysteresis_block,
+    hysteresis_window_violation,
     min_safe_amplitude_v,
     plan_refinement_step,
 )
@@ -225,7 +226,6 @@ class StagedAutolockRun:
     latest_candidates: list[Any]
     stage_index: int = 0
     identity: Any | None = None
-    shift_per_fraction: float | None = None
     narrow_count: int = 0
     stages: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     timer: threading.Timer | None = None
@@ -238,13 +238,17 @@ class StagedAutolockRun:
     # from under it -- see `_get_idle_staged_run_or_raise`,
     # `_staged_autolock_expire` and `_staged_autolock_finish_busy`.
     busy: bool = False
-    # Width-shift measurement deferred from the geometry-changing stage that
-    # produced the run's CURRENT frame, until the caller's selection on that
-    # frame is known (the next `step` or `lock` call) -- see
-    # `_consume_pending_shift_measurement`. Never the best-score candidate:
-    # using it would charge the width-shift estimate to a serrodyne order the
-    # caller never selected. None when the current frame was not produced by
-    # a geometry change (e.g. right after `begin`, or a "done" stage).
+    # The hysteresis prediction for the geometry-changing stage that produced
+    # the run's CURRENT frame -- the previously selected target's voltage and
+    # geometry, plus the model's `hysteresis` block -- held until the caller's
+    # selection on that frame is known (the next `step` or `lock` call): the
+    # selection must sit within the block's tolerance of the predicted
+    # position, and only then is the stage's measured-vs-predicted diagnostic
+    # recorded (see `_check_pending_hysteresis`/`_consume_pending_hysteresis`).
+    # Never checked against the best-score candidate: that may be a different
+    # serrodyne order than the one the caller selects. None when the current
+    # frame was not produced by a geometry change (e.g. right after `begin`,
+    # or a "done" stage).
     pending_shift: dict[str, Any] | None = None
 
 # Frames a verification sweep must observe before it trusts what it sees. One is
@@ -3368,7 +3372,6 @@ class DeviceSession:
         target: Any,
         detector: str,
         trace_length: int,
-        shift_per_fraction: float | None,
         geometry_settle_s: float,
         detect_narrow: Callable[
             [float, float, float],
@@ -3394,7 +3397,7 @@ class DeviceSession:
         the fresh frame instead of picking one, for the caller to choose from.
 
         Bookkeeping that the two callers do differently -- stage-log entries,
-        IdentityGuard ordering/mutation, ``shift_per_fraction`` updates,
+        IdentityGuard ordering/mutation, the hysteresis-window identity check,
         ``narrow_count``, the "did it actually narrow" guard -- stays with the
         caller; this method makes no I/O beyond the two callbacks and never
         raises on the planner's behalf (a ``"refuse"`` step is returned, not
@@ -3408,7 +3411,6 @@ class DeviceSession:
             sideband_offset_v=target.sideband_offset_v,
             detector=detector,
             trace_length=trace_length,
-            shift_per_fraction=shift_per_fraction,
         )
         before_v = float(target.target_voltage)
         before_amplitude = abs(amplitude_v)
@@ -3452,6 +3454,44 @@ class DeviceSession:
             before_center=before_center,
             before_detector=before_detector,
         )
+
+    @staticmethod
+    def _hysteresis_stage_record(
+        settings: AutoLockScanSettings,
+        outcome: "DeviceSession._RefinementStageOutcome",
+        new_target_v: float,
+    ) -> dict[str, Any]:
+        """The hysteresis model's prediction for one executed stage, with what
+        was measured beside it (``measured_shift_v``, ``residual_v``).
+
+        Uses the geometry READ BACK after the write, not the one requested: a
+        register that quantises or clamps the request moves the feature by the
+        realised endpoint change.
+        """
+        block = hysteresis_block(
+            settings,
+            outcome.before_center, outcome.before_amplitude,
+            outcome.center_v, outcome.amplitude_v,
+        )
+        measured = float(new_target_v) - float(outcome.before_v)
+        return {
+            **block,
+            "before_v": float(outcome.before_v),
+            "measured_shift_v": measured,
+            "residual_v": measured - block["predicted_shift_v"],
+        }
+
+    @staticmethod
+    def _check_hysteresis_window(
+        record: dict[str, Any], outcome: Any, target: Any
+    ) -> None:
+        """Raise `_TrackingIdentityChanged` when the walk's new target is not
+        within tolerance of the position the old one is predicted to move to."""
+        reason = hysteresis_window_violation(
+            record, float(outcome.before_v), float(target.target_voltage)
+        )
+        if reason is not None:
+            raise _TrackingIdentityChanged(reason)
 
     def _trajectory_refine_auto_lock(
         self,
@@ -3513,9 +3553,11 @@ class DeviceSession:
             # follows. Measured on this device at 73 mV for one 2x narrowing --
             # larger than the 65 mV signal width the centre steps are bounded
             # by, so an unbounded width change is the bigger move of the two.
-            # Each stage measures it (shift per unit fractional width change)
-            # and the next stage is sized from what was actually observed.
-            shift_per_fraction: float | None = None
+            # The shift is -h * dL for the change dL in the lower scan endpoint
+            # (settings.hysteresis_per_volt_lower): the planner pre-compensates
+            # the commanded centre with it, and each stage below is identity-
+            # checked against the position it predicts. Each stage records
+            # measured vs predicted, for the operator and for re-fitting h.
             while detector == "coarse" or scan_too_wide_to_lock(
                 settings, amplitude_v, target.sideband_offset_v,
                 trace_points=trace_length,
@@ -3560,7 +3602,6 @@ class DeviceSession:
                     target=target,
                     detector=detector,
                     trace_length=trace_length,
-                    shift_per_fraction=shift_per_fraction,
                     geometry_settle_s=geometry_settle_s,
                     detect_narrow=_detect_narrow,
                     detect_recenter=_detect_recenter,
@@ -3581,12 +3622,17 @@ class DeviceSession:
                         outcome.resolution, outcome.coarse_metrics,
                     )
                     detector = "coarse"
+                    hysteresis = self._hysteresis_stage_record(
+                        settings, outcome, float(target.target_voltage)
+                    )
+                    self._check_hysteresis_window(hysteresis, outcome, target)
                     identity.check(target, amplitude_v=amplitude_v, detector="coarse", resolution_samples=resolution)
                     stages.append({"kind": "recenter", "center_v": center_v,
                                    "amplitude_v": amplitude_v, "target_voltage": target.target_voltage,
                                    "resolution_samples": resolution, "detector": "coarse",
                                    "sideband_offset_v": target.sideband_offset_v,
-                                   "metrics": coarse_metrics, "bounds": step.bounds})
+                                   "metrics": coarse_metrics, "bounds": step.bounds,
+                                   "hysteresis": hysteresis})
                     narrow_count += 1
                     continue
                 if step.action == "rail_escape":
@@ -3608,47 +3654,13 @@ class DeviceSession:
                     outcome.target, outcome.center_v, outcome.amplitude_v,
                     outcome.resolution, outcome.detector, outcome.coarse_metrics,
                 )
-                # What the width change actually did to the apparent position.
+                # What the geometry change actually did to the apparent position,
+                # against what the hysteresis model predicted for it.
                 width_shift_v = abs(float(target.target_voltage) - before_v)
-                width_fraction = (
-                    1.0 - (abs(amplitude_v) / before_amplitude)
-                    if before_amplitude > 1e-12 else 0.0
-                )
-                # Only a same-detector pair measures the actuator. The strict
-                # detector and the coarse tracker can settle on different
-                # crossings of a multi-feature scan, and their difference --
-                # 100 mV in the field -- is not a width-induced shift. Charging
-                # it to the shift estimate spends the stage allowance on it,
-                # which is what left a narrowing stage with no centre budget at
-                # all: it took the width change and skipped the centring.
-                # A narrowing stage moves the centre in the same register
-                # write, and both changes move the apparent feature. Dividing
-                # the WHOLE observed move by the width fraction alone charges
-                # the centre's share to the width, and the smaller the cut the
-                # larger the bogus coefficient: the field case cut 22.6 mV of
-                # half-range while commanding the centre 40.3 mV, and the
-                # resulting 27.8 mV move over a 0.096 fraction read as 0.289 V
-                # per unit fraction -- double the 0.144 the same walk had
-                # measured on stages where the width did dominate. The max()
-                # below then made that permanent, and it throttled every
-                # subsequent cut and centre step until the walk gave up.
-                # So only a stage whose width change outweighs its centre
-                # change is allowed to speak for the width. Both are sweep
-                # volts, so the comparison carries no scale of its own.
-                width_delta_v = max(0.0, before_amplitude - abs(amplitude_v))
                 center_delta_v = abs(float(center_v) - before_center)
-                if (
-                    width_fraction > _REFINEMENT_MIN_MEASURABLE_FRACTION
-                    and detector == before_detector
-                    and width_delta_v >= center_delta_v
-                ):
-                    observed = width_shift_v / width_fraction
-                    # Keep the worst seen: one gentle stage must not talk the
-                    # walk back into a step a harsher one already showed is big.
-                    shift_per_fraction = (
-                        observed if shift_per_fraction is None
-                        else max(shift_per_fraction, observed)
-                    )
+                hysteresis = self._hysteresis_stage_record(
+                    settings, outcome, float(target.target_voltage)
+                )
                 stages.append({
                     "kind": "narrow", "center_v": center_v, "amplitude_v": amplitude_v,
                     "target_voltage": target.target_voltage, "resolution_samples": resolution,
@@ -3656,9 +3668,12 @@ class DeviceSession:
                     "sideband_offset_v": target.sideband_offset_v,
                     "width_shift_v": width_shift_v,
                     "center_shift_v": center_delta_v,
-                    "shift_per_fraction_v": shift_per_fraction,
+                    "hysteresis": hysteresis,
                     "bounds": step.bounds,
                 })
+                # Position first: a candidate off the predicted position is a
+                # different crossing whatever its slope and spacing say.
+                self._check_hysteresis_window(hysteresis, outcome, target)
                 identity.check(target, amplitude_v=amplitude_v, detector=detector, resolution_samples=resolution)
                 # Checked after the identity guard: if the walk has lost the
                 # feature, that is the more specific diagnosis. A narrowing that
@@ -3946,50 +3961,62 @@ class DeviceSession:
         if expire_now:
             self._staged_autolock_expire(token)
 
-    def _consume_pending_shift_measurement(
+    @staticmethod
+    def _pending_hysteresis_violation(
+        run: "StagedAutolockRun", candidate: Any
+    ) -> str | None:
+        """Why ``candidate`` is not the previously selected feature after the
+        geometry change that produced the run's current frame, or None.
+
+        None too when the current frame was not produced by a geometry change.
+        Non-mutating: it also annotates every candidate on the frame.
+        """
+        pending = run.pending_shift
+        if pending is None:
+            return None
+        return hysteresis_window_violation(
+            pending["hysteresis"], float(pending["before_v"]),
+            float(candidate.target_voltage),
+        )
+
+    def _check_pending_hysteresis(
         self, run: "StagedAutolockRun", selected: Any
     ) -> None:
-        """Finish a width-shift measurement deferred by the prior stage.
+        """Refuse (422) a selection outside the hysteresis window. Caller must
+        hold `_state_lock`. The pending prediction is kept, so a corrected
+        selection on the same frame is still judged against it."""
+        reason = self._pending_hysteresis_violation(run, selected)
+        if reason is not None:
+            raise StagedAutolockError(reason, status_code=422)
 
-        Caller must hold `_state_lock`. `staged_autolock_step` used to measure
-        the width-induced shift (and derive `needs_more_refinement`) from
-        `outcome.target` -- the best-score candidate on the new frame, which
-        may be a different serrodyne order than the one the caller is about
-        to select. The measurement is only meaningful for the SAME feature
-        before and after the geometry change, so it must wait for the
-        caller's selection on the new frame -- exactly the same formula and
-        same-detector/width-dominates conditions the one-shot loop applies in
-        `_trajectory_refine_auto_lock`. No-op if the current frame was not
-        produced by a geometry change (`pending_shift` is None).
+    def _consume_pending_hysteresis(
+        self, run: "StagedAutolockRun", selected: Any
+    ) -> None:
+        """Record the measured-vs-predicted shift of the stage that produced the
+        current frame, now that the caller's selection on it is known and has
+        passed the window and identity checks. Caller must hold `_state_lock`.
+
+        Measured against the SELECTED candidate, never the best-score one,
+        which may be a different serrodyne order. Diagnostic only: nothing
+        learned here feeds back into planning. No-op if the current frame was
+        not produced by a geometry change (`pending_shift` is None).
         """
         pending = run.pending_shift
         if pending is None:
             return
         run.pending_shift = None
-        before_v = float(pending["before_v"])
-        before_amplitude = float(pending["before_amplitude"])
-        before_center = float(pending["before_center"])
-        before_detector = str(pending["before_detector"])
-        detector = str(pending["detector"])
-        amplitude_v = float(pending["amplitude_v"])
-        center_v = float(pending["center_v"])
-        width_shift_v = abs(float(selected.target_voltage) - before_v)
-        width_fraction = (
-            1.0 - (abs(amplitude_v) / before_amplitude)
-            if before_amplitude > 1e-12 else 0.0
-        )
-        width_delta_v = max(0.0, before_amplitude - abs(amplitude_v))
-        center_delta_v = abs(center_v - before_center)
-        if (
-            width_fraction > _REFINEMENT_MIN_MEASURABLE_FRACTION
-            and detector == before_detector
-            and width_delta_v >= center_delta_v
-        ):
-            observed = width_shift_v / width_fraction
-            run.shift_per_fraction = (
-                observed if run.shift_per_fraction is None
-                else max(run.shift_per_fraction, observed)
-            )
+        block = pending["hysteresis"]
+        measured = float(selected.target_voltage) - float(pending["before_v"])
+        run.stages.append({
+            "kind": pending["action"],
+            "stage_index": pending["stage_index"],
+            "hysteresis": {
+                **block,
+                "before_v": float(pending["before_v"]),
+                "measured_shift_v": measured,
+                "residual_v": measured - block["predicted_shift_v"],
+            },
+        })
 
     @staticmethod
     def _augment_candidates_with_lockable_here(
@@ -4082,12 +4109,16 @@ class DeviceSession:
         amplitude_v: float,
         detector: str,
         resolution_samples: float,
+        hysteresis_violation: Callable[[Any], str | None] | None = None,
     ) -> list[dict[str, Any]]:
         """Every candidate's dict, plus identity_ok/identity_reason.
 
         Uses `IdentityGuard.evaluate` (non-mutating): annotating every
         candidate on a frame must never let one the caller does not select
-        become, or replace, the tracked identity.
+        become, or replace, the tracked identity. ``hysteresis_violation``
+        (candidate -> reason or None) adds the position check the next
+        `step`/`lock` will apply, so a candidate outside the predicted window
+        is annotated ``identity_ok: false`` before the caller picks it.
         """
         out: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -4102,6 +4133,9 @@ class DeviceSession:
                     detector=detector,
                     resolution_samples=resolution_samples,
                 )
+                if ok and hysteresis_violation is not None:
+                    reason = hysteresis_violation(candidate)
+                    ok = reason is None
                 payload["identity_ok"] = ok
                 payload["identity_reason"] = reason
             out.append(payload)
@@ -4221,6 +4255,11 @@ class DeviceSession:
             "detector": detector,
             "detail": detail,
             "stage_index": 0,
+            # No geometry change yet (dL = 0): shows the settings the run will
+            # predict with.
+            "hysteresis": hysteresis_block(
+                settings, center_v, amplitude_v, center_v, amplitude_v
+            ),
         }
 
     def staged_autolock_renew(self, token: str, ttl_s: float) -> dict[str, Any]:
@@ -4394,6 +4433,10 @@ class DeviceSession:
                     trace_length=run.trace_length, detector=run.latest_detector,
                 )
             else:
+                # Position first, as in the one-shot walk: outside the
+                # hysteresis window is a different crossing whatever its slope
+                # and sideband spacing say.
+                self._check_pending_hysteresis(run, selected)
                 try:
                     run.identity.check(
                         selected,
@@ -4404,18 +4447,15 @@ class DeviceSession:
                 except _TrackingIdentityChanged as exc:
                     raise StagedAutolockError(str(exc), status_code=422) from exc
             # The caller's selection on THIS frame is now known to be
-            # identity-consistent -- only NOW finish any width-shift
-            # measurement the stage that produced this frame deferred (fix
-            # #7 / _consume_pending_shift_measurement). Consuming it before
-            # the identity check let a wrong pick's width-shift estimate
-            # stick (max()) even though the pick itself was then refused.
-            self._consume_pending_shift_measurement(run, selected)
+            # identity-consistent -- only NOW record the measured-vs-predicted
+            # diagnostic of the stage that produced this frame. Recording it
+            # before the checks would attribute a refused pick's shift to it.
+            self._consume_pending_hysteresis(run, selected)
             settings = run.settings
             geometry_settle_s = max(0.0, float(run.acceptance.settle_ms) / 1000.0)
             center_v, amplitude_v = run.center_v, run.amplitude_v
             trace_length = run.trace_length
             detector = run.latest_detector
-            shift_per_fraction = run.shift_per_fraction
             narrow_count = run.narrow_count
             if narrow_count >= _MAX_REFINEMENT_STAGES:
                 raise StagedAutolockError(
@@ -4485,7 +4525,6 @@ class DeviceSession:
                         target=selected,
                         detector=detector,
                         trace_length=trace_length,
-                        shift_per_fraction=shift_per_fraction,
                         geometry_settle_s=geometry_settle_s,
                         detect_narrow=_detect_narrow,
                         detect_recenter=_detect_recenter,
@@ -4526,6 +4565,11 @@ class DeviceSession:
                         "expires_at": run.expires_at,
                         "needs_more_refinement": not any_lockable,
                         "planner": {"action": step.action, "reason": step.reason, "bounds": step.bounds},
+                        # Nothing moved: dL = 0, no shift, tolerance = the floor.
+                        "hysteresis": hysteresis_block(
+                            settings, run.center_v, run.amplitude_v,
+                            run.center_v, run.amplitude_v,
+                        ),
                     }
                 # "narrow" / "recenter" / "rail_escape": geometry moved and a
                 # fresh frame was detected -- adopt it as the run's new latest
@@ -4546,25 +4590,28 @@ class DeviceSession:
                 run.latest_resolution = outcome.resolution
                 run.latest_candidates = latest_candidates_box
                 run.latest_frame = dict(latest_frame_box)
-                # Width-induced shift bookkeeping is DEFERRED until the
-                # caller selects a candidate on this new frame (see fix #3):
-                # `outcome.target` is only the best-score candidate, which
-                # may be a different serrodyne order than the one about to be
-                # selected, and measuring the shift against the wrong order
-                # would poison shift_per_fraction for every later stage.
+                # The hysteresis window is applied to the caller's SELECTION on
+                # this frame (the next step/lock), not to `outcome.target`: that
+                # is only the best-score candidate, which may be a different
+                # serrodyne order than the one about to be selected. Predicted
+                # from the geometry READ BACK, not the one requested.
+                hysteresis = hysteresis_block(
+                    settings, outcome.before_center, outcome.before_amplitude,
+                    run.center_v, run.amplitude_v,
+                )
                 run.pending_shift = {
                     "before_v": outcome.before_v,
-                    "before_amplitude": outcome.before_amplitude,
-                    "before_center": outcome.before_center,
-                    "before_detector": outcome.before_detector,
-                    "detector": run.latest_detector,
-                    "amplitude_v": run.amplitude_v,
-                    "center_v": run.center_v,
+                    "action": step.action,
+                    "stage_index": run.stage_index,
+                    "hysteresis": hysteresis,
                 }
                 annotated = self._annotate_candidates(
                     run.latest_candidates, run.identity,
                     amplitude_v=run.amplitude_v, detector=run.latest_detector,
                     resolution_samples=run.latest_resolution,
+                    hysteresis_violation=lambda c, _run=run: (
+                        self._pending_hysteresis_violation(_run, c)
+                    ),
                 )
                 # `needs_more_refinement` is now a per-frame compatibility key
                 # derived from the per-candidate `lockable_here` flags (fix
@@ -4584,6 +4631,7 @@ class DeviceSession:
                     "expires_at": run.expires_at,
                     "needs_more_refinement": not any_lockable,
                     "planner": {"action": step.action, "reason": step.reason, "bounds": step.bounds},
+                    "hysteresis": hysteresis,
                 }
         finally:
             self._staged_autolock_finish_busy(token)
@@ -4706,6 +4754,10 @@ class DeviceSession:
                     trace_length=run.trace_length, detector=run.latest_detector,
                 )
             else:
+                # As in `step`: the hysteresis window first. `lock` straight
+                # after a geometry-changing `step` must not hand a slipped
+                # selection to the lock engagement.
+                self._check_pending_hysteresis(run, selected)
                 try:
                     run.identity.check(
                         selected,
@@ -4716,14 +4768,10 @@ class DeviceSession:
                 except _TrackingIdentityChanged as exc:
                     raise StagedAutolockError(str(exc), status_code=422) from exc
             # As in `step`: only NOW, once the selection is known to be
-            # identity-consistent, finish any deferred width-shift
-            # measurement from the stage that produced this frame (fix #7).
-            # Harmless if `lock` is called straight after a geometry-changing
-            # `step` with no intervening `step` call -- the measurement is
-            # not used again once locked, but recording it keeps the run's
-            # bookkeeping consistent for a caller that inspects it after the
-            # fact.
-            self._consume_pending_shift_measurement(run, selected)
+            # identity-consistent, record the measured-vs-predicted diagnostic
+            # of the stage that produced this frame, so the refinement record
+            # below carries it.
+            self._consume_pending_hysteresis(run, selected)
             settings = run.settings
             acceptance = run.acceptance
             center_v, amplitude_v = run.center_v, run.amplitude_v
@@ -4731,6 +4779,7 @@ class DeviceSession:
             restore_center_v = run.restore_center_v
             restore_amplitude_v = run.restore_amplitude_v
             identity = run.identity
+            stage_records = [dict(record) for record in run.stages]
             # From here the operation does slow I/O with `_state_lock`
             # released (a fresh-frame wait, then `_move_and_lock`) -- see
             # StagedAutolockRun.busy.
@@ -4822,7 +4871,7 @@ class DeviceSession:
                 "original_amplitude_v": restore_amplitude_v,
                 "final_center_v": center_v,
                 "final_amplitude_v": amplitude_v,
-                "stages": [],
+                "stages": stage_records,
                 "restored": False,
             }
             # After the fresh-frame I/O above, re-check the run is still the

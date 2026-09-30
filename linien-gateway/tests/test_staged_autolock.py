@@ -182,12 +182,14 @@ def test_staged_step_follows_the_callers_selection_not_the_higher_score(monkeypa
     assert result["candidates"][1]["target_index"] == 200
     token = result["token"]
 
-    # After narrowing, a fresh frame shows the desired feature at a NEW
-    # (unpredictable) position, distinguished only by target_index -- the
-    # decoy remains higher-scoring.
+    # After narrowing, a fresh frame shows the desired feature where the
+    # hysteresis model puts it -- (0, 1.0) -> (0.05, 0.3) raises the lower
+    # endpoint by 0.75 V, so -0.085 * 0.75 = -63.75 mV: 0.180 -> 0.1163 --
+    # distinguished from the decoy only by target_index; the decoy remains
+    # higher-scoring.
     post_move_candidates = [
-        _result(50, 0.191, score=0.4, sideband_offset_v=0.1),  # desired, moved, weaker score
-        _result(75, -0.402, score=0.97),  # decoy, still highest score
+        _result(50, 0.1163, score=0.4, sideband_offset_v=0.1),  # desired, moved, weaker score
+        _result(75, -0.4737, score=0.97),  # decoy, still highest score
     ]
 
     def _narrow_detect(settings, after=None):
@@ -205,16 +207,16 @@ def test_staged_step_follows_the_callers_selection_not_the_higher_score(monkeypa
     # The caller selects the DESIRED (lower-score) candidate by target_index.
     def _final_detect(settings, after=None):
         return (
-            [_result(50, 0.191, score=0.4)],
+            [_result(50, 0.1163, score=0.4)],
             0.05, 0.3, 9.0, _frame(3, 0.05, 0.3),
         )
 
     monkeypatch.setattr(session, "_capture_auto_lock_candidates_strict", _final_detect)
 
     lock_result = session.staged_autolock_lock(token, 2, 50)
-    assert lock_result["target_voltage"] == pytest.approx(0.191)
+    assert lock_result["target_voltage"] == pytest.approx(0.1163)
     assert len(locked) == 1
-    assert locked[0].target_voltage == pytest.approx(0.191)
+    assert locked[0].target_voltage == pytest.approx(0.1163)
     # The run has ended.
     assert session.staged_autolock_state() == {"active": False}
     # Never wrote geometry anywhere near the decoy's voltage.
@@ -658,11 +660,11 @@ def test_needs_more_refinement_is_true_when_no_candidate_is_lockable_here():
     assert step_result["needs_more_refinement"] is True
 
 
-def test_width_shift_measurement_uses_the_callers_selection_not_the_best_score():
-    """Regression for fix #3: the shift-per-fraction bookkeeping must be
-    measured against the candidate the CALLER selects on the new frame, not
-    `outcome.target` (the best-score one) -- otherwise a decoy at a wildly
-    different voltage poisons `shift_per_fraction` for every later stage.
+def test_hysteresis_diagnostic_uses_the_callers_selection_not_the_best_score():
+    """Regression for fix #3, for the hysteresis diagnostic: measured-vs-
+    predicted must be taken against the candidate the CALLER selects on the new
+    frame, not `outcome.target` (the best-score one) -- a decoy at a wildly
+    different voltage must not be charged as the tracked feature's shift.
     """
     session = _make_session()
     _geometry_recorder(session)
@@ -678,24 +680,29 @@ def test_width_shift_measurement_uses_the_callers_selection_not_the_best_score()
     result = session.staged_autolock_begin(None, 60.0)
     token = result["token"]
 
-    # After narrowing (amplitude 1.0 -> 0.3), the desired feature moved only
-    # slightly (0.180 -> 0.191); the decoy is far away (-0.402). Both
-    # sidebands are now wide enough that selecting either would make the
-    # NEXT step's planner declare "done" with no further detection needed.
+    # After narrowing (0, 1.0) -> (0.05, 0.3) the model predicts -63.75 mV:
+    # the desired feature lands 3 mV off that (0.180 -> 0.119); the decoy is
+    # far away (-0.402). Both sidebands are now wide enough that selecting
+    # either would make the NEXT step's planner declare "done" with no
+    # further detection needed.
     post_move_candidates = [
-        _result(50, 0.191, score=0.4, sideband_offset_v=0.2),  # desired, moved
+        _result(50, 0.119, score=0.4, sideband_offset_v=0.2),  # desired, moved
         _result(75, -0.402, score=0.97, sideband_offset_v=0.2),  # decoy, still highest score
     ]
     session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
         lambda settings, after=None: (post_move_candidates, 0.05, 0.3, 9.0, _frame(2, 0.05, 0.3))
     )
-    session.staged_autolock_step(token, 1, 100)  # select the DESIRED candidate
+    step = session.staged_autolock_step(token, 1, 100)  # select the DESIRED candidate
+    # The decoy is annotated as outside the window before anyone picks it.
+    by_index = {c["target_index"]: c for c in step["candidates"]}
+    assert by_index[50]["identity_ok"] is True
+    assert by_index[75]["identity_ok"] is False
+    assert "hysteresis window" in by_index[75]["identity_reason"]
 
-    # The width-shift measurement from the step above is still PENDING: it
-    # has not been consumed yet, because no selection has been made on frame
-    # 2 -- see StagedAutolockRun.pending_shift.
+    # The prediction for the step above is still PENDING: no selection has
+    # been made on frame 2 -- see StagedAutolockRun.pending_shift.
     assert session._staged_autolock.pending_shift is not None
-    assert session._staged_autolock.shift_per_fraction is None
+    assert session._staged_autolock.stages == []
 
     # Selecting the DESIRED candidate on frame 2 consumes it.
     session.staged_autolock_step(token, 2, 50)
@@ -703,13 +710,13 @@ def test_width_shift_measurement_uses_the_callers_selection_not_the_best_score()
     run = session._staged_autolock
     assert run is not None
     assert run.pending_shift is None
-    assert run.shift_per_fraction is not None
-    # Expected: |0.191 - 0.180| / (1 - 0.3/1.0) ~= 0.0157 -- small, because
-    # the desired feature barely moved.
-    assert run.shift_per_fraction == pytest.approx(0.011 / 0.7, rel=1e-6)
-    # NOT the value the pre-fix code would have measured against the decoy:
-    # |-0.402 - 0.180| / 0.7 ~= 0.831 -- would poison every later stage.
-    assert run.shift_per_fraction != pytest.approx(0.582 / 0.7, rel=0.01)
+    (record,) = run.stages
+    hysteresis = record["hysteresis"]
+    assert hysteresis["measured_shift_v"] == pytest.approx(0.119 - 0.180)
+    assert hysteresis["predicted_shift_v"] == pytest.approx(-0.085 * 0.75)
+    assert hysteresis["residual_v"] == pytest.approx(-0.061 + 0.06375)
+    # NOT what it would have been against the decoy: -0.402 - 0.180.
+    assert abs(hysteresis["residual_v"]) < 0.01
 
 
 # --------------------------------------------------------------------------
@@ -985,7 +992,7 @@ def test_expire_racing_a_renew_does_not_abort_the_extended_run():
 # --------------------------------------------------------------------------
 
 
-def test_a_rejected_selection_does_not_consume_the_pending_shift_measurement():
+def test_a_rejected_selection_does_not_consume_the_pending_hysteresis_prediction():
     session = _make_session()
     _geometry_recorder(session)
     session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
@@ -1001,25 +1008,29 @@ def test_a_rejected_selection_does_not_consume_the_pending_shift_measurement():
     # The stage that follows produces a frame with a pending shift
     # measurement (see StagedAutolockRun.pending_shift) and a candidate with
     # the OPPOSITE slope -- selecting it must fail identity.
+    # (0, 1.0) -> (0.1, 0.5) raises the lower endpoint 0.6 V: the model puts the
+    # 0.1 V feature at 0.049 V, so the opposite-slope candidate sits inside the
+    # window and it is the slope, not the position, that must refuse it.
     session._capture_auto_lock_candidates_strict = (  # type: ignore[method-assign]
         lambda settings, after=None: (
-            [_result(2, 0.2, sideband_offset_v=0.03, slope_rising=False)],
+            [_result(2, 0.049, sideband_offset_v=0.03, slope_rising=False)],
             0.1, 0.5, 5.0, _frame(2, 0.1, 0.5),
         )
     )
     session.staged_autolock_step(token, 1, 1)
     run = session._staged_autolock
     assert run.pending_shift is not None
+    recorded = len(run.stages)  # the earlier, accepted stage's diagnostic
 
     with pytest.raises(StagedAutolockError):
         session.staged_autolock_step(token, 2, 2)
 
-    # Pre-fix, `_consume_pending_shift_measurement` ran BEFORE the identity
-    # check and had already recorded a (wrong) shift_per_fraction by the time
-    # the rejection was raised -- and `max()` in `plan_refinement_step`'s
-    # caller means that bad value would stick for every later stage.
+    # Pre-fix, the pending measurement was consumed BEFORE the identity check
+    # and had already recorded a (wrong) value by the time the rejection was
+    # raised. The prediction must stay pending, and nothing be recorded, so a
+    # corrected selection on the same frame is still judged against it.
     assert run.pending_shift is not None
-    assert run.shift_per_fraction is None
+    assert len(run.stages) == recorded
 
 
 # --------------------------------------------------------------------------

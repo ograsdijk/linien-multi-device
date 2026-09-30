@@ -3,54 +3,54 @@
   "calls": [
    [
     "strict",
-    0.056,
+    0.0135,
     0.5
    ],
    [
     "coarse",
-    0.056,
+    0.0135,
     0.5
    ],
    [
     "strict",
-    0.10645,
+    0.058875,
     0.375
    ],
    [
     "coarse",
-    0.10645,
+    0.058875,
     0.375
    ],
    [
     "strict",
-    0.13448,
+    0.086549539171,
     0.28125
    ],
    [
     "strict",
-    0.12839575,
+    0.081041186636,
     0.2109375
    ],
    [
     "strict",
-    0.1265432375,
+    0.077677419355,
     0.168
    ],
    [
     "strict",
-    0.1265432375,
+    0.077677419355,
     0.168
    ],
    [
     "strict",
-    0.1265432375,
+    0.077677419355,
     0.168
    ]
   ],
   "refinement": {
    "attempted": true,
    "final_amplitude_v": 0.168,
-   "final_center_v": 0.1265432375,
+   "final_center_v": 0.077677419355,
    "initial_resolution_samples": 1.5,
    "original_amplitude_v": 1.0,
    "original_center_v": 0.0,
@@ -69,117 +69,202 @@
     {
      "amplitude_v": 0.5,
      "bounds": {
-      "centre_budget_v": 0.056,
+      "centre_budget_v": 0.0135,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": 0.1113525,
+      "predicted_width_shift_v": 0.0425,
       "rail_v": 0.5,
       "scheduled_v": 0.5,
       "shift_capped_v": 0.5
      },
-     "center_shift_v": 0.056,
-     "center_v": 0.056,
+     "center_shift_v": 0.0135,
+     "center_v": 0.0135,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.155,
+      "delta_lower_v": 0.5135,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.0436475,
+      "new_geometry": {
+       "amplitude_v": 0.5,
+       "center_v": 0.0135
+      },
+      "old_geometry": {
+       "amplitude_v": 1.0,
+       "center_v": 0.0
+      },
+      "predicted_shift_v": -0.0436475,
+      "residual_v": 0.0,
+      "tolerance_v": 0.0127025
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 3.0,
-     "shift_per_fraction_v": 0.0222,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.1439,
-     "width_shift_v": 0.0111
+     "target_voltage": 0.1113525,
+     "width_shift_v": 0.0436475
     },
     {
      "amplitude_v": 0.375,
      "bounds": {
-      "centre_budget_v": 0.05045,
+      "centre_budget_v": 0.045375,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.00555,
+      "predicted_target_v": 0.096870625,
+      "predicted_width_shift_v": 0.010625,
       "rail_v": 0.625,
       "scheduled_v": 0.375,
       "shift_capped_v": 0.375
      },
-     "center_shift_v": 0.05045,
-     "center_v": 0.10645,
+     "center_shift_v": 0.045375,
+     "center_v": 0.058875,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.1113525,
+      "delta_lower_v": 0.170375,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.014481875,
+      "new_geometry": {
+       "amplitude_v": 0.375,
+       "center_v": 0.058875
+      },
+      "old_geometry": {
+       "amplitude_v": 0.5,
+       "center_v": 0.0135
+      },
+      "predicted_shift_v": -0.014481875,
+      "residual_v": -0.0,
+      "tolerance_v": 0.007555625
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 3.0,
-     "shift_per_fraction_v": 0.03768,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.13448,
-     "width_shift_v": 0.00942
+     "target_voltage": 0.096870625,
+     "width_shift_v": 0.014481875
     },
     {
      "amplitude_v": 0.28125,
      "bounds": {
-      "centre_budget_v": 0.04658,
+      "centre_budget_v": 0.04803125,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.00942,
+      "predicted_target_v": 0.086549539171,
+      "predicted_width_shift_v": 0.00796875,
       "rail_v": 0.71875,
       "scheduled_v": 0.28125,
       "shift_capped_v": 0.28125
      },
-     "center_shift_v": 0.02803,
-     "center_v": 0.13448,
+     "center_shift_v": 0.027674539171,
+     "center_v": 0.086549539171,
      "detector": "strict",
+     "hysteresis": {
+      "before_v": 0.096870625,
+      "delta_lower_v": 0.121424539171,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.010321085829,
+      "new_geometry": {
+       "amplitude_v": 0.28125,
+       "center_v": 0.086549539171
+      },
+      "old_geometry": {
+       "amplitude_v": 0.375,
+       "center_v": 0.058875
+      },
+      "predicted_shift_v": -0.010321085829,
+      "residual_v": 0.0,
+      "tolerance_v": 0.006821368088
+     },
      "kind": "narrow",
      "metrics": null,
      "resolution_samples": 11.0,
-     "shift_per_fraction_v": 0.03768,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.12839575,
-     "width_shift_v": 0.00608425
+     "target_voltage": 0.086549539171,
+     "width_shift_v": 0.010321085829
     },
     {
      "amplitude_v": 0.2109375,
      "bounds": {
-      "centre_budget_v": 0.04658,
+      "centre_budget_v": 0.0500234375,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.00942,
+      "predicted_target_v": 0.081041186636,
+      "predicted_width_shift_v": 0.0059765625,
       "rail_v": 0.7890625,
       "scheduled_v": 0.2109375,
       "shift_capped_v": 0.2109375
      },
-     "center_shift_v": 0.00608425,
-     "center_v": 0.12839575,
+     "center_shift_v": 0.005508352535,
+     "center_v": 0.081041186636,
      "detector": "strict",
+     "hysteresis": {
+      "before_v": 0.086549539171,
+      "delta_lower_v": 0.064804147465,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.005508352535,
+      "new_geometry": {
+       "amplitude_v": 0.2109375,
+       "center_v": 0.081041186636
+      },
+      "old_geometry": {
+       "amplitude_v": 0.28125,
+       "center_v": 0.086549539171
+      },
+      "predicted_shift_v": -0.005508352535,
+      "residual_v": -0.0,
+      "tolerance_v": 0.005972062212
+     },
      "kind": "narrow",
      "metrics": null,
      "resolution_samples": 11.0,
-     "shift_per_fraction_v": 0.03768,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.1265432375,
-     "width_shift_v": 0.0018525125
+     "target_voltage": 0.081041186636,
+     "width_shift_v": 0.005508352535
     },
     {
      "amplitude_v": 0.168,
      "bounds": {
-      "centre_budget_v": 0.045064401667,
+      "centre_budget_v": 0.0490846875,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.007669973333,
+      "predicted_target_v": 0.077677419355,
+      "predicted_width_shift_v": 0.0036496875,
       "rail_v": 0.832,
       "scheduled_v": 0.158203125,
       "shift_capped_v": 0.158203125
      },
-     "center_shift_v": 0.0018525125,
-     "center_v": 0.1265432375,
+     "center_shift_v": 0.003363767281,
+     "center_v": 0.077677419355,
      "detector": "strict",
+     "hysteresis": {
+      "before_v": 0.081041186636,
+      "delta_lower_v": 0.039573732719,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.003363767281,
+      "new_geometry": {
+       "amplitude_v": 0.168,
+       "center_v": 0.077677419355
+      },
+      "old_geometry": {
+       "amplitude_v": 0.2109375,
+       "center_v": 0.081041186636
+      },
+      "predicted_shift_v": -0.003363767281,
+      "residual_v": 0.0,
+      "tolerance_v": 0.005593605991
+     },
      "kind": "narrow",
      "metrics": null,
      "resolution_samples": 11.0,
-     "shift_per_fraction_v": 0.03768,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.12522567625,
-     "width_shift_v": 0.00131756125
+     "target_voltage": 0.077677419355,
+     "width_shift_v": 0.003363767281
     },
     {
      "amplitude_v": 0.168,
-     "center_v": 0.1265432375,
+     "center_v": 0.077677419355,
      "consistent": true,
      "detector": "strict",
      "kind": "final_verify",
      "resolution_samples": 11.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.12522567625
+     "target_voltage": 0.077677419355
     }
    ],
    "trigger": "under_resolved"
@@ -200,27 +285,27 @@
    "symmetry": 0.94,
    "target_index": 1024,
    "target_slope_rising": true,
-   "target_voltage": 0.12522567625
+   "target_voltage": 0.077677419355
   },
   "writes": [
    [
-    0.056,
+    0.0135,
     0.5
    ],
    [
-    0.10645,
+    0.058875,
     0.375
    ],
    [
-    0.13448,
+    0.086549539171,
     0.28125
    ],
    [
-    0.12839575,
+    0.081041186636,
     0.2109375
    ],
    [
-    0.1265432375,
+    0.077677419355,
     0.168
    ]
   ]
@@ -229,49 +314,49 @@
   "calls": [
    [
     "strict",
-    0.056,
+    0.0135,
     0.5
    ],
    [
     "coarse",
-    0.056,
+    0.0135,
     0.5
    ],
    [
     "strict",
-    0.112,
+    0.058875,
     0.375
    ],
    [
     "strict",
-    0.168,
+    0.10690625,
     0.28125
    ],
    [
     "strict",
-    0.18,
+    0.10408266129,
     0.2109375
    ],
    [
     "strict",
-    0.18,
+    0.100718894009,
     0.168
    ],
    [
     "strict",
-    0.18,
+    0.100718894009,
     0.168
    ],
    [
     "strict",
-    0.18,
+    0.100718894009,
     0.168
    ]
   ],
   "refinement": {
    "attempted": true,
    "final_amplitude_v": 0.168,
-   "final_center_v": 0.18,
+   "final_center_v": 0.100718894009,
    "initial_resolution_samples": 2.0,
    "original_amplitude_v": 1.0,
    "original_center_v": 0.0,
@@ -290,119 +375,204 @@
     {
      "amplitude_v": 0.5,
      "bounds": {
-      "centre_budget_v": 0.056,
+      "centre_budget_v": 0.0135,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": 0.1363525,
+      "predicted_width_shift_v": 0.0425,
       "rail_v": 0.5,
       "scheduled_v": 0.5,
       "shift_capped_v": 0.5
      },
-     "center_shift_v": 0.056,
-     "center_v": 0.056,
+     "center_shift_v": 0.0135,
+     "center_v": 0.0135,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.18,
+      "delta_lower_v": 0.5135,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.0436475,
+      "new_geometry": {
+       "amplitude_v": 0.5,
+       "center_v": 0.0135
+      },
+      "old_geometry": {
+       "amplitude_v": 1.0,
+       "center_v": 0.0
+      },
+      "predicted_shift_v": -0.0436475,
+      "residual_v": 0.0,
+      "tolerance_v": 0.0127025
+     },
      "kind": "narrow",
      "metrics": {
       "decoy_score": 5.0
      },
      "resolution_samples": 4.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.18,
-     "width_shift_v": 0.0
+     "target_voltage": 0.1363525,
+     "width_shift_v": 0.0436475
     },
     {
      "amplitude_v": 0.375,
      "bounds": {
-      "centre_budget_v": 0.056,
+      "centre_budget_v": 0.045375,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": 0.121870625,
+      "predicted_width_shift_v": 0.010625,
       "rail_v": 0.625,
       "scheduled_v": 0.375,
       "shift_capped_v": 0.375
      },
-     "center_shift_v": 0.056,
-     "center_v": 0.112,
+     "center_shift_v": 0.045375,
+     "center_v": 0.058875,
      "detector": "strict",
+     "hysteresis": {
+      "before_v": 0.1363525,
+      "delta_lower_v": 0.170375,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.014481875,
+      "new_geometry": {
+       "amplitude_v": 0.375,
+       "center_v": 0.058875
+      },
+      "old_geometry": {
+       "amplitude_v": 0.5,
+       "center_v": 0.0135
+      },
+      "predicted_shift_v": -0.014481875,
+      "residual_v": -0.0,
+      "tolerance_v": 0.007555625
+     },
      "kind": "narrow",
      "metrics": null,
      "resolution_samples": 10.5,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.18,
-     "width_shift_v": 0.0
+     "target_voltage": 0.121870625,
+     "width_shift_v": 0.014481875
     },
     {
      "amplitude_v": 0.28125,
      "bounds": {
-      "centre_budget_v": 0.056,
+      "centre_budget_v": 0.04803125,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": 0.10981921875,
+      "predicted_width_shift_v": 0.00796875,
       "rail_v": 0.71875,
       "scheduled_v": 0.28125,
       "shift_capped_v": 0.28125
      },
-     "center_shift_v": 0.056,
-     "center_v": 0.168,
+     "center_shift_v": 0.04803125,
+     "center_v": 0.10690625,
      "detector": "strict",
+     "hysteresis": {
+      "before_v": 0.121870625,
+      "delta_lower_v": 0.14178125,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.01205140625,
+      "new_geometry": {
+       "amplitude_v": 0.28125,
+       "center_v": 0.10690625
+      },
+      "old_geometry": {
+       "amplitude_v": 0.375,
+       "center_v": 0.058875
+      },
+      "predicted_shift_v": -0.01205140625,
+      "residual_v": 0.0,
+      "tolerance_v": 0.00712671875
+     },
      "kind": "narrow",
      "metrics": null,
      "resolution_samples": 10.5,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.18,
-     "width_shift_v": 0.0
+     "target_voltage": 0.10981921875,
+     "width_shift_v": 0.01205140625
     },
     {
      "amplitude_v": 0.2109375,
      "bounds": {
-      "centre_budget_v": 0.056,
+      "centre_budget_v": 0.0500234375,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": 0.10408266129,
+      "predicted_width_shift_v": 0.0059765625,
       "rail_v": 0.7890625,
       "scheduled_v": 0.2109375,
       "shift_capped_v": 0.2109375
      },
-     "center_shift_v": 0.012,
-     "center_v": 0.18,
+     "center_shift_v": 0.00282358871,
+     "center_v": 0.10408266129,
      "detector": "strict",
+     "hysteresis": {
+      "before_v": 0.10981921875,
+      "delta_lower_v": 0.06748891129,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.00573655746,
+      "new_geometry": {
+       "amplitude_v": 0.2109375,
+       "center_v": 0.10408266129
+      },
+      "old_geometry": {
+       "amplitude_v": 0.28125,
+       "center_v": 0.10690625
+      },
+      "predicted_shift_v": -0.00573655746,
+      "residual_v": -0.0,
+      "tolerance_v": 0.006012333669
+     },
      "kind": "narrow",
      "metrics": null,
      "resolution_samples": 10.5,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.18,
-     "width_shift_v": 0.0
+     "target_voltage": 0.10408266129,
+     "width_shift_v": 0.00573655746
     },
     {
      "amplitude_v": 0.168,
      "bounds": {
-      "centre_budget_v": 0.052734375,
+      "centre_budget_v": 0.0490846875,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": 0.100718894009,
+      "predicted_width_shift_v": 0.0036496875,
       "rail_v": 0.832,
       "scheduled_v": 0.158203125,
       "shift_capped_v": 0.158203125
      },
-     "center_shift_v": 0.0,
-     "center_v": 0.18,
+     "center_shift_v": 0.003363767281,
+     "center_v": 0.100718894009,
      "detector": "strict",
+     "hysteresis": {
+      "before_v": 0.10408266129,
+      "delta_lower_v": 0.039573732719,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.003363767281,
+      "new_geometry": {
+       "amplitude_v": 0.168,
+       "center_v": 0.100718894009
+      },
+      "old_geometry": {
+       "amplitude_v": 0.2109375,
+       "center_v": 0.10408266129
+      },
+      "predicted_shift_v": -0.003363767281,
+      "residual_v": 0.0,
+      "tolerance_v": 0.005593605991
+     },
      "kind": "narrow",
      "metrics": null,
      "resolution_samples": 10.5,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.18,
-     "width_shift_v": 0.0
+     "target_voltage": 0.100718894009,
+     "width_shift_v": 0.003363767281
     },
     {
      "amplitude_v": 0.168,
-     "center_v": 0.18,
+     "center_v": 0.100718894009,
      "consistent": true,
      "detector": "strict",
      "kind": "final_verify",
      "resolution_samples": 10.5,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.18
+     "target_voltage": 0.100718894009
     }
    ],
    "trigger": "under_resolved"
@@ -423,27 +593,27 @@
    "symmetry": 0.94,
    "target_index": 1024,
    "target_slope_rising": true,
-   "target_voltage": 0.18
+   "target_voltage": 0.100718894009
   },
   "writes": [
    [
-    0.056,
+    0.0135,
     0.5
    ],
    [
-    0.112,
+    0.058875,
     0.375
    ],
    [
-    0.168,
+    0.10690625,
     0.28125
    ],
    [
-    0.18,
+    0.10408266129,
     0.2109375
    ],
    [
-    0.18,
+    0.100718894009,
     0.168
    ]
   ]
@@ -452,54 +622,54 @@
   "calls": [
    [
     "strict",
-    0.05,
+    0.006912442396,
     0.5
    ],
    [
     "coarse",
-    0.05,
+    0.006912442396,
     0.5
    ],
    [
     "strict",
-    0.05,
+    -0.002880184332,
     0.375
    ],
    [
     "coarse",
-    0.05,
+    -0.002880184332,
     0.375
    ],
    [
     "strict",
-    0.05,
+    -0.010224654378,
     0.28125
    ],
    [
     "strict",
-    0.05,
+    -0.015733006912,
     0.2109375
    ],
    [
     "strict",
-    0.05,
+    -0.019096774194,
     0.168
    ],
    [
     "strict",
-    0.05,
+    -0.019096774194,
     0.168
    ],
    [
     "strict",
-    0.05,
+    -0.019096774194,
     0.168
    ]
   ],
   "refinement": {
    "attempted": true,
    "final_amplitude_v": 0.168,
-   "final_center_v": 0.05,
+   "final_center_v": -0.019096774194,
    "initial_resolution_samples": 1.5,
    "original_amplitude_v": 1.0,
    "original_center_v": 0.0,
@@ -518,121 +688,206 @@
     {
      "amplitude_v": 0.5,
      "bounds": {
-      "centre_budget_v": 0.056,
+      "centre_budget_v": 0.0135,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": 0.006912442396,
+      "predicted_width_shift_v": 0.0425,
       "rail_v": 0.5,
       "scheduled_v": 0.5,
       "shift_capped_v": 0.5
      },
-     "center_shift_v": 0.05,
-     "center_v": 0.05,
+     "center_shift_v": 0.006912442396,
+     "center_v": 0.006912442396,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.05,
+      "delta_lower_v": 0.506912442396,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.043087557604,
+      "new_geometry": {
+       "amplitude_v": 0.5,
+       "center_v": 0.006912442396
+      },
+      "old_geometry": {
+       "amplitude_v": 1.0,
+       "center_v": 0.0
+      },
+      "predicted_shift_v": -0.043087557604,
+      "residual_v": 0.0,
+      "tolerance_v": 0.012603686636
+     },
      "kind": "narrow",
      "metrics": {
       "call": 1
      },
      "resolution_samples": 3.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.05,
-     "width_shift_v": 0.0
+     "target_voltage": 0.006912442396,
+     "width_shift_v": 0.043087557604
     },
     {
      "amplitude_v": 0.375,
      "bounds": {
-      "centre_budget_v": 0.056,
+      "centre_budget_v": 0.045375,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": -0.002880184332,
+      "predicted_width_shift_v": 0.010625,
       "rail_v": 0.625,
       "scheduled_v": 0.375,
       "shift_capped_v": 0.375
      },
-     "center_shift_v": 0.0,
-     "center_v": 0.05,
+     "center_shift_v": 0.009792626728,
+     "center_v": -0.002880184332,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.006912442396,
+      "delta_lower_v": 0.115207373272,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.009792626728,
+      "new_geometry": {
+       "amplitude_v": 0.375,
+       "center_v": -0.002880184332
+      },
+      "old_geometry": {
+       "amplitude_v": 0.5,
+       "center_v": 0.006912442396
+      },
+      "predicted_shift_v": -0.009792626728,
+      "residual_v": -0.0,
+      "tolerance_v": 0.006728110599
+     },
      "kind": "narrow",
      "metrics": {
       "call": 2
      },
      "resolution_samples": 3.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.05,
-     "width_shift_v": 0.0
+     "target_voltage": -0.002880184332,
+     "width_shift_v": 0.009792626728
     },
     {
      "amplitude_v": 0.28125,
      "bounds": {
-      "centre_budget_v": 0.056,
+      "centre_budget_v": 0.04803125,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": -0.010224654378,
+      "predicted_width_shift_v": 0.00796875,
       "rail_v": 0.71875,
       "scheduled_v": 0.28125,
       "shift_capped_v": 0.28125
      },
-     "center_shift_v": 0.0,
-     "center_v": 0.05,
+     "center_shift_v": 0.007344470046,
+     "center_v": -0.010224654378,
      "detector": "strict",
+     "hysteresis": {
+      "before_v": -0.002880184332,
+      "delta_lower_v": 0.086405529954,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.007344470046,
+      "new_geometry": {
+       "amplitude_v": 0.28125,
+       "center_v": -0.010224654378
+      },
+      "old_geometry": {
+       "amplitude_v": 0.375,
+       "center_v": -0.002880184332
+      },
+      "predicted_shift_v": -0.007344470046,
+      "residual_v": 0.0,
+      "tolerance_v": 0.006296082949
+     },
      "kind": "narrow",
      "metrics": null,
      "resolution_samples": 12.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.05,
-     "width_shift_v": 0.0
+     "target_voltage": -0.010224654378,
+     "width_shift_v": 0.007344470046
     },
     {
      "amplitude_v": 0.2109375,
      "bounds": {
-      "centre_budget_v": 0.056,
+      "centre_budget_v": 0.0500234375,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": -0.015733006912,
+      "predicted_width_shift_v": 0.0059765625,
       "rail_v": 0.7890625,
       "scheduled_v": 0.2109375,
       "shift_capped_v": 0.2109375
      },
-     "center_shift_v": 0.0,
-     "center_v": 0.05,
+     "center_shift_v": 0.005508352535,
+     "center_v": -0.015733006912,
      "detector": "strict",
+     "hysteresis": {
+      "before_v": -0.010224654378,
+      "delta_lower_v": 0.064804147465,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.005508352535,
+      "new_geometry": {
+       "amplitude_v": 0.2109375,
+       "center_v": -0.015733006912
+      },
+      "old_geometry": {
+       "amplitude_v": 0.28125,
+       "center_v": -0.010224654378
+      },
+      "predicted_shift_v": -0.005508352535,
+      "residual_v": 0.0,
+      "tolerance_v": 0.005972062212
+     },
      "kind": "narrow",
      "metrics": null,
      "resolution_samples": 12.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.05,
-     "width_shift_v": 0.0
+     "target_voltage": -0.015733006912,
+     "width_shift_v": 0.005508352535
     },
     {
      "amplitude_v": 0.168,
      "bounds": {
-      "centre_budget_v": 0.052734375,
+      "centre_budget_v": 0.0490846875,
       "goal_v": 0.168,
-      "predicted_width_shift_v": 0.0,
+      "predicted_target_v": -0.019096774194,
+      "predicted_width_shift_v": 0.0036496875,
       "rail_v": 0.832,
       "scheduled_v": 0.158203125,
       "shift_capped_v": 0.158203125
      },
-     "center_shift_v": 0.0,
-     "center_v": 0.05,
+     "center_shift_v": 0.003363767281,
+     "center_v": -0.019096774194,
      "detector": "strict",
+     "hysteresis": {
+      "before_v": -0.015733006912,
+      "delta_lower_v": 0.039573732719,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.003363767281,
+      "new_geometry": {
+       "amplitude_v": 0.168,
+       "center_v": -0.019096774194
+      },
+      "old_geometry": {
+       "amplitude_v": 0.2109375,
+       "center_v": -0.015733006912
+      },
+      "predicted_shift_v": -0.003363767281,
+      "residual_v": 0.0,
+      "tolerance_v": 0.005593605991
+     },
      "kind": "narrow",
      "metrics": null,
      "resolution_samples": 12.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.05,
-     "width_shift_v": 0.0
+     "target_voltage": -0.019096774194,
+     "width_shift_v": 0.003363767281
     },
     {
      "amplitude_v": 0.168,
-     "center_v": 0.05,
+     "center_v": -0.019096774194,
      "consistent": true,
      "detector": "strict",
      "kind": "final_verify",
      "resolution_samples": 12.0,
      "sideband_offset_v": 0.028,
-     "target_voltage": 0.05
+     "target_voltage": -0.019096774194
     }
    ],
    "trigger": "under_resolved"
@@ -653,27 +908,27 @@
    "symmetry": 0.94,
    "target_index": 1024,
    "target_slope_rising": true,
-   "target_voltage": 0.05
+   "target_voltage": -0.019096774194
   },
   "writes": [
    [
-    0.05,
+    0.006912442396,
     0.5
    ],
    [
-    0.05,
+    -0.002880184332,
     0.375
    ],
    [
-    0.05,
+    -0.010224654378,
     0.28125
    ],
    [
-    0.05,
+    -0.015733006912,
     0.2109375
    ],
    [
-    0.05,
+    -0.019096774194,
     0.168
    ]
   ]
@@ -682,163 +937,163 @@
   "calls": [
    [
     "strict",
-    0.002,
-    0.553333333333
+    0.0,
+    0.9
    ],
    [
     "coarse",
-    0.002,
-    0.553333333333
+    0.0,
+    0.9
    ],
    [
     "strict",
-    0.004,
-    0.551111111111
+    0.0,
+    0.81
    ],
    [
     "coarse",
-    0.004,
-    0.551111111111
+    0.0,
+    0.81
    ],
    [
     "strict",
-    0.006,
-    0.548888888889
+    0.0,
+    0.729
    ],
    [
     "coarse",
-    0.006,
-    0.548888888889
+    0.0,
+    0.729
    ],
    [
     "strict",
-    0.008,
-    0.546666666667
+    0.0,
+    0.6561
    ],
    [
     "coarse",
-    0.008,
-    0.546666666667
+    0.0,
+    0.6561
    ],
    [
     "strict",
-    0.01,
-    0.544444444444
+    0.0,
+    0.59049
    ],
    [
     "coarse",
-    0.01,
-    0.544444444444
+    0.0,
+    0.59049
    ],
    [
     "strict",
-    0.012,
-    0.542222222222
+    0.0,
+    0.531441
    ],
    [
     "coarse",
-    0.012,
-    0.542222222222
+    0.0,
+    0.531441
    ],
    [
     "strict",
-    0.014,
-    0.54
+    0.000435964188,
+    0.51304057868
    ],
    [
     "coarse",
-    0.014,
-    0.54
+    0.000435964188,
+    0.51304057868
    ],
    [
     "strict",
-    0.016,
-    0.537777777778
+    0.00212520999,
+    0.509384646936
    ],
    [
     "coarse",
-    0.016,
-    0.537777777778
+    0.00212520999,
+    0.509384646936
    ],
    [
     "strict",
-    0.018,
-    0.535555555556
+    0.003913414144,
+    0.506892931107
    ],
    [
     "coarse",
-    0.018,
-    0.535555555556
+    0.003913414144,
+    0.506892931107
    ],
    [
     "strict",
-    0.02,
-    0.533333333333
+    0.00570943199,
+    0.504493141058
    ],
    [
     "coarse",
-    0.02,
-    0.533333333333
+    0.00570943199,
+    0.504493141058
    ],
    [
     "strict",
-    0.022,
-    0.531111111111
+    0.0075060668,
+    0.502100609412
    ],
    [
     "coarse",
-    0.022,
-    0.531111111111
+    0.0075060668,
+    0.502100609412
    ],
    [
     "strict",
-    0.024,
-    0.528888888889
+    0.009302750325,
+    0.499708650885
    ],
    [
     "coarse",
-    0.024,
-    0.528888888889
+    0.009302750325,
+    0.499708650885
    ],
    [
     "strict",
-    0.026,
-    0.526666666667
+    0.011099437697,
+    0.497316737612
    ],
    [
     "coarse",
-    0.026,
-    0.526666666667
+    0.011099437697,
+    0.497316737612
    ],
    [
     "strict",
-    0.028,
-    0.524444444444
+    0.012896125372,
+    0.494924827911
    ],
    [
     "coarse",
-    0.028,
-    0.524444444444
+    0.012896125372,
+    0.494924827911
    ],
    [
     "strict",
-    0.03,
-    0.522222222222
+    0.014692813072,
+    0.492532918493
    ],
    [
     "coarse",
-    0.03,
-    0.522222222222
+    0.014692813072,
+    0.492532918493
    ],
    [
     "strict",
-    0.032,
-    0.52
+    0.016489500773,
+    0.490141009097
    ],
    [
     "coarse",
-    0.032,
-    0.52
+    0.016489500773,
+    0.490141009097
    ]
   ],
   "message": "Trajectory-aware auto-lock refinement failed: No lockable scan after 16 trajectory refinement stages. (scan geometry restored).",
@@ -862,423 +1117,689 @@
      "target_voltage": 0.5
     },
     {
-     "amplitude_v": 0.553333333333,
+     "amplitude_v": 0.9,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.553333333333,
+      "centre_budget_v": 0.0,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.446666666667,
+      "predicted_target_v": 0.4915,
+      "predicted_width_shift_v": 0.0085,
+      "rail_v": 0.1,
       "scheduled_v": 0.5,
-      "shift_capped_v": 0.5
+      "shift_capped_v": 0.9
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.002,
+     "center_shift_v": 0.0,
+     "center_v": 0.0,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.5,
+      "delta_lower_v": 0.1,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.0085,
+      "new_geometry": {
+       "amplitude_v": 0.9,
+       "center_v": 0.0
+      },
+      "old_geometry": {
+       "amplitude_v": 1.0,
+       "center_v": 0.0
+      },
+      "predicted_shift_v": -0.0085,
+      "residual_v": -0.0,
+      "tolerance_v": 0.0065
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.4915,
+     "width_shift_v": 0.0085
     },
     {
-     "amplitude_v": 0.551111111111,
+     "amplitude_v": 0.81,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.551111111111,
+      "centre_budget_v": 0.0,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.448888888889,
-      "scheduled_v": 0.276666666667,
-      "shift_capped_v": 0.276666666667
+      "predicted_target_v": 0.48385,
+      "predicted_width_shift_v": 0.00765,
+      "rail_v": 0.19,
+      "scheduled_v": 0.45,
+      "shift_capped_v": 0.81
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.004,
+     "center_shift_v": 0.0,
+     "center_v": 0.0,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.4915,
+      "delta_lower_v": 0.09,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.00765,
+      "new_geometry": {
+       "amplitude_v": 0.81,
+       "center_v": 0.0
+      },
+      "old_geometry": {
+       "amplitude_v": 0.9,
+       "center_v": 0.0
+      },
+      "predicted_shift_v": -0.00765,
+      "residual_v": 0.0,
+      "tolerance_v": 0.00635
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.48385,
+     "width_shift_v": 0.00765
     },
     {
-     "amplitude_v": 0.548888888889,
+     "amplitude_v": 0.729,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.548888888889,
+      "centre_budget_v": 0.0,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.451111111111,
-      "scheduled_v": 0.275555555556,
-      "shift_capped_v": 0.275555555556
+      "predicted_target_v": 0.476965,
+      "predicted_width_shift_v": 0.006885,
+      "rail_v": 0.271,
+      "scheduled_v": 0.405,
+      "shift_capped_v": 0.729
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.006,
+     "center_shift_v": 0.0,
+     "center_v": 0.0,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.48385,
+      "delta_lower_v": 0.081,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.006885,
+      "new_geometry": {
+       "amplitude_v": 0.729,
+       "center_v": 0.0
+      },
+      "old_geometry": {
+       "amplitude_v": 0.81,
+       "center_v": 0.0
+      },
+      "predicted_shift_v": -0.006885,
+      "residual_v": 0.0,
+      "tolerance_v": 0.006215
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.476965,
+     "width_shift_v": 0.006885
     },
     {
-     "amplitude_v": 0.546666666667,
+     "amplitude_v": 0.6561,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.546666666667,
+      "centre_budget_v": 0.0,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.453333333333,
-      "scheduled_v": 0.274444444444,
-      "shift_capped_v": 0.274444444444
+      "predicted_target_v": 0.4707685,
+      "predicted_width_shift_v": 0.0061965,
+      "rail_v": 0.3439,
+      "scheduled_v": 0.3645,
+      "shift_capped_v": 0.6561
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.008,
+     "center_shift_v": 0.0,
+     "center_v": 0.0,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.476965,
+      "delta_lower_v": 0.0729,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.0061965,
+      "new_geometry": {
+       "amplitude_v": 0.6561,
+       "center_v": 0.0
+      },
+      "old_geometry": {
+       "amplitude_v": 0.729,
+       "center_v": 0.0
+      },
+      "predicted_shift_v": -0.0061965,
+      "residual_v": 0.0,
+      "tolerance_v": 0.0060935
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.4707685,
+     "width_shift_v": 0.0061965
     },
     {
-     "amplitude_v": 0.544444444444,
+     "amplitude_v": 0.59049,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.544444444444,
+      "centre_budget_v": 0.0,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.455555555556,
-      "scheduled_v": 0.273333333333,
-      "shift_capped_v": 0.273333333333
+      "predicted_target_v": 0.46519165,
+      "predicted_width_shift_v": 0.00557685,
+      "rail_v": 0.40951,
+      "scheduled_v": 0.32805,
+      "shift_capped_v": 0.59049
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.01,
+     "center_shift_v": 0.0,
+     "center_v": 0.0,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.4707685,
+      "delta_lower_v": 0.06561,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.00557685,
+      "new_geometry": {
+       "amplitude_v": 0.59049,
+       "center_v": 0.0
+      },
+      "old_geometry": {
+       "amplitude_v": 0.6561,
+       "center_v": 0.0
+      },
+      "predicted_shift_v": -0.00557685,
+      "residual_v": -0.0,
+      "tolerance_v": 0.00598415
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.46519165,
+     "width_shift_v": 0.00557685
     },
     {
-     "amplitude_v": 0.542222222222,
+     "amplitude_v": 0.531441,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.542222222222,
+      "centre_budget_v": 0.0,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.457777777778,
-      "scheduled_v": 0.272222222222,
-      "shift_capped_v": 0.272222222222
+      "predicted_target_v": 0.460172485,
+      "predicted_width_shift_v": 0.005019165,
+      "rail_v": 0.468559,
+      "scheduled_v": 0.295245,
+      "shift_capped_v": 0.531441
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.012,
+     "center_shift_v": 0.0,
+     "center_v": 0.0,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.46519165,
+      "delta_lower_v": 0.059049,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.005019165,
+      "new_geometry": {
+       "amplitude_v": 0.531441,
+       "center_v": 0.0
+      },
+      "old_geometry": {
+       "amplitude_v": 0.59049,
+       "center_v": 0.0
+      },
+      "predicted_shift_v": -0.005019165,
+      "residual_v": 0.0,
+      "tolerance_v": 0.005885735
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.460172485,
+     "width_shift_v": 0.005019165
     },
     {
-     "amplitude_v": 0.54,
+     "amplitude_v": 0.51304057868,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.54,
+      "centre_budget_v": 0.000435964188,
+      "crop_floor_v": 0.51304057868,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.46,
-      "scheduled_v": 0.271111111111,
-      "shift_capped_v": 0.271111111111
+      "predicted_target_v": 0.458571392232,
+      "predicted_width_shift_v": 0.001564035812,
+      "rail_v": 0.48695942132,
+      "scheduled_v": 0.2657205,
+      "shift_capped_v": 0.4782969
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.014,
+     "center_shift_v": 0.000435964188,
+     "center_v": 0.000435964188,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.460172485,
+      "delta_lower_v": 0.018836385508,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.001601092768,
+      "new_geometry": {
+       "amplitude_v": 0.51304057868,
+       "center_v": 0.000435964188
+      },
+      "old_geometry": {
+       "amplitude_v": 0.531441,
+       "center_v": 0.0
+      },
+      "predicted_shift_v": -0.001601092768,
+      "residual_v": -0.0,
+      "tolerance_v": 0.005282545783
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.458571392232,
+     "width_shift_v": 0.001601092768
     },
     {
-     "amplitude_v": 0.537777777778,
+     "amplitude_v": 0.509384646936,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.537777777778,
+      "centre_budget_v": 0.001689245802,
+      "crop_floor_v": 0.509384646936,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.462222222222,
-      "scheduled_v": 0.27,
-      "shift_capped_v": 0.27
+      "predicted_target_v": 0.45811705214,
+      "predicted_width_shift_v": 0.000310754198,
+      "rail_v": 0.490615353064,
+      "scheduled_v": 0.25652028934,
+      "shift_capped_v": 0.461736520812
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.016,
+     "center_shift_v": 0.001689245802,
+     "center_v": 0.00212520999,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.458571392232,
+      "delta_lower_v": 0.005345177546,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.000454340091,
+      "new_geometry": {
+       "amplitude_v": 0.509384646936,
+       "center_v": 0.00212520999
+      },
+      "old_geometry": {
+       "amplitude_v": 0.51304057868,
+       "center_v": 0.000435964188
+      },
+      "predicted_shift_v": -0.000454340091,
+      "residual_v": 0.0,
+      "tolerance_v": 0.005080177663
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.45811705214,
+     "width_shift_v": 0.000454340091
     },
     {
-     "amplitude_v": 0.535555555556,
+     "amplitude_v": 0.506892931107,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.535555555556,
+      "centre_budget_v": 0.001788204155,
+      "crop_floor_v": 0.506892931107,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.464444444444,
-      "scheduled_v": 0.268888888889,
-      "shift_capped_v": 0.268888888889
+      "predicted_target_v": 0.457753258942,
+      "predicted_width_shift_v": 0.000211795845,
+      "rail_v": 0.493107068893,
+      "scheduled_v": 0.254692323468,
+      "shift_capped_v": 0.458446182242
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.018,
+     "center_shift_v": 0.001788204155,
+     "center_v": 0.003913414144,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.45811705214,
+      "delta_lower_v": 0.004279919983,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.000363793199,
+      "new_geometry": {
+       "amplitude_v": 0.506892931107,
+       "center_v": 0.003913414144
+      },
+      "old_geometry": {
+       "amplitude_v": 0.509384646936,
+       "center_v": 0.00212520999
+      },
+      "predicted_shift_v": -0.000363793199,
+      "residual_v": -0.0,
+      "tolerance_v": 0.0050641988
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.457753258942,
+     "width_shift_v": 0.000363793199
     },
     {
-     "amplitude_v": 0.533333333333,
+     "amplitude_v": 0.504493141058,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.533333333333,
+      "centre_budget_v": 0.001796017846,
+      "crop_floor_v": 0.504493141058,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.466666666667,
-      "scheduled_v": 0.267777777778,
-      "shift_capped_v": 0.267777777778
+      "predicted_target_v": 0.457396615271,
+      "predicted_width_shift_v": 0.000203982154,
+      "rail_v": 0.495506858942,
+      "scheduled_v": 0.253446465554,
+      "shift_capped_v": 0.456203637996
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.02,
+     "center_shift_v": 0.001796017846,
+     "center_v": 0.00570943199,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.457753258942,
+      "delta_lower_v": 0.004195807895,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.000356643671,
+      "new_geometry": {
+       "amplitude_v": 0.504493141058,
+       "center_v": 0.00570943199
+      },
+      "old_geometry": {
+       "amplitude_v": 0.506892931107,
+       "center_v": 0.003913414144
+      },
+      "predicted_shift_v": -0.000356643671,
+      "residual_v": -0.0,
+      "tolerance_v": 0.005062937118
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.457396615271,
+     "width_shift_v": 0.000356643671
     },
     {
-     "amplitude_v": 0.531111111111,
+     "amplitude_v": 0.502100609412,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.531111111111,
+      "centre_budget_v": 0.00179663481,
+      "crop_floor_v": 0.502100609412,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.468888888889,
-      "scheduled_v": 0.266666666667,
-      "shift_capped_v": 0.266666666667
+      "predicted_target_v": 0.457040536122,
+      "predicted_width_shift_v": 0.00020336519,
+      "rail_v": 0.497899390588,
+      "scheduled_v": 0.252246570529,
+      "shift_capped_v": 0.454043826952
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.022,
+     "center_shift_v": 0.00179663481,
+     "center_v": 0.0075060668,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.457396615271,
+      "delta_lower_v": 0.004189166456,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.000356079149,
+      "new_geometry": {
+       "amplitude_v": 0.502100609412,
+       "center_v": 0.0075060668
+      },
+      "old_geometry": {
+       "amplitude_v": 0.504493141058,
+       "center_v": 0.00570943199
+      },
+      "predicted_shift_v": -0.000356079149,
+      "residual_v": -0.0,
+      "tolerance_v": 0.005062837497
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.457040536122,
+     "width_shift_v": 0.000356079149
     },
     {
-     "amplitude_v": 0.528888888889,
+     "amplitude_v": 0.499708650885,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.528888888889,
+      "centre_budget_v": 0.001796683525,
+      "crop_floor_v": 0.499708650885,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.471111111111,
-      "scheduled_v": 0.265555555556,
-      "shift_capped_v": 0.265555555556
+      "predicted_target_v": 0.456684501548,
+      "predicted_width_shift_v": 0.000203316475,
+      "rail_v": 0.500291349115,
+      "scheduled_v": 0.251050304706,
+      "shift_capped_v": 0.451890548471
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.024,
+     "center_shift_v": 0.001796683525,
+     "center_v": 0.009302750325,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.457040536122,
+      "delta_lower_v": 0.004188642052,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.000356034574,
+      "new_geometry": {
+       "amplitude_v": 0.499708650885,
+       "center_v": 0.009302750325
+      },
+      "old_geometry": {
+       "amplitude_v": 0.502100609412,
+       "center_v": 0.0075060668
+      },
+      "predicted_shift_v": -0.000356034574,
+      "residual_v": 0.0,
+      "tolerance_v": 0.005062829631
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.456684501548,
+     "width_shift_v": 0.000356034574
     },
     {
-     "amplitude_v": 0.526666666667,
+     "amplitude_v": 0.497316737612,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.526666666667,
+      "centre_budget_v": 0.001796687372,
+      "crop_floor_v": 0.497316737612,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.473333333333,
-      "scheduled_v": 0.264444444444,
-      "shift_capped_v": 0.264444444444
+      "predicted_target_v": 0.456328470493,
+      "predicted_width_shift_v": 0.000203312628,
+      "rail_v": 0.502683262388,
+      "scheduled_v": 0.249854325443,
+      "shift_capped_v": 0.449737785797
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.026,
+     "center_shift_v": 0.001796687372,
+     "center_v": 0.011099437697,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.456684501548,
+      "delta_lower_v": 0.004188600645,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.000356031055,
+      "new_geometry": {
+       "amplitude_v": 0.497316737612,
+       "center_v": 0.011099437697
+      },
+      "old_geometry": {
+       "amplitude_v": 0.499708650885,
+       "center_v": 0.009302750325
+      },
+      "predicted_shift_v": -0.000356031055,
+      "residual_v": -0.0,
+      "tolerance_v": 0.00506282901
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.456328470493,
+     "width_shift_v": 0.000356031055
     },
     {
-     "amplitude_v": 0.524444444444,
+     "amplitude_v": 0.494924827911,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.524444444444,
+      "centre_budget_v": 0.001796687675,
+      "crop_floor_v": 0.494924827911,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.475555555556,
-      "scheduled_v": 0.263333333333,
-      "shift_capped_v": 0.263333333333
+      "predicted_target_v": 0.455972439716,
+      "predicted_width_shift_v": 0.000203312325,
+      "rail_v": 0.505075172089,
+      "scheduled_v": 0.248658368806,
+      "shift_capped_v": 0.447585063851
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.028,
+     "center_shift_v": 0.001796687675,
+     "center_v": 0.012896125372,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.456328470493,
+      "delta_lower_v": 0.004188597376,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.000356030777,
+      "new_geometry": {
+       "amplitude_v": 0.494924827911,
+       "center_v": 0.012896125372
+      },
+      "old_geometry": {
+       "amplitude_v": 0.497316737612,
+       "center_v": 0.011099437697
+      },
+      "predicted_shift_v": -0.000356030777,
+      "residual_v": 0.0,
+      "tolerance_v": 0.005062828961
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.455972439716,
+     "width_shift_v": 0.000356030777
     },
     {
-     "amplitude_v": 0.522222222222,
+     "amplitude_v": 0.492532918493,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.522222222222,
+      "centre_budget_v": 0.001796687699,
+      "crop_floor_v": 0.492532918493,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.477777777778,
-      "scheduled_v": 0.262222222222,
-      "shift_capped_v": 0.262222222222
+      "predicted_target_v": 0.455616408961,
+      "predicted_width_shift_v": 0.000203312301,
+      "rail_v": 0.507467081507,
+      "scheduled_v": 0.247462413956,
+      "shift_capped_v": 0.44543234512
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.03,
+     "center_shift_v": 0.001796687699,
+     "center_v": 0.014692813072,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.455972439716,
+      "delta_lower_v": 0.004188597118,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.000356030755,
+      "new_geometry": {
+       "amplitude_v": 0.492532918493,
+       "center_v": 0.014692813072
+      },
+      "old_geometry": {
+       "amplitude_v": 0.494924827911,
+       "center_v": 0.012896125372
+      },
+      "predicted_shift_v": -0.000356030755,
+      "residual_v": -0.0,
+      "tolerance_v": 0.005062828957
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.455616408961,
+     "width_shift_v": 0.000356030755
     },
     {
-     "amplitude_v": 0.52,
+     "amplitude_v": 0.490141009097,
      "bounds": {
-      "centre_budget_v": 0.002,
-      "crop_floor_v": 0.52,
+      "centre_budget_v": 0.001796687701,
+      "crop_floor_v": 0.490141009097,
       "goal_v": 0.006,
-      "predicted_width_shift_v": 0.0,
-      "rail_v": 0.48,
-      "scheduled_v": 0.261111111111,
-      "shift_capped_v": 0.261111111111
+      "predicted_target_v": 0.455260378208,
+      "predicted_width_shift_v": 0.000203312299,
+      "rail_v": 0.509858990903,
+      "scheduled_v": 0.246266459247,
+      "shift_capped_v": 0.443279626644
      },
-     "center_shift_v": 0.002,
-     "center_v": 0.032,
+     "center_shift_v": 0.001796687701,
+     "center_v": 0.016489500773,
      "detector": "coarse",
+     "hysteresis": {
+      "before_v": 0.455616408961,
+      "delta_lower_v": 0.004188597097,
+      "h_per_volt": 0.085,
+      "measured_shift_v": -0.000356030753,
+      "new_geometry": {
+       "amplitude_v": 0.490141009097,
+       "center_v": 0.016489500773
+      },
+      "old_geometry": {
+       "amplitude_v": 0.492532918493,
+       "center_v": 0.014692813072
+      },
+      "predicted_shift_v": -0.000356030753,
+      "residual_v": 0.0,
+      "tolerance_v": 0.005062828956
+     },
      "kind": "narrow",
      "metrics": {},
      "resolution_samples": 1.0,
-     "shift_per_fraction_v": 0.0,
      "sideband_offset_v": 0.001,
-     "target_voltage": 0.5,
-     "width_shift_v": 0.0
+     "target_voltage": 0.455260378208,
+     "width_shift_v": 0.000356030753
     }
    ]
   },
   "writes": [
    [
-    0.002,
-    0.553333333333
+    0.0,
+    0.9
    ],
    [
-    0.004,
-    0.551111111111
+    0.0,
+    0.81
    ],
    [
-    0.006,
-    0.548888888889
+    0.0,
+    0.729
    ],
    [
-    0.008,
-    0.546666666667
+    0.0,
+    0.6561
    ],
    [
-    0.01,
-    0.544444444444
+    0.0,
+    0.59049
    ],
    [
-    0.012,
-    0.542222222222
+    0.0,
+    0.531441
    ],
    [
-    0.014,
-    0.54
+    0.000435964188,
+    0.51304057868
    ],
    [
-    0.016,
-    0.537777777778
+    0.00212520999,
+    0.509384646936
    ],
    [
-    0.018,
-    0.535555555556
+    0.003913414144,
+    0.506892931107
    ],
    [
-    0.02,
-    0.533333333333
+    0.00570943199,
+    0.504493141058
    ],
    [
-    0.022,
-    0.531111111111
+    0.0075060668,
+    0.502100609412
    ],
    [
-    0.024,
-    0.528888888889
+    0.009302750325,
+    0.499708650885
    ],
    [
-    0.026,
-    0.526666666667
+    0.011099437697,
+    0.497316737612
    ],
    [
-    0.028,
-    0.524444444444
+    0.012896125372,
+    0.494924827911
    ],
    [
-    0.03,
-    0.522222222222
+    0.014692813072,
+    0.492532918493
    ],
    [
-    0.032,
-    0.52
+    0.016489500773,
+    0.490141009097
    ]
   ]
  }

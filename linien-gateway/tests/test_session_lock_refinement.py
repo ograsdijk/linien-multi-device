@@ -142,6 +142,11 @@ def _make_session(
     board.plot_state = session.plot_state
 
     session.auto_lock_scan_settings["half_range_sweep_v"] = HALF_RANGE_V
+    # The walk tests below feed the walk hand-written detection sequences whose
+    # moves are not the physical -h * dL shift, and pin the final gate, the
+    # sideband identity and the drift rules -- not the hysteresis window, which
+    # has its own tests (test_hysteresis_window.py). A one-volt floor opens it.
+    session.auto_lock_scan_settings["hysteresis_floor_v"] = 1.0
     settings = {
         "enabled": True,
         "capture_fraction": 0.5,
@@ -1351,7 +1356,7 @@ def test_a_narrowing_that_moves_the_feature_too_far_gentles_the_next_one(monkeyp
     assert len(widths) >= 2
     first_cut = 1.0 - widths[0] / 0.6
     second_cut = 1.0 - widths[1] / widths[0]
-    assert first_cut == pytest.approx(0.5)      # no measurement yet
+    assert first_cut == pytest.approx(0.5)      # the model's shift is inside the allowance
     assert second_cut < first_cut, (
         f"kept cutting {second_cut:.0%} after a {first_cut:.0%} cut moved the "
         "feature past its allowance"
@@ -1498,17 +1503,16 @@ def test_a_rail_blocked_narrowing_never_cuts_below_the_safe_floor(monkeypatch):
     )
 
 
-# -------------------------- the shift estimate measures the actuator, not the
-# -------------------------- disagreement between two detectors
+# ------------------- the shift is predicted by the model, never latched
 #
 # Field payload, centre 0.2 V amplitude 0.8 V: the initial coarse detection put
 # the feature at 0.5341 V and the first (strict) narrowing stage at 0.4312 V.
-# The walk recorded the 103 mV difference as a width-induced shift, inferred
-# 0.206 V per unit fractional width change, and from then on the predicted
-# shift consumed the entire stage allowance -- so the very next stage narrowed
-# with a centre budget of 7e-18 V. That is the "narrows without recentring"
-# the operator sees. The two numbers were measured by different detectors on
-# different crossings; their difference is not a shift.
+# The walk used to record the 103 mV difference as a width-induced shift,
+# infer a per-fraction coefficient and max-latch it, so the predicted shift
+# then consumed the entire stage allowance of every later stage: one
+# contaminated reading (two detectors on different crossings) throttled the
+# rest of the walk. The shift is now the hysteresis model's -h * dL; a stage
+# only RECORDS what it measured beside that prediction.
 
 def _shift_walk(monkeypatch, *, strict_raises: bool):
     """Narrow once from a coarse initial detection, with the feature apparently
@@ -1546,19 +1550,25 @@ def _shift_walk(monkeypatch, *, strict_raises: bool):
     return narrows[0]
 
 
-def test_a_shift_measured_across_a_detector_change_is_not_charged_to_the_budget(
-    monkeypatch,
+@pytest.mark.parametrize("strict_raises", [False, True])
+def test_a_stage_records_measured_against_predicted_shift_for_either_detector(
+    monkeypatch, strict_raises
 ):
-    # coarse -> strict across the write: nothing may be inferred about the actuator.
-    assert _shift_walk(monkeypatch, strict_raises=False)["shift_per_fraction_v"] is None
-
-
-def test_a_shift_measured_by_one_detector_twice_is_charged_to_the_budget(monkeypatch):
-    # coarse -> coarse: the same detector on both sides, so this is a measurement.
-    narrow = _shift_walk(monkeypatch, strict_raises=True)
-    assert narrow["shift_per_fraction_v"] == pytest.approx(
-        abs(0.4312 - 0.5341) / (1.0 - narrow["amplitude_v"] / 0.8), rel=0.02
+    """The record is the model's, not a learned coefficient: the same numbers
+    whichever detector served the stage, and nothing latched for later stages."""
+    narrow = _shift_walk(monkeypatch, strict_raises=strict_raises)
+    assert "shift_per_fraction_v" not in narrow
+    record = narrow["hysteresis"]
+    # dL = (0.2649 - 0.4) - (0.2 - 0.8): the lower endpoint rose 464.9 mV.
+    assert record["delta_lower_v"] == pytest.approx(0.4649)
+    assert record["predicted_shift_v"] == pytest.approx(-0.085 * 0.4649)
+    assert record["measured_shift_v"] == pytest.approx(0.4312 - 0.5341)
+    assert record["residual_v"] == pytest.approx(
+        (0.4312 - 0.5341) + 0.085 * 0.4649
     )
+    assert record["tolerance_v"] == pytest.approx(1.0 + 0.015 * 0.4649)  # opened floor
+    assert record["old_geometry"] == {"center_v": 0.2, "amplitude_v": 0.8}
+    assert record["new_geometry"] == {"center_v": 0.2649, "amplitude_v": 0.4}
 
 
 def test_every_refinement_geometry_write_waits_for_the_calibrated_settle(monkeypatch):
