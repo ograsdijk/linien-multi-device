@@ -98,6 +98,14 @@ class FakeControl:
     def __init__(self, board: FakeBoard) -> None:
         self.board = board
 
+    def exposed_pause_acquisition(self) -> None:
+        self.board.parameters.pause_acquisition = FakeParam(True)
+        self.board.parameters.pause_acquisition._cached_value = True
+
+    def exposed_continue_acquisition(self) -> None:
+        self.board.parameters.pause_acquisition.value = False
+        self.board.parameters.pause_acquisition._cached_value = False
+
     def exposed_write_registers(self) -> None:
         self.board.on_write_registers()
 
@@ -506,21 +514,37 @@ def test_one_processed_frame_is_not_accepted_as_proof_of_a_fresh_sweep(monkeypat
 def test_a_second_frame_confirms_the_sweep_post_dates_the_move(monkeypatch):
     import threading
 
+    first_seen = threading.Event()
+
+    class ObservedPlotState(SteppedPlotState):
+        @property
+        def last_unlocked_trace_at(self):
+            stamp = self._stamp
+            if stamp > moved_at:
+                first_seen.set()
+            return stamp
+
+        @last_unlocked_trace_at.setter
+        def last_unlocked_trace_at(self, value):
+            self._stamp = value
+
     session, _board = _make_session(monkeypatch, _no_error)
-    stepped = SteppedPlotState()
+    stepped = ObservedPlotState()
     session.plot_state = stepped
     moved_at = time.time()
-    time.sleep(0.01)
 
     def _deliver_two() -> None:
-        time.sleep(0.05)
+        time.sleep(0.01)
         stepped.deliver()
-        time.sleep(0.05)
-        stepped.deliver()
+        # Ensure the waiter observes the first frame before replacing its stamp.
+        # A scheduling delay must not collapse both test events into one observation.
+        if first_seen.wait(timeout=2.0):
+            stepped.deliver()
 
-    threading.Thread(target=_deliver_two, daemon=True).start()
-
+    thread = threading.Thread(target=_deliver_two, daemon=True)
+    thread.start()
     assert session._wait_for_fresh_unlocked_trace(moved_at, 2.0) is True
+    thread.join(timeout=2.0)
 
 
 def test_the_wait_budget_is_per_frame(monkeypatch):

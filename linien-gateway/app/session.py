@@ -489,6 +489,10 @@ class DeviceSession:
         self.param_cache_serialized: Dict[str, Any] = {}
         self._param_metadata_cache: List[Dict[str, Any]] | None = None
         self.plot_state = PlotState()
+        # The axes used for each accepted unlocked acquisition. `to_plot` does
+        # not carry geometry, so capture the parameter-cache geometry in the
+        # same ordered callback that accepts the trace.
+        self._unlocked_geometry_by_frame: dict[int, tuple[float, float]] = {}
         self.auto_lock_scan_settings = self._initial_auto_lock_scan_settings()
         self.lock_acceptance_settings = self._initial_lock_acceptance_settings()
         self.lock_indicator = LockIndicatorEvaluator(
@@ -1757,6 +1761,7 @@ class DeviceSession:
                 self.param_cache_serialized = {}
                 self._param_metadata_cache = None
                 self.plot_state = PlotState()
+                self._unlocked_geometry_by_frame = {}
                 with self._rpyc_lock:
                     self._sanitize_parameters_on_connect()
                     self._seed_or_replay_persistent_settings_locked()
@@ -1885,20 +1890,12 @@ class DeviceSession:
                 if self.parameters is not None:
                     with self._rpyc_lock:
                         self.parameters.check_for_changed_parameters()
-                    if (
-                        self.last_plot_timestamp is None
-                        or (time.time() - self.last_plot_timestamp) > 1.0
-                    ):
-                        try:
-                            with self._rpyc_lock:
-                                raw = self.parameters.to_plot.value
-                            self._on_to_plot(raw)
-                        except Exception:  # noqa: BLE001 - keep polling on transient frame errors
-                            logger.debug(
-                                "Transient to_plot processing failure device=%s",
-                                self.device.key,
-                                exc_info=True,
-                            )
+                    # `to_plot` is a latest-value parameter. Reading it here
+                    # when the event stream is quiet reprocesses the same cached
+                    # hardware acquisition and used to advance unlocked-frame
+                    # IDs/timestamps as if a new sweep had arrived. The remote
+                    # listener registered in `_add_parameter_callbacks` is the
+                    # acquisition event path; a stalled stream stays stalled.
                 time.sleep(0.05)
             except Exception as exc:
                 self._handle_poll_failure(exc)
@@ -2092,17 +2089,31 @@ class DeviceSession:
         return modulation_raw_to_hz(value)
 
     def _snapshot_sweep_params(
-        self, *, require_unlocked: bool = False
+        self, *, require_unlocked: bool = False, frame_id: int | None = None
     ) -> tuple[float, float, bool, float | None]:
         """Read the sweep params + modulation frequency the auto-lock paths need, in
         one rpyc-lock acquisition. With ``require_unlocked`` it first refuses if the
-        device is already locked. Returns
+        device is already locked. When `frame_id` is supplied, its captured center
+        and amplitude are used so the detector keeps the trace/geometry pair that
+        arrived in the same Linien callback batch. Returns
         (sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz)."""
+        frame_geometry = None
+        if frame_id is not None:
+            with self._state_lock:
+                frame_geometry = self._unlocked_geometry_by_frame.get(int(frame_id))
+            if frame_geometry is None and int(frame_id) >= 0:
+                raise RuntimeError(
+                    f"No sweep geometry snapshot is available for frame {frame_id}."
+                )
+
         with self._rpyc_lock:
             if require_unlocked and bool(self.parameters.lock.value):
                 raise RuntimeError("Device is already locked. Start sweep first.")
-            sweep_center = float(self.parameters.sweep_center.value)
-            sweep_amplitude = float(self.parameters.sweep_amplitude.value)
+            if frame_geometry is None:
+                sweep_center = float(self.parameters.sweep_center.value)
+                sweep_amplitude = float(self.parameters.sweep_amplitude.value)
+            else:
+                sweep_center, sweep_amplitude = frame_geometry
             preferred_slope_rising = bool(self.parameters.target_slope_rising.value)
             modulation_raw = self.parameters.modulation_frequency.value
         return (
@@ -2394,6 +2405,7 @@ class DeviceSession:
             "offset_b": self._read_param_fast("offset_b"),
             "pid_on_slow_enabled": self._read_param_fast("pid_on_slow_enabled"),
             "autolock_preparing": self._read_param_fast("autolock_preparing"),
+            "sweep_center": self._read_param_fast("sweep_center"),
             "sweep_amplitude": self._read_param_fast("sweep_amplitude"),
             "autolock_initial_sweep_amplitude": self._read_param_fast(
                 "autolock_initial_sweep_amplitude"
@@ -2508,6 +2520,23 @@ class DeviceSession:
             )
             if frame is None:
                 return
+            if not lock_value:
+                center_v = _coerce_float(params.get("sweep_center"))
+                amplitude_v = _coerce_float(params.get("sweep_amplitude"))
+                if center_v is not None and amplitude_v is not None:
+                    frame_id = int(self.plot_state.last_unlocked_frame_id)
+                    self._unlocked_geometry_by_frame[frame_id] = (
+                        center_v,
+                        amplitude_v,
+                    )
+                    # Keep enough history to cover callers holding a recent
+                    # frame_id while bounding memory during long-running plots.
+                    cutoff = frame_id - 64
+                    self._unlocked_geometry_by_frame = {
+                        fid: geometry
+                        for fid, geometry in self._unlocked_geometry_by_frame.items()
+                        if fid > cutoff
+                    }
             frame["signal_stats"] = asdict(signal_stats)
             # Surface the discriminator slope (last auto-lock scan) and the
             # derived in-loop lock error alongside the per-frame stats so the
@@ -2906,7 +2935,7 @@ class DeviceSession:
             else:
                 settings = self._merged_auto_lock_scan_settings(settings_payload)
         sweep_center, sweep_amplitude, preferred_slope_rising, modulation_frequency_hz = (
-            self._snapshot_sweep_params()
+            self._snapshot_sweep_params(frame_id=frame_id)
         )
 
         reason: str | None = None
@@ -3105,7 +3134,9 @@ class DeviceSession:
             error_trace, monitor_trace, frame_id, acquired_at = (
                 self._snapshot_auto_lock_traces_with_frame()
             )
-            c_v, a_v, rising, mod_hz = self._snapshot_sweep_params()
+            c_v, a_v, rising, mod_hz = self._snapshot_sweep_params(
+                frame_id=frame_id
+            )
             result.update(_coarse_block(
                 error_trace=error_trace, monitor_trace=monitor_trace, frame_id=frame_id,
                 acquired_at=acquired_at, center_v=c_v, amplitude_v=a_v,
@@ -3120,19 +3151,21 @@ class DeviceSession:
     ) -> bool:
         """Block until a sweep *acquired* after ``after`` has landed.
 
-        Traces arrive on the plot poll thread; there is no way to demand one, so
-        the verification step waits for the next sweep to come round rather than
-        re-reading whatever was already in hand (which still shows the feature
-        at its pre-move position).
+        Traces arrive on the plot callback path; there is no way to demand one,
+        so the verification step waits for the next sweep to come round rather
+        than re-reading whatever was already in hand (which still shows the
+        feature at its pre-move position). Geometry writes use Linien's
+        pause/continue acquisition epoch below, so callbacks queued before the
+        pause are discarded before this timestamp gate is armed.
 
-        Two frames, not one. ``last_unlocked_trace_at`` records when a frame was
-        PROCESSED, not when the board acquired it, and the poll loop reads
-        ``to_plot`` under the same ``_rpyc_lock`` the ramp is using -- so an
-        array pulled off the device mid-ramp, or before the settle finished, can
-        be processed after ``after`` and would pass a single-frame check. That
-        is precisely the un-settled state ``settle_ms`` exists to let decay. The
-        second frame cannot have been acquired before the first was processed,
-        so it post-dates the move for real.
+        Two frames, not one. The processed timestamp alone is not acquisition
+        proof: a delayed callback could otherwise be mistaken for a fresh
+        sweep. The Linien acquisition pause rotates the server's acquisition
+        UUID, discards old-epoch data and does not resume publication until the
+        FPGA writes are complete. We also wait for the pause notification to
+        pass through the client's ordered parameter queue before resuming, so
+        queued pre-pause callbacks are observed while the cached pause state is
+        still true and ignored by `_on_to_plot`.
 
         The budget is per frame, since each wait is independent.
         """
@@ -3270,20 +3303,53 @@ class DeviceSession:
     def _set_sweep_geometry(
         self, center_v: float, amplitude_v: float, *, settle_s: float = 0.0
     ) -> float:
-        """Atomically command both scan axes and return the completion timestamp.
+        """Apply geometry in a new Linien acquisition epoch.
 
-        The refinement walk lets `settle_ms` decay before it believes a trace
-        (see _apply_center_plan); the refinement walk did not, and started
-        counting frames the instant the registers were written. Both axes are
-        actuators with a settling tail, so the first frames after the write show
-        the scan mid-transition. The timestamp is taken AFTER the settle so that
-        the freshness check admits only frames acquired past it.
+        Linien's public pause/continue RPCs rotate the server's acquisition UUID;
+        the server then discards data acquired in the old epoch and resumes only
+        after register writes finish. Wait for the `pause_acquisition=True`
+        notification before continuing so the client's ordered callback queue
+        has drained all old `to_plot` events while `_on_to_plot` can still see
+        the paused state. The returned timestamp is a post-write freshness
+        threshold, not an acquisition timestamp.
         """
-        with self._rpyc_lock:
-            self.parameters.sweep_center.value = float(center_v)
-            self.parameters.sweep_amplitude.value = float(amplitude_v)
-            self.control.exposed_write_registers()
-            self._last_sweep_geometry_write_completed_at = time.time()
+        if self.parameters is None or self.control is None:
+            raise RuntimeError("Device not connected")
+
+        pause_requested = False
+        try:
+            # Mark before the RPC: if the connection drops after the server
+            # changed its acquisition epoch but before the reply returns, the
+            # finally block still attempts to resume it.
+            pause_requested = True
+            with self._rpyc_lock:
+                self.control.exposed_pause_acquisition()
+
+            # The pause flag is cacheable. `_poll_loop` applies queued parameter
+            # changes on its own thread, outside this method's RPyC lock.
+            pause_timeout_s = max(2.0, float(self._unlocked_trace_timeout_s()))
+            deadline = time.monotonic() + pause_timeout_s
+            pause_param = getattr(self.parameters, "pause_acquisition", None)
+            while getattr(pause_param, "_cached_value", _UNSET) is not True:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "Linien acquisition pause was not acknowledged; "
+                        "scan geometry was not changed."
+                    )
+                time.sleep(0.01)
+
+            with self._rpyc_lock:
+                self.parameters.sweep_center.value = float(center_v)
+                self.parameters.sweep_amplitude.value = float(amplitude_v)
+                self.control.exposed_write_registers()
+                self._last_sweep_geometry_write_completed_at = time.time()
+        finally:
+            # A failed pause acknowledgement may still mean the server paused;
+            # always try to resume once the pause RPC itself returned.
+            if pause_requested:
+                with self._rpyc_lock:
+                    self.control.exposed_continue_acquisition()
+
         if settle_s > 0.0:
             time.sleep(float(settle_s))
         return time.time()
@@ -3328,7 +3394,7 @@ class DeviceSession:
                 self._snapshot_auto_lock_traces_with_frame()
             )
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
-            require_unlocked=True
+            require_unlocked=True, frame_id=frame_id if traces is None else None
         )
         diagnostic = None
         if traces is None:
@@ -3374,7 +3440,7 @@ class DeviceSession:
             self._snapshot_auto_lock_traces_with_frame()
         )
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
-            require_unlocked=True
+            require_unlocked=True, frame_id=frame_id
         )
         diagnostic = self._record_refinement_detection_frame(
             error_trace=error_trace, frame_id=frame_id, acquired_at=acquired_at,
@@ -3428,7 +3494,7 @@ class DeviceSession:
             self._snapshot_auto_lock_traces_with_frame()
         )
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
-            require_unlocked=True
+            require_unlocked=True, frame_id=frame_id
         )
         diagnostic = self._record_refinement_detection_frame(
             error_trace=error_trace, frame_id=frame_id, acquired_at=acquired_at,
@@ -3481,7 +3547,7 @@ class DeviceSession:
             self._snapshot_auto_lock_traces_with_frame()
         )
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
-            require_unlocked=True
+            require_unlocked=True, frame_id=frame_id
         )
         diagnostic = self._record_refinement_detection_frame(
             error_trace=error_trace, frame_id=frame_id, acquired_at=acquired_at,
@@ -4510,7 +4576,9 @@ class DeviceSession:
                 error_trace, monitor_trace, frame_id, acquired_at = (
                     self._snapshot_auto_lock_traces_with_frame()
                 )
-                center_v, amplitude_v, _rising, mod_hz = self._snapshot_sweep_params()
+                center_v, amplitude_v, _rising, mod_hz = self._snapshot_sweep_params(
+                    frame_id=frame_id
+                )
                 frame = _frame_summary(
                     error_trace, frame_id, acquired_at, center_v, amplitude_v, mod_hz, []
                 )
@@ -4721,8 +4789,9 @@ class DeviceSession:
         after and `observe_frame` rejected every later frame as being at the
         "wrong" geometry. This re-reads the device's ACTUAL geometry,
         advances `stage_index`, clears `latest_candidates`/`pending_shift`,
-        and records whatever frame is current if one is available -- the run
-        stays ACTIVE so the caller can retry `step` from here, or `abort`.
+        and retains a cached frame only when that frame carries the same
+        captured geometry. Otherwise the run stays active with no selectable
+        frame so the caller can acquire a new one before retrying `step`.
 
         Always raises `StagedAutolockError(422)`; never returns normally.
         """
@@ -4734,6 +4803,9 @@ class DeviceSession:
                     status_code=422,
                 ) from exc
             try:
+                # Bookkeep the device's current geometry independently of the
+                # last cached trace: a failed detector may have left that trace
+                # at the previous stage's geometry.
                 center_v, amplitude_v, _rising, mod_hz = self._snapshot_sweep_params()
             except Exception:  # noqa: BLE001 - keep the run's last-known geometry
                 center_v, amplitude_v, mod_hz = run.center_v, run.amplitude_v, None
@@ -4742,15 +4814,26 @@ class DeviceSession:
             run.amplitude_v = float(amplitude_v)
             run.latest_candidates = []
             run.pending_shift = None
+            run.latest_frame = {}
             try:
                 error_trace, _monitor_trace, frame_id, acquired_at = (
                     self._snapshot_auto_lock_traces_with_frame()
                 )
-                run.latest_frame = _frame_summary(
-                    error_trace, frame_id, acquired_at, center_v, amplitude_v,
-                    mod_hz, [],
-                )
-            except Exception:  # noqa: BLE001 - keep the previous latest_frame
+                frame_geometry = self._unlocked_geometry_by_frame.get(frame_id)
+                if (
+                    frame_geometry is not None
+                    and math.isclose(
+                        frame_geometry[0], center_v, rel_tol=0.0, abs_tol=1e-9
+                    )
+                    and math.isclose(
+                        frame_geometry[1], amplitude_v, rel_tol=0.0, abs_tol=1e-9
+                    )
+                ):
+                    run.latest_frame = _frame_summary(
+                        error_trace, frame_id, acquired_at, center_v, amplitude_v,
+                        mod_hz, [],
+                    )
+            except Exception:  # noqa: BLE001 - no matching frame is available
                 pass
         raise StagedAutolockError(
             f"No candidate at the new geometry -- abort or retry ({exc})",
@@ -5710,10 +5793,18 @@ class DeviceSession:
             combined_error = np.array(plot_data[2], copy=True)
             frame_id = int(self.plot_state.last_unlocked_frame_id)
             acquired_at = self.plot_state.last_unlocked_trace_at
+            frame_geometry = self._unlocked_geometry_by_frame.get(frame_id)
+            if frame_geometry is None and frame_id > 0:
+                raise RuntimeError(
+                    f"No sweep geometry snapshot is available for frame {frame_id}."
+                )
 
         dual_channel = bool(self._read_param_fast("dual_channel", False))
-        center = float(self._read_param_fast("sweep_center", 0.0) or 0.0)
-        amplitude = float(self._read_param_fast("sweep_amplitude", 1.0) or 1.0)
+        if frame_geometry is None:
+            center = float(self._read_param_fast("sweep_center", 0.0) or 0.0)
+            amplitude = float(self._read_param_fast("sweep_amplitude", 1.0) or 1.0)
+        else:
+            center, amplitude = frame_geometry
         n_points = int(combined_error.shape[0])
 
         def to_volts(arr: "np.ndarray | None") -> "list[float] | None":

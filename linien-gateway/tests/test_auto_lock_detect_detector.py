@@ -18,7 +18,7 @@ def _session(monkeypatch, *, strict, coarse):
     monkeypatch.setattr(
         session, "_snapshot_auto_lock_traces_with_frame", lambda: (trace, None, 7, 123.0)
     )
-    monkeypatch.setattr(session, "_snapshot_sweep_params", lambda: (0.0, 1.0, True, 10e6))
+    monkeypatch.setattr(session, "_snapshot_sweep_params", lambda **kwargs: (0.0, 1.0, True, 10e6))
     calls: list[str] = []
 
     def _strict(**kwargs):
@@ -155,7 +155,7 @@ def test_a_staged_runs_own_detection_is_untouched_by_include_coarse(monkeypatch)
         session, "_snapshot_auto_lock_traces_with_frame", lambda: (trace, None, 6, 1.0)
     )
     monkeypatch.setattr(session, "_snapshot_sweep_params",
-                        lambda require_unlocked=False: (0.0, 1.0, True, 10e6))
+                        lambda require_unlocked=False, frame_id=None: (0.0, 1.0, True, 10e6))
     monkeypatch.setattr(
         session_module, "find_plausible_coarse_candidates",
         lambda **kw: [SimpleNamespace(result=_result(1, 0.25)), SimpleNamespace(result=_result(8, -0.4))],

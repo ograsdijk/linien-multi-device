@@ -66,9 +66,18 @@ class _FakeParameters:
 
 
 class _FakeControl:
-    def __init__(self) -> None:
+    def __init__(self, parameters) -> None:
+        self.parameters = parameters
         self.write_count = 0
         self.lock_started = False
+
+    def exposed_pause_acquisition(self) -> None:
+        self.parameters.pause_acquisition = _FakeParam(True)
+        self.parameters.pause_acquisition._cached_value = True
+
+    def exposed_continue_acquisition(self) -> None:
+        self.parameters.pause_acquisition.value = False
+        self.parameters.pause_acquisition._cached_value = False
 
     def exposed_write_registers(self) -> None:
         self.write_count += 1
@@ -126,7 +135,7 @@ def _make_bare_session() -> tuple[DeviceSession, _FakeControl]:
         modulation_frequency=0.0,
         lock=False,
     )
-    control = _FakeControl()
+    control = _FakeControl(session.parameters)
     session.control = control
     session.auto_lock_scan_settings["half_range_sweep_v"] = 0.02
     return session, control

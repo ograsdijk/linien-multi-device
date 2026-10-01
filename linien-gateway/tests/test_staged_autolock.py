@@ -887,6 +887,7 @@ def test_begin_reports_when_both_detectors_find_nothing(monkeypatch):
         lambda: (np.zeros(2048), None, 1, time.time()),
     )
 
+    session._unlocked_geometry_by_frame[1] = (0.0, 1.0)
     result = session.staged_autolock_begin(None, 60.0)
     assert result["candidates"] == []
     assert result["detail"] is not None

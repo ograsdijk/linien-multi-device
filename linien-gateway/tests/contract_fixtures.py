@@ -123,6 +123,10 @@ class SimBoard:
         """`_snapshot_auto_lock_traces_with_frame`: one NEW frame per call."""
         trace = self.trace()
         self.frame_id += 1
+        self.session._unlocked_geometry_by_frame[self.frame_id] = (
+            float(self.session.parameters.sweep_center.value),
+            float(self.session.parameters.sweep_amplitude.value),
+        )
         self.recent.append((self.frame_id, trace * V))
         del self.recent[:-8]
         return trace, None, self.frame_id, time.time()
