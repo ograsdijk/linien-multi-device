@@ -48,6 +48,7 @@ from .auto_relock import AutoRelockConfig, AutoRelockController
 from .device_recovery import RecoveryCancelled, reboot_device
 from .lock_acceptance import (
     AcceptanceSettings,
+    AcceptanceWindow,
     acceptance_window_v,
     capture_tolerance_v,
     final_pair_diagnostics,
@@ -167,14 +168,6 @@ RELOCK_ACTION_DRAIN_TIMEOUT_S = 5.0
 # geometry, so a dropped orchestrator client cannot strand the sweep narrowed.
 STAGED_AUTOLOCK_DEFAULT_TTL_S = 60.0
 STAGED_AUTOLOCK_MAX_TTL_S = 3600.0
-# Position tolerance for the `lock` stage's same-geometry consistency check,
-# in samples. Position comparison is otherwise forbidden across a geometry
-# change (see lock_refinement.py's hysteresis note); at the SAME geometry
-# (the fresh verification frame taken at the run's final, unmoved centre and
-# amplitude) it is the only invariant available, so it gets a documented,
-# generous-but-specific tolerance rather than reusing a narrower cross-
-# geometry bound by accident.
-STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES = 3.0
 
 
 def _selection_window_fields(window: dict[str, Any] | None) -> dict[str, Any]:
@@ -4106,63 +4099,11 @@ class DeviceSession:
                 raise _TrackingIdentityChanged(
                     "The two final detections disagreed on the discriminator slope."
                 )
-            drift_v = abs(strict_one.target_voltage - strict_two.target_voltage)
-            # Two questions, not one. They were conflated into a single
-            # displacement test that a drifting laser cannot pass: verifying a
-            # detection costs two fresh sweeps, so the two readings are seconds
-            # apart, while the capture window is half a feature half-width. On
-            # the characterization device -- 1-3 mV/s of drift against a 0.889 mV
-            # window -- any honest pair of verifications is 2-3 mV apart and was
-            # refused, however well the walk had converged.
-            #
-            # 1. Are these the same crossing? The scale for that is the distance
-            #    to the next feature, which is what the neighbour guard already
-            #    derives; the capture window says nothing about it.
-            # rejection_bound_v is already defined as the offset beyond which a
-            # re-detection is a different crossing rather than a moved one, so
-            # it is the threshold -- not half of it. On the field device that
-            # bound is 7.1 mV and an honest pair of verifications is 2-3 mV
-            # apart; halving it would leave 7% of headroom.
-            neighbour_bound = window.bound_v
-            if neighbour_bound is not None and drift_v > neighbour_bound:
-                raise _TrackingIdentityChanged(
-                    f"The two final detections were {drift_v * 1e3:.3f} mV apart, "
-                    f"past the {neighbour_bound * 1e3:.3f} mV neighbour bound: "
-                    "they are not the same crossing."
-                )
-            # 2. Preserve the established one-shot rate gate using the
-            #    configured settle_ms as an estimate. The gateway has no
-            #    measurement of physical lock-engagement duration; diagnostics
-            #    label this duration as an assumption for later lab review.
-            interval_s = float(final_diagnostics["observation_interval_s"])
-            handover_s = max(0.0, float(acceptance.settle_ms) / 1000.0)
-            if interval_s > 1e-3:
-                drift_rate_v_s = drift_v / interval_s
-                predicted_v = drift_rate_v_s * handover_s
-                final_diagnostics["predicted_motion_during_configured_handover_v"] = predicted_v
-                if predicted_v > tolerance:
-                    raise ValueError(
-                        f"The feature is drifting at {drift_rate_v_s * 1e3:.2f} mV/s "
-                        f"({drift_v * 1e3:.3f} mV between two detections "
-                        f"{interval_s:.2f} s apart), so it moves "
-                        f"{predicted_v * 1e3:.3f} mV under the configured {handover_s * 1e3:.0f} ms "
-                        f"handover -- outside the {tolerance * 1e3:.3f} mV capture "
-                        f"window (capture_fraction {float(acceptance.capture_fraction):g} "
-                        f"x feature half-width "
-                        f"{float(settings.half_range_sweep_v) * 1e3:.3f} mV). The "
-                        "configured interval is an estimate, not a measured "
-                        "lock-engagement duration; inspect the recorded timing "
-                        "before changing the threshold."
-                    )
-            elif drift_v > tolerance:
-                # No usable interval to derive a rate from: fall back to the
-                # displacement, which is all that can be said.
-                raise ValueError(
-                    f"The two final detections were {drift_v * 1e3:.3f} mV apart, "
-                    f"outside the {tolerance * 1e3:.3f} mV acceptance window "
-                    f"(capture_fraction {float(acceptance.capture_fraction):g} x feature "
-                    f"half-width {float(settings.half_range_sweep_v) * 1e3:.3f} mV)."
-                )
+            self._check_final_handover(
+                strict_one, strict_two, window=window, tolerance=tolerance,
+                final_diagnostics=final_diagnostics, acceptance=acceptance,
+                settings=settings,
+            )
             final_diagnostics["acceptance_passed"] = True
             final_diagnostics["target_voltage"] = strict_two.target_voltage
             final_diagnostics["consistent"] = True
@@ -5109,6 +5050,70 @@ class DeviceSession:
         finally:
             self._staged_autolock_finish_busy(token)
 
+    def _check_final_handover(
+        self, first: Any, second: Any, *, window: AcceptanceWindow, tolerance: float,
+        final_diagnostics: dict[str, Any], acceptance: AcceptanceSettings,
+        settings: AutoLockScanSettings,
+    ) -> None:
+        """Shared neighbour and configured-handover rate checks for both lock paths."""
+        drift_v = abs(first.target_voltage - second.target_voltage)
+        # Two questions, not one. They were conflated into a single
+        # displacement test that a drifting laser cannot pass: verifying a
+        # detection costs two fresh sweeps, so the two readings are seconds
+        # apart, while the capture window is half a feature half-width. On
+        # the characterization device -- 1-3 mV/s of drift against a 0.889 mV
+        # window -- any honest pair of verifications is 2-3 mV apart and was
+        # refused, however well the walk had converged.
+        #
+        # 1. Are these the same crossing? The scale for that is the distance
+        #    to the next feature, which is what the neighbour guard already
+        #    derives; the capture window says nothing about it.
+        # rejection_bound_v is already defined as the offset beyond which a
+        # re-detection is a different crossing rather than a moved one, so
+        # it is the threshold -- not half of it. On the field device that
+        # bound is 7.1 mV and an honest pair of verifications is 2-3 mV
+        # apart; halving it would leave 7% of headroom.
+        neighbour_bound = window.bound_v
+        if neighbour_bound is not None and drift_v > neighbour_bound:
+            raise _TrackingIdentityChanged(
+                f"The two final detections were {drift_v * 1e3:.3f} mV apart, "
+                f"past the {neighbour_bound * 1e3:.3f} mV neighbour bound: "
+                "they are not the same crossing."
+            )
+        # 2. Preserve the established one-shot rate gate using the
+        #    configured settle_ms as an estimate. The gateway has no
+        #    measurement of physical lock-engagement duration; diagnostics
+        #    label this duration as an assumption for later lab review.
+        interval_s = float(final_diagnostics["observation_interval_s"])
+        handover_s = max(0.0, float(acceptance.settle_ms) / 1000.0)
+        if interval_s > 1e-3:
+            drift_rate_v_s = drift_v / interval_s
+            predicted_v = drift_rate_v_s * handover_s
+            final_diagnostics["predicted_motion_during_configured_handover_v"] = predicted_v
+            if predicted_v > tolerance:
+                raise ValueError(
+                    f"The feature is drifting at {drift_rate_v_s * 1e3:.2f} mV/s "
+                    f"({drift_v * 1e3:.3f} mV between two detections "
+                    f"{interval_s:.2f} s apart), so it moves "
+                    f"{predicted_v * 1e3:.3f} mV under the configured {handover_s * 1e3:.0f} ms "
+                    f"handover -- outside the {tolerance * 1e3:.3f} mV capture "
+                    f"window (capture_fraction {float(acceptance.capture_fraction):g} "
+                    f"x feature half-width "
+                    f"{float(settings.half_range_sweep_v) * 1e3:.3f} mV). The "
+                    "configured interval is an estimate, not a measured "
+                    "lock-engagement duration; inspect the recorded timing "
+                    "before changing the threshold."
+                )
+        elif drift_v > tolerance:
+            # No usable interval to derive a rate from: fall back to the
+            # displacement, which is all that can be said.
+            raise ValueError(
+                f"The two final detections were {drift_v * 1e3:.3f} mV apart, "
+                f"outside the {tolerance * 1e3:.3f} mV acceptance window "
+                f"(capture_fraction {float(acceptance.capture_fraction):g} x feature "
+                f"half-width {float(settings.half_range_sweep_v) * 1e3:.3f} mV)."
+            )
+
     def _staged_lock_match_candidate(
         self,
         settings: AutoLockScanSettings,
@@ -5116,26 +5121,12 @@ class DeviceSession:
         *,
         amplitude_v: float,
         trace_length: int,
+        acceptance: AcceptanceSettings,
     ) -> tuple[Any, float, float]:
-        """One fresh strict capture, matched against `selected` (fix #9).
+        """Confirm the selected crossing within its calibrated neighbour bound.
 
-        Unique candidate, same slope, within
-        `STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES` and same slope -- mirroring
-        the one-shot's final
-        verification at unchanged geometry
-        (`_trajectory_refine_auto_lock`'s `identity.check(..., check_sideband=False)`):
-        position comparison is only ever valid when geometry has not moved,
-        which is exactly this call's situation (nothing moves between `step`
-        and `lock`), and the sideband estimate a freshly-narrowed run just
-        measured is the very thing under test here, not a gate on it.
-
-        `staged_autolock_lock` calls this TWICE -- once per confirmation
-        frame -- so a transient false match on a single noisy trace can never
-        start a lock by itself.
-
-        Returns ``(matched_candidate, verify_center_v, verify_amplitude_v)``.
-        Raises `StagedAutolockError(422)` on a strict rejection, no
-        consistent match, or an ambiguous one.
+        This is an identity association gate, not the handover capture window.
+        Never choose by score or accept multiple same-slope matches.
         """
         try:
             candidates, verify_center, verify_amplitude, _resolution, _frame = (
@@ -5146,8 +5137,12 @@ class DeviceSession:
                 f"No strict candidate found at lock-verification time: {exc}",
                 status_code=422,
             ) from exc
-        tolerance_samples = STAGED_AUTOLOCK_LOCK_TOLERANCE_SAMPLES
-        tolerance_v = tolerance_samples * 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
+        window = acceptance_window_v(
+            acceptance, settings.half_range_sweep_v, selected.sideband_offset_v
+        )
+        tolerance_v = window.bound_v if window.bound_v is not None else max(
+            window.tolerance_v, 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
+        )
         matches = [
             c for c in candidates
             if c.target_slope_rising == selected.target_slope_rising
@@ -5157,7 +5152,7 @@ class DeviceSession:
             raise StagedAutolockError(
                 "No fresh strict candidate is consistent with the selected "
                 f"target at {selected.target_voltage:.6f} V within "
-                f"{tolerance_v * 1e3:.3f} mV ({tolerance_samples:g} samples); "
+                f"{tolerance_v * 1e3:.3f} mV neighbour association bound; "
                 "refusing to lock rather than substitute a different candidate.",
                 status_code=422,
             )
@@ -5274,6 +5269,7 @@ class DeviceSession:
             first, verify_center, verify_amplitude = self._staged_lock_match_candidate(
                 settings, selected,
                 amplitude_v=amplitude_v, trace_length=trace_length,
+                acceptance=acceptance,
             )
             first_observed_at = time.time()
             if (
@@ -5287,8 +5283,9 @@ class DeviceSession:
                     status_code=422,
                 )
             second, verify_center2, verify_amplitude2 = self._staged_lock_match_candidate(
-                settings, selected,
+                settings, first,
                 amplitude_v=amplitude_v, trace_length=trace_length,
+                acceptance=acceptance,
             )
             second_observed_at = time.time()
             # Same acceptance-window tolerance the one-shot's final_verify
@@ -5299,7 +5296,6 @@ class DeviceSession:
             consistency_tolerance_v = max(
                 window.tolerance_v, 2.0 * abs(amplitude_v) / max(1, trace_length - 1)
             )
-            drift_v = abs(second.target_voltage - first.target_voltage)
             final_diagnostics = final_pair_diagnostics(
                 first_voltage_v=first.target_voltage,
                 second_voltage_v=second.target_voltage,
@@ -5308,7 +5304,8 @@ class DeviceSession:
                 capture_tolerance_v=consistency_tolerance_v,
                 last_geometry_change_at=run.last_geometry_change_at,
                 geometry_change_timestamp_source=run.last_geometry_change_timestamp_source,
-                policy="staged_displacement_within_capture_window",
+                policy="one_shot_configured_handover_rate_projection",
+                configured_handover_s=max(0.0, float(acceptance.settle_ms) / 1000.0),
             )
             final_diagnostics.update({
                 "center_v": center_v,
@@ -5344,16 +5341,18 @@ class DeviceSession:
                     status_code=422,
                     details={"verification": final_diagnostics},
                 )
-            if drift_v > consistency_tolerance_v:
-                final_diagnostics["failure"] = "final pair displacement exceeded capture window"
-                raise StagedAutolockError(
-                    f"The two lock-verification detections were "
-                    f"{drift_v * 1e3:.3f} mV apart, past the "
-                    f"{consistency_tolerance_v * 1e3:.3f} mV acceptance window "
-                    "-- not consistent enough to lock.",
-                    status_code=422,
-                    details={"verification": final_diagnostics},
+            try:
+                self._check_final_handover(
+                    first, second, window=window, tolerance=consistency_tolerance_v,
+                    final_diagnostics=final_diagnostics, acceptance=acceptance,
+                    settings=settings,
                 )
+            except (_TrackingIdentityChanged, ValueError) as exc:
+                final_diagnostics["failure"] = str(exc)
+                raise StagedAutolockError(
+                    str(exc), status_code=422,
+                    details={"verification": final_diagnostics},
+                ) from exc
             try:
                 identity.check(
                     first, amplitude_v=amplitude_v, detector="strict",

@@ -1281,3 +1281,63 @@ def test_lock_handover_refuses_while_a_one_shot_walk_holds_the_center_lock():
         assert locked == []
     finally:
         session._center_move_lock.release()
+
+
+@pytest.mark.parametrize("drift_v,accepted", [(0.000889475, True), (0.004, False)])
+def test_final_handover_follows_det2_motion_and_keeps_the_rate_gate(monkeypatch, drift_v, accepted):
+    """DET2's selected crossing can move beyond three samples before handover."""
+    from app.lock_acceptance import AcceptanceSettings
+
+    session = _make_session()
+    locked = _lock_recorder(session)
+    center, amplitude = 0.6980547959947125, 0.1434375
+    selected_v, first_v = 0.682829139110073, 0.6845431
+    selected = _result(915, selected_v, sideband_offset_v=0.037979)
+    session._capture_auto_lock_candidates_strict = lambda settings, after=None: (
+        [selected], center, amplitude, 9.0, _frame(1, center, amplitude)
+    )
+    token = session.staged_autolock_begin({"half_range_sweep_v": 0.001270151441133366}, 60.0)["token"]
+    session._staged_autolock.acceptance = AcceptanceSettings(capture_fraction=0.5, settle_ms=300)
+    clock = [1000.0]
+    monkeypatch.setattr(session_module.time, "time", lambda: clock[0])
+    calls = []
+
+    def capture(settings, after=None):
+        calls.append(after)
+        clock[0] += 0.922280073
+        v = first_v if len(calls) == 1 else first_v - drift_v
+        return ([_result(927-len(calls), v, sideband_offset_v=0.037979)],
+                center, amplitude, 9.0, _frame(len(calls)+1, center, amplitude))
+
+    session._capture_auto_lock_candidates_strict = capture
+    if accepted:
+        result = session.staged_autolock_lock(token, 1, 915)
+        assert result["target_voltage"] == pytest.approx(first_v-drift_v)
+        assert locked[0].target_voltage == pytest.approx(first_v-drift_v)
+        verification = result["refinement"]["stages"][-1]
+        assert verification["acceptance_policy"] == "one_shot_configured_handover_rate_projection"
+        assert verification["acceptance_passed"] is True
+        assert verification["pair_displacement_within_capture_window"] is False
+    else:
+        with pytest.raises(StagedAutolockError, match="drifting") as exc:
+            session.staged_autolock_lock(token, 1, 915)
+        assert exc.value.details["verification"]["acceptance_passed"] is False
+        assert not locked
+    assert len(calls) == 2
+
+
+def test_final_handover_refuses_two_same_slope_candidates_inside_identity_bound():
+    session = _make_session()
+    locked = _lock_recorder(session)
+    selected = _result(1, 0.1, sideband_offset_v=0.2)
+    session._capture_auto_lock_candidates_strict = lambda settings, after=None: (
+        [selected], 0.0, 1.0, 2.0, _frame(1, 0.0, 1.0)
+    )
+    token = session.staged_autolock_begin(None, 60.0)["token"]
+    session._capture_auto_lock_candidates_strict = lambda settings, after=None: (
+        [_result(2, 0.102, sideband_offset_v=0.2),
+         _result(3, 0.104, sideband_offset_v=0.2)], 0.0, 1.0, 2.0, _frame(2, 0.0, 1.0)
+    )
+    with pytest.raises(StagedAutolockError, match="ambiguous"):
+        session.staged_autolock_lock(token, 1, 1)
+    assert not locked
