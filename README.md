@@ -159,7 +159,7 @@ npm install
 npm run build
 
 cd ..\linien-gateway
-python -m uvicorn app.main:app --reload
+python -m uvicorn app.main:app
 ```
 
 Open `http://localhost:8000` for the UI and `/api` for backend endpoints
@@ -169,7 +169,7 @@ For LAN access (run from the `linien-gateway` directory so `app.main:app` resolv
 
 ```powershell
 cd linien-gateway
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 ## Locking workflows

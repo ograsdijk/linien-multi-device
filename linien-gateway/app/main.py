@@ -2569,8 +2569,7 @@ def main() -> None:
         host=get_api_host(),
         port=get_api_port(),
         reload=False,
-        # See run.py for the rationale; same flag for the no-reload
-        # production-style invocation.
+        # See run.py for the rationale behind both flags.
         ws_per_message_deflate=True,
     )
 
