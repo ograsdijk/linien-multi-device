@@ -286,6 +286,27 @@ def build_acquisition_row(acquisition: "LockAcquisition") -> dict[str, Any]:
                 if acquisition.refinement is not None
                 else None
             ),
+            "linien_config": (
+                _json_safe(acquisition.linien_config)
+                if acquisition.linien_config is not None
+                else None
+            ),
+            "verification_status": acquisition.verification_status,
+            "verification_reason": acquisition.verification_reason,
+            "verification_completed_at": acquisition.verification_completed_at,
         }
     )
+    characterization = acquisition.characterization
+    row["characterization"] = (
+        _json_safe(characterization) if characterization is not None else None
+    )
+    summary = characterization if isinstance(characterization, dict) else {}
+    row["characterization_status"] = summary.get("status")
+    for key in (
+        "zero_crossing_sweep_v",
+        "slope_error_v_per_sweep_v",
+        "discriminator_slope_v_per_mhz",
+        "peak_to_peak_v",
+    ):
+        row[key] = _to_float(summary.get(key))
     return row

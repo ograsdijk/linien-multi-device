@@ -64,16 +64,19 @@ from .lock_refinement import (
     plan_refinement_step,
 )
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
+from .linien_config import build_linien_config
 from .lock_acquisition import (
     SECONDARY_ROLE_ERROR_SIGNAL_2,
     SECONDARY_ROLE_MONITOR,
     LockAcquisition,
     TraceSnapshot,
+    VerificationTracker,
     acquisition_scope,
     attach_acquisition_id,
     current_acquisition,
     unavailable_trace,
 )
+from .lock_characterization import characterize_trace
 from .manual_lock_record import ADC_SCALE, build_acquisition_row, modulation_raw_to_hz
 from .plot_processing import PlotState, V, build_plot_frame
 from .signal_stats import SignalStats, compute_signal_stats
@@ -494,6 +497,9 @@ class DeviceSession:
         self._lock = threading.RLock()
         self._rpyc_lock = threading.RLock()
         self._state_lock = threading.RLock()
+        # The accepted lock whose verification is still open, fed by the plot
+        # frame handler (guarded by _state_lock).
+        self._pending_verification: tuple[LockAcquisition, VerificationTracker] | None = None
         self._relock_action_lock = threading.Lock()
         # Serialises everything that drives the sweep center over time. A
         # refinement walk moves the actuator for seconds; interleaved runs would
@@ -1294,6 +1300,9 @@ class DeviceSession:
             laser_name=str(device_name),
             lock_source=lock_source,
         )
+        # A new attempt ends any verification still open: whatever happens
+        # next is about this attempt, not the previous one.
+        self._resolve_pending_verification(("unavailable", "superseded_by_new_attempt"))
         try:
             acquisition.params = self._collect_manual_lock_params(
                 LOCK_RECORD_PARAM_NAMES
@@ -1304,7 +1313,29 @@ class DeviceSession:
                 self.device.key,
                 exc_info=True,
             )
+        self._snapshot_linien_config(acquisition, "attempt_start")
         return acquisition
+
+    def _snapshot_linien_config(self, acquisition: LockAcquisition, stage: str) -> None:
+        """Store the raw Linien configuration on the attempt. Never raises.
+
+        Reads go through the linien-client parameter cache where it is
+        populated, so this adds no board round-trips on the lock path.
+        """
+        try:
+            with self._state_lock:
+                gateway = {
+                    "auto_lock_scan": dict(self.auto_lock_scan_settings),
+                    "lock_acceptance": dict(self.lock_acceptance_settings),
+                    "lock_indicator": self.lock_indicator.get_config(),
+                }
+            acquisition.linien_config = build_linien_config(
+                self._read_param_fast, captured_at_stage=stage, gateway=gateway
+            )
+        except Exception:  # noqa: BLE001 - the record is still worth keeping
+            logger.warning(
+                "Linien config snapshot failed device=%s", self.device.key, exc_info=True
+            )
 
     def _close_acquisition(
         self,
@@ -1330,6 +1361,9 @@ class DeviceSession:
                         )
             if not acquisition.claim_record():
                 return
+            acquisition.characterization = self._characterize_acquisition(acquisition)
+            if acquisition.lock_command_status == "accepted":
+                self._begin_verification(acquisition)
             self._write_lock_result_to_postgres(
                 acquisition=acquisition, event_source=event_source
             )
@@ -1340,6 +1374,118 @@ class DeviceSession:
                 acquisition.lock_acquisition_id,
                 exc_info=True,
             )
+
+    def _characterize_acquisition(self, acquisition: LockAcquisition) -> dict[str, Any]:
+        with self._state_lock:
+            settings = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
+        params = acquisition.params
+        rising = params.get("target_slope_rising")
+        if rising is None:
+            rising = self._read_param_fast("target_slope_rising")
+        return characterize_trace(
+            acquisition.trace,
+            settings=settings,
+            result=acquisition.decision_result,
+            preferred_slope_rising=None if rising is None else bool(rising),
+            modulation_frequency_hz=self._mod_freq_to_hz(
+                params.get("modulation_frequency")
+            ),
+            dual_channel=(
+                None if params.get("dual_channel") is None
+                else bool(params.get("dual_channel"))
+            ),
+        )
+
+    # ------------------------------------------------- lock verification
+
+    def _begin_verification(self, acquisition: LockAcquisition) -> None:
+        """Open verification of an accepted lock command (non-blocking).
+
+        The plot frames that drive the lock indicator decide it (see
+        `_observe_verification`); a timer closes it if frames stop.
+        """
+        with self._state_lock:
+            indicator_enabled = bool(self.lock_indicator.get_config().get("enabled"))
+            hold_s = float(self.auto_relock.get_config().get("verify_hold_s", 1.2))
+            if not indicator_enabled:
+                acquisition.verification_status = "unavailable"
+                acquisition.verification_reason = "lock_indicator_disabled"
+                acquisition.verification_completed_at = time.time()
+                return
+            tracker = VerificationTracker(
+                commanded_at=float(acquisition.lock_command_at or time.time()),
+                hold_s=hold_s,
+            )
+            acquisition.verification_status = "pending"
+            self._pending_verification = (acquisition, tracker)
+        timer = threading.Timer(
+            tracker.timeout_s + 0.5,
+            self._verification_deadline,
+            args=(acquisition,),
+        )
+        timer.daemon = True
+        timer.start()
+
+    def _verification_deadline(self, acquisition: LockAcquisition) -> None:
+        with self._state_lock:
+            pending = self._pending_verification
+            if pending is None or pending[0] is not acquisition:
+                return
+            outcome = pending[1].check_deadline(time.time())
+        if outcome is not None:
+            self._resolve_pending_verification(outcome, only=acquisition)
+
+    def _observe_verification(self, now: float, lock: bool, indicator_state: Any) -> Any:
+        """Feed one frame to the open verification. Caller holds _state_lock;
+        returns (acquisition, outcome) once it is decided, else None."""
+        pending = self._pending_verification
+        if pending is None:
+            return None
+        acquisition, tracker = pending
+        outcome = tracker.observe(
+            now,
+            lock=lock,
+            indicator_state=indicator_state if isinstance(indicator_state, str) else None,
+        )
+        if outcome is None:
+            return None
+        return acquisition, outcome
+
+    def _resolve_pending_verification(
+        self,
+        outcome: tuple[str, str | None],
+        *,
+        only: LockAcquisition | None = None,
+    ) -> None:
+        """Close the open verification with ``outcome`` and update its record
+        (same lock_acquisition_id, so the row is updated, never duplicated)."""
+        with self._state_lock:
+            pending = self._pending_verification
+            if pending is None or (only is not None and pending[0] is not only):
+                return
+            self._pending_verification = None
+        acquisition = pending[0]
+        status, reason = outcome
+        acquisition.verification_status = status
+        acquisition.verification_reason = reason
+        acquisition.verification_completed_at = time.time()
+        self._emit_log_event(
+            level=logging.INFO if status == "verified" else logging.WARNING,
+            source="lock",
+            code=f"lock_acquisition_{status}",
+            message=f"Lock acquisition verification: {status}.",
+            details={
+                "lock_acquisition_id": acquisition.lock_acquisition_id,
+                "lock_source": acquisition.lock_source,
+                "reason": reason,
+            },
+        )
+        try:
+            self._write_lock_result_to_postgres(
+                acquisition=acquisition, event_source="lock_verification"
+            )
+        except Exception:  # noqa: BLE001 - never break the frame handler
+            logger.warning("Recording lock verification failed", exc_info=True)
 
     @contextmanager
     def _acquisition(self, lock_source: str, *, event_source: str | None = None):
@@ -2841,6 +2987,14 @@ class DeviceSession:
             frame["auto_relock"] = auto_relock_status
             self.last_plot_frame = frame
             self.last_plot_timestamp = time.time()
+            verification_done = self._observe_verification(
+                self.last_plot_timestamp, lock_value, indicator_state
+            )
+
+        # Recording the verification outcome enqueues a row; outside _state_lock.
+        if verification_done is not None:
+            acquisition_done, outcome = verification_done
+            self._resolve_pending_verification(outcome, only=acquisition_done)
 
         # Perform the auto-relock device I/O OUTSIDE _state_lock so status()
         # and snapshot reads don't stall during a (possibly multi-second)
@@ -3028,6 +3182,9 @@ class DeviceSession:
         self._ensure_no_staged_autolock_run("start_lock")
         with self._acquisition("manual_lock") as acquisition:
             acquisition.trace = self._capture_pre_lock_trace(acquisition)
+            if acquisition.linien_config is not None:
+                # Read just before the trace copy and the lock command.
+                acquisition.linien_config["captured_at_stage"] = "pre_lock_command"
             acquisition.stage = "lock_command"
             commanded_at = time.time()
             try:
@@ -3570,6 +3727,10 @@ class DeviceSession:
         acquisition = current_acquisition()
         if acquisition is not None:
             acquisition.stage = "lock_command"
+            # The configuration the lock is engaged with: after any refinement,
+            # before the center moves to the lock point. Taken before the
+            # handover timing starts, so it does not count towards it.
+            self._snapshot_linien_config(acquisition, "pre_lock_command")
         command_started_at = time.time()
         with self._rpyc_lock:
             self.parameters.sweep_center.value = float(result.target_voltage)
@@ -5738,6 +5899,7 @@ class DeviceSession:
             # the trace this lock was decided on.
             acquisition.refinement = refinement
             acquisition.trace = self._final_trace(acquisition, final)
+            acquisition.decision_result = final
             try:
                 with self._exclusive_center_move("staged auto-lock lock"):
                     handover_timing = self._move_and_lock(final, center_v)
@@ -5909,6 +6071,7 @@ class DeviceSession:
                 # handover so a rejected lock command still records it.
                 acquisition.refinement = refinement
                 acquisition.trace = self._final_trace(acquisition, result)
+                acquisition.decision_result = result
                 handover_timing: dict[str, Any] | None = None
                 try:
                     # The refinement final verification leaves geometry untouched,

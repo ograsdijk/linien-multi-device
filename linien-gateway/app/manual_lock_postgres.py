@@ -73,6 +73,23 @@ ACQUISITION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("trace_unavailable_reason", "TEXT"),
     ("trace_meta", "JSONB"),
     ("refinement", "JSONB"),
+    # Raw Linien parameters at acquisition (schema_version inside).
+    ("linien_config", "JSONB"),
+    (
+        "verification_status",
+        "TEXT NOT NULL CHECK (verification_status IN "
+        "('not_attempted', 'pending', 'verified', 'failed', 'unavailable'))",
+    ),
+    ("verification_reason", "TEXT"),
+    ("verification_completed_at", "TIMESTAMPTZ"),
+    # Diagnostic description of the stored trace; the JSON holds the full
+    # result and its units, the columns repeat the most queried values.
+    ("characterization", "JSONB"),
+    ("characterization_status", "TEXT"),
+    ("zero_crossing_sweep_v", "DOUBLE PRECISION"),
+    ("slope_error_v_per_sweep_v", "DOUBLE PRECISION"),
+    ("discriminator_slope_v_per_mhz", "DOUBLE PRECISION"),
+    ("peak_to_peak_v", "DOUBLE PRECISION"),
 )
 # The geometry of the stored trace. Kept as its own list for the idempotent
 # ADD COLUMN below.

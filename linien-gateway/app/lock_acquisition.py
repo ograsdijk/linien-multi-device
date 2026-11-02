@@ -126,6 +126,15 @@ class LockAcquisition:
     failure_stage: str | None = None
     failure_reason: str | None = None
     refinement: dict[str, Any] | None = None
+    # Raw Linien configuration (see linien_config.build_linien_config).
+    linien_config: dict[str, Any] | None = None
+    # Diagnostic description of the stored trace (lock_characterization).
+    characterization: dict[str, Any] | None = None
+    # The detection result the lock was decided on, for characterization.
+    decision_result: Any = field(default=None, repr=False)
+    verification_status: str = "not_attempted"
+    verification_reason: str | None = None
+    verification_completed_at: float | None = None
     # Path-specific facts about which trace was kept (e.g. the staged run's
     # selected frame), merged into the stored trace metadata.
     trace_context: dict[str, Any] = field(default_factory=dict)
@@ -197,6 +206,78 @@ class LockAcquisition:
             return False
         self._recorded = True
         return True
+
+
+VERIFICATION_STATUSES = ("not_attempted", "pending", "verified", "failed", "unavailable")
+
+# How long after the lock command verification waits for the lock indicator to
+# confirm the lock before declaring it failed.
+VERIFY_TIMEOUT_S = 15.0
+# A verification that sees no plot frame at all for this long is unavailable,
+# not failed: nothing was observed either way.
+VERIFY_NO_FRAME_S = 5.0
+
+
+@dataclass
+class VerificationTracker:
+    """Decides whether an accepted lock command produced a stable lock.
+
+    Fed once per plot frame with Linien's ``lock`` flag and the gateway lock
+    indicator's state (the same evaluator auto-relock uses). Verified once the
+    indicator has said "locked" continuously for ``hold_s`` on frames after the
+    command; failed if the lock drops, the indicator reports "lost", or the
+    timeout passes without confirmation; unavailable if no frames arrive.
+    """
+
+    commanded_at: float
+    hold_s: float
+    timeout_s: float = VERIFY_TIMEOUT_S
+    no_frame_s: float = VERIFY_NO_FRAME_S
+    locked_since: float | None = None
+    last_frame_at: float | None = None
+    frames: int = 0
+    outcome: tuple[str, str | None] | None = None
+
+    def observe(
+        self, now: float, *, lock: bool, indicator_state: str | None
+    ) -> tuple[str, str | None] | None:
+        if self.outcome is not None or now < self.commanded_at:
+            return self.outcome
+        self.frames += 1
+        self.last_frame_at = now
+        if not lock:
+            # Frames from before the lock took hold are expected right after
+            # the command; only a sustained unlock after that is a failure.
+            if now - self.commanded_at >= self.hold_s:
+                self.outcome = ("failed", "lock_dropped")
+            self.locked_since = None
+            return self.outcome
+        if indicator_state == "lost":
+            self.outcome = ("failed", "lock_indicator_lost")
+        elif indicator_state == "locked":
+            if self.locked_since is None:
+                self.locked_since = now
+            if now - self.locked_since >= self.hold_s:
+                self.outcome = ("verified", None)
+        else:
+            self.locked_since = None
+        if self.outcome is None:
+            self.check_deadline(now)
+        return self.outcome
+
+    def check_deadline(self, now: float) -> tuple[str, str | None] | None:
+        if self.outcome is not None:
+            return self.outcome
+        if now - self.commanded_at < self.timeout_s:
+            reference = self.last_frame_at or self.commanded_at
+            if self.frames == 0 and now - reference >= self.no_frame_s:
+                self.outcome = ("unavailable", "no_plot_frames")
+            return self.outcome
+        if self.frames == 0:
+            self.outcome = ("unavailable", "no_plot_frames")
+        else:
+            self.outcome = ("failed", "not_confirmed_within_timeout")
+        return self.outcome
 
 
 _current: contextvars.ContextVar[LockAcquisition | None] = contextvars.ContextVar(

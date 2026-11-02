@@ -256,9 +256,16 @@ def test_ids_are_stable_within_an_attempt_and_unique_between_attempts():
     second = session.start_lock()
 
     assert first != second
-    assert [row["lock_acquisition_id"] for row in postgres.rows] == [first, second]
+    # Rows are upserts by ID: the first attempt's row is written again when
+    # the second attempt closes its still-open verification -- same ID, so the
+    # same row, never a new one.
+    ids = [row["lock_acquisition_id"] for row in postgres.rows]
+    assert list(dict.fromkeys(ids)) == [first, second]
+    latest_first = [row for row in postgres.rows if row["lock_acquisition_id"] == first][-1]
+    assert latest_first["verification_status"] == "unavailable"
+    assert latest_first["verification_reason"] == "superseded_by_new_attempt"
     enqueued = [e for e in events if e["code"] == "lock_result_postgres_enqueued"]
-    assert [e["details"]["lock_acquisition_id"] for e in enqueued] == [first, second]
+    assert {e["details"]["lock_acquisition_id"] for e in enqueued} == {first, second}
 
 
 def test_a_precheck_refusal_is_not_an_acquisition():
@@ -401,6 +408,15 @@ def test_auto_lock_after_refinement_records_the_refined_trace_with_its_own_geome
     assert row["trace_x"][-1] == pytest.approx(NARROW[0] + NARROW[1])
     assert row["refinement"]["final_amplitude_v"] == pytest.approx(NARROW[1])
     assert row["lock_command_status"] == "accepted"
+    # Characterized from the detection it locked on, not a re-detection, and
+    # the config snapshot is the one the lock was engaged with.
+    assert row["characterization"]["result_source"] == "locked_detection"
+    assert row["zero_crossing_sweep_v"] == pytest.approx(TARGET_V)
+    assert row["linien_config"]["captured_at_stage"] == "pre_lock_command"
+    assert row["linien_config"]["parameters"]["sweep_amplitude"] == pytest.approx(
+        NARROW[1]
+    )
+    assert row["verification_status"] == "pending"
 
 
 def test_a_direct_auto_lock_records_the_scan_it_detected_on(monkeypatch):
