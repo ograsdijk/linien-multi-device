@@ -515,7 +515,10 @@ class PostgresManualLockConfig(BaseModel):
     port: int = Field(default=5432, ge=1, le=65535)
     database: str = "experiment_db"
     user: str = "admin"
-    password: str = "adminpassword"
+    # Write-only. Responses carry "" plus password_set; a blank password in a
+    # PUT keeps the stored one.
+    password: str = ""
+    password_set: Optional[bool] = None
     sslmode: Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] = "prefer"
     connect_timeout_s: float = Field(default=3.0, ge=0.1, le=120.0)
     # PostgreSQL schema holding the lock-acquisition tables.

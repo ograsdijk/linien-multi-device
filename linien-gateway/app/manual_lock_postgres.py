@@ -236,6 +236,138 @@ def prepare_row(row: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+# ----------------------------------------------------------------- reads
+#
+# The read API returns records in one shape whichever store answers: the
+# writer's row (epoch-second timestamps, JSON columns as objects, NaN as null),
+# plus `source` ("postgres" or "spool") and `persistence` (the spool state, or
+# "persisted"). Large fields are opt-in on list queries.
+
+INCLUDE_GROUPS: dict[str, tuple[str, ...]] = {
+    "traces": ("trace_x", "trace_y", "secondary_trace_y"),
+    "config": ("linien_config",),
+    "refinement": ("refinement",),
+}
+ALL_INCLUDES = frozenset(INCLUDE_GROUPS)
+_OPTIONAL_COLUMNS = frozenset(
+    column for columns in INCLUDE_GROUPS.values() for column in columns
+)
+VERIFICATION_STATUSES = ("not_attempted", "pending", "verified", "failed", "unavailable")
+LOCK_COMMAND_STATUSES = ("not_sent", "accepted", "rejected")
+
+
+@dataclass(frozen=True)
+class RecordFilters:
+    since: float | None = None
+    until: float | None = None
+    lock_source: str | None = None
+    verification_status: str | None = None
+    lock_command_status: str | None = None
+    success: bool | None = None
+
+    def matches(self, row: dict[str, Any]) -> bool:
+        """The non-indexed filters, for the spool (PostgreSQL does them in SQL)."""
+        if self.verification_status is not None and (
+            row.get("verification_status") != self.verification_status
+        ):
+            return False
+        if self.lock_command_status is not None and (
+            row.get("lock_command_status") != self.lock_command_status
+        ):
+            return False
+        if self.success is not None and bool(row.get("success")) != self.success:
+            return False
+        return True
+
+
+def _select_list(include: frozenset[str]) -> str:
+    wanted = {
+        column for group in include for column in INCLUDE_GROUPS.get(group, ())
+    }
+    columns = [
+        name for name, _sql in TABLE_COLUMNS
+        if name not in _OPTIONAL_COLUMNS or name in wanted
+    ]
+    rendered = []
+    for name in columns:
+        sql = dict(TABLE_COLUMNS)[name]
+        if name == "lock_acquisition_id":
+            rendered.append(f"{name}::text AS {name}")
+        elif sql.startswith("TIMESTAMPTZ"):
+            rendered.append(f"EXTRACT(EPOCH FROM {name})::double precision AS {name}")
+        else:
+            rendered.append(name)
+    return ", ".join(rendered)
+
+
+def build_list_query(
+    schema: str,
+    device_key: str | None,
+    filters: RecordFilters,
+    include: frozenset[str],
+    limit: int,
+    offset: int,
+) -> tuple[str, list[Any]]:
+    s = validate_schema_name(schema)
+    clauses: list[str] = []
+    params: list[Any] = []
+    if device_key is not None:
+        clauses.append("device_key = %s")
+        params.append(device_key)
+    if filters.since is not None:
+        clauses.append("attempt_started_at >= to_timestamp(%s)")
+        params.append(float(filters.since))
+    if filters.until is not None:
+        clauses.append("attempt_started_at < to_timestamp(%s)")
+        params.append(float(filters.until))
+    for column in ("lock_source", "verification_status", "lock_command_status", "success"):
+        value = getattr(filters, column)
+        if value is not None:
+            clauses.append(f"{column} = %s")
+            params.append(value)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = (
+        f"SELECT {_select_list(include)} FROM {s}.{TABLE_NAME}{where} "
+        "ORDER BY attempt_started_at DESC LIMIT %s OFFSET %s"
+    )
+    return sql, params + [int(limit), int(offset)]
+
+
+def build_get_query(schema: str, acquisition_id: str) -> tuple[str, list[Any]]:
+    s = validate_schema_name(schema)
+    return (
+        f"SELECT {_select_list(ALL_INCLUDES)} FROM {s}.{TABLE_NAME} "
+        "WHERE lock_acquisition_id = %s::uuid",
+        [str(acquisition_id)],
+    )
+
+
+def normalize_record(
+    row: dict[str, Any],
+    *,
+    include: frozenset[str],
+    source: str,
+    persistence: str | None = None,
+) -> dict[str, Any]:
+    wanted = {
+        column for group in include for column in INCLUDE_GROUPS.get(group, ())
+    }
+    record: dict[str, Any] = {}
+    for name, value in row.items():
+        if name in _OPTIONAL_COLUMNS and name not in wanted:
+            continue
+        if name in JSONB_COLUMNS and isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                pass
+        if hasattr(value, "timestamp") and callable(value.timestamp):
+            value = value.timestamp()
+        record[name] = _json_safe(value)
+    record["source"] = source
+    record["persistence"] = persistence if persistence is not None else "persisted"
+    return record
+
 class SchemaMismatchError(RuntimeError):
     """The target database holds a table this writer must not write to."""
 
@@ -327,6 +459,16 @@ def _is_permanent(exc: BaseException) -> bool:
     return bool(permanent) and isinstance(exc, permanent)
 
 
+_PASSWORD_IN_TEXT = re.compile(r"(password\s*=\s*)(\S+)", re.IGNORECASE)
+
+
+def redact(message: str | None) -> str | None:
+    """Errors are shown in the UI and logs; never let a password through."""
+    if message is None:
+        return None
+    return _PASSWORD_IN_TEXT.sub(r"\1***", str(message))
+
+
 def retry_delay_s(attempts: int) -> float:
     return min(RETRY_MAX_S, RETRY_BASE_S * (2 ** max(0, int(attempts))))
 
@@ -405,6 +547,9 @@ class LockResultPostgresService:
         with self._lock:
             status = asdict(self._status)
             config = asdict(self._config)
+        # The stored password is write-only: report whether one is set.
+        config["password_set"] = bool(config.get("password"))
+        config["password"] = ""
         status.update(
             pending_count=counts["pending"],
             retrying_count=counts["retrying"],
@@ -419,6 +564,10 @@ class LockResultPostgresService:
         with self._lock:
             current = asdict(self._config)
             normalized = {key: payload.get(key, current[key]) for key in current}
+            # get_state never returns the password, so a client saving back
+            # the config it read sends a blank one: keep the stored password.
+            if not normalized.get("password"):
+                normalized["password"] = current["password"]
             validate_schema_name(normalized["db_schema"])
             self._config = LockResultPostgresConfig(**normalized)
             self._schema_ready = False
@@ -442,8 +591,9 @@ class LockResultPostgresService:
         try:
             self._ensure_schema()
         except Exception as exc:
-            self._mark_test(False, str(exc))
-            return False, str(exc)
+            message = redact(str(exc)) or type(exc).__name__
+            self._mark_test(False, message)
+            return False, message
         self._mark_test(True, None)
         self._wake.set()
         return True, "Connection successful."
@@ -522,7 +672,9 @@ class LockResultPostgresService:
                         self._rollback(conn)
                         if _is_permanent(exc):
                             self._spool.mark_failed(
-                                item["lock_acquisition_id"], item["revision"], str(exc)
+                                item["lock_acquisition_id"],
+                                item["revision"],
+                                redact(str(exc)),
                             )
                             self._mark_write(False, str(exc))
                         else:
@@ -545,7 +697,9 @@ class LockResultPostgresService:
 
     def _retry(self, item: dict[str, Any], exc: BaseException) -> None:
         delay = retry_delay_s(int(item.get("attempts", 0)))
-        self._spool.mark_retry(item["lock_acquisition_id"], item["revision"], str(exc), delay)
+        self._spool.mark_retry(
+            item["lock_acquisition_id"], item["revision"], redact(str(exc)), delay
+        )
         self._mark_write(False, str(exc))
         if isinstance(exc, SchemaMismatchError):
             self._schema_ready = False
@@ -638,6 +792,107 @@ class LockResultPostgresService:
             self._status.schema_ok = True
             self._status.schema_error = None
 
+    # ------------------------------------------------------------- reads
+
+    def list_records(
+        self,
+        *,
+        device_key: str | None,
+        filters: RecordFilters,
+        include: frozenset[str] = frozenset(),
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Acquisition records, newest first: from PostgreSQL when reachable,
+        otherwise from the local spool. The response says which."""
+        rows, error = self._postgres_rows(
+            build_list_query(
+                self._schema_name(), device_key, filters, include, limit, offset
+            )
+        )
+        unsent = self._unsent_count()
+        if rows is not None:
+            items = [
+                normalize_record(row, include=include, source="postgres")
+                for row in rows
+            ]
+            return {
+                "source": "postgres",
+                "items": items,
+                "count": len(items),
+                "limit": limit,
+                "offset": offset,
+                # Spooled records PostgreSQL does not have yet; they are not
+                # in this list (fetch one by ID, or wait for the writer).
+                "unsent_records": unsent,
+            }
+        found = self.spool.query(
+            device_key=device_key,
+            since=filters.since,
+            until=filters.until,
+            lock_source=filters.lock_source,
+            predicate=filters.matches,
+            limit=limit,
+            offset=offset,
+        )
+        items = [
+            normalize_record(
+                item["row"], include=include, source="spool", persistence=item["state"]
+            )
+            for item in found
+        ]
+        return {
+            "source": "spool",
+            "postgres_unavailable_reason": error,
+            "items": items,
+            "count": len(items),
+            "limit": limit,
+            "offset": offset,
+            "unsent_records": unsent,
+        }
+
+    def get_record(self, acquisition_id: str) -> dict[str, Any] | None:
+        """One full record (config and traces included), or None."""
+        rows, _error = self._postgres_rows(
+            build_get_query(self._schema_name(), acquisition_id)
+        )
+        if rows:
+            return normalize_record(rows[0], include=ALL_INCLUDES, source="postgres")
+        # Not in PostgreSQL (yet), or PostgreSQL unreachable: the spool holds
+        # every record written while logging was enabled and not yet pruned.
+        found = self.spool.get(acquisition_id)
+        if found is None:
+            return None
+        return normalize_record(
+            found["row"], include=ALL_INCLUDES, source="spool", persistence=found["state"]
+        )
+
+    def _unsent_count(self) -> int:
+        counts = self.spool.counts()
+        return counts["pending"] + counts["retrying"]
+
+    def _postgres_rows(
+        self, query: tuple[str, list[Any]]
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """Rows, or (None, reason) when PostgreSQL cannot answer. The reason
+        is generic on purpose: driver errors can name hosts and users."""
+        with self._lock:
+            enabled = self._config.enabled
+        if not enabled:
+            return None, "postgres_logging_disabled"
+        if psycopg is None:
+            return None, "psycopg_not_installed"
+        sql, params = query
+        try:
+            with psycopg.connect(**self._connect_kwargs()) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    names = [column[0] for column in cur.description]
+                    return [dict(zip(names, row)) for row in cur.fetchall()], None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Lock-record query failed: %s", exc)
+            return None, "postgres_query_failed"
+
     # ------------------------------------------------------------- status
 
     def _mark_test(self, ok: bool, error: str | None) -> None:
@@ -657,6 +912,7 @@ class LockResultPostgresService:
             self._status.active = bool(self._config.enabled and ok)
 
     def _mark_write(self, ok: bool, error: str | None) -> None:
+        error = redact(error)
         now = time.time()
         if not ok and error:
             logger.warning("Lock-result postgres write failed: %s", error)

@@ -433,7 +433,10 @@ export type PostgresManualLockConfig = {
   port: number;
   database: string;
   user: string;
+  // Write-only: the gateway returns "" and reports password_set; saving a
+  // blank password keeps the stored one.
   password: string;
+  password_set?: boolean | null;
   sslmode: PostgresSslMode;
   connect_timeout_s: number;
   // PostgreSQL schema for the lock-acquisition tables (default "linien").

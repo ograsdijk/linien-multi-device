@@ -8,7 +8,7 @@ const DEFAULT_POSTGRES_CONFIG: PostgresManualLockConfig = {
   port: 5432,
   database: 'experiment_db',
   user: 'admin',
-  password: 'adminpassword',
+  password: '',
   sslmode: 'prefer',
   connect_timeout_s: 3,
 };

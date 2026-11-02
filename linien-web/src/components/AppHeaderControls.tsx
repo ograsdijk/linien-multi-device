@@ -454,6 +454,9 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
               <PasswordInput
                 label="Password"
                 value={props.postgresDraft.password}
+                placeholder={
+                  props.postgresDraft.password_set ? 'Stored (leave blank to keep)' : undefined
+                }
                 onChange={(event) => props.updatePostgresDraft('password', event.currentTarget.value)}
                 disabled={props.postgresBusy}
               />

@@ -149,3 +149,27 @@ def test_a_foreign_table_in_the_schema_is_refused(tmp_path, schema):
 
     assert not ok and "no schema version" in detail
     assert SchemaMismatchError.__name__  # imported for readers of this test
+
+
+def test_the_read_queries_return_what_was_written(tmp_path, schema):
+    from app.manual_lock_postgres import RecordFilters
+
+    service = _service(tmp_path, schema)
+    assert service.test_connection()[0]
+    row = _full_row()
+    with psycopg.connect(DSN) as conn:
+        conn.execute(render_upsert_sql(schema), prepare_row(row))
+
+    listed = service.list_records(
+        device_key="dev-1", filters=RecordFilters(lock_source="auto_relock"), limit=10
+    )
+    one = service.get_record(row["lock_acquisition_id"])
+
+    assert listed["source"] == "postgres"
+    assert [item["lock_acquisition_id"] for item in listed["items"]] == [
+        row["lock_acquisition_id"]
+    ]
+    assert "trace_y" not in listed["items"][0]
+    assert one["trace_y"] == [0.1, None, -0.1]
+    assert one["attempt_started_at"] == pytest.approx(row["attempt_started_at"], abs=1e-3)
+    assert one["linien_config"]["parameters"] == {"p": None}

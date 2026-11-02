@@ -249,6 +249,59 @@ class LockRecordSpool:
         counts.update({state: int(n) for state, n in rows})
         return counts
 
+    def query(
+        self,
+        *,
+        device_key: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        lock_source: str | None = None,
+        states: tuple[str, ...] | None = None,
+        predicate: Any = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Records newest attempt first, filtered on the indexed columns in
+        SQL and on anything else by ``predicate(row)``."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if device_key is not None:
+            clauses.append("device_key = ?")
+            params.append(device_key)
+        if since is not None:
+            clauses.append("attempt_started_at >= ?")
+            params.append(float(since))
+        if until is not None:
+            clauses.append("attempt_started_at < ?")
+            params.append(float(until))
+        if lock_source is not None:
+            clauses.append("lock_source = ?")
+            params.append(lock_source)
+        if states:
+            clauses.append(f"state IN ({', '.join('?' for _ in states)})")
+            params.extend(states)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cursor = self._conn.execute(
+                f"SELECT payload, state FROM records {where} "
+                "ORDER BY attempt_started_at DESC",
+                params,
+            )
+            matched: list[dict[str, Any]] = []
+            skipped = 0
+            for payload, state in cursor:
+                row = json.loads(payload)
+                if predicate is not None and not predicate(row):
+                    continue
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                matched.append({"row": row, "state": state})
+                if len(matched) >= limit:
+                    break
+            cursor.close()
+        return matched
+
     def get(self, acquisition_id: str) -> dict[str, Any] | None:
         with self._lock:
             found = self._conn.execute(

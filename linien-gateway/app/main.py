@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
@@ -51,7 +52,14 @@ from .board_event_store import (
 from .diagnosis import DiagnosisProbe
 from .influx_writer import InfluxLineWriter
 from .log_store import LogStore
-from .manual_lock_postgres import LockResultPostgresService
+from .manual_lock_postgres import (
+    INCLUDE_GROUPS,
+    LOCK_COMMAND_STATUSES,
+    LOCK_SOURCES,
+    VERIFICATION_STATUSES,
+    LockResultPostgresService,
+    RecordFilters,
+)
 from .path_utils import find_repo_root, resolve_repo_path
 from .psd_store import PsdStore
 from .rp_telemetry import RpTelemetryManager
@@ -2255,6 +2263,84 @@ def test_postgres_manual_lock_state() -> dict:
         "detail": detail,
         "state": lock_result_postgres.get_state(),
     }
+
+
+def _choice(name: str, value: str | None, allowed: tuple[str, ...]) -> str | None:
+    if value is None or value in allowed:
+        return value
+    raise HTTPException(
+        status_code=422, detail=f"{name} must be one of {', '.join(allowed)}."
+    )
+
+
+def _includes(include: str | None) -> frozenset[str]:
+    groups = frozenset(item.strip() for item in (include or "").split(",") if item.strip())
+    unknown = groups - set(INCLUDE_GROUPS)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"include accepts {', '.join(sorted(INCLUDE_GROUPS))}; "
+            f"got {', '.join(sorted(unknown))}.",
+        )
+    return groups
+
+
+@app.get("/api/devices/{key}/lock-acquisitions")
+def list_lock_acquisitions(
+    key: str,
+    since: float | None = Query(None, description="Attempts at or after (Unix s)."),
+    until: float | None = Query(None, description="Attempts before (Unix s)."),
+    lock_source: str | None = None,
+    verification_status: str | None = None,
+    lock_command_status: str | None = None,
+    success: bool | None = None,
+    include: str | None = Query(
+        None, description="Comma-separated extras: traces, config, refinement."
+    ),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """Lock-acquisition history of one device, newest attempt first.
+
+    Read-only. Metadata only unless ``include`` asks for the traces, the Linien
+    configuration snapshot or the refinement history. Served from PostgreSQL
+    when reachable, otherwise from the gateway's local spool; ``source`` says
+    which. Records of a device that has since been removed stay queryable.
+    """
+    filters = RecordFilters(
+        since=since,
+        until=until,
+        lock_source=_choice("lock_source", lock_source, LOCK_SOURCES),
+        verification_status=_choice(
+            "verification_status", verification_status, VERIFICATION_STATUSES
+        ),
+        lock_command_status=_choice(
+            "lock_command_status", lock_command_status, LOCK_COMMAND_STATUSES
+        ),
+        success=success,
+    )
+    result = lock_result_postgres.list_records(
+        device_key=key,
+        filters=filters,
+        include=_includes(include),
+        limit=limit,
+        offset=offset,
+    )
+    return {"device_key": key, **result}
+
+
+@app.get("/api/lock-acquisitions/{lock_acquisition_id}")
+def get_lock_acquisition(lock_acquisition_id: str) -> dict:
+    """One lock-acquisition record by its ID, with its Linien configuration
+    snapshot, traces and refinement history."""
+    try:
+        canonical = str(uuid.UUID(lock_acquisition_id))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Not a lock_acquisition_id (UUID).")
+    record = lock_result_postgres.get_record(canonical)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Lock acquisition not found.")
+    return record
 
 
 @app.get("/api/logs/tail", response_model=LogTailResponse)
