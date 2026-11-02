@@ -229,6 +229,9 @@ class AutoLockScanResult(BaseModel):
     # Host-side duration of the final register write/start-lock RPC calls.
     # This does not claim to measure physical lock engagement.
     handover_command_timing: Optional[dict[str, Any]] = None
+    # Identifies this attempt's lock-acquisition record (one per attempt).
+    # Optional so clients and payloads that predate it stay valid.
+    lock_acquisition_id: Optional[str] = None
 
 
 class StagedAutolockSelected(BaseModel):
@@ -374,6 +377,7 @@ class AutoRelockStatus(BaseModel):
     last_attempt_at: Optional[float] = None
     last_success_at: Optional[float] = None
     last_failure_at: Optional[float] = None
+    last_lock_acquisition_id: Optional[str] = None
     last_error: Optional[str] = None
 
 

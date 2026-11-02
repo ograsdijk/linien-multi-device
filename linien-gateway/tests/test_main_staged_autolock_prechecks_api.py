@@ -121,7 +121,6 @@ def test_staged_lock_failure_log_keeps_verification_diagnostics(monkeypatch):
     monkeypatch.setattr(
         main, "_emit_log", lambda **kwargs: log_records.append(kwargs)
     )
-    monkeypatch.setattr(main, "_enqueue_auto_lock_row", lambda *_args, **_kwargs: None)
     client = TestClient(main.app)
     response = client.post(
         "/api/devices/dev/control/staged_autolock/token/lock",

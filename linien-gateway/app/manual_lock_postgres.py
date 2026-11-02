@@ -12,6 +12,8 @@ from typing import Any
 
 from linien_common.config import USER_DATA_PATH
 
+from .manual_lock_record import _json_safe
+
 try:
     import psycopg  # type: ignore
 except Exception:  # pragma: no cover - exercised through runtime status/message
@@ -31,15 +33,79 @@ SWEEP_COLUMNS: tuple[tuple[str, str], ...] = (
     ("sweep_amplitude_v", "DOUBLE PRECISION"),
 )
 
+# Every column the writer fills, in table order, declared once and rendered
+# into the CREATE, the INSERT and the upsert below. The key is the
+# lock_acquisition_id (one row per acquisition attempt); a re-sent row updates
+# that same row rather than adding another.
+ACQUISITION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("lock_acquisition_id", "UUID NOT NULL UNIQUE"),
+    ("record_version", "INTEGER NOT NULL"),
+    ("device_key", "TEXT NOT NULL"),
+    ("laser_name", "TEXT NOT NULL"),
+    ("lock_source", "TEXT NOT NULL"),
+    ("success", "BOOLEAN"),
+    ("attempt_started_at", "TIMESTAMPTZ NOT NULL"),
+    ("lock_command_at", "TIMESTAMPTZ"),
+    (
+        "lock_command_status",
+        "TEXT NOT NULL CHECK (lock_command_status IN "
+        "('not_sent', 'accepted', 'rejected'))",
+    ),
+    ("failure_stage", "TEXT"),
+    ("failure_reason", "TEXT"),
+    ("modulation_frequency_hz", "DOUBLE PRECISION"),
+    ("demod_phase_deg", "DOUBLE PRECISION"),
+    ("signal_offset_volts", "DOUBLE PRECISION"),
+    ("modulation_amplitude", "DOUBLE PRECISION"),
+    ("pid_p", "DOUBLE PRECISION"),
+    ("pid_i", "DOUBLE PRECISION"),
+    ("pid_d", "DOUBLE PRECISION"),
+    # NULL when no trace was captured: never a placeholder waveform.
+    ("trace_x", "DOUBLE PRECISION[]"),
+    ("trace_y", "DOUBLE PRECISION[]"),
+    ("secondary_trace_y", "DOUBLE PRECISION[]"),
+    ("trace_x_units", "TEXT"),
+    ("trace_y_units", "TEXT"),
+    ("secondary_trace_y_units", "TEXT"),
+    ("trace_x_source", "TEXT"),
+    ("trace_y_role", "TEXT"),
+    ("secondary_trace_role", "TEXT"),
+    ("trace_unavailable_reason", "TEXT"),
+    ("trace_meta", "JSONB"),
+    ("refinement", "JSONB"),
+)
+# The geometry of the stored trace. Kept as its own list for the idempotent
+# ADD COLUMN below.
+SWEEP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("sweep_center_v", "DOUBLE PRECISION"),
+    ("sweep_amplitude_v", "DOUBLE PRECISION"),
+)
+TIMESTAMP_COLUMNS = frozenset(
+    name for name, sql in ACQUISITION_COLUMNS if sql.startswith("TIMESTAMPTZ")
+)
+JSONB_COLUMNS = frozenset(
+    name for name, sql in ACQUISITION_COLUMNS if sql.startswith("JSONB")
+)
+_ALL_COLUMNS = ACQUISITION_COLUMNS + SWEEP_COLUMNS
+INSERT_COLUMN_NAMES = tuple(name for name, _sql in _ALL_COLUMNS)
+
 # psycopg sends a Python str as PostgreSQL ``text`` (StrDumper.oid = 25), and
-# ``text`` does not implicitly coerce to ``jsonb``, so a JSON column needs an
-# explicit cast on the placeholder or every insert fails -- quietly, since the
-# writer swallows errors into a log event.
-_PARAM_CASTS = {"JSONB": "::jsonb"}
+# ``text`` does not implicitly coerce to ``jsonb`` or ``uuid``, so those columns
+# need an explicit cast on the placeholder or every insert fails -- quietly,
+# since the writer swallows errors into a log event. Timestamps travel as Unix
+# seconds and are converted server-side.
+def _placeholder(name: str, sql: str) -> str:
+    if name in TIMESTAMP_COLUMNS:
+        return f"to_timestamp(%({name})s)"
+    if sql.startswith("JSONB"):
+        return f"%({name})s::jsonb"
+    if sql.startswith("UUID"):
+        return f"%({name})s::uuid"
+    return f"%({name})s"
 
 
 def _column_definitions() -> str:
-    return "".join(f",\n    {name} {sql}" for name, sql in SWEEP_COLUMNS)
+    return "".join(f",\n    {name} {sql}" for name, sql in _ALL_COLUMNS)
 
 
 def _add_column_clauses() -> str:
@@ -49,12 +115,18 @@ def _add_column_clauses() -> str:
 
 
 def _insert_names() -> str:
-    return ",\n".join(f"    {name}" for name, _sql in SWEEP_COLUMNS)
+    return ",\n".join(f"    {name}" for name in INSERT_COLUMN_NAMES)
 
 
 def _insert_values() -> str:
+    return ",\n".join(f"    {_placeholder(name, sql)}" for name, sql in _ALL_COLUMNS)
+
+
+def _upsert_assignments() -> str:
     return ",\n".join(
-        f"    %({name})s{_PARAM_CASTS.get(sql, '')}" for name, sql in SWEEP_COLUMNS
+        f"    {name} = EXCLUDED.{name}"
+        for name in INSERT_COLUMN_NAMES
+        if name != "lock_acquisition_id"
     )
 
 
@@ -62,22 +134,7 @@ CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS pdh_lock_results (
     id BIGSERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    laser_name TEXT NOT NULL,
-    lock_source TEXT NOT NULL DEFAULT 'manual_lock',
-    success BOOLEAN,
-    modulation_frequency_hz DOUBLE PRECISION,
-    demod_phase_deg DOUBLE PRECISION,
-    signal_offset_volts DOUBLE PRECISION,
-    modulation_amplitude DOUBLE PRECISION,
-    pid_p DOUBLE PRECISION,
-    pid_i DOUBLE PRECISION,
-    pid_d DOUBLE PRECISION,
-    trace_x DOUBLE PRECISION[] NOT NULL,
-    trace_y DOUBLE PRECISION[] NOT NULL,
-    monitor_trace_y DOUBLE PRECISION[] NOT NULL,
-    trace_x_units TEXT NOT NULL DEFAULT 'V',
-    trace_y_units TEXT NOT NULL DEFAULT 'V',
-    monitor_trace_y_units TEXT NOT NULL DEFAULT 'V'""" + _column_definitions() + """
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()""" + _column_definitions() + """
 );
 """
 ALTER_TABLE_ADD_LOCK_SOURCE_SQL = """
@@ -100,45 +157,33 @@ CREATE_INDEX_LASER_SQL = """
 CREATE INDEX IF NOT EXISTS idx_pdh_lock_results_laser_created_at
     ON pdh_lock_results (laser_name, created_at DESC);
 """
+CREATE_INDEX_DEVICE_SQL = """
+CREATE INDEX IF NOT EXISTS idx_pdh_lock_results_device_attempt
+    ON pdh_lock_results (device_key, attempt_started_at DESC);
+"""
+# Idempotent by lock_acquisition_id: writing the same attempt again (a retry,
+# or a later update such as a verification result) updates its one row.
 INSERT_SQL = """
 INSERT INTO pdh_lock_results (
-    laser_name,
-    lock_source,
-    success,
-    modulation_frequency_hz,
-    demod_phase_deg,
-    signal_offset_volts,
-    modulation_amplitude,
-    pid_p,
-    pid_i,
-    pid_d,
-    trace_x,
-    trace_y,
-    monitor_trace_y,
-    trace_x_units,
-    trace_y_units,
-    monitor_trace_y_units,
 """ + _insert_names() + """
 ) VALUES (
-    %(laser_name)s,
-    %(lock_source)s,
-    %(success)s,
-    %(modulation_frequency_hz)s,
-    %(demod_phase_deg)s,
-    %(signal_offset_volts)s,
-    %(modulation_amplitude)s,
-    %(pid_p)s,
-    %(pid_i)s,
-    %(pid_d)s,
-    %(trace_x)s,
-    %(trace_y)s,
-    %(monitor_trace_y)s,
-    %(trace_x_units)s,
-    %(trace_y_units)s,
-    %(monitor_trace_y_units)s,
 """ + _insert_values() + """
-);
+)
+ON CONFLICT (lock_acquisition_id) DO UPDATE SET
+""" + _upsert_assignments() + """,
+    updated_at = NOW();
 """
+
+
+def prepare_row(row: dict[str, Any]) -> dict[str, Any]:
+    """The writer's parameters for one row: every column present, JSON
+    columns serialized (non-finite floats as null)."""
+    params = {name: row.get(name) for name in INSERT_COLUMN_NAMES}
+    for name in JSONB_COLUMNS:
+        value = params.get(name)
+        if value is not None and not isinstance(value, str):
+            params[name] = json.dumps(_json_safe(value), allow_nan=False)
+    return params
 
 
 @dataclass
@@ -337,6 +382,7 @@ class LockResultPostgresService:
         cur.execute(ALTER_TABLE_ADD_SWEEP_SQL)
         cur.execute(CREATE_INDEX_CREATED_SQL)
         cur.execute(CREATE_INDEX_LASER_SQL)
+        cur.execute(CREATE_INDEX_DEVICE_SQL)
 
     def _ensure_table(self) -> None:
         if psycopg is None:
@@ -362,7 +408,7 @@ class LockResultPostgresService:
                 # names actually exist on the target database.
                 if not self._schema_ready:
                     self._apply_schema(cur)
-                cur.execute(INSERT_SQL, row)
+                cur.execute(INSERT_SQL, prepare_row(row))
             conn.commit()
         self._schema_ready = True
 

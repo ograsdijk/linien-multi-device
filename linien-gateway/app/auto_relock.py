@@ -106,6 +106,9 @@ class AutoRelockController:
         self._last_success_at: float | None = None
         self._last_failure_at: float | None = None
         self._last_error: str | None = None
+        # The lock_acquisition_id of the most recent relock attempt, so a client
+        # can find that attempt's record.
+        self._last_lock_acquisition_id: str | None = None
 
     def set_event_hook(
         self, event_hook: Callable[[str, dict[str, Any]], None] | None
@@ -327,6 +330,9 @@ class AutoRelockController:
             self._wait_since = None
             self._set_state("verifying")
 
+    def note_lock_acquisition(self, lock_acquisition_id: str | None) -> None:
+        self._last_lock_acquisition_id = lock_acquisition_id
+
     def get_config(self) -> dict[str, Any]:
         return self._config.to_dict()
 
@@ -365,6 +371,7 @@ class AutoRelockController:
             "last_success_at": self._last_success_at,
             "last_failure_at": self._last_failure_at,
             "last_error": self._last_error,
+            "last_lock_acquisition_id": self._last_lock_acquisition_id,
         }
 
     def get_state(self, now: float | None = None) -> dict[str, Any]:

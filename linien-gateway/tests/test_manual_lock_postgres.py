@@ -92,6 +92,7 @@ def test_service_test_connection_and_write_row(monkeypatch, tmp_path: Path):
 
     service._write_row(  # noqa: SLF001 - explicit unit-level check of writer behavior
         {
+            "lock_acquisition_id": "7f0c1a52-5d0e-4b8e-9a51-3f7d2c4c9e10",
             "laser_name": "L1",
             "lock_source": "manual_lock",
             "success": True,
@@ -104,10 +105,11 @@ def test_service_test_connection_and_write_row(monkeypatch, tmp_path: Path):
             "pid_d": 3.0,
             "trace_x": [0.0, 1.0],
             "trace_y": [0.0, 1.0],
-            "monitor_trace_y": [0.25, 0.5],
+            "secondary_trace_y": [0.25, 0.5],
             "trace_x_units": "V",
             "trace_y_units": "V",
-            "monitor_trace_y_units": "V",
+            "secondary_trace_y_units": "V",
+            "trace_meta": {"n_samples": 2, "bad": float("nan")},
         }
     )
     assert any("INSERT INTO pdh_lock_results" in sql for sql, _ in fake_driver.calls)
@@ -118,7 +120,11 @@ def test_service_test_connection_and_write_row(monkeypatch, tmp_path: Path):
     ]
     assert insert_calls
     assert insert_calls[-1][1]["lock_source"] == "manual_lock"
-    assert insert_calls[-1][1]["monitor_trace_y"] == [0.25, 0.5]
+    assert insert_calls[-1][1]["secondary_trace_y"] == [0.25, 0.5]
+    # Upsert on the attempt's UUID, so re-sending a row never adds a second.
+    assert "ON CONFLICT (lock_acquisition_id) DO UPDATE" in insert_calls[-1][0]
+    # JSON columns are serialized as valid JSON (NaN -> null).
+    assert insert_calls[-1][1]["trace_meta"] == '{"n_samples": 2, "bad": null}'
 
 
 
