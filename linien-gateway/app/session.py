@@ -1244,7 +1244,7 @@ class DeviceSession:
                     level=logging.INFO,
                     source="postgres",
                     code="lock_result_postgres_enqueued",
-                    message="Lock-result row enqueued for Postgres writer.",
+                    message="Lock-acquisition record spooled for PostgreSQL (not yet persisted).",
                     details=details,
                 )
                 return

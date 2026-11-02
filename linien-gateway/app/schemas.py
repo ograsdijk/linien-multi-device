@@ -518,6 +518,11 @@ class PostgresManualLockConfig(BaseModel):
     password: str = "adminpassword"
     sslmode: Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] = "prefer"
     connect_timeout_s: float = Field(default=3.0, ge=0.1, le=120.0)
+    # PostgreSQL schema holding the lock-acquisition tables.
+    db_schema: str = Field(default="linien", pattern=r"^[a-z_][a-z0-9_]{0,62}$")
+    # Local spool retention (records awaiting or already sent to PostgreSQL).
+    spool_max_records: int = Field(default=10_000, ge=100, le=1_000_000)
+    spool_max_age_days: float = Field(default=30.0, ge=1.0, le=3650.0)
 
 
 class PostgresManualLockStatus(BaseModel):
@@ -533,6 +538,14 @@ class PostgresManualLockStatus(BaseModel):
     write_error_count: int = 0
     dropped_count: int = 0
     queue_size: int = 0
+    # Local spool: awaiting first send / backing off after a temporary
+    # failure / acknowledged by PostgreSQL / rejected permanently.
+    pending_count: int = 0
+    retrying_count: int = 0
+    persisted_count: int = 0
+    failed_count: int = 0
+    schema_ok: Optional[bool] = None
+    schema_error: Optional[str] = None
 
 
 class PostgresManualLockState(BaseModel):

@@ -436,6 +436,10 @@ export type PostgresManualLockConfig = {
   password: string;
   sslmode: PostgresSslMode;
   connect_timeout_s: number;
+  // PostgreSQL schema for the lock-acquisition tables (default "linien").
+  db_schema?: string;
+  spool_max_records?: number;
+  spool_max_age_days?: number;
 };
 
 export type PostgresManualLockStatus = {
@@ -450,6 +454,13 @@ export type PostgresManualLockStatus = {
   write_error_count: number;
   dropped_count: number;
   queue_size: number;
+  // Local spool: awaiting send / backing off / acknowledged / rejected.
+  pending_count?: number;
+  retrying_count?: number;
+  persisted_count?: number;
+  failed_count?: number;
+  schema_ok?: boolean | null;
+  schema_error?: string | null;
 };
 
 export type PostgresManualLockState = {
