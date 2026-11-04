@@ -64,7 +64,20 @@ from .lock_refinement import (
     plan_refinement_step,
 )
 from .lock_indicator import LockIndicatorConfig, LockIndicatorEvaluator
-from .manual_lock_record import ADC_SCALE, build_manual_lock_row, modulation_raw_to_hz
+from .linien_config import build_linien_config
+from .lock_acquisition import (
+    SECONDARY_ROLE_ERROR_SIGNAL_2,
+    SECONDARY_ROLE_MONITOR,
+    LockAcquisition,
+    TraceSnapshot,
+    VerificationTracker,
+    acquisition_scope,
+    attach_acquisition_id,
+    current_acquisition,
+    unavailable_trace,
+)
+from .lock_characterization import characterize_trace
+from .manual_lock_record import ADC_SCALE, build_acquisition_row, modulation_raw_to_hz
 from .plot_processing import PlotState, V, build_plot_frame
 from .signal_stats import SignalStats, compute_signal_stats
 from .serializers import UNSERIALIZABLE, to_jsonable
@@ -162,6 +175,30 @@ class TrajectoryRefinementAborted(RuntimeError):
 # going ahead anyway. A relock scan takes seconds; abandoning one part-way
 # leaves the sweep center on an arbitrary set-point.
 RELOCK_ACTION_DRAIN_TIMEOUT_S = 5.0
+
+# A manual lock records the unlocked sweep cached just before the lock command.
+# Older than this, the cached frame no longer describes the sweep being locked
+# from (the stream stalled, or the device sat locked), so no trace is stored.
+MANUAL_LOCK_MAX_TRACE_AGE_S = 5.0
+
+# Parameters read for the converted columns of a lock-acquisition record.
+LOCK_RECORD_PARAM_NAMES = (
+    "modulation_frequency",
+    "modulation_amplitude",
+    "demodulation_phase_a",
+    "demodulation_phase_b",
+    "offset_a",
+    "offset_b",
+    "control_channel",
+    "p",
+    "i",
+    "d",
+    "sweep_center",
+    "sweep_amplitude",
+    "sweep_pause",
+    "dual_channel",
+    "channel_mixing",
+)
 
 # Default TTL for a staged auto-lock run (see StagedAutolockRun), matching the
 # spec default. A run left untouched this long auto-aborts and restores
@@ -460,6 +497,9 @@ class DeviceSession:
         self._lock = threading.RLock()
         self._rpyc_lock = threading.RLock()
         self._state_lock = threading.RLock()
+        # The accepted lock whose verification is still open, fed by the plot
+        # frame handler (guarded by _state_lock).
+        self._pending_verification: tuple[LockAcquisition, VerificationTracker] | None = None
         self._relock_action_lock = threading.Lock()
         # Serialises everything that drives the sweep center over time. A
         # refinement walk moves the actuator for seconds; interleaved runs would
@@ -1157,33 +1197,31 @@ class DeviceSession:
     def _write_lock_result_to_postgres(
         self,
         *,
-        lock_source: str,
+        acquisition: LockAcquisition,
         event_source: str,
-        success: bool = True,
     ) -> None:
+        """Hand one acquisition's record to the PostgreSQL writer (non-blocking).
+
+        Called exactly once per acquisition (see `_close_acquisition`).
+        """
+        lock_source = acquisition.lock_source
         if self._lock_result_postgres is None:
             self._emit_log_event(
                 level=logging.WARNING,
                 source="postgres",
                 code="lock_result_postgres_unavailable",
                 message="Lock-result postgres service unavailable.",
-                details={"lock_source": lock_source, "event_source": event_source},
+                details={
+                    "lock_source": lock_source,
+                    "event_source": event_source,
+                    "lock_acquisition_id": acquisition.lock_acquisition_id,
+                },
             )
             return
 
         service = self._lock_result_postgres
         try:
-            device_name = (
-                self.device.name
-                if getattr(self.device, "name", None)
-                else self.device.key
-            )
-            row = self.build_manual_lock_row(
-                device_name=device_name,
-                device_key=self.device.key,
-                lock_source=lock_source,
-                success=success,
-            )
+            row = build_acquisition_row(acquisition)
             enqueued = service.enqueue_lock_result(row)
             get_state = getattr(service, "get_state", None)
             state = get_state() if callable(get_state) else {}
@@ -1195,6 +1233,7 @@ class DeviceSession:
             details: dict[str, Any] = {
                 "lock_source": lock_source,
                 "event_source": event_source,
+                "lock_acquisition_id": acquisition.lock_acquisition_id,
                 "config_enabled": config_enabled,
             }
             if isinstance(status, dict):
@@ -1205,7 +1244,7 @@ class DeviceSession:
                     level=logging.INFO,
                     source="postgres",
                     code="lock_result_postgres_enqueued",
-                    message="Lock-result row enqueued for Postgres writer.",
+                    message="Lock-acquisition record spooled for PostgreSQL (not yet persisted).",
                     details=details,
                 )
                 return
@@ -1241,9 +1280,389 @@ class DeviceSession:
                 details={
                     "lock_source": lock_source,
                     "event_source": event_source,
+                    "lock_acquisition_id": acquisition.lock_acquisition_id,
                     "error": str(exc),
                 },
             )
+
+    # ------------------------------------------------- lock acquisitions
+
+    def _open_acquisition(self, lock_source: str) -> LockAcquisition:
+        """Start one acquisition attempt: assign its ID and read its parameters.
+
+        Called once the attempt has passed its prechecks and before any
+        hardware command. Never raises: a parameter that cannot be read is
+        simply absent from the record.
+        """
+        device_name = getattr(self.device, "name", None) or self.device.key
+        acquisition = LockAcquisition(
+            device_key=self.device.key,
+            laser_name=str(device_name),
+            lock_source=lock_source,
+        )
+        # A new attempt ends any verification still open: whatever happens
+        # next is about this attempt, not the previous one.
+        self._resolve_pending_verification(("unavailable", "superseded_by_new_attempt"))
+        try:
+            acquisition.params = self._collect_manual_lock_params(
+                LOCK_RECORD_PARAM_NAMES
+            )
+        except Exception:  # noqa: BLE001 - a record without params beats none
+            logger.warning(
+                "Reading lock-record parameters failed device=%s",
+                self.device.key,
+                exc_info=True,
+            )
+        self._snapshot_linien_config(acquisition, "attempt_start")
+        return acquisition
+
+    def _snapshot_linien_config(self, acquisition: LockAcquisition, stage: str) -> None:
+        """Store the raw Linien configuration on the attempt. Never raises.
+
+        Reads go through the linien-client parameter cache where it is
+        populated, so this adds no board round-trips on the lock path.
+        """
+        try:
+            with self._state_lock:
+                gateway = {
+                    "auto_lock_scan": dict(self.auto_lock_scan_settings),
+                    "lock_acceptance": dict(self.lock_acceptance_settings),
+                    "lock_indicator": self.lock_indicator.get_config(),
+                }
+            acquisition.linien_config = build_linien_config(
+                self._read_param_fast, captured_at_stage=stage, gateway=gateway
+            )
+        except Exception:  # noqa: BLE001 - the record is still worth keeping
+            logger.warning(
+                "Linien config snapshot failed device=%s", self.device.key, exc_info=True
+            )
+
+    def _close_acquisition(
+        self,
+        acquisition: LockAcquisition,
+        exc: BaseException | None,
+        *,
+        event_source: str,
+    ) -> None:
+        """Finish an attempt and record it, once. Never raises."""
+        try:
+            if exc is not None:
+                acquisition.fail(exc)
+                attach_acquisition_id(exc, acquisition)
+                refinement = getattr(exc, "refinement", None)
+                if acquisition.refinement is None and isinstance(refinement, dict):
+                    acquisition.refinement = refinement
+                if acquisition.trace is None:
+                    latest = acquisition.latest_capture()
+                    if latest is not None:
+                        # The last frame the attempt analysed before failing.
+                        acquisition.trace = dataclasses.replace(
+                            latest, purpose="last_analysed_frame"
+                        )
+            if not acquisition.claim_record():
+                return
+            acquisition.characterization = self._characterize_acquisition(acquisition)
+            if acquisition.lock_command_status == "accepted":
+                self._begin_verification(acquisition)
+            self._write_lock_result_to_postgres(
+                acquisition=acquisition, event_source=event_source
+            )
+        except Exception:  # noqa: BLE001 - recording must never break a lock
+            logger.warning(
+                "Recording lock acquisition failed device=%s id=%s",
+                self.device.key,
+                acquisition.lock_acquisition_id,
+                exc_info=True,
+            )
+
+    def _characterize_acquisition(self, acquisition: LockAcquisition) -> dict[str, Any]:
+        with self._state_lock:
+            settings = AutoLockScanSettings.from_mapping(self.auto_lock_scan_settings)
+        params = acquisition.params
+        rising = params.get("target_slope_rising")
+        if rising is None:
+            rising = self._read_param_fast("target_slope_rising")
+        return characterize_trace(
+            acquisition.trace,
+            settings=settings,
+            result=acquisition.decision_result,
+            preferred_slope_rising=None if rising is None else bool(rising),
+            modulation_frequency_hz=self._mod_freq_to_hz(
+                params.get("modulation_frequency")
+            ),
+            dual_channel=(
+                None if params.get("dual_channel") is None
+                else bool(params.get("dual_channel"))
+            ),
+        )
+
+    # ------------------------------------------------- lock verification
+
+    def _begin_verification(self, acquisition: LockAcquisition) -> None:
+        """Open verification of an accepted lock command (non-blocking).
+
+        The plot frames that drive the lock indicator decide it (see
+        `_observe_verification`); a timer closes it if frames stop.
+        """
+        with self._state_lock:
+            indicator_enabled = bool(self.lock_indicator.get_config().get("enabled"))
+            hold_s = float(self.auto_relock.get_config().get("verify_hold_s", 1.2))
+            if not indicator_enabled:
+                acquisition.verification_status = "unavailable"
+                acquisition.verification_reason = "lock_indicator_disabled"
+                acquisition.verification_completed_at = time.time()
+                return
+            tracker = VerificationTracker(
+                commanded_at=float(acquisition.lock_command_at or time.time()),
+                hold_s=hold_s,
+            )
+            acquisition.verification_status = "pending"
+            self._pending_verification = (acquisition, tracker)
+        timer = threading.Timer(
+            tracker.timeout_s + 0.5,
+            self._verification_deadline,
+            args=(acquisition,),
+        )
+        timer.daemon = True
+        timer.start()
+
+    def _verification_deadline(self, acquisition: LockAcquisition) -> None:
+        with self._state_lock:
+            pending = self._pending_verification
+            if pending is None or pending[0] is not acquisition:
+                return
+            outcome = pending[1].check_deadline(time.time())
+        if outcome is not None:
+            self._resolve_pending_verification(outcome, only=acquisition)
+
+    def _observe_verification(self, now: float, lock: bool, indicator_state: Any) -> Any:
+        """Feed one frame to the open verification. Caller holds _state_lock;
+        returns (acquisition, outcome) once it is decided, else None."""
+        pending = self._pending_verification
+        if pending is None:
+            return None
+        acquisition, tracker = pending
+        outcome = tracker.observe(
+            now,
+            lock=lock,
+            indicator_state=indicator_state if isinstance(indicator_state, str) else None,
+        )
+        if outcome is None:
+            return None
+        return acquisition, outcome
+
+    def _resolve_pending_verification(
+        self,
+        outcome: tuple[str, str | None],
+        *,
+        only: LockAcquisition | None = None,
+    ) -> None:
+        """Close the open verification with ``outcome`` and update its record
+        (same lock_acquisition_id, so the row is updated, never duplicated)."""
+        with self._state_lock:
+            pending = self._pending_verification
+            if pending is None or (only is not None and pending[0] is not only):
+                return
+            self._pending_verification = None
+        acquisition = pending[0]
+        status, reason = outcome
+        acquisition.verification_status = status
+        acquisition.verification_reason = reason
+        acquisition.verification_completed_at = time.time()
+        self._emit_log_event(
+            level=logging.INFO if status == "verified" else logging.WARNING,
+            source="lock",
+            code=f"lock_acquisition_{status}",
+            message=f"Lock acquisition verification: {status}.",
+            details={
+                "lock_acquisition_id": acquisition.lock_acquisition_id,
+                "lock_source": acquisition.lock_source,
+                "reason": reason,
+            },
+        )
+        try:
+            self._write_lock_result_to_postgres(
+                acquisition=acquisition, event_source="lock_verification"
+            )
+        except Exception:  # noqa: BLE001 - never break the frame handler
+            logger.warning("Recording lock verification failed", exc_info=True)
+
+    @contextmanager
+    def _acquisition(self, lock_source: str, *, event_source: str | None = None):
+        acquisition = self._open_acquisition(lock_source)
+        error: BaseException | None = None
+        try:
+            with acquisition_scope(acquisition):
+                yield acquisition
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            self._close_acquisition(
+                acquisition, error, event_source=event_source or lock_source
+            )
+
+    @staticmethod
+    def _final_trace(acquisition: LockAcquisition, result: Any) -> TraceSnapshot:
+        """The trace the locked-on detection came from, with its own geometry."""
+        snapshot = acquisition.capture_for(result)
+        if snapshot is None:
+            return unavailable_trace(
+                "final_detection_trace_not_recorded", purpose="final_detection"
+            )
+        return dataclasses.replace(snapshot, purpose="final_detection")
+
+    @staticmethod
+    def _secondary_from_plot_data(
+        plot_data: list[Any], monitor_raw: Any
+    ) -> tuple[np.ndarray | None, str | None]:
+        """The second input's trace (volts) and what it is.
+
+        last_plot_data[1] is error_signal_2 whenever the board sent one (dual
+        channel); it is the monitor only when it IS last_monitor_signal.
+        """
+        secondary_raw = plot_data[1] if len(plot_data) > 1 else None
+        if secondary_raw is None:
+            return None, None
+        role = (
+            SECONDARY_ROLE_MONITOR
+            if monitor_raw is not None and secondary_raw is monitor_raw
+            else SECONDARY_ROLE_ERROR_SIGNAL_2
+        )
+        return np.array(secondary_raw, copy=True, dtype=float) / ADC_SCALE, role
+
+    def _note_frame_for_acquisition(
+        self,
+        error_trace: np.ndarray,
+        plot_data: list[Any],
+        monitor_raw: Any,
+        frame_id: int | None,
+        processed_at: float | None,
+    ) -> None:
+        """Remember which frame a trace handed to a detector came from."""
+        acquisition = current_acquisition()
+        if acquisition is None:
+            return
+        secondary_v, role = self._secondary_from_plot_data(plot_data, monitor_raw)
+        acquisition.note_frame(
+            error_trace,
+            {
+                "frame_id": None if frame_id is None else int(frame_id),
+                "frame_processed_at": processed_at,
+                "secondary_v": secondary_v,
+                "secondary_role": role,
+            },
+        )
+
+    def _note_detection(
+        self,
+        *,
+        error_trace: Any,
+        monitor_trace: Any,
+        center_v: float,
+        amplitude_v: float,
+        detector: str,
+    ) -> Any:
+        """Pair a trace about to be analysed with the geometry it is detected
+        against. Returns the capture (attach results to it once the detector
+        accepts the trace), or None outside an acquisition."""
+        acquisition = current_acquisition()
+        if acquisition is None:
+            return None
+        meta = acquisition.frame_meta_for(error_trace)
+        secondary_v = meta.get("secondary_v")
+        role = meta.get("secondary_role")
+        if secondary_v is None and monitor_trace is not None:
+            secondary_v, role = monitor_trace, SECONDARY_ROLE_MONITOR
+        sweep_pause = acquisition.params.get("sweep_pause")
+        frame_id = meta.get("frame_id")
+        with self._state_lock:
+            stored = (
+                self._unlocked_geometry_by_frame.get(int(frame_id))
+                if frame_id is not None
+                else None
+            )
+        geometry_source = (
+            "frame_callback"
+            if stored is not None
+            and math.isclose(stored[0], float(center_v), abs_tol=1e-12)
+            and math.isclose(stored[1], float(amplitude_v), abs_tol=1e-12)
+            else "device_readback"
+        )
+        return acquisition.note_capture(
+            TraceSnapshot(
+                error_v=np.asarray(error_trace, dtype=float),
+                secondary_v=(
+                    np.asarray(secondary_v, dtype=float)
+                    if secondary_v is not None
+                    else None
+                ),
+                secondary_role=role if secondary_v is not None else None,
+                frame_id=meta.get("frame_id"),
+                frame_processed_at=meta.get("frame_processed_at"),
+                sweep_center_v=float(center_v),
+                sweep_amplitude_v=float(amplitude_v),
+                geometry_read_at=time.time(),
+                purpose="detection",
+                detector=detector,
+                sweep_paused=None if sweep_pause is None else bool(sweep_pause),
+                geometry_source=geometry_source,
+            ),
+        )
+
+    def _capture_pre_lock_trace(self, acquisition: LockAcquisition) -> TraceSnapshot:
+        """Copy the cached unlocked sweep before a manual lock command.
+
+        Its geometry is what `_open_acquisition` read as this attempt started;
+        nothing in the gateway moves the sweep between that read and the lock
+        command, which is issued straight after this copy.
+        """
+        purpose = "pre_lock_snapshot"
+        with self._state_lock:
+            plot_data = self.plot_state.last_plot_data
+            monitor_raw = self.plot_state.last_monitor_signal
+            frame_id = int(self.plot_state.last_unlocked_frame_id)
+            processed_at = self.plot_state.last_unlocked_trace_at
+            if plot_data is None or len(plot_data) < 3 or plot_data[2] is None:
+                return unavailable_trace("no_unlocked_trace_cached", purpose=purpose)
+            error_v = np.array(plot_data[2], copy=True, dtype=float) / ADC_SCALE
+            secondary_v, role = self._secondary_from_plot_data(plot_data, monitor_raw)
+            frame_geometry = self._unlocked_geometry_by_frame.get(frame_id)
+        if bool(self._read_param_fast("lock", False)):
+            return unavailable_trace("device_already_locked", purpose=purpose)
+        age_s = (
+            acquisition.attempt_started_at - float(processed_at)
+            if processed_at is not None
+            else None
+        )
+        if age_s is None or age_s > MANUAL_LOCK_MAX_TRACE_AGE_S:
+            return unavailable_trace(
+                "stale_unlocked_trace"
+                + ("" if age_s is None else f" ({age_s:.1f} s old)"),
+                purpose=purpose,
+            )
+        params = acquisition.params
+        if frame_geometry is not None:
+            center, amplitude = frame_geometry
+            geometry_source = "frame_callback"
+        else:
+            center = params.get("sweep_center")
+            amplitude = params.get("sweep_amplitude")
+            geometry_source = "device_readback"
+        sweep_pause = params.get("sweep_pause")
+        return TraceSnapshot(
+            error_v=error_v,
+            secondary_v=secondary_v,
+            secondary_role=role,
+            frame_id=frame_id,
+            frame_processed_at=processed_at,
+            sweep_center_v=None if center is None else float(center),
+            sweep_amplitude_v=None if amplitude is None else float(amplitude),
+            geometry_read_at=acquisition.attempt_started_at,
+            purpose=purpose,
+            sweep_paused=None if sweep_pause is None else bool(sweep_pause),
+            geometry_source=geometry_source,
+        )
 
     def _initial_lock_indicator_config(self) -> dict[str, Any]:
         parameters = getattr(self.device, "parameters", None)
@@ -2057,6 +2476,11 @@ class DeviceSession:
             # The *true* monitor (None if the device has no monitor signal), not
             # last_plot_data[1] which is monitor_or_error_signal_2.
             monitor_trace_raw = self.plot_state.last_monitor_signal
+            # Frame identity for the acquisition record, read under the same
+            # lock as the trace. Optional: a plot state without a frame counter
+            # simply leaves it out of the record.
+            frame_id = getattr(self.plot_state, "last_unlocked_frame_id", None)
+            acquired_at = self.plot_state.last_unlocked_trace_at
         if error_trace_raw is None:
             raise RuntimeError("No error trace available")
         # Plot units: divide by ADC_SCALE (= plot_processing.V) so auto-lock thresholds
@@ -2066,6 +2490,9 @@ class DeviceSession:
             np.array(monitor_trace_raw, copy=True) / ADC_SCALE
             if monitor_trace_raw is not None
             else None
+        )
+        self._note_frame_for_acquisition(
+            error_trace, plot_data, monitor_trace_raw, frame_id, acquired_at
         )
         return error_trace, monitor_trace
 
@@ -2115,21 +2542,6 @@ class DeviceSession:
             preferred_slope_rising,
             self._mod_freq_to_hz(modulation_raw),
         )
-
-    def _snapshot_manual_lock_sources(
-        self,
-    ) -> tuple[list[np.ndarray | None] | None, Dict[str, Any] | None]:
-        with self._state_lock:
-            plot_data = self.plot_state.last_plot_data
-            if plot_data is None:
-                plot_data_snapshot = None
-            else:
-                plot_data_snapshot = [
-                    np.array(item, copy=True) if item is not None else None
-                    for item in plot_data
-                ]
-            frame_snapshot = deepcopy(self.last_plot_frame)
-        return plot_data_snapshot, frame_snapshot
 
     def _decode_to_plot_payload(self, value: Any) -> dict[str, Any] | None:
         try:
@@ -2425,26 +2837,32 @@ class DeviceSession:
                 code="auto_relock_action_start",
                 message="Auto-relock action started.",
             )
-            self.auto_lock_from_scan(None)
+            payload = self.auto_lock_from_scan(None, lock_source="auto_relock")
+            acquisition_id = payload.get("lock_acquisition_id")
+            self._note_relock_acquisition(acquisition_id)
             self._emit_log_event(
                 level=logging.INFO,
                 source="auto_relock",
                 code="auto_relock_action_success",
                 message="Auto-relock action completed.",
-            )
-            self._write_lock_result_to_postgres(
-                lock_source="auto_relock",
-                event_source="auto_relock",
+                details={"lock_acquisition_id": acquisition_id},
             )
         except Exception as exc:
+            acquisition_id = getattr(exc, "lock_acquisition_id", None)
+            if acquisition_id is not None:
+                self._note_relock_acquisition(acquisition_id)
             self._emit_log_event(
                 level=logging.ERROR,
                 source="auto_relock",
                 code="auto_relock_action_failed",
                 message="Auto-relock action failed.",
-                details={"error": str(exc)},
+                details={"error": str(exc), "lock_acquisition_id": acquisition_id},
             )
             raise
+
+    def _note_relock_acquisition(self, acquisition_id: str | None) -> None:
+        with self._state_lock:
+            self.auto_relock.note_lock_acquisition(acquisition_id)
 
     def _on_to_plot(self, value: Any) -> None:
         if self.parameters is None:
@@ -2569,6 +2987,14 @@ class DeviceSession:
             frame["auto_relock"] = auto_relock_status
             self.last_plot_frame = frame
             self.last_plot_timestamp = time.time()
+            verification_done = self._observe_verification(
+                self.last_plot_timestamp, lock_value, indicator_state
+            )
+
+        # Recording the verification outcome enqueues a row; outside _state_lock.
+        if verification_done is not None:
+            acquisition_done, outcome = verification_done
+            self._resolve_pending_verification(outcome, only=acquisition_done)
 
         # Perform the auto-relock device I/O OUTSIDE _state_lock so status()
         # and snapshot reads don't stall during a (possibly multi-second)
@@ -2744,12 +3170,31 @@ class DeviceSession:
         with self._rpyc_lock:
             self.control.exposed_write_registers()
 
-    def start_lock(self) -> None:
+    def start_lock(self) -> str:
+        """Start a manual lock; returns its lock_acquisition_id.
+
+        The unlocked sweep is copied BEFORE the lock command: once the lock is
+        engaged the plot stream carries locked-operation frames, and the cached
+        frame is no longer the sweep the lock was started from.
+        """
         if self.control is None:
             raise RuntimeError("Device not connected")
         self._ensure_no_staged_autolock_run("start_lock")
-        with self._rpyc_lock:
-            self.control.exposed_start_lock()
+        with self._acquisition("manual_lock") as acquisition:
+            acquisition.trace = self._capture_pre_lock_trace(acquisition)
+            if acquisition.linien_config is not None:
+                # Read just before the trace copy and the lock command.
+                acquisition.linien_config["captured_at_stage"] = "pre_lock_command"
+            acquisition.stage = "lock_command"
+            commanded_at = time.time()
+            try:
+                with self._rpyc_lock:
+                    self.control.exposed_start_lock()
+            except Exception:
+                acquisition.mark_lock_command(False, at=commanded_at)
+                raise
+            acquisition.mark_lock_command(True, at=commanded_at)
+        return acquisition.lock_acquisition_id
 
     def _snapshot_auto_lock_traces_with_frame(
         self,
@@ -2777,6 +3222,9 @@ class DeviceSession:
             np.array(monitor_trace_raw, copy=True) / ADC_SCALE
             if monitor_trace_raw is not None
             else None
+        )
+        self._note_frame_for_acquisition(
+            error_trace, plot_data, monitor_trace_raw, frame_id, acquired_at
         )
         return error_trace, monitor_trace, frame_id, acquired_at
 
@@ -3276,13 +3724,27 @@ class DeviceSession:
         current_center = self._current_sweep_center()
         if current_center is not None:
             sweep_center = current_center
+        acquisition = current_acquisition()
+        if acquisition is not None:
+            acquisition.stage = "lock_command"
+            # The configuration the lock is engaged with: after any refinement,
+            # before the center moves to the lock point. Taken before the
+            # handover timing starts, so it does not count towards it.
+            self._snapshot_linien_config(acquisition, "pre_lock_command")
         command_started_at = time.time()
         with self._rpyc_lock:
             self.parameters.sweep_center.value = float(result.target_voltage)
             self.control.exposed_write_registers()
             write_completed_at = time.time()
-            self.control.exposed_start_lock()
+            try:
+                self.control.exposed_start_lock()
+            except Exception:
+                if acquisition is not None:
+                    acquisition.mark_lock_command(False, at=write_completed_at)
+                raise
             start_lock_returned_at = time.time()
+        if acquisition is not None:
+            acquisition.mark_lock_command(True, at=write_completed_at)
         return {
             "command_started_at": command_started_at,
             "register_write_completed_at": write_completed_at,
@@ -3389,6 +3851,10 @@ class DeviceSession:
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
             require_unlocked=True, frame_id=frame_id if traces is None else None
         )
+        capture = self._note_detection(
+            error_trace=error_trace, monitor_trace=monitor_trace,
+            center_v=center_v, amplitude_v=amplitude_v, detector="strict",
+        )
         diagnostic = None
         if traces is None:
             diagnostic = self._record_refinement_detection_frame(
@@ -3413,6 +3879,8 @@ class DeviceSession:
             raise
         if diagnostic is not None:
             diagnostic["candidate"] = result.to_dict()
+        if capture is not None:
+            capture.results = (result,)
         return result, center_v, amplitude_v, feature_resolution_samples(
             settings, len(error_trace), amplitude_v
         )
@@ -3434,6 +3902,10 @@ class DeviceSession:
         )
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
             require_unlocked=True, frame_id=frame_id
+        )
+        capture = self._note_detection(
+            error_trace=error_trace, monitor_trace=monitor_trace,
+            center_v=center_v, amplitude_v=amplitude_v, detector="coarse",
         )
         diagnostic = self._record_refinement_detection_frame(
             error_trace=error_trace, frame_id=frame_id, acquired_at=acquired_at,
@@ -3458,6 +3930,8 @@ class DeviceSession:
         if diagnostic is not None:
             diagnostic["candidate"] = candidate.result.to_dict()
             diagnostic["metrics"] = candidate.metrics
+        if capture is not None:
+            capture.results = (candidate.result,)
         return candidate.result, center_v, amplitude_v, feature_resolution_samples(
             settings, len(error_trace), amplitude_v
         ), candidate.metrics
@@ -3489,6 +3963,10 @@ class DeviceSession:
         center_v, amplitude_v, rising, mod_hz = self._snapshot_sweep_params(
             require_unlocked=True, frame_id=frame_id
         )
+        capture = self._note_detection(
+            error_trace=error_trace, monitor_trace=monitor_trace,
+            center_v=center_v, amplitude_v=amplitude_v, detector="strict",
+        )
         diagnostic = self._record_refinement_detection_frame(
             error_trace=error_trace, frame_id=frame_id, acquired_at=acquired_at,
             center_v=center_v, amplitude_v=amplitude_v, detector="strict_candidates",
@@ -3511,6 +3989,8 @@ class DeviceSession:
             raise
         if diagnostic is not None:
             diagnostic["candidates"] = [c.to_dict() for c in candidates]
+        if capture is not None:
+            capture.results = tuple(candidates)
         resolution = feature_resolution_samples(settings, len(error_trace), amplitude_v)
         frame = _frame_summary(
             error_trace, frame_id, acquired_at, center_v, amplitude_v, mod_hz, candidates
@@ -5256,7 +5736,20 @@ class DeviceSession:
             run.busy = True
             self._staged_autolock_arm_timer(run, run.ttl_s)
 
+        acquisition: LockAcquisition | None = None
+        acquisition_error: BaseException | None = None
+        scope = None
         try:
+            # The selection is valid and the run is ours: one recorded attempt.
+            acquisition = self._open_acquisition("staged_autolock")
+            acquisition.trace_context.update(
+                {
+                    "selected_frame_id": int(selected_frame_id),
+                    "selected_target_index": int(selected_target_index),
+                }
+            )
+            scope = acquisition_scope(acquisition)
+            scope.__enter__()
             # Strict verification at the SAME geometry -- position comparison
             # is only ever valid here because nothing has moved since
             # `selected` was detected. Fix #9: align with the one-shot's
@@ -5402,6 +5895,11 @@ class DeviceSession:
                     )
             # The centre move + lock handover must not interleave with a one-shot
             # walk driving the same actuator (same rule as `step`).
+            # The second confirmation frame -- at the final geometry -- is
+            # the trace this lock was decided on.
+            acquisition.refinement = refinement
+            acquisition.trace = self._final_trace(acquisition, final)
+            acquisition.decision_result = final
             try:
                 with self._exclusive_center_move("staged auto-lock lock"):
                     handover_timing = self._move_and_lock(final, center_v)
@@ -5432,13 +5930,26 @@ class DeviceSession:
             payload["detail"] = "Staged auto-lock started."
             # The window that judged the selection (None: nothing pending).
             payload["hysteresis"] = _selection_window_fields(selection_window)
+            payload["lock_acquisition_id"] = acquisition.lock_acquisition_id
             return payload
+        except BaseException as exc:
+            acquisition_error = exc
+            raise
         finally:
+            if scope is not None:
+                scope.__exit__(None, None, None)
+            if acquisition is not None:
+                self._close_acquisition(
+                    acquisition, acquisition_error, event_source="staged_autolock"
+                )
             # No-op if `lock` already succeeded and cleared the run above.
             self._staged_autolock_finish_busy(token)
 
     def auto_lock_from_scan(
-        self, settings_payload: dict[str, Any] | None
+        self,
+        settings_payload: dict[str, Any] | None,
+        *,
+        lock_source: str = "auto_lock_scan",
     ) -> dict[str, Any]:
         if self.control is None or self.parameters is None:
             raise RuntimeError("Device not connected")
@@ -5468,114 +5979,126 @@ class DeviceSession:
             sweep_center, sweep_amplitude, _preferred_slope_rising, _modulation_frequency_hz = (
                 self._snapshot_sweep_params(require_unlocked=True)
             )
-            # A strict detection is authoritative: if the calibrated detector
-            # accepts this trace, lock on it. Refinement used to run whenever
-            # the sample count was below a hardcoded 10, which meant it could
-            # only ever discard a target the detector had just accepted -- and
-            # on a feature that moves with scan geometry, its own verification
-            # then refused the lock outright.
-            error_trace, monitor_trace = self._snapshot_auto_lock_traces()
-            try:
-                direct, direct_center, direct_amplitude, direct_resolution = (
-                    self._capture_auto_lock_target(
-                        settings, traces=(error_trace, monitor_trace)
-                    )
-                )
-            except ValueError as strict_error:
-                # The detector REJECTED this trace -- the case refinement was
-                # written for. Seed the walk with a coarse candidate and narrow
-                # until strict agrees. A RuntimeError (no trace, already locked)
-                # is not a detection problem and still propagates.
-                coarse, coarse_center, coarse_amplitude, coarse_resolution, _metrics = (
-                    self._coarse_auto_lock_target(settings)
-                )
+            # Prechecks passed (connected, unlocked, actuator free): from here
+            # on this is one recorded acquisition attempt.
+            with self._acquisition(lock_source) as acquisition:
+                # A strict detection is authoritative: if the calibrated detector
+                # accepts this trace, lock on it. Refinement used to run whenever
+                # the sample count was below a hardcoded 10, which meant it could
+                # only ever discard a target the detector had just accepted -- and
+                # on a feature that moves with scan geometry, its own verification
+                # then refused the lock outright.
+                error_trace, monitor_trace = self._snapshot_auto_lock_traces()
                 try:
-                    result, refinement = self._trajectory_refine_auto_lock(
-                        settings,
-                        acceptance,
-                        sweep_center,
-                        sweep_amplitude,
-                        initial_target=coarse,
-                        initial_center_v=coarse_center,
-                        initial_amplitude_v=coarse_amplitude,
-                        initial_resolution=coarse_resolution,
-                        initial_detector="coarse",
-                        trace_length=len(error_trace),
+                    direct, direct_center, direct_amplitude, direct_resolution = (
+                        self._capture_auto_lock_target(
+                            settings, traces=(error_trace, monitor_trace)
+                        )
                     )
-                except TrajectoryRefinementAborted as refine_error:
-                    # Nothing to fall back to: the strict detector never
-                    # accepted anything. Report the original rejection, which is
-                    # what the operator has to act on, with the walk's history.
-                    refine_error.refinement["strict_rejection"] = str(strict_error)
-                    raise
-            else:
-                result = direct
-                # The detector is happy, but on a scan this wide the centre move
-                # that follows is one long hysteretic jump and lands on the
-                # wrong feature. Narrow around the target first so the centre
-                # walks there in bounded steps instead.
-                if scan_too_wide_to_lock(
-                    settings, direct_amplitude, direct.sideband_offset_v,
-                    trace_points=len(error_trace),
-                ):
+                except ValueError as strict_error:
+                    # The detector REJECTED this trace -- the case refinement was
+                    # written for. Seed the walk with a coarse candidate and narrow
+                    # until strict agrees. A RuntimeError (no trace, already locked)
+                    # is not a detection problem and still propagates.
+                    coarse, coarse_center, coarse_amplitude, coarse_resolution, _metrics = (
+                        self._coarse_auto_lock_target(settings)
+                    )
+                    acquisition.stage = "refinement"
                     try:
                         result, refinement = self._trajectory_refine_auto_lock(
                             settings,
                             acceptance,
                             sweep_center,
                             sweep_amplitude,
-                            initial_target=direct,
-                            initial_center_v=direct_center,
-                            initial_amplitude_v=direct_amplitude,
-                            initial_resolution=direct_resolution,
-                            initial_detector="strict",
+                            initial_target=coarse,
+                            initial_center_v=coarse_center,
+                            initial_amplitude_v=coarse_amplitude,
+                            initial_resolution=coarse_resolution,
+                            initial_detector="coarse",
                             trace_length=len(error_trace),
                         )
                     except TrajectoryRefinementAborted as refine_error:
-                        # Unlike the rejection path there IS something to fall
-                        # back to. Narrowing is an improvement on a detection
-                        # that already passed, so failing to narrow must not
-                        # cost the lock -- except when the walk lost the feature
-                        # itself, which is the one failure that means the target
-                        # can no longer be trusted.
-                        if refine_error.failure_kind == "identity":
-                            raise
-                        logger.warning(
-                            "Auto-lock narrowing failed (%s); locking on the "
-                            "direct detection at the original scan instead.",
-                            refine_error,
-                        )
-                        refinement = dict(refine_error.refinement)
-                        refinement["fell_back_to_direct"] = True
-                        result = direct
-                        refinement_failed = True
-            handover_timing: dict[str, Any] | None = None
-            try:
-                # The refinement final verification leaves geometry untouched,
-                # so the handover starts from the exact verified scan.
-                handover_timing = self._move_and_lock(result, sweep_center)
-            except Exception as exc:
-                if refinement is not None:
-                    self._restore_sweep_geometry(sweep_center, sweep_amplitude)
-                    # The refinement stage history that got us here is otherwise
-                    # lost, and it is the most informative diagnostic for this
-                    # failure.
-                    if not hasattr(exc, "refinement"):
-                        exc.refinement = refinement
-                raise
-            else:
-                if refinement is not None and not refinement_failed:
-                    # Do NOT restore now: while locked, sweep_center is the
-                    # lock's operating point (_move_and_lock set it to the
-                    # target just before start_lock), so writing the old center
-                    # would pull the laser off the feature. Put the operator's
-                    # geometry back when the sweep next starts instead, so the
-                    # free-running scan is not left narrowed.
-                    with self._rpyc_lock:
-                        self._deferred_sweep_geometry = (
-                            float(sweep_center),
-                            float(sweep_amplitude),
-                        )
+                        # Nothing to fall back to: the strict detector never
+                        # accepted anything. Report the original rejection, which is
+                        # what the operator has to act on, with the walk's history.
+                        refine_error.refinement["strict_rejection"] = str(strict_error)
+                        raise
+                else:
+                    result = direct
+                    # The detector is happy, but on a scan this wide the centre move
+                    # that follows is one long hysteretic jump and lands on the
+                    # wrong feature. Narrow around the target first so the centre
+                    # walks there in bounded steps instead.
+                    if scan_too_wide_to_lock(
+                        settings, direct_amplitude, direct.sideband_offset_v,
+                        trace_points=len(error_trace),
+                    ):
+                        acquisition.stage = "refinement"
+                        try:
+                            result, refinement = self._trajectory_refine_auto_lock(
+                                settings,
+                                acceptance,
+                                sweep_center,
+                                sweep_amplitude,
+                                initial_target=direct,
+                                initial_center_v=direct_center,
+                                initial_amplitude_v=direct_amplitude,
+                                initial_resolution=direct_resolution,
+                                initial_detector="strict",
+                                trace_length=len(error_trace),
+                            )
+                        except TrajectoryRefinementAborted as refine_error:
+                            # Unlike the rejection path there IS something to fall
+                            # back to. Narrowing is an improvement on a detection
+                            # that already passed, so failing to narrow must not
+                            # cost the lock -- except when the walk lost the feature
+                            # itself, which is the one failure that means the target
+                            # can no longer be trusted.
+                            if refine_error.failure_kind == "identity":
+                                raise
+                            logger.warning(
+                                "Auto-lock narrowing failed (%s); locking on the "
+                                "direct detection at the original scan instead.",
+                                refine_error,
+                            )
+                            refinement = dict(refine_error.refinement)
+                            refinement["fell_back_to_direct"] = True
+                            result = direct
+                            refinement_failed = True
+                # The trace the decision was made on, paired with the geometry
+                # of that same sweep -- after a refinement walk, the narrowed
+                # scan, not the one the attempt started from. Fixed before the
+                # handover so a rejected lock command still records it.
+                acquisition.refinement = refinement
+                acquisition.trace = self._final_trace(acquisition, result)
+                acquisition.decision_result = result
+                handover_timing: dict[str, Any] | None = None
+                try:
+                    # The refinement final verification leaves geometry untouched,
+                    # so the handover starts from the exact verified scan.
+                    handover_timing = self._move_and_lock(result, sweep_center)
+                except Exception as exc:
+                    if refinement is not None:
+                        self._restore_sweep_geometry(sweep_center, sweep_amplitude)
+                        # The refinement stage history that got us here is otherwise
+                        # lost, and it is the most informative diagnostic for this
+                        # failure.
+                        if not hasattr(exc, "refinement"):
+                            exc.refinement = refinement
+                    raise
+                else:
+                    if refinement is not None and not refinement_failed:
+                        # Do NOT restore now: while locked, sweep_center is the
+                        # lock's operating point (_move_and_lock set it to the
+                        # target just before start_lock), so writing the old center
+                        # would pull the laser off the feature. Put the operator's
+                        # geometry back when the sweep next starts instead, so the
+                        # free-running scan is not left narrowed.
+                        with self._rpyc_lock:
+                            self._deferred_sweep_geometry = (
+                                float(sweep_center),
+                                float(sweep_amplitude),
+                            )
         # Cache the discriminator slope measured on this scan so status()/plot
         # frames can report the in-loop lock error in MHz. Only overwrite when the
         # scan resolved one (PDH + known modulation frequency); keep the previous
@@ -5592,42 +6115,8 @@ class DeviceSession:
         if handover_timing is not None:
             payload["handover_command_timing"] = handover_timing
         payload["detail"] = "Auto-lock started from scan."
+        payload["lock_acquisition_id"] = acquisition.lock_acquisition_id
         return payload
-
-    def build_manual_lock_row(
-        self,
-        *,
-        device_name: str | None = None,
-        device_key: str,
-        lock_source: str = "manual_lock",
-        success: bool = True,
-    ) -> dict[str, Any]:
-        param_names = (
-            "modulation_frequency",
-            "modulation_amplitude",
-            "demodulation_phase_a",
-            "demodulation_phase_b",
-            "offset_a",
-            "offset_b",
-            "control_channel",
-            "p",
-            "i",
-            "d",
-            "sweep_center",
-            "sweep_amplitude",
-        )
-        params = self._collect_manual_lock_params(param_names)
-        trace_values, monitor_trace_values = self._extract_manual_lock_traces()
-
-        return build_manual_lock_row(
-            device_name=device_name,
-            device_key=device_key,
-            lock_source=lock_source,
-            success=success,
-            params=params,
-            trace_y=trace_values,
-            monitor_trace_y=monitor_trace_values,
-        )
 
     def _collect_manual_lock_params(self, names: tuple[str, ...]) -> dict[str, Any]:
         params: dict[str, Any] = {}
@@ -5643,55 +6132,6 @@ class DeviceSession:
                 params.update(self._get_cached_param_values(tuple(missing_names)))
             return params
         return self._get_cached_param_values(names)
-
-    def _extract_manual_lock_traces(
-        self,
-    ) -> tuple[list[float] | None, list[float] | None]:
-        trace_values: list[float] | None = None
-        monitor_trace_values: list[float] | None = None
-        plot_data, last_plot_frame = self._snapshot_manual_lock_sources()
-        if plot_data is not None and len(plot_data) >= 3:
-            try:
-                if plot_data[2] is not None:
-                    combined_error = np.asarray(plot_data[2], dtype=float)
-                    trace_values = (combined_error / ADC_SCALE).tolist()
-                if plot_data[1] is not None:
-                    monitor_trace = np.asarray(plot_data[1], dtype=float)
-                    monitor_trace_values = (monitor_trace / ADC_SCALE).tolist()
-            except Exception:
-                logger.debug(
-                    "Failed extracting lock traces from raw plot_data device=%s",
-                    self.device.key,
-                    exc_info=True,
-                )
-                trace_values = None
-                monitor_trace_values = None
-            return trace_values, monitor_trace_values
-
-        if last_plot_frame is None:
-            return None, None
-
-        series = last_plot_frame.get("series", {})
-        combined_series = series.get("combined_error")
-        monitor_series = series.get("monitor_signal")
-        if monitor_series is None:
-            monitor_series = series.get("error_signal_2")
-
-        def _series_to_list(value: Any) -> list[float] | None:
-            # Plot frames now hold numpy arrays in `series`; legacy
-            # list-with-Nones (from pre-#6 caches or tests) also supported.
-            if isinstance(value, np.ndarray):
-                arr = value.astype(float, copy=False)
-                return [float(v) for v in arr]
-            if isinstance(value, list):
-                return [
-                    float(v) if v is not None else float("nan") for v in value
-                ]
-            return None
-
-        trace_values = _series_to_list(combined_series)
-        monitor_trace_values = _series_to_list(monitor_series)
-        return trace_values, monitor_trace_values
 
     def start_sweep(self) -> None:
         if self.control is None:

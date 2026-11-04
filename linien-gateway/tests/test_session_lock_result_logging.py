@@ -1,6 +1,13 @@
 import logging
 
+from app.lock_acquisition import LockAcquisition
 from app.session import DeviceSession
+
+
+def _acquisition() -> LockAcquisition:
+    return LockAcquisition(
+        device_key="dev-a", laser_name="Device A", lock_source="auto_relock"
+    )
 
 
 class _DummyDevice:
@@ -57,7 +64,7 @@ def test_write_lock_result_logs_enqueued():
     session, events = _build_session(postgres)
 
     session._write_lock_result_to_postgres(
-        lock_source="auto_relock",
+        acquisition=_acquisition(),
         event_source="auto_relock",
     )
 
@@ -79,7 +86,7 @@ def test_write_lock_result_logs_disabled_skip():
     session, events = _build_session(_Postgres())
 
     session._write_lock_result_to_postgres(
-        lock_source="auto_relock",
+        acquisition=_acquisition(),
         event_source="auto_relock",
     )
 
@@ -102,7 +109,7 @@ def test_write_lock_result_logs_rejected_as_error():
     session, events = _build_session(_Postgres())
 
     session._write_lock_result_to_postgres(
-        lock_source="auto_relock",
+        acquisition=_acquisition(),
         event_source="auto_relock",
     )
 

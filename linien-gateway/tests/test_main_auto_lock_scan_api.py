@@ -156,7 +156,11 @@ def test_auto_lock_scan_endpoint_maps_validation_error(monkeypatch):
     assert "no candidate" in response.text
 
 
-def test_auto_lock_scan_endpoint_enqueues_auto_lock_source(monkeypatch):
+def test_auto_lock_scan_endpoint_leaves_recording_to_the_session(monkeypatch):
+    """The session records the attempt; the endpoint passes its ID through and
+    writes no row of its own (it used to, which recorded relocks never and
+    could record a scan twice)."""
+
     class DummyDevice:
         key = "test-device"
         name = "test-laser"
@@ -173,7 +177,13 @@ def test_auto_lock_scan_endpoint_enqueues_auto_lock_source(monkeypatch):
             self.rows.append(row)
             return True
 
-    dummy = DummyAutoLockSession()
+    class IdSession(DummyAutoLockSession):
+        def auto_lock_from_scan(self, payload):
+            body = super().auto_lock_from_scan(payload)
+            body["lock_acquisition_id"] = "5e2d8c1a-0b7f-4c3e-8d2a-9f6b1e4a7c33"
+            return body
+
+    dummy = IdSession()
     postgres = CapturingPostgres()
     monkeypatch.setattr(main.device_store, "get_device", lambda _key: DummyDevice())
     monkeypatch.setattr(main.device_store, "save_device", lambda _device: None)
@@ -184,10 +194,11 @@ def test_auto_lock_scan_endpoint_enqueues_auto_lock_source(monkeypatch):
 
     response = client.post("/api/devices/test-device/control/auto_lock_scan", json={})
     assert response.status_code == 200
-    assert dummy.last_build_kwargs is not None
-    assert dummy.last_build_kwargs["lock_source"] == "auto_lock_scan"
-    assert postgres.rows
-    assert postgres.rows[-1]["lock_source"] == "auto_lock_scan"
+    assert (
+        response.json()["lock_acquisition_id"]
+        == "5e2d8c1a-0b7f-4c3e-8d2a-9f6b1e4a7c33"
+    )
+    assert postgres.rows == []
 
 
 def test_auto_lock_scan_does_not_fail_when_enqueue_raises(monkeypatch):

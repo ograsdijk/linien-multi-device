@@ -34,8 +34,10 @@ Linien laser-lock devices from one interface.
   the hardware lock is likely still held.
 - Multi-device operations: a device overview grid, simultaneous (multi-device) sweep,
   fresh-trace acquisition, and per-device sweep-speed control.
-- Optional lock logging to Postgres (`pdh_lock_results`) for manual, auto-lock-from-scan,
-  and auto-relock actions.
+- Lock-acquisition records: one record per manual, scan, staged or auto-relock lock
+  attempt, with a stable `lock_acquisition_id`, the unlocked sweep it was decided on,
+  the Linien configuration and the verification outcome, stored in PostgreSQL
+  (`linien.pdh_lock_results`) through a durable local spool and readable over the API.
 - Optional InfluxDB logging control from the UI (credentials, interval, loggable
   parameter multiselect), resumed on reconnect.
 - Red Pitaya die-temperature telemetry: a near-zero-CPU C helper on the board,
@@ -125,7 +127,9 @@ Network and plot-stream settings, read by the gateway at startup:
   [Board diagnostics](#board-diagnostics)). Also gitignored and created at
   runtime; capped at 200 events and 30 days per device.
 - The Linien client also persists a device list (`devices.json`) and
-  `manual_lock_postgres.json` under `linien_common.config.USER_DATA_PATH`.
+  `manual_lock_postgres.json` under `linien_common.config.USER_DATA_PATH`. The
+  lock-record spool `lock_acquisition_spool.sqlite3` (plus its `-wal`/`-shm` files)
+  lives next to it.
 - In addition to the three config blocks above, the gateway snapshots a set of
   *restorable* Linien server parameters per device and replays them on reconnect.
 
@@ -159,7 +163,7 @@ npm install
 npm run build
 
 cd ..\linien-gateway
-python -m uvicorn app.main:app --reload
+python -m uvicorn app.main:app
 ```
 
 Open `http://localhost:8000` for the UI and `/api` for backend endpoints
@@ -169,7 +173,7 @@ For LAN access (run from the `linien-gateway` directory so `app.main:app` resolv
 
 ```powershell
 cd linien-gateway
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 ## Locking workflows
@@ -191,7 +195,10 @@ python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 A per-device controller that re-establishes a lost lock. It is configured with
 trigger / verify / cooldown behavior and exposes its state over REST and in the live
-stream. Auto-relock-driven locks are logged to Postgres with `lock_source = "auto_relock"`.
+stream. Every relock attempt, successful or not, is recorded as a lock acquisition with
+`lock_source = "auto_relock"` (see
+[Lock-acquisition records](#lock-acquisition-records-optional-postgresql)); the status
+reports the latest one as `last_lock_acquisition_id`.
 
 ## PSD (noise spectrum)
 
@@ -374,63 +381,291 @@ persistent journal, and stops offering it once it does.
 - Logs stream: `ws /api/logs/stream`.
 - PSD stream: `ws /api/psd/stream` (live noise-spectrum results — see [PSD](#psd-noise-spectrum)).
 
-## Optional Postgres lock logging
+## Lock-acquisition records (optional PostgreSQL)
 
-Configure in the UI:
+The gateway keeps one record per PDH lock-acquisition attempt: which path started it,
+the unlocked sweep the lock was decided on, the Linien configuration it was engaged
+with, whether Linien accepted the lock command, and whether the lock was then
+verified. Records go to PostgreSQL through a durable local spool. This is a record of
+*acquisitions*, not continuous telemetry: continuous PDH signals stay in
+[InfluxDB](#optional-influxdb-logging).
 
-- Use the `Postgres` chip in the top header.
-- Enable logging, set host/port/db/user/password/ssl/timeout.
-- Use `Test connection` and `Save`.
+Configure it in the UI with the `Postgres` chip in the top header: enable logging, set
+host, port, database, user, password, SSL mode, timeout and PostgreSQL schema, then
+`Test connection` and `Save`. The settings live in `manual_lock_postgres.json` under
+`linien_common.config.USER_DATA_PATH`. The password is write-only: the API returns it
+blank with `password_set: true`, and saving a blank password keeps the stored one.
 
-Logging behavior:
+### What is recorded
 
-- Best effort, non-blocking for lock actions.
-- Writes include `lock_source` — one of `manual_lock`, `auto_lock_scan` or
-  `auto_relock` — plus error/monitor traces and the sweep geometry.
+One record per attempt, on each of the four acquisition paths:
 
-Expected Postgres schema (`pdh_lock_results`):
+| `lock_source` | Started by | One attempt is |
+|---|---|---|
+| `manual_lock` | `POST /api/devices/{key}/control/start_lock` | one call |
+| `auto_lock_scan` | `POST /api/devices/{key}/control/auto_lock_scan` | one call, including its refinement walk |
+| `staged_autolock` | `POST /api/devices/{key}/control/staged_autolock/{token}/lock` | one `/lock` call (`begin`/`step`/`renew`/`abort` are not attempts) |
+| `auto_relock` | the auto-relock controller | one relock attempt; with `max_attempts > 1` each try is its own record |
 
-```sql
-CREATE TABLE IF NOT EXISTS pdh_lock_results (
-    id BIGSERIAL PRIMARY KEY,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    laser_name TEXT NOT NULL,
-    lock_source TEXT NOT NULL DEFAULT 'manual_lock',
-    success BOOLEAN,
-    modulation_frequency_hz DOUBLE PRECISION,
-    demod_phase_deg DOUBLE PRECISION,
-    signal_offset_volts DOUBLE PRECISION,
-    modulation_amplitude DOUBLE PRECISION,
-    pid_p DOUBLE PRECISION,
-    pid_i DOUBLE PRECISION,
-    pid_d DOUBLE PRECISION,
-    trace_x DOUBLE PRECISION[] NOT NULL,
-    trace_y DOUBLE PRECISION[] NOT NULL,
-    monitor_trace_y DOUBLE PRECISION[] NOT NULL,
-    trace_x_units TEXT NOT NULL DEFAULT 'V',
-    trace_y_units TEXT NOT NULL DEFAULT 'V',
-    monitor_trace_y_units TEXT NOT NULL DEFAULT 'V',
-    -- The sweep itself, previously only recoverable by inverting trace_x:
-    sweep_center_v DOUBLE PRECISION,
-    sweep_amplitude_v DOUBLE PRECISION
-);
+Failed attempts are recorded too (failed detection, aborted refinement, rejected lock
+command, no usable trace), with `failure_stage` (`trace_capture`, `detection`,
+`refinement`, `lock_command`) and `failure_reason`.
+
+Not recorded:
+
+- Requests refused by a precheck before any hardware command (device not connected,
+  already locked, actuator busy, a staged run active, a stale staged frame).
+- Anything that keeps an existing lock: parameter changes while locked, register
+  writes, recentring, lock-indicator or lock-state updates.
+- Read-only probes: `auto_lock_candidates`, `acquire_scan`, calibration, staged
+  `begin`/`step`.
+
+### `lock_acquisition_id`
+
+Each attempt gets a UUID4 `lock_acquisition_id` once it passes its prechecks and
+before any hardware command, whether or not PostgreSQL is enabled or reachable. It
+identifies that attempt everywhere: in the API response, in the board/log events, in
+the PostgreSQL row (its primary key), and in later updates of that row. It never
+changes, and no two attempts share one.
+
+Where a client gets it:
+
+- `start_lock` returns `{"ok": true, "lock_acquisition_id": "…"}`.
+- `auto_lock_scan` and staged `/lock` responses carry a `lock_acquisition_id` field.
+- On failure: if the error `detail` is an object it gains `lock_acquisition_id`;
+  a string `detail` stays a string and the ID is in the `X-Lock-Acquisition-Id`
+  response header. A precheck refusal has no ID (it was not an attempt).
+- Auto-relock: `last_lock_acquisition_id` in the auto-relock status, and in the
+  `auto_relock_action_*` log events.
+
+A client that keeps its own records stores the ID next to them and fetches the
+gateway's record when it needs it. The gateway knows nothing about the client's
+records; the link lives on the client's side only.
+
+```python
+import requests
+
+GATEWAY = "http://127.0.0.1:8000"
+
+r = requests.post(f"{GATEWAY}/api/devices/laser-a/control/auto_lock_scan", json={})
+acquisition_id = r.json().get("lock_acquisition_id") or r.headers.get("X-Lock-Acquisition-Id")
+my_measurement["lock_acquisition_id"] = acquisition_id      # in your own store
+
+# later
+record = requests.get(f"{GATEWAY}/api/lock-acquisitions/{acquisition_id}").json()
+print(record["verification_status"], record["sweep_center_v"], record["linien_config"])
 ```
 
-Existing deployments migrate themselves: the first write of each gateway process applies
-`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` on the same connection before
-inserting, so no hand-run migration and no re-saving of the settings is needed. (The
-schema step previously ran only from `Test connection`, which meant an upgraded gateway
-nobody re-saved would insert columns that had never been added — and the failure is
-swallowed by the best-effort writer, so *all* lock logging would have gone quiet.)
+### Accepted, verified, persisted
 
-**Aborted auto-locks are written too**, with `success = false`. They carry the largest
-measured offsets, so leaving them out would keep the most informative rows out of the
-table you would characterise a laser's hysteresis from. The same numbers also ride on
-the `auto_lock_scan_started` / `auto_lock_scan_failed` board events, so per-device
-history is visible in the UI without querying the database.
+Three separate facts, each with its own field:
+
+| Question | Field | Meaning |
+|---|---|---|
+| Did Linien take the lock command? | `lock_command_status` (`not_sent` / `accepted` / `rejected`), `lock_command_at` | `success` is kept for compatibility and means exactly `accepted`. It is **not** proof of a stable lock. |
+| Did a stable lock follow? | `verification_status`, `verification_reason`, `verification_completed_at` | `verified`: the gateway lock indicator said "locked" continuously for auto-relock's `verify_hold_s` (default 1.2 s) after the command. `failed`: the indicator reported "lost", the lock dropped, or nothing was confirmed within 15 s. `unavailable`: lock indicator disabled, no plot frames, or a new attempt started first. `not_attempted`: the command was not accepted. `pending` until decided. |
+| Is the record in PostgreSQL? | spool state, `persistence` in the read API | `pending`/`retrying` until PostgreSQL acknowledges the upsert, then `persisted`. Enqueued never means persisted. |
+
+Verification runs off the plot frames that already drive the lock indicator; nothing
+waits for it. Its outcome updates the same row by `lock_acquisition_id`.
+
+### The stored trace
+
+Each record stores the unlocked sweep the acquisition was decided on, paired with the
+sweep geometry of that same sweep:
+
+- **Manual lock:** the cached unlocked sweep, copied *before* the lock command. If it is
+  older than 5 s, or the device was already locked, no trace is stored.
+- **Scan auto-lock / auto-relock:** the frame whose detection produced the result the
+  lock was started from. After a refinement walk that is the narrowed scan's verified
+  frame, with the narrowed geometry, not the scan the attempt started from and not the
+  lock point written to `sweep_center` afterwards.
+- **Staged lock:** the second confirmation frame measured at the final geometry; the
+  caller's `selected_frame_id` and `selected_target_index` are in `trace_meta`.
+- **Failed attempts:** the last frame the attempt analysed (`trace_meta.purpose =
+  "last_analysed_frame"`), or no trace.
+
+| Column | Content |
+|---|---|
+| `trace_y` | Combined error signal Linien locks on (`trace_y_role = "combined_error"`), in plot volts: ADC counts / 8192. |
+| `secondary_trace_y` | The second input, with `secondary_trace_role`: `monitor` (photodiode) or `error_signal_2` (dual-channel mode: a second demodulated error signal, **not** a monitor). |
+| `trace_x` | Sweep axis. `trace_x_source = "reconstructed_from_sweep"`: volts, sample *k* of *n* at `sweep_center_v − sweep_amplitude_v + 2·sweep_amplitude_v·k/(n−1)`. The board does not report per-sample sweep voltages; this is the same mapping the auto-lock uses to command a lock point, so it is validated by every auto-lock that lands on target. `sample_index` (units `sample`) when the geometry is unknown or the sweep is paused. |
+| `sweep_center_v`, `sweep_amplitude_v` | The geometry of the stored trace, read back from the device right after the trace was copied (`trace_meta.geometry_read_at`). |
+| `trace_meta` (JSONB) | `purpose`, `detector`, `frame_id`, `frame_processed_at` (gateway processing time, not board acquisition time), `trace_age_at_attempt_s`, `n_samples`, `secondary_n_samples`, `secondary_length_mismatch`, `dual_channel`, `channel_mixing`, `sweep_paused`, `x_axis_source`, `x_axis_model`, `y_scale`. |
+
+A missing trace is `NULL`, never a placeholder waveform, and `trace_unavailable_reason`
+says why (`no_trace_captured`, `stale_unlocked_trace (… s old)`,
+`device_already_locked`, `no_unlocked_trace_cached`, …). A second trace of a different
+length is stored as measured, not padded.
+
+### Configuration snapshot (`linien_config`)
+
+Raw Linien parameter values in Linien's own units (register counts, internal scales),
+read from the linien-client cache just before the lock command. That is after any
+refinement; a failed attempt keeps the copy taken when it started
+(`captured_at_stage`). Included: output routing (`mod_channel`, `control_channel`,
+`sweep_channel`, `slow_control_channel`, output polarities), modulation and
+demodulation (frequency, amplitude, phases, multipliers, inversion), error-signal
+combination (`dual_channel`, `channel_mixing`, offsets, `combined_offset`), all filter
+settings, the controller (`p`, `i`, `d`, `target_slope_rising`, slow-PID settings,
+`pid_only_mode`), the sweep (`sweep_center`, `sweep_amplitude`, `sweep_speed`,
+`sweep_pause`), Linien's lock watching and autolock preferences, and `lock`.
+
+```json
+{"schema_version": 1, "captured_at": 1793600000.1, "captured_at_stage": "pre_lock_command",
+ "linien_client_version": "2.1.0", "units": "raw Linien parameter values (internal units)",
+ "parameters": {"modulation_frequency": 33554432, "p": 50, "...": "..."},
+ "missing": [], "gateway": {"auto_lock_scan": {}, "lock_acceptance": {}, "lock_indicator": {}}}
+```
+
+Parameters that do not exist or cannot be read are listed in `missing`; non-finite
+values are stored as `null`. Plot buffers, histories, task/optimization/PSD state and
+credentials are never included. The converted columns (`modulation_frequency_hz`,
+`demod_phase_deg`, `signal_offset_volts`, `modulation_amplitude`, `pid_p/i/d`) remain
+for convenient SQL.
+
+### Trace characterization
+
+A diagnostic description of the stored trace, computed with the auto-lock detector's
+own functions. It never influences a lock decision, and a failure here never blocks a
+lock or a record. Auto-lock records describe the detection the lock was started from;
+manual-lock records run the detector read-only on the copied sweep.
+
+| Field | Units |
+|---|---|
+| `zero_crossing_sweep_v` | sweep volts |
+| `slope_error_v_per_sweep_v` | error plot-volts per sweep volt (fit over half the detector's `half_range_sweep_v` window, so it depends on that calibration) |
+| `discriminator_slope_v_per_mhz` | error plot-volts per MHz; **only** when the sidebands calibrate the sweep axis (PDH, known modulation frequency, sidebands resolved). `characterization.frequency_calibration` then holds `hz_per_sweep_v`. Otherwise `null`. |
+| `peak_to_peak_v` | lobe peak-to-peak around the carrier, plot volts |
+| `characterization.baseline_v`, `.feature_width_sweep_v` | median error away from the feature; separation of the two carrier lobe peaks. `null` when not measurable, with a note. |
+
+`characterization_status` is `ok`, `no_feature_detected` (not a resolvable
+discriminator signal), `not_applicable` (sweep paused or geometry unknown),
+`unavailable` (no trace) or `error`, with `characterization.reason`.
+
+### Database setup
+
+Everything lives in one PostgreSQL schema, `linien` by default (configurable in the
+`Postgres` settings as `db_schema`):
+
+- `linien.pdh_lock_results`: one row per attempt, primary key `lock_acquisition_id`.
+- `linien.pdh_lock_schema`: a single row holding `schema_version` (currently 1).
+
+Two ways to create them, with identical results:
+
+1. Start the bundled container (`docker/postgres`), whose init script
+   `docker/postgres/postgres-init/01-init.sql` creates them on a fresh data volume.
+2. Point the gateway at an empty database: it creates the schema on the first
+   `Test connection` or write.
+
+Both come from one definition, `TABLE_COLUMNS` in
+`linien-gateway/app/manual_lock_postgres.py`. `01-init.sql` is generated by
+`render_init_sql()`, and a test fails if the two differ. After changing the definition,
+regenerate the file:
+
+```powershell
+cd linien-gateway
+python -c "from app.manual_lock_postgres import render_init_sql; open('../docker/postgres/postgres-init/01-init.sql','w',newline='\n').write(render_init_sql())"
+```
+
+**The gateway never alters an existing table.** If it finds a table without a version
+row, a different `schema_version`, or a column set other than the one it writes, it
+reports `schema_ok: false` with the reason in the Postgres status, writes nothing, and
+keeps the records in the spool. A future schema change will ship an explicit migration
+keyed on `schema_version`.
+
+Earlier gateway versions defined a `public.pdh_lock_results` table with a different
+shape. The new writer neither reads nor touches it. If you have such a table and want
+its rows, copy them across by hand. They have no acquisition IDs or trace metadata,
+so generate IDs and leave the new columns `NULL` rather than inventing values.
+
+### Local spool and recovery
+
+Every record is written first to a local SQLite file (WAL mode),
+`lock_acquisition_spool.sqlite3`, next to `manual_lock_postgres.json`. That takes a few
+milliseconds and never touches the network, so hardware control never waits for
+PostgreSQL. A background writer then upserts due records by `lock_acquisition_id`, so
+retries and updates never create a second row.
+
+| Spool state | Meaning |
+|---|---|
+| `pending` | new, updated, or recovered after a restart; waiting to be sent |
+| `retrying` | the last attempt hit a temporary error (connection, timeout, schema mismatch); next try after exponential backoff, 1 s doubling to a 5 min cap |
+| `persisted` | PostgreSQL acknowledged the latest version |
+| `failed` | PostgreSQL rejected it permanently (data or constraint error); kept for inspection, not retried |
+
+- The Postgres status (`GET /api/postgres/manual-lock`) reports `pending_count`,
+  `retrying_count`, `persisted_count`, `failed_count`, `queue_size`,
+  `dropped_count`, `schema_ok` and `schema_error`.
+- On shutdown the writer finishes the record in flight and stops. Anything unsent stays
+  in the spool and goes out after the next start; no drain timeout loses records.
+- Retention, configurable: `spool_max_records` (10,000) and `spool_max_age_days` (30).
+  Persisted records are pruned first. Unsent records never expire by age and are only
+  dropped (oldest first, with a warning, counted in `dropped_count`) if unsent records
+  alone exceed the limit.
+- WAL with `synchronous=NORMAL` survives a gateway crash; an OS crash or power loss can
+  lose the last few spooled records.
+- With PostgreSQL logging disabled nothing is recorded or spooled. The acquisition IDs
+  are still assigned and returned.
+
+### Reading the history
+
+Read-only endpoints, useful to any client:
+
+- `GET /api/devices/{key}/lock-acquisitions`: newest attempt first. Filters: `since`,
+  `until` (Unix seconds), `lock_source`, `verification_status`, `lock_command_status`,
+  `success`; paging with `limit` (≤ 1000) and `offset`. Metadata only by default;
+  `include=traces,config,refinement` adds the large fields.
+- `GET /api/lock-acquisitions/{lock_acquisition_id}`: one full record, with its
+  configuration snapshot, traces and refinement history.
+
+Responses come from PostgreSQL when it is reachable (`"source": "postgres"`), otherwise
+from the local spool (`"source": "spool"`, with a generic
+`postgres_unavailable_reason`). A list from PostgreSQL does not include records still
+waiting in the spool; `unsent_records` counts them, and fetching one by ID falls back
+to the spool. Each record carries `persistence` (`persisted`, or its spool state).
+Timestamps are Unix seconds, and `NaN` samples are `null`. Responses never contain
+database credentials or connection strings.
+
+### Querying in SQL
+
+```sql
+-- Last 20 attempts on one device, with outcome
+SELECT lock_acquisition_id, attempt_started_at, lock_source, lock_command_status,
+       verification_status, failure_stage, failure_reason
+FROM linien.pdh_lock_results
+WHERE device_key = 'laser-a'
+ORDER BY attempt_started_at DESC LIMIT 20;
+
+-- Verified locks with their discriminator slope and PID settings
+SELECT attempt_started_at, discriminator_slope_v_per_mhz, slope_error_v_per_sweep_v,
+       pid_p, pid_i, pid_d, linien_config->'parameters'->>'demodulation_phase_a' AS phase_a_raw
+FROM linien.pdh_lock_results
+WHERE verification_status = 'verified' AND device_key = 'laser-a';
+
+-- One acquisition's trace as (x, y) pairs
+SELECT x, y
+FROM linien.pdh_lock_results,
+     unnest(trace_x, trace_y) AS t(x, y)
+WHERE lock_acquisition_id = '7f0c1a52-5d0e-4b8e-9a51-3f7d2c4c9e10';
+
+-- Acquisitions without a usable trace, and why
+SELECT lock_source, trace_unavailable_reason, count(*)
+FROM linien.pdh_lock_results
+WHERE trace_y IS NULL
+GROUP BY 1, 2;
+```
+
+The writer is tested against an in-memory stand-in. To also run its tests against a
+real PostgreSQL, start the bundled container and set `LINIEN_TEST_POSTGRES_DSN`. Each
+test uses and drops its own throwaway schema:
+
+```powershell
+$env:LINIEN_TEST_POSTGRES_DSN = "host=127.0.0.1 port=5432 dbname=experiment_db user=admin password=adminpassword"
+python -m pytest linien-gateway/tests/test_lock_records_real_postgres.py
+```
 
 For a local Dockerized Postgres/pgAdmin setup, see [docker/README.md](docker/README.md).
-The shipped init SQL is `docker/postgres/postgres-init/01-init.sql`.
 
 ## Optional InfluxDB logging
 

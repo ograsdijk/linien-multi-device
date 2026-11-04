@@ -19,6 +19,7 @@
  },
  "hz_per_v": 159726495.7,
  "left_excursion": 0.2578119316,
+ "lock_acquisition_id": "LOCK_ACQUISITION_ID",
  "monitor_contrast": null,
  "monitor_level": null,
  "pair_excursion": 0.5530732815,

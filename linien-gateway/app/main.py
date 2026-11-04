@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
@@ -51,7 +52,14 @@ from .board_event_store import (
 from .diagnosis import DiagnosisProbe
 from .influx_writer import InfluxLineWriter
 from .log_store import LogStore
-from .manual_lock_postgres import LockResultPostgresService
+from .manual_lock_postgres import (
+    INCLUDE_GROUPS,
+    LOCK_COMMAND_STATUSES,
+    LOCK_SOURCES,
+    VERIFICATION_STATUSES,
+    LockResultPostgresService,
+    RecordFilters,
+)
 from .path_utils import find_repo_root, resolve_repo_path
 from .psd_store import PsdStore
 from .rp_telemetry import RpTelemetryManager
@@ -847,11 +855,46 @@ def reboot_device(key: str, response: Response) -> dict:
     return {"ok": True, "operation_id": recovery["operation_id"]}
 
 
+LOCK_ACQUISITION_ID_HEADER = "X-Lock-Acquisition-Id"
+
+
+def _lock_attempt_http_error(
+    status_code: int, detail: Any, exc: BaseException
+) -> HTTPException:
+    """An HTTPException that also identifies the failed lock attempt, if any.
+
+    A dict ``detail`` gains a ``lock_acquisition_id`` key. A string ``detail``
+    stays a string -- clients parse it -- and the ID goes in the
+    ``X-Lock-Acquisition-Id`` header instead. An attempt refused by a precheck
+    (not connected, already locked, actuator busy) never started, so it has no
+    ID and gets neither.
+    """
+    acquisition_id = getattr(exc, "lock_acquisition_id", None)
+    if not isinstance(acquisition_id, str):
+        return HTTPException(status_code=status_code, detail=detail)
+    if isinstance(detail, dict):
+        return HTTPException(
+            status_code=status_code,
+            detail={**detail, "lock_acquisition_id": acquisition_id},
+            headers={LOCK_ACQUISITION_ID_HEADER: acquisition_id},
+        )
+    return HTTPException(
+        status_code=status_code,
+        detail=detail,
+        headers={LOCK_ACQUISITION_ID_HEADER: acquisition_id},
+    )
+
+
 @app.post("/api/devices/{key}/control/start_lock")
 def start_lock(key: str) -> dict:
+    """Start a manual lock.
+
+    Returns ``{"ok": true, "lock_acquisition_id": "<uuid>"}``; the session
+    records the attempt (trace copied before the lock command) under that ID.
+    """
     session = _get_session(key)
     try:
-        session.start_lock()
+        acquisition_id = session.start_lock()
     except ValueError as exc:
         _emit_log(
             level=logging.ERROR,
@@ -859,9 +902,12 @@ def start_lock(key: str) -> dict:
             code="manual_lock_failed",
             message="Manual lock failed.",
             device_key=key,
-            details={"error": str(exc)},
+            details={
+                "error": str(exc),
+                "lock_acquisition_id": getattr(exc, "lock_acquisition_id", None),
+            },
         )
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise _lock_attempt_http_error(422, str(exc), exc)
     except RuntimeError as exc:
         _emit_log(
             level=logging.ERROR,
@@ -869,62 +915,24 @@ def start_lock(key: str) -> dict:
             code="manual_lock_failed",
             message="Manual lock failed.",
             device_key=key,
-            details={"error": str(exc)},
+            details={
+                "error": str(exc),
+                "lock_acquisition_id": getattr(exc, "lock_acquisition_id", None),
+            },
         )
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise _lock_attempt_http_error(409, str(exc), exc)
+    response: dict[str, Any] = {"ok": True}
+    if isinstance(acquisition_id, str):
+        response["lock_acquisition_id"] = acquisition_id
     _emit_log(
         level=logging.INFO,
         source="lock",
         code="manual_lock_attempt",
         message="Manual lock command accepted.",
         device_key=key,
+        details={"lock_acquisition_id": response.get("lock_acquisition_id")},
     )
-    try:
-        device = device_store.get_device(key)
-        device_name = device.name if device is not None else key
-        row = session.build_manual_lock_row(
-            device_name=device_name,
-            device_key=key,
-            lock_source="manual_lock",
-        )
-        enqueued = lock_result_postgres.enqueue_lock_result(row)
-        if not enqueued:
-            details: dict[str, Any] = {"error": "enqueue_rejected"}
-            if hasattr(lock_result_postgres, "get_state"):
-                try:
-                    state = lock_result_postgres.get_state()
-                    status = state.get("status", {}) if isinstance(state, dict) else {}
-                    if isinstance(status, dict):
-                        details["last_error"] = status.get("last_error")
-                        details["active"] = status.get("active")
-                except Exception:
-                    logger.debug(
-                        "Failed reading postgres state after manual enqueue rejection",
-                        exc_info=True,
-                    )
-            _emit_log(
-                level=logging.WARNING,
-                source="postgres",
-                code="lock_result_postgres_enqueue_rejected",
-                message="Lock-result postgres enqueue rejected.",
-                device_key=key,
-                details=details,
-            )
-    except Exception as exc:  # noqa: BLE001 - best effort logging hook
-        logger.warning(
-            "Lock-result postgres enqueue failed device=%s",
-            key,
-            exc_info=True,
-        )
-        _emit_log(
-            level=logging.WARNING,
-            source="postgres",
-            code="lock_result_postgres_enqueue_failed",
-            message="Lock-result postgres enqueue failed.",
-            device_key=key,
-            details={"error": str(exc)},
-        )
-    return {"ok": True}
+    return response
 
 
 @app.get("/api/devices/{key}/lock-indicator")
@@ -1268,6 +1276,7 @@ def _auto_lock_event_details(result: dict[str, Any]) -> dict[str, Any]:
         "target_voltage": result.get("target_voltage"),
         "target_index": result.get("target_index"),
         "score": result.get("score"),
+        "lock_acquisition_id": result.get("lock_acquisition_id"),
     }
     handover_timing = result.get("handover_command_timing")
     if isinstance(handover_timing, dict):
@@ -1324,30 +1333,14 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
     )
     try:
         result = session.auto_lock_from_scan(settings_payload)
-    except RuntimeError as exc:
-        report = getattr(exc, "report", None)
-        details: dict[str, Any] = {"error": str(exc)}
-        refinement = getattr(exc, "refinement", None)
-        if isinstance(refinement, dict):
-            details["refinement"] = refinement
-        if isinstance(report, dict):
-            _enqueue_auto_lock_row(session, key, success=False)
-        _emit_log(
-            level=logging.ERROR,
-            source="auto_lock_scan",
-            code="auto_lock_scan_failed",
-            message="Auto-lock from scan failed.",
-            device_key=key,
-            details=details,
-        )
-        if isinstance(refinement, dict):
-            raise HTTPException(
-                status_code=409,
-                detail={"message": str(exc), "refinement": refinement},
-            )
-        raise HTTPException(status_code=409, detail=str(exc))
-    except ValueError as exc:
-        details = {"error": str(exc)}
+    except (RuntimeError, ValueError) as exc:
+        # The session has already recorded the attempt (if it got past its
+        # prechecks); the API only reports it.
+        status_code = 409 if isinstance(exc, RuntimeError) else 422
+        details: dict[str, Any] = {
+            "error": str(exc),
+            "lock_acquisition_id": getattr(exc, "lock_acquisition_id", None),
+        }
         refinement = getattr(exc, "refinement", None)
         if isinstance(refinement, dict):
             details["refinement"] = refinement
@@ -1360,11 +1353,10 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
             details=details,
         )
         if isinstance(refinement, dict):
-            raise HTTPException(
-                status_code=422,
-                detail={"message": str(exc), "refinement": refinement},
+            raise _lock_attempt_http_error(
+                status_code, {"message": str(exc), "refinement": refinement}, exc
             )
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise _lock_attempt_http_error(status_code, str(exc), exc)
     _emit_log(
         level=logging.INFO,
         source="auto_lock_scan",
@@ -1373,68 +1365,7 @@ def auto_lock_scan(key: str, payload: AutoLockScanSettings) -> dict:
         device_key=key,
         details=_auto_lock_event_details(result),
     )
-    _enqueue_auto_lock_row(session, key, success=True)
     return result
-
-
-def _enqueue_auto_lock_row(
-    session: Any,
-    key: str,
-    *,
-    success: bool,
-) -> None:
-    """Record an auto-lock attempt in postgres, successful or not.
-
-    Aborted attempts are written too: they carry the largest measured offsets,
-    so leaving them out would keep the most informative rows out of the very
-    table you would characterise a laser's hysteresis from.
-    """
-    try:
-        device = device_store.get_device(key)
-        device_name = device.name if device is not None else key
-        row = session.build_manual_lock_row(
-            device_name=device_name,
-            device_key=key,
-            lock_source="auto_lock_scan",
-            success=success,
-        )
-        enqueued = lock_result_postgres.enqueue_lock_result(row)
-        if not enqueued:
-            details: dict[str, Any] = {"error": "enqueue_rejected"}
-            if hasattr(lock_result_postgres, "get_state"):
-                try:
-                    state = lock_result_postgres.get_state()
-                    status = state.get("status", {}) if isinstance(state, dict) else {}
-                    if isinstance(status, dict):
-                        details["last_error"] = status.get("last_error")
-                        details["active"] = status.get("active")
-                except Exception:
-                    logger.debug(
-                        "Failed reading postgres state after autolock enqueue rejection",
-                        exc_info=True,
-                    )
-            _emit_log(
-                level=logging.WARNING,
-                source="postgres",
-                code="auto_lock_scan_postgres_enqueue_rejected",
-                message="Auto-lock postgres enqueue rejected.",
-                device_key=key,
-                details=details,
-            )
-    except Exception as exc:  # noqa: BLE001 - best effort logging hook
-        logger.warning(
-            "Auto-lock postgres enqueue failed device=%s",
-            key,
-            exc_info=True,
-        )
-        _emit_log(
-            level=logging.WARNING,
-            source="postgres",
-            code="auto_lock_scan_postgres_enqueue_failed",
-            message="Auto-lock postgres enqueue failed.",
-            device_key=key,
-            details={"error": str(exc)},
-        )
 
 
 @app.post(
@@ -1650,12 +1581,15 @@ async def staged_autolock_lock(
                     if isinstance(exc.details, dict) and "verification" in exc.details
                     else {}
                 ),
+                "lock_acquisition_id": getattr(exc, "lock_acquisition_id", None),
             },
         )
-        _enqueue_auto_lock_row(session, key, success=False)
-        raise _staged_autolock_http_error(exc)
+        # The staged error's own detail (e.g. its verification report), with
+        # the attempt's lock_acquisition_id added.
+        staged_error = _staged_autolock_http_error(exc)
+        raise _lock_attempt_http_error(staged_error.status_code, staged_error.detail, exc)
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise _lock_attempt_http_error(409, str(exc), exc)
     _emit_log(
         level=logging.INFO,
         source="staged_autolock",
@@ -1664,7 +1598,6 @@ async def staged_autolock_lock(
         device_key=key,
         details=_auto_lock_event_details(result),
     )
-    _enqueue_auto_lock_row(session, key, success=True)
     return result
 
 
@@ -2332,6 +2265,84 @@ def test_postgres_manual_lock_state() -> dict:
     }
 
 
+def _choice(name: str, value: str | None, allowed: tuple[str, ...]) -> str | None:
+    if value is None or value in allowed:
+        return value
+    raise HTTPException(
+        status_code=422, detail=f"{name} must be one of {', '.join(allowed)}."
+    )
+
+
+def _includes(include: str | None) -> frozenset[str]:
+    groups = frozenset(item.strip() for item in (include or "").split(",") if item.strip())
+    unknown = groups - set(INCLUDE_GROUPS)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"include accepts {', '.join(sorted(INCLUDE_GROUPS))}; "
+            f"got {', '.join(sorted(unknown))}.",
+        )
+    return groups
+
+
+@app.get("/api/devices/{key}/lock-acquisitions")
+def list_lock_acquisitions(
+    key: str,
+    since: float | None = Query(None, description="Attempts at or after (Unix s)."),
+    until: float | None = Query(None, description="Attempts before (Unix s)."),
+    lock_source: str | None = None,
+    verification_status: str | None = None,
+    lock_command_status: str | None = None,
+    success: bool | None = None,
+    include: str | None = Query(
+        None, description="Comma-separated extras: traces, config, refinement."
+    ),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """Lock-acquisition history of one device, newest attempt first.
+
+    Read-only. Metadata only unless ``include`` asks for the traces, the Linien
+    configuration snapshot or the refinement history. Served from PostgreSQL
+    when reachable, otherwise from the gateway's local spool; ``source`` says
+    which. Records of a device that has since been removed stay queryable.
+    """
+    filters = RecordFilters(
+        since=since,
+        until=until,
+        lock_source=_choice("lock_source", lock_source, LOCK_SOURCES),
+        verification_status=_choice(
+            "verification_status", verification_status, VERIFICATION_STATUSES
+        ),
+        lock_command_status=_choice(
+            "lock_command_status", lock_command_status, LOCK_COMMAND_STATUSES
+        ),
+        success=success,
+    )
+    result = lock_result_postgres.list_records(
+        device_key=key,
+        filters=filters,
+        include=_includes(include),
+        limit=limit,
+        offset=offset,
+    )
+    return {"device_key": key, **result}
+
+
+@app.get("/api/lock-acquisitions/{lock_acquisition_id}")
+def get_lock_acquisition(lock_acquisition_id: str) -> dict:
+    """One lock-acquisition record by its ID, with its Linien configuration
+    snapshot, traces and refinement history."""
+    try:
+        canonical = str(uuid.UUID(lock_acquisition_id))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Not a lock_acquisition_id (UUID).")
+    record = lock_result_postgres.get_record(canonical)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Lock acquisition not found.")
+    return record
+
+
 @app.get("/api/logs/tail", response_model=LogTailResponse)
 def get_logs_tail(limit: int = 500) -> dict:
     safe_limit = max(1, min(int(limit), 5_000))
@@ -2569,8 +2580,7 @@ def main() -> None:
         host=get_api_host(),
         port=get_api_port(),
         reload=False,
-        # See run.py for the rationale; same flag for the no-reload
-        # production-style invocation.
+        # See run.py for the rationale behind both flags.
         ws_per_message_deflate=True,
     )
 

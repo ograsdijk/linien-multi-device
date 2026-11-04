@@ -63,4 +63,12 @@ Initialization SQL:
 
 - `docker/postgres/postgres-init/01-init.sql`
 
-This SQL creates/updates the `pdh_lock_results` table used by gateway lock logging.
+It is generated from the gateway's schema definition (do not edit it by hand) and
+creates the `linien` schema with `linien.pdh_lock_results` (one row per lock-acquisition
+attempt) and `linien.pdh_lock_schema` (its schema version). Docker runs init scripts
+only on an empty data volume. On an existing volume the gateway creates the same schema
+itself on first use, and refuses to write to a table of another version. See
+[Lock-acquisition records](../README.md#lock-acquisition-records-optional-postgresql).
+
+The gateway's default Postgres password matches this container (`adminpassword`). The
+API never returns the stored password; leave the password field blank to keep it.

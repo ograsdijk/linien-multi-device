@@ -229,6 +229,9 @@ class AutoLockScanResult(BaseModel):
     # Host-side duration of the final register write/start-lock RPC calls.
     # This does not claim to measure physical lock engagement.
     handover_command_timing: Optional[dict[str, Any]] = None
+    # Identifies this attempt's lock-acquisition record (one per attempt).
+    # Optional so clients and payloads that predate it stay valid.
+    lock_acquisition_id: Optional[str] = None
 
 
 class StagedAutolockSelected(BaseModel):
@@ -374,6 +377,7 @@ class AutoRelockStatus(BaseModel):
     last_attempt_at: Optional[float] = None
     last_success_at: Optional[float] = None
     last_failure_at: Optional[float] = None
+    last_lock_acquisition_id: Optional[str] = None
     last_error: Optional[str] = None
 
 
@@ -511,9 +515,17 @@ class PostgresManualLockConfig(BaseModel):
     port: int = Field(default=5432, ge=1, le=65535)
     database: str = "experiment_db"
     user: str = "admin"
-    password: str = "adminpassword"
+    # Write-only. Responses carry "" plus password_set; a blank password in a
+    # PUT keeps the stored one.
+    password: str = ""
+    password_set: Optional[bool] = None
     sslmode: Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] = "prefer"
     connect_timeout_s: float = Field(default=3.0, ge=0.1, le=120.0)
+    # PostgreSQL schema holding the lock-acquisition tables.
+    db_schema: str = Field(default="linien", pattern=r"^[a-z_][a-z0-9_]{0,62}$")
+    # Local spool retention (records awaiting or already sent to PostgreSQL).
+    spool_max_records: int = Field(default=10_000, ge=100, le=1_000_000)
+    spool_max_age_days: float = Field(default=30.0, ge=1.0, le=3650.0)
 
 
 class PostgresManualLockStatus(BaseModel):
@@ -529,6 +541,14 @@ class PostgresManualLockStatus(BaseModel):
     write_error_count: int = 0
     dropped_count: int = 0
     queue_size: int = 0
+    # Local spool: awaiting first send / backing off after a temporary
+    # failure / acknowledged by PostgreSQL / rejected permanently.
+    pending_count: int = 0
+    retrying_count: int = 0
+    persisted_count: int = 0
+    failed_count: int = 0
+    schema_ok: Optional[bool] = None
+    schema_error: Optional[str] = None
 
 
 class PostgresManualLockState(BaseModel):
