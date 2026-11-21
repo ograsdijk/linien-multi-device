@@ -44,6 +44,8 @@ export type LockAcquisitionSummary = {
   peak_to_peak_v: number | null;
   trace_unavailable_reason: string | null;
   trace_meta: Record<string, unknown> | null;
+  // Control voltage on the first locked frame after the command (plot volts).
+  post_lock_control_v?: number | null;
   persistence?: string;
   source?: string;
 };
@@ -62,6 +64,35 @@ export type LockAcquisitionRecord = LockAcquisitionSummary & {
   } | null;
   characterization?: Record<string, unknown> | null;
   refinement?: Record<string, unknown> | null;
+  post_lock?: PostLock | null;
+};
+
+export type PostLockFrame = {
+  t_s: number;
+  lock: boolean;
+  control_mean_v: number | null;
+  control_std_v: number | null;
+  error_std_v: number | null;
+  error_mean_abs_v: number | null;
+  monitor_mean_v: number | null;
+  monitor_std_v: number | null;
+};
+
+export type PostLock = {
+  version: number;
+  window_s: number;
+  end_reason: string | null;
+  frames_seen: number;
+  summary: {
+    first_locked_at_s: number | null;
+    locked_fraction: number | null;
+    first_control_v: number | null;
+    last_control_v: number | null;
+    control_drift_v: number | null;
+    mean_error_std_v: number | null;
+  };
+  frames: PostLockFrame[];
+  first_locked_frame: Record<string, unknown> | null;
 };
 
 export type LockAcquisitionList = {
@@ -365,4 +396,23 @@ export const lockMarkers = (record: LockAcquisitionRecord): LockMarkers => {
     legend: 'Dashed orange line: the zero crossing the lock was placed on.',
     summary: null,
   };
+};
+
+/** One line on what the board did after the lock command, or null if not recorded. */
+export const describePostLock = (postLock: PostLock | null | undefined): string | null => {
+  if (!postLock) return null;
+  const s = postLock.summary;
+  if (s.first_locked_at_s === null) {
+    return postLock.frames_seen === 0
+      ? 'No plot frames arrived after the lock command, so nothing was recorded.'
+      : `No frame showed the board locked within ${postLock.window_s} s of the command.`;
+  }
+  const parts = [`First locked frame ${Math.round(s.first_locked_at_s * 1000)} ms after the command`];
+  if (s.first_control_v !== null) parts.push(`control at ${Number(s.first_control_v.toFixed(4))} V`);
+  if (s.control_drift_v !== null)
+    parts.push(`moving ${Number((s.control_drift_v * 1000).toFixed(1))} mV over the next ${postLock.window_s} s`);
+  let line = parts.join(', ') + '.';
+  if (s.locked_fraction !== null && s.locked_fraction < 1)
+    line += ` Locked on ${Math.round(s.locked_fraction * 100)}% of the frames.`;
+  return line;
 };

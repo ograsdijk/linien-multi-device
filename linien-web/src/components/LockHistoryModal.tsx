@@ -19,12 +19,14 @@ import { api } from '../api';
 import { openDeviceStream } from '../ws';
 import type { Device, StreamMessage } from '../types';
 import { LockTracePlot } from './LockTracePlot';
+import { PostLockPlot } from './PostLockPlot';
 import { sweepIndexToVoltage } from './plotShared';
 import {
   LOCK_SOURCE_LABEL,
   SETTING_LABEL,
   commandDisplay,
   describeAttempt,
+  describePostLock,
   exportRecord,
   formatSetting,
   historyQuery,
@@ -406,6 +408,7 @@ export function LockHistoryModal({ opened, initialDeviceKey, devices, onClose }:
                   <Table.Th>Verification</Table.Th>
                   <Table.Th>Modulation</Table.Th>
                   <Table.Th>Slope</Table.Th>
+                  <Table.Th>Control after lock</Table.Th>
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -434,12 +437,13 @@ export function LockHistoryModal({ opened, initialDeviceKey, devices, onClose }:
                       </Table.Td>
                       <Table.Td>{formatMHz(item.modulation_frequency_hz)}</Table.Td>
                       <Table.Td>{formatNumber(item.discriminator_slope_v_per_mhz, 'V/MHz')}</Table.Td>
+                      <Table.Td>{formatNumber(item.post_lock_control_v ?? null, 'V', 4)}</Table.Td>
                     </Table.Tr>
                   );
                 })}
                 {items.length === 0 && !listLoading ? (
                   <Table.Tr>
-                    <Table.Td colSpan={7}>
+                    <Table.Td colSpan={8}>
                       <Text size="sm" c="dimmed" ta="center" py="md">
                         No lock attempts match these filters.
                       </Text>
@@ -557,6 +561,30 @@ export function LockHistoryModal({ opened, initialDeviceKey, devices, onClose }:
                   No trace was recorded for this attempt.
                 </Text>
               )}
+
+              {record.lock_command_status === 'accepted' ? (
+                <Stack gap={4} mt="xs">
+                  <Text size="sm" fw={600}>
+                    After the lock
+                  </Text>
+                  {record.post_lock ? (
+                    <>
+                      <Text size="sm">{describePostLock(record.post_lock)}</Text>
+                      {record.post_lock.frames.length > 0 ? (
+                        <PostLockPlot frames={record.post_lock.frames} />
+                      ) : null}
+                      <Text size="xs" c="dimmed">
+                        Green: control voltage (left axis). Blue: error signal spread (right axis). One point per
+                        plot frame, over the first {record.post_lock.window_s} s after the lock command.
+                      </Text>
+                    </>
+                  ) : (
+                    <Text size="sm" c="dimmed">
+                      Not recorded: this attempt predates post-lock recording, or its capture is still running.
+                    </Text>
+                  )}
+                </Stack>
+              ) : null}
 
               <Group justify="space-between" mt="xs">
                 <Group gap="xs">

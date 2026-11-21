@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   describeAttempt,
+  describePostLock,
   exportRecord,
   formatSetting,
   historyQuery,
@@ -147,5 +148,41 @@ describe('lockMarkers', () => {
     const auto = { ...manual, lock_source: 'auto_lock_scan' } as unknown as LockAcquisitionRecord;
     expect(lockMarkers(auto).markers.map((m) => m.sweepV)).toEqual([0.1062]);
     expect(lockMarkers(auto).summary).toBeNull();
+  });
+});
+
+describe('describePostLock', () => {
+  const base = {
+    version: 1, window_s: 3, end_reason: 'window_elapsed', frames_seen: 30, frames: [], first_locked_frame: null,
+  };
+  it('says when the lock engaged and where the control went', () => {
+    expect(
+      describePostLock({
+        ...base,
+        summary: {
+          first_locked_at_s: 0.12, locked_fraction: 1, first_control_v: 0.2104,
+          last_control_v: 0.2159, control_drift_v: 0.0055, mean_error_std_v: 0.0004,
+        },
+      }),
+    ).toBe('First locked frame 120 ms after the command, control at 0.2104 V, moving 5.5 mV over the next 3 s.');
+  });
+  it('flags a lock that dropped, and one that never engaged', () => {
+    const dropped = describePostLock({
+      ...base,
+      summary: {
+        first_locked_at_s: 0.1, locked_fraction: 0.4, first_control_v: 0.2,
+        last_control_v: 0.9, control_drift_v: 0.7, mean_error_std_v: 0.01,
+      },
+    });
+    expect(dropped).toContain('Locked on 40% of the frames.');
+    const never = describePostLock({
+      ...base,
+      summary: {
+        first_locked_at_s: null, locked_fraction: 0, first_control_v: null,
+        last_control_v: null, control_drift_v: null, mean_error_std_v: null,
+      },
+    });
+    expect(never).toBe('No frame showed the board locked within 3 s of the command.');
+    expect(describePostLock(null)).toBeNull();
   });
 });
