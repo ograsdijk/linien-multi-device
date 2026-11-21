@@ -4,7 +4,8 @@ import copy
 import json
 import logging
 import threading
-from typing import List
+from collections.abc import Callable
+from typing import Any, List
 
 from linien_client.device import (
     Device,
@@ -15,6 +16,10 @@ from linien_client.device import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The device's saved restorable Linien settings, replayed onto the board on
+# every connect (see DeviceSession._seed_or_replay_persistent_settings_locked).
+SETTINGS_SNAPSHOT_KEY = "linien_settings_snapshot"
 
 # Single process-wide lock serializing ALL access to devices.json — both the
 # in-memory cache and the on-disk read-modify-write.
@@ -98,6 +103,16 @@ def get_device(key: str) -> Device | None:
 
 
 def save_device(device: Device) -> None:
+    """Write `device` to devices.json, except its Linien settings snapshot.
+
+    Callers save whole records from copies they took earlier (the last-healthy
+    and recovery state, influx logging, config sync, a device edit), and the
+    gateway replays the snapshot onto the board on every connect. Saving a
+    stale copy used to write an old snapshot back, so the next restart put old
+    demodulation, filter and PID settings onto the board. The snapshot is
+    therefore owned by `update_settings_snapshot`: this keeps whatever is on
+    disk, and refreshes the caller's copy to match.
+    """
     # Hold the store lock across the existence check AND the underlying
     # linien_client write so concurrent saves can't interleave and clobber
     # each other (each rewrites the entire devices.json).
@@ -106,8 +121,62 @@ def save_device(device: Device) -> None:
         if existing is None:
             add_device(device)
         else:
+            _keep_stored_snapshot(existing, device)
             update_device(device)
         _invalidate_cache()
+
+
+def _keep_stored_snapshot(stored: Device, device: Device) -> None:
+    stored_params = getattr(stored, "parameters", None)
+    if not isinstance(stored_params, dict) or SETTINGS_SNAPSHOT_KEY not in stored_params:
+        return
+    params = getattr(device, "parameters", None)
+    params = params if isinstance(params, dict) else {}
+    stored_snapshot = stored_params[SETTINGS_SNAPSHOT_KEY]
+    if params.get(SETTINGS_SNAPSHOT_KEY) == stored_snapshot:
+        return
+    params[SETTINGS_SNAPSHOT_KEY] = copy.deepcopy(stored_snapshot)
+    device.parameters = params
+
+
+def get_settings_snapshot(key: str) -> tuple[bool, dict[str, Any] | None]:
+    """(device is stored, its snapshot as on disk). Reads disk, not the cache."""
+    with _store_lock:
+        device = _find_device(_safe_load_device_list(), key)
+        if device is None:
+            return False, None
+        params = device.parameters if isinstance(device.parameters, dict) else {}
+        snapshot = params.get(SETTINGS_SNAPSHOT_KEY)
+        return True, copy.deepcopy(snapshot) if isinstance(snapshot, dict) else None
+
+
+def update_settings_snapshot(
+    key: str,
+    mutate: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+) -> tuple[bool, dict[str, Any] | None]:
+    """Change one device's settings snapshot: read, mutate, write, under one lock.
+
+    `mutate` gets a copy of the snapshot on disk (None if there is none) and
+    returns the new snapshot, or None to leave it unchanged. Returns
+    (device is stored, the snapshot now on disk). Nothing is written when the
+    device is not stored.
+    """
+    with _store_lock:
+        devices = _safe_load_device_list()
+        device = _find_device(devices, key)
+        if device is None:
+            return False, None
+        params = device.parameters if isinstance(device.parameters, dict) else {}
+        current = params.get(SETTINGS_SNAPSHOT_KEY)
+        current = copy.deepcopy(current) if isinstance(current, dict) else None
+        updated = mutate(copy.deepcopy(current))
+        if updated is None:
+            return True, current
+        params[SETTINGS_SNAPSHOT_KEY] = copy.deepcopy(updated)
+        device.parameters = params
+        update_device(device)
+        _invalidate_cache()
+        return True, copy.deepcopy(updated)
 
 
 def remove_device(device: Device) -> None:
