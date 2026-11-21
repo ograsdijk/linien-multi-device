@@ -105,8 +105,12 @@ NORMALIZED_PARAMS_ON_CONNECT = (
     "channel_mixing",
     "modulation_frequency",
 )
-PERSISTENT_SETTINGS_SNAPSHOT_KEY = "linien_settings_snapshot"
+PERSISTENT_SETTINGS_SNAPSHOT_KEY = device_store.SETTINGS_SNAPSHOT_KEY
 PERSISTENT_SETTINGS_SNAPSHOT_VERSION = 1
+# Recent changes to the snapshot (who/what changed which setting from what to
+# what, and each replay onto the board), kept in devices.json so earlier
+# values can be looked up after the fact. The gateway keeps no log file.
+SETTINGS_SNAPSHOT_HISTORY_LIMIT = 200
 RECOVERY_STATE_KEY = "gateway_recovery"
 # When we last had a working connection to this board, and which kernel boot it
 # was in. Persisted because both halves are evidence about the *board*, and a
@@ -500,6 +504,7 @@ class DeviceSession:
         self.influx_logging_state = self._initial_influx_logging_state()
         self._persistent_param_names: set[str] = set(EXTRA_PERSISTENT_SETTINGS)
         self._persistent_replay_active = False
+        self._initial_param_callbacks_active = False
         self._pending_gateway_param_writes: dict[str, Any] = {}
         # Locally-mirrored value of `control.exposed_get_logging_status()`.
         # Refreshed on connect and whenever we call exposed_start_logging /
@@ -570,14 +575,129 @@ class DeviceSession:
             self.device.parameters = parameters
         return parameters
 
-    def _persistent_settings_snapshot(self) -> dict[str, Any] | None:
-        snapshot = self._device_parameters().get(PERSISTENT_SETTINGS_SNAPSHOT_KEY)
-        if not isinstance(snapshot, dict):
-            return None
-        values = snapshot.get("values")
-        if not isinstance(values, dict):
+    @staticmethod
+    def _valid_snapshot(snapshot: Any) -> dict[str, Any] | None:
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("values"), dict):
             return None
         return snapshot
+
+    def _persistent_settings_snapshot(self) -> dict[str, Any] | None:
+        """The snapshot as stored in devices.json (this session's copy if not stored).
+
+        Read from disk rather than from `self.device`: that copy is swapped on
+        every API request and can be older than what was last saved.
+        """
+        stored, snapshot = device_store.get_settings_snapshot(self.device.key)
+        if not stored:
+            snapshot = self._device_parameters().get(PERSISTENT_SETTINGS_SNAPSHOT_KEY)
+        return self._valid_snapshot(deepcopy(snapshot))
+
+    def _change_settings_snapshot(
+        self,
+        mutate: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+        *,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Change the stored snapshot with `mutate`, keep `self.device` in step, log it.
+
+        `mutate` gets the current snapshot (None if there is none) and returns
+        the new one, or None for no change. All snapshot writes go through
+        here, as a read-modify-write of devices.json under the store lock, so
+        a stale copy of the device can never write an older snapshot back.
+        """
+        seen: dict[str, Any] = {}
+
+        def _mutate(current: dict[str, Any] | None) -> dict[str, Any] | None:
+            seen["before"] = deepcopy(current)
+            updated = mutate(deepcopy(current))
+            if updated is None:
+                return None
+            changes = self._snapshot_value_changes(current, updated)
+            history = list((current or {}).get("history") or [])
+            if changes:
+                history.append(
+                    {"at": self._utc_now_iso(), "reason": reason, "changes": changes}
+                )
+            if history:
+                updated["history"] = history[-SETTINGS_SNAPSHOT_HISTORY_LIMIT:]
+            return updated
+
+        stored, snapshot = device_store.update_settings_snapshot(self.device.key, _mutate)
+        if not stored:
+            # A device that isn't in devices.json (not yet saved, or a test):
+            # keep the snapshot on this session's copy only.
+            local = self._device_parameters().get(PERSISTENT_SETTINGS_SNAPSHOT_KEY)
+            current = deepcopy(local) if isinstance(local, dict) else None
+            updated = _mutate(deepcopy(current))
+            snapshot = updated if updated is not None else current
+        parameters = self._device_parameters()
+        if snapshot is None:
+            parameters.pop(PERSISTENT_SETTINGS_SNAPSHOT_KEY, None)
+        else:
+            parameters[PERSISTENT_SETTINGS_SNAPSHOT_KEY] = deepcopy(snapshot)
+        self._log_snapshot_change(seen.get("before"), snapshot, reason)
+        return snapshot
+
+    @classmethod
+    def _snapshot_value_changes(
+        cls, before: dict[str, Any] | None, after: dict[str, Any] | None
+    ) -> dict[str, dict[str, Any]]:
+        old = (cls._valid_snapshot(before) or {}).get("values", {})
+        new = (cls._valid_snapshot(after) or {}).get("values", {})
+        return {
+            name: {"old": old.get(name), "new": new.get(name)}
+            for name in sorted(set(old) | set(new))
+            if not cls._settings_values_equal(old.get(name), new.get(name))
+        }
+
+    def _record_snapshot_history(
+        self, reason: str, changes: dict[str, dict[str, Any]]
+    ) -> None:
+        """Append to the snapshot's history without changing its values."""
+
+        def _mutate(current: dict[str, Any] | None) -> dict[str, Any] | None:
+            snapshot = self._valid_snapshot(current)
+            if snapshot is None:
+                return None
+            history = list(snapshot.get("history") or [])
+            history.append({"at": self._utc_now_iso(), "reason": reason, "changes": changes})
+            snapshot["history"] = history[-SETTINGS_SNAPSHOT_HISTORY_LIMIT:]
+            return snapshot
+
+        stored, snapshot = device_store.update_settings_snapshot(self.device.key, _mutate)
+        if stored and snapshot is not None:
+            self._device_parameters()[PERSISTENT_SETTINGS_SNAPSHOT_KEY] = deepcopy(snapshot)
+
+    def _log_snapshot_change(
+        self, before: dict[str, Any] | None, after: dict[str, Any] | None, reason: str
+    ) -> None:
+        changes = self._snapshot_value_changes(before, after)
+        if not changes:
+            return
+        summary = ", ".join(
+            f"{name}: {change['old']!r} -> {change['new']!r}"
+            for name, change in changes.items()
+        )
+        logger.info(
+            "Saved Linien settings changed device=%s reason=%s %s",
+            self.device.key,
+            reason,
+            summary,
+        )
+        self._emit_log_event(
+            level=logging.INFO,
+            source="settings_snapshot",
+            code="settings_snapshot_changed",
+            message=f"Saved settings changed ({reason}): {summary}",
+            details={"reason": reason, "changes": changes},
+        )
+
+    def _new_snapshot(self, values: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "version": PERSISTENT_SETTINGS_SNAPSHOT_VERSION,
+            "updated_at": self._utc_now_iso(),
+            "values": values,
+        }
 
     def _persist_settings_snapshot_values(self, values: dict[str, Any]) -> None:
         normalized_values: dict[str, Any] = {}
@@ -592,40 +712,36 @@ class DeviceSession:
                     self.device.key,
                     name,
                 )
-        parameters = self._device_parameters()
-        parameters[PERSISTENT_SETTINGS_SNAPSHOT_KEY] = {
-            "version": PERSISTENT_SETTINGS_SNAPSHOT_VERSION,
-            "updated_at": self._utc_now_iso(),
-            "values": normalized_values,
-        }
-        device_store.save_device(self.device)
+        self._change_settings_snapshot(
+            lambda _current: self._new_snapshot(normalized_values),
+            reason="seeded_from_board",
+        )
 
-    def _update_persistent_setting(self, name: str, value: Any) -> bool:
+    def _update_persistent_setting(
+        self, name: str, value: Any, *, reason: str = "gateway_write"
+    ) -> bool:
         if name not in self._persistent_param_names:
             return False
         try:
             encoded = self._serializable_setting_value(value)
         except ValueError:
             return False
-        parameters = self._device_parameters()
-        snapshot = self._persistent_settings_snapshot()
-        if snapshot is None:
-            snapshot = {
-                "version": PERSISTENT_SETTINGS_SNAPSHOT_VERSION,
-                "values": {},
-            }
-            parameters[PERSISTENT_SETTINGS_SNAPSHOT_KEY] = snapshot
-        values = snapshot.setdefault("values", {})
-        if not isinstance(values, dict):
-            values = {}
-            snapshot["values"] = values
-        if values.get(name) == encoded:
-            return False
-        values[name] = encoded
-        snapshot["version"] = PERSISTENT_SETTINGS_SNAPSHOT_VERSION
-        snapshot["updated_at"] = self._utc_now_iso()
-        device_store.save_device(self.device)
-        return True
+        changed = False
+
+        def _mutate(current: dict[str, Any] | None) -> dict[str, Any] | None:
+            nonlocal changed
+            snapshot = self._valid_snapshot(current) or self._new_snapshot({})
+            values = snapshot["values"]
+            if name in values and values[name] == encoded:
+                return None
+            values[name] = encoded
+            snapshot["version"] = PERSISTENT_SETTINGS_SNAPSHOT_VERSION
+            snapshot["updated_at"] = self._utc_now_iso()
+            changed = True
+            return snapshot
+
+        self._change_settings_snapshot(_mutate, reason=reason)
+        return changed
 
     def _refresh_persistent_param_names_locked(self) -> None:
         if self.parameters is None:
@@ -665,10 +781,9 @@ class DeviceSession:
             )
             return
 
-        values = snapshot.get("values")
-        if not isinstance(values, dict):
-            return
-        changed = 0
+        values = snapshot["values"]
+        replayed: dict[str, dict[str, Any]] = {}
+        missing: dict[str, Any] = {}
         self._persistent_replay_active = True
         try:
             for name, value in values.items():
@@ -678,24 +793,61 @@ class DeviceSession:
                     param = getattr(self.parameters, name)
                 except AttributeError:
                     continue
-                if self._settings_values_equal(param.value, value):
+                board_value = param.value
+                if self._settings_values_equal(board_value, value):
                     continue
                 normalized_value = self._normalize_param_value(name, value)
                 param.value = normalized_value
-                changed += 1
                 self._pending_gateway_param_writes[name] = normalized_value
-            if changed:
+                replayed[name] = {
+                    "board": to_jsonable(board_value),
+                    "saved": to_jsonable(normalized_value),
+                }
+            for name in sorted(self._persistent_param_names - set(values)):
+                try:
+                    missing[name] = getattr(self.parameters, name).value
+                except AttributeError:
+                    continue
+            if replayed:
                 self.control.exposed_write_registers()
+                summary = ", ".join(
+                    f"{name}: {change['board']!r} -> {change['saved']!r}"
+                    for name, change in sorted(replayed.items())
+                )
                 logger.info(
-                    "Replayed Linien settings snapshot device=%s count=%s",
+                    "Replayed Linien settings snapshot device=%s count=%s %s",
                     self.device.key,
-                    changed,
+                    len(replayed),
+                    summary,
+                )
+                self._record_snapshot_history(
+                    "replayed_onto_board",
+                    {
+                        name: {"old": change["board"], "new": change["saved"]}
+                        for name, change in replayed.items()
+                    },
+                )
+                self._emit_log_event(
+                    level=logging.INFO,
+                    source="settings_snapshot",
+                    code="settings_snapshot_replayed",
+                    message=f"Restored saved settings onto the board: {summary}",
+                    details={"replayed": replayed},
                 )
         finally:
             self._persistent_replay_active = False
+        # Settings the snapshot doesn't have yet (e.g. a newer server version
+        # added a restorable parameter) are taken from the board, so the next
+        # connect has them too.
+        for name, value in missing.items():
+            self._update_persistent_setting(name, value, reason="added_from_board")
 
     def _adopt_persistent_setting_change(self, name: str, value: Any) -> None:
-        if self._persistent_replay_active or name not in self._persistent_param_names:
+        if (
+            self._persistent_replay_active
+            or self._initial_param_callbacks_active
+            or name not in self._persistent_param_names
+        ):
             return
         pending = self._pending_gateway_param_writes.get(name, _UNSET)
         if pending is not _UNSET:
@@ -703,12 +855,7 @@ class DeviceSession:
                 self._pending_gateway_param_writes.pop(name, None)
                 return
             self._pending_gateway_param_writes.pop(name, None)
-        if self._update_persistent_setting(name, value):
-            logger.info(
-                "Adopted remote Linien setting change device=%s param=%s",
-                self.device.key,
-                name,
-            )
+        self._update_persistent_setting(name, value, reason="board_change")
 
     def _emit_log_event(
         self,
@@ -1913,9 +2060,16 @@ class DeviceSession:
         if self.parameters is None:
             return
         self._suppress_param_publish = True
+        # `call_immediately` callbacks report linien-client's cached values,
+        # which are the board's values from before the snapshot replay (setting
+        # a value doesn't update that cache). Adopting them would save the
+        # board's old settings over the snapshot just written to it; the
+        # replayed values arrive later as ordinary change notifications.
+        self._initial_param_callbacks_active = True
         try:
             self._add_parameter_callbacks()
         finally:
+            self._initial_param_callbacks_active = False
             self._suppress_param_publish = False
         self._publish_param_snapshot()
 
