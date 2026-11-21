@@ -513,3 +513,33 @@ def test_a_manual_lock_during_a_database_outage_locks_and_spools(tmp_path, monke
         assert _wait(lambda: acquisition_id in db.rows)
     finally:
         service.stop()
+
+
+def test_start_checks_the_connection_so_status_is_active_without_a_lock(tmp_path, monkeypatch):
+    """After a restart the status must not read inactive until the next lock."""
+    db = FakeDatabase()
+    service = _service(tmp_path, db, monkeypatch)
+    assert service.get_state()["status"]["active"] is False
+
+    service.start()
+    try:
+        assert _wait(lambda: service.get_state()["status"]["active"] is True)
+        status = service.get_state()["status"]
+        assert status["last_test_ok"] is True
+        assert status["schema_ok"] is True
+        assert status["write_ok_count"] == 0
+    finally:
+        service.stop()
+
+
+def test_start_reports_an_unreachable_server(tmp_path, monkeypatch):
+    db = FakeDatabase()
+    db.down = True
+    service = _service(tmp_path, db, monkeypatch)
+
+    service.start()
+    try:
+        assert _wait(lambda: service.get_state()["status"]["last_test_ok"] is False)
+        assert service.get_state()["status"]["active"] is False
+    finally:
+        service.stop()

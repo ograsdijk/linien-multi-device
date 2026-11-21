@@ -625,6 +625,17 @@ class LockResultPostgresService:
     # ------------------------------------------------------------- worker
 
     def _worker_loop(self) -> None:
+        # After a gateway restart nothing has been tested or written yet, so
+        # the status read "Active: no" until the next lock was recorded, even
+        # with logging enabled and the server up. Check the connection (and
+        # schema) once at startup, off the request path.
+        with self._lock:
+            enabled = self._config.enabled
+        if enabled and psycopg is not None and not self._stop_event.is_set():
+            try:
+                self.test_connection()
+            except Exception:  # noqa: BLE001 - status only; writes retry anyway
+                logger.debug("Startup postgres connection check failed", exc_info=True)
         while not self._stop_event.is_set():
             with self._lock:
                 enabled = self._config.enabled
