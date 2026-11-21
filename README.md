@@ -610,16 +610,44 @@ retries and updates never create a second row.
 - With PostgreSQL logging disabled nothing is recorded or spooled. The acquisition IDs
   are still assigned and returned.
 
+### Lock history in the web UI
+
+**Lock history** in the header lists every device's attempts; the **Lock history**
+button next to a device's **Diagnostics** opens the same view filtered to that device.
+Filter by device, source, outcome and time range. Selecting an attempt shows:
+
+- what happened, and the trace analysis (zero crossing, slope, peak-to-peak, sweep);
+- the trace it was decided on (error signal, monitor, and the zero crossing the lock was
+  placed on), zoomable, optionally with the board's current trace overlaid;
+- the Linien settings at lock time next to the board's current ones, differences
+  highlighted, with **Restore these settings** to write the saved values back (it lists
+  the changes first, and is refused while the device is locked);
+- **Export JSON**: the whole record, traces and settings included, as one file.
+
 ### Reading the history
 
 Read-only endpoints, useful to any client:
 
+- `GET /api/lock-acquisitions`: every device's attempts, newest first; `device_key`
+  narrows it to one device. Same filters, paging and `include` as below.
 - `GET /api/devices/{key}/lock-acquisitions`: newest attempt first. Filters: `since`,
   `until` (Unix seconds), `lock_source`, `verification_status`, `lock_command_status`,
   `success`; paging with `limit` (≤ 1000) and `offset`. Metadata only by default;
   `include=traces,config,refinement` adds the large fields.
 - `GET /api/lock-acquisitions/{lock_acquisition_id}`: one full record, with its
   configuration snapshot, traces and refinement history.
+
+Comparing and restoring a record's settings (the device must be connected):
+
+- `GET /api/devices/{key}/lock-acquisitions/{id}/settings`: every saved Linien parameter
+  with its value at lock time (`at_lock`), its current value (`now`), `differs`, and
+  `restorable` (the board's restorable settings, the same set the gateway's settings
+  snapshot keeps).
+- `POST /api/devices/{key}/lock-acquisitions/{id}/restore-settings`: writes the
+  restorable parameters that differ (or only `{"names": [...]}`) in one register write,
+  and returns what changed. Refused with 409 while the device is locked, disconnected or
+  in a staged run, or when the record belongs to another device. Restored values appear
+  in the settings snapshot's history as `restored_from_record`.
 
 Responses come from PostgreSQL when it is reachable (`"source": "postgres"`), otherwise
 from the local spool (`"source": "spool"`, with a generic

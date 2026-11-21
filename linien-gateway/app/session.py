@@ -3298,7 +3298,14 @@ class DeviceSession:
             **telemetry_fields,
         }
 
-    def set_param(self, name: str, value: Any, write_registers: bool) -> None:
+    def set_param(
+        self,
+        name: str,
+        value: Any,
+        write_registers: bool,
+        *,
+        reason: str = "gateway_write",
+    ) -> None:
         if self.parameters is None or self.control is None:
             raise RuntimeError("Device not connected")
         with self._rpyc_lock:
@@ -3314,9 +3321,77 @@ class DeviceSession:
             except Exception:
                 self._pending_gateway_param_writes.pop(name, None)
                 raise
-            self._update_persistent_setting(name, normalized_value)
+            if reason == "gateway_write":
+                self._update_persistent_setting(name, normalized_value)
+            else:
+                self._update_persistent_setting(name, normalized_value, reason=reason)
             if write_registers:
                 self.control.exposed_write_registers()
+
+    def compare_saved_settings(self, saved: dict[str, Any]) -> dict[str, Any]:
+        """Compare Linien parameter values saved in a lock record with the board's.
+
+        Every saved parameter is listed with its value then and now;
+        `restorable` marks the ones `restore_saved_settings` may write (the
+        board's restorable settings: the same set the settings snapshot keeps).
+        """
+        if self.parameters is None or self.control is None:
+            raise RuntimeError("Device not connected")
+        rows: list[dict[str, Any]] = []
+        with self._rpyc_lock:
+            self._refresh_persistent_param_names_locked()
+            restorable = set(self._persistent_param_names)
+            for name in sorted(saved):
+                try:
+                    current = to_jsonable(getattr(self.parameters, name).value)
+                except AttributeError:
+                    current = None
+                at_lock = saved[name]
+                rows.append(
+                    {
+                        "name": name,
+                        "at_lock": at_lock,
+                        "now": current,
+                        "restorable": name in restorable and at_lock is not None,
+                        "differs": not self._settings_values_equal(at_lock, current),
+                    }
+                )
+        return {"locked": bool(self._read_param_fast("lock", False)), "parameters": rows}
+
+    def restore_saved_settings(
+        self, saved: dict[str, Any], names: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Write a lock record's saved values back to the board.
+
+        Only restorable parameters that differ are written (all of them, or
+        only `names`), in one register write. Refused while the device is
+        locked or a staged auto-lock run is active: these settings change the
+        error signal under a running lock.
+        """
+        comparison = self.compare_saved_settings(saved)
+        if comparison["locked"]:
+            raise RuntimeError("The device is locked. Unlock it before restoring settings.")
+        self._ensure_no_staged_autolock_run("restoring saved settings")
+        wanted = None if names is None else set(names)
+        changes = [
+            row
+            for row in comparison["parameters"]
+            if row["restorable"]
+            and row["differs"]
+            and (wanted is None or row["name"] in wanted)
+        ]
+        if not changes:
+            return []
+        with self._rpyc_lock:
+            for row in changes:
+                self.set_param(
+                    row["name"],
+                    row["at_lock"],
+                    write_registers=False,
+                    reason="restored_from_record",
+                )
+            self.control.exposed_write_registers()
+        return [{"name": r["name"], "old": r["now"], "new": r["at_lock"]} for r in changes]
 
     def write_registers(self) -> None:
         if self.control is None:

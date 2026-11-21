@@ -64,6 +64,7 @@ from .path_utils import find_repo_root, resolve_repo_path
 from .psd_store import PsdStore
 from .rp_telemetry import RpTelemetryManager
 from .schemas import (
+    RestoreSettingsRequest,
     AutoLockCalibrateRequest,
     AutoLockCalibrationResult,
     AutoLockScanResult,
@@ -2307,6 +2308,55 @@ def list_lock_acquisitions(
     when reachable, otherwise from the gateway's local spool; ``source`` says
     which. Records of a device that has since been removed stay queryable.
     """
+    return {
+        "device_key": key,
+        **_list_lock_acquisitions(
+            key, since, until, lock_source, verification_status,
+            lock_command_status, success, include, limit, offset,
+        ),
+    }
+
+
+@app.get("/api/lock-acquisitions")
+def list_all_lock_acquisitions(
+    device_key: str | None = Query(None, description="Only this device."),
+    since: float | None = Query(None, description="Attempts at or after (Unix s)."),
+    until: float | None = Query(None, description="Attempts before (Unix s)."),
+    lock_source: str | None = None,
+    verification_status: str | None = None,
+    lock_command_status: str | None = None,
+    success: bool | None = None,
+    include: str | None = Query(
+        None, description="Comma-separated extras: traces, config, refinement."
+    ),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """Lock-acquisition history of every device (or one), newest attempt first.
+
+    Same filters and response as the per-device list.
+    """
+    return {
+        "device_key": device_key,
+        **_list_lock_acquisitions(
+            device_key, since, until, lock_source, verification_status,
+            lock_command_status, success, include, limit, offset,
+        ),
+    }
+
+
+def _list_lock_acquisitions(
+    device_key: str | None,
+    since: float | None,
+    until: float | None,
+    lock_source: str | None,
+    verification_status: str | None,
+    lock_command_status: str | None,
+    success: bool | None,
+    include: str | None,
+    limit: int,
+    offset: int,
+) -> dict:
     filters = RecordFilters(
         since=since,
         until=until,
@@ -2319,14 +2369,13 @@ def list_lock_acquisitions(
         ),
         success=success,
     )
-    result = lock_result_postgres.list_records(
-        device_key=key,
+    return lock_result_postgres.list_records(
+        device_key=device_key,
         filters=filters,
         include=_includes(include),
         limit=limit,
         offset=offset,
     )
-    return {"device_key": key, **result}
 
 
 @app.get("/api/lock-acquisitions/{lock_acquisition_id}")
@@ -2341,6 +2390,60 @@ def get_lock_acquisition(lock_acquisition_id: str) -> dict:
     if record is None:
         raise HTTPException(status_code=404, detail="Lock acquisition not found.")
     return record
+
+
+def _saved_settings_for(key: str, lock_acquisition_id: str) -> dict[str, Any]:
+    """The Linien parameter values saved in a record of this device."""
+    record = get_lock_acquisition(lock_acquisition_id)
+    if record.get("device_key") != key:
+        raise HTTPException(
+            status_code=409,
+            detail="This lock record belongs to another device.",
+        )
+    config = record.get("linien_config")
+    saved = config.get("parameters") if isinstance(config, dict) else None
+    if not isinstance(saved, dict) or not saved:
+        raise HTTPException(
+            status_code=422,
+            detail="This lock record has no saved Linien settings.",
+        )
+    return saved
+
+
+@app.get("/api/devices/{key}/lock-acquisitions/{lock_acquisition_id}/settings")
+def compare_lock_acquisition_settings(key: str, lock_acquisition_id: str) -> dict:
+    """The record's saved Linien settings next to the board's current values."""
+    saved = _saved_settings_for(key, lock_acquisition_id)
+    session = _get_session(key)
+    try:
+        comparison = session.compare_saved_settings(saved)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"device_key": key, "lock_acquisition_id": lock_acquisition_id, **comparison}
+
+
+@app.post("/api/devices/{key}/lock-acquisitions/{lock_acquisition_id}/restore-settings")
+def restore_lock_acquisition_settings(
+    key: str, lock_acquisition_id: str, payload: RestoreSettingsRequest | None = None
+) -> dict:
+    """Write the record's saved settings back to the board.
+
+    Restorable parameters that differ only, in one register write. Refused
+    (409) while the device is locked, disconnected or in a staged run.
+    """
+    saved = _saved_settings_for(key, lock_acquisition_id)
+    session = _get_session(key)
+    try:
+        applied = session.restore_saved_settings(
+            saved, None if payload is None else payload.names
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {
+        "device_key": key,
+        "lock_acquisition_id": lock_acquisition_id,
+        "applied": applied,
+    }
 
 
 @app.get("/api/logs/tail", response_model=LogTailResponse)

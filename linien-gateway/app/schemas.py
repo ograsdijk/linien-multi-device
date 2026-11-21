@@ -37,6 +37,12 @@ class DevicePatch(BaseModel):
     parameters: Optional[Dict[str, Any]] = None
 
 
+class RestoreSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Only these parameters (default: every restorable one that differs).
+    names: Optional[list[str]] = None
+
+
 class ParamUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     value: Any
