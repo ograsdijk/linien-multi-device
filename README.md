@@ -528,7 +528,7 @@ inputs (both channels' values are in `linien_config`).
 
 ### After the lock
 
-For an accepted lock command, the gateway keeps the first 3 s of plot frames, whether
+For an accepted lock command, the gateway keeps the first 10 s of plot frames, whether
 or not the lock indicator is on, and adds them to the record when the window ends (or
 when another attempt starts on the device):
 
@@ -640,7 +640,10 @@ Filter by device, source, outcome and time range. Selecting an attempt shows:
 
 - what happened, and the trace analysis (zero crossing, slope, peak-to-peak, sweep);
 - the trace it was decided on (error signal, monitor, and the zero crossing the lock was
-  placed on), zoomable, optionally with the board's current trace overlaid;
+  placed on; for a manual lock, its lock point and the crossing it should settle on),
+  zoomable, optionally with the board's current trace overlaid. The control voltage right
+  after the lock, and 10 s later if it moved, is marked on the same sweep axis: that is
+  where the laser actually locked;
 - the Linien settings at lock time next to the board's current ones, differences
   highlighted, with **Restore these settings** to write the saved values back (it lists
   the changes first, and is refused while the device is locked);

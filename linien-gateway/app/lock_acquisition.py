@@ -283,8 +283,9 @@ class VerificationTracker:
 
 
 # How long after an accepted lock command the signals are kept, and how much.
-POST_LOCK_WINDOW_S = 3.0
-POST_LOCK_MAX_FRAMES = 200
+# 10 s at up to 60 frames/s.
+POST_LOCK_WINDOW_S = 10.0
+POST_LOCK_MAX_FRAMES = 600
 # The first locked frame's time traces are kept at this many points.
 POST_LOCK_TRACE_POINTS = 512
 _POST_LOCK_STATS = (

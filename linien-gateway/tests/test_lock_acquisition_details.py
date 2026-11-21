@@ -507,7 +507,7 @@ def test_an_accepted_lock_records_its_post_lock_signals():
     stats = SignalStats(control_mean_v=0.3, control_std_v=0.001, error_std_v=0.0005)
     with session._state_lock:
         assert session._observe_post_lock(now + 0.1, True, stats, to_plot) is None
-        done = session._observe_post_lock(now + 5.0, True, stats, to_plot)
+        done = session._observe_post_lock(now + 11.0, True, stats, to_plot)
     assert done is acquisition
     session._finish_post_lock_capture(None, only=done)
 
