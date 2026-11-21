@@ -522,7 +522,9 @@ Parameters that do not exist or cannot be read are listed in `missing`; non-fini
 values are stored as `null`. Plot buffers, histories, task/optimization/PSD state and
 credentials are never included. The converted columns (`modulation_frequency_hz`,
 `demod_phase_deg`, `signal_offset_volts`, `modulation_amplitude`, `pid_p/i/d`) remain
-for convenient SQL.
+for convenient SQL. `demod_phase_deg` and `signal_offset_volts` are input A's in
+single-channel mode, and empty in dual-channel mode, where the error signal mixes both
+inputs (both channels' values are in `linien_config`).
 
 ### Trace characterization
 

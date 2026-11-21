@@ -133,9 +133,14 @@ def build_manual_lock_row(
     measured at; they fall back to ``params`` only when the caller has none.
     """
     laser_name = (device_name or "").strip() or device_key
-    control_channel_raw = _to_float(params.get("control_channel"))
-    control_channel = int(control_channel_raw) if control_channel_raw is not None else 0
-    suffix = "_b" if control_channel == 1 else "_a"
+    # The demodulation phase and offset belong to an input channel. In
+    # single-channel mode the error signal is input A's. In dual-channel mode
+    # the error signal mixes A and B, so no single value is right; the columns
+    # stay empty and linien_config holds both channels. (`control_channel`
+    # picks the output carrying the control signal, not an input: using it
+    # here recorded channel B's unused settings on every board with its
+    # control signal on output 2.)
+    suffix = None if bool(params.get("dual_channel")) else "_a"
 
     modulation_raw = _to_float(params.get("modulation_frequency"))
     modulation_hz = (
@@ -149,9 +154,11 @@ def build_manual_lock_row(
         else modulation_amplitude_raw / MOD_AMP_SCALE
     )
 
-    offset_raw = _to_float(params.get(f"offset{suffix}"))
+    offset_raw = None if suffix is None else _to_float(params.get(f"offset{suffix}"))
     offset_volts = None if offset_raw is None else offset_raw / OFFSET_SCALE
-    demod_phase = _to_float(params.get(f"demodulation_phase{suffix}"))
+    demod_phase = (
+        None if suffix is None else _to_float(params.get(f"demodulation_phase{suffix}"))
+    )
 
     pid_p = _to_float(params.get("p"))
     pid_i = _to_float(params.get("i"))
