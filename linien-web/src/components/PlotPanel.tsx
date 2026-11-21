@@ -26,6 +26,7 @@ import {
   getCachedAxisTheme,
   getXBuffer,
   padYRange,
+  visibleYExtent,
   refreshThemeCache,
   sweepIndexToVoltage,
   toFinite,
@@ -369,20 +370,13 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
       last.dual !== dual ||
       last.hasDataKey !== hasDataKey;
 
-    let yMin = Infinity;
-    let yMax = -Infinity;
-    SERIES_KEYS.forEach((key, idx) => {
-      if (!desiredVisibility[key] || !hasDataByKey[key]) return;
-      if (key === 'signal_strength_a_upper' || key === 'signal_strength_a_lower') {
-        if (!error1Visible) return;
-      }
-      if (key === 'signal_strength_b_upper' || key === 'signal_strength_b_lower') {
-        if (!error2Visible) return;
-      }
-      const s = stats[idx];
-      if (!s.hasFinite) return;
-      if (s.min < yMin) yMin = s.min;
-      if (s.max > yMax) yMax = s.max;
+    const { yMin, yMax } = visibleYExtent({
+      stats,
+      desiredVisibility,
+      hasDataByKey,
+      userShow: userShowRef.current,
+      error1Visible,
+      error2Visible,
     });
     const padded = padYRange(yMin, yMax);
     const lastY = lastAppliedYRef.current;
@@ -440,6 +434,9 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
       }
     });
   };
+  // The legend hook is created once; it calls the latest applyFrameInternal.
+  const applyFrameRef = useRef(applyFrameInternal);
+  applyFrameRef.current = applyFrameInternal;
 
   useImperativeHandle(
     ref,
@@ -566,6 +563,12 @@ export const PlotPanel = forwardRef<PlotPanelHandle, PlotPanelProps>(function Pl
             if (idx == null) return;
             if (suppressSeriesEventRef.current) return;
             userShowRef.current[idx] = u.series[idx].show ?? false;
+            // Rescale to what is still drawn right away, rather than on the
+            // next frame (a paused sweep may not send one).
+            const replayFrame = latestFrameRef.current;
+            if (replayFrame) {
+              queueMicrotask(() => applyFrameRef.current?.(replayFrame));
+            }
             const link = bandLinks.find((item) => item.controllerIdx === idx);
             if (!link) return;
             suppressSeriesEventRef.current = true;
