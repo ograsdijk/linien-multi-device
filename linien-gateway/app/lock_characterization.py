@@ -44,6 +44,74 @@ def _volts_per_sample(n_points: int, sweep_amplitude_v: float) -> float | None:
     return 2.0 * abs(float(sweep_amplitude_v)) / (n_points - 1)
 
 
+def expected_lock_crossing(
+    error_v: np.ndarray,
+    *,
+    sweep_center_v: float,
+    sweep_amplitude_v: float,
+    lock_point_sweep_v: float,
+    slope_rising: bool,
+    settings: AutoLockScanSettings,
+) -> dict[str, Any] | None:
+    """The zero crossing a lock started at `lock_point_sweep_v` should settle on.
+
+    Linien's manual lock holds the sweep at its center and the PID pulls the
+    laser to the nearest zero crossing whose slope matches the configured
+    sign (`slope_rising`). That is this crossing: of the crossings with the
+    right slope, the one nearest the lock point. A crossing counts only when
+    it has a lobe of each sign within the detector's half-range, each clearing
+    10% of the signal's peak-to-peak and 6 sigma of its noise, so noise around
+    a flat baseline is not one.
+    None when no such crossing exists.
+    """
+    raw = _sanitize_trace(np.asarray(error_v, dtype=float))
+    n = len(raw)
+    vps = _volts_per_sample(n, sweep_amplitude_v)
+    if vps is None:
+        return None
+    smoothed = _moving_average(raw, settings.smooth_window_pts)
+    # Lobes must stand out from both the signal (10% of its peak-to-peak) and
+    # the noise (6 sigma, from the median absolute sample-to-sample step).
+    step = np.diff(raw)
+    noise_sigma = 1.4826 * float(np.median(np.abs(step - np.median(step)))) / np.sqrt(2.0)
+    floor = max(0.1 * float(np.ptp(smoothed)), 6.0 * noise_sigma)
+    if floor <= 0.0:
+        return None
+    w = max(2, _half_range_to_points(settings.half_range_sweep_v, n, sweep_amplitude_v))
+    start_v = float(sweep_center_v) - abs(float(sweep_amplitude_v))
+    lock_index = (float(lock_point_sweep_v) - start_v) / vps
+
+    a = smoothed[:-1]
+    b = smoothed[1:]
+    if slope_rising:
+        sign_change = (a <= 0.0) & (b > 0.0)
+    else:
+        sign_change = (a >= 0.0) & (b < 0.0)
+    candidates: list[float] = []
+    for i in np.flatnonzero(sign_change):
+        if i - w < 0 or i + 1 + w >= n:
+            continue
+        # A real crossing has a lobe of each sign within the half-range.
+        left = smoothed[i - w : i + 1]
+        right = smoothed[i + 1 : i + 2 + w]
+        if slope_rising and not (left.min() < -floor and right.max() > floor):
+            continue
+        if not slope_rising and not (left.max() > floor and right.min() < -floor):
+            continue
+        candidates.append(float(i) + float(a[i] / (a[i] - b[i])))
+    if not candidates:
+        return None
+    index = min(candidates, key=lambda c: abs(c - lock_index))
+    sweep_v = start_v + index * vps
+    return {
+        "sweep_v": sweep_v,
+        "index": index,
+        "distance_from_lock_point_v": sweep_v - float(lock_point_sweep_v),
+        "slope_rising": bool(slope_rising),
+        "crossings_with_this_slope": len(candidates),
+    }
+
+
 def _status(status: str, reason: str | None, **extra: Any) -> dict[str, Any]:
     return {
         "version": CHARACTERIZATION_VERSION,
@@ -62,12 +130,19 @@ def characterize_trace(
     preferred_slope_rising: bool | None = None,
     modulation_frequency_hz: float | None = None,
     dual_channel: bool | None = None,
+    lock_point_sweep_v: float | None = None,
 ) -> dict[str, Any]:
     """Characterize one stored acquisition trace; never raises.
 
     ``result`` is the detection the lock was decided on, when there was one
     (auto-lock paths); otherwise the detector is run read-only on the trace
     with the device's current auto-lock settings.
+
+    ``lock_point_sweep_v`` is where a manual lock was engaged (the sweep
+    center). With it, the record also gets the crossing that lock should
+    settle on (``expected_lock_crossing``), which can differ from the
+    detector's choice: the detector picks the strongest crossing, the PID
+    takes the nearest one with the configured slope.
     """
     try:
         return _characterize(
@@ -77,6 +152,7 @@ def characterize_trace(
             preferred_slope_rising=preferred_slope_rising,
             modulation_frequency_hz=modulation_frequency_hz,
             dual_channel=dual_channel,
+            lock_point_sweep_v=lock_point_sweep_v,
         )
     except Exception as exc:  # noqa: BLE001 - diagnostics must never break a record
         return _status("error", f"{type(exc).__name__}: {exc}")
@@ -90,6 +166,7 @@ def _characterize(
     preferred_slope_rising: bool | None,
     modulation_frequency_hz: float | None,
     dual_channel: bool | None,
+    lock_point_sweep_v: float | None = None,
 ) -> dict[str, Any]:
     if trace is None or not trace.available or trace.error_v is None:
         reason = trace.unavailable_reason if trace is not None else None
@@ -104,7 +181,21 @@ def _characterize(
     if vps is None:
         return _status("not_applicable", "degenerate_sweep_axis")
 
+    lock_point: dict[str, Any] = {}
+    if lock_point_sweep_v is not None and preferred_slope_rising is not None:
+        lock_point = {
+            "lock_point_sweep_v": float(lock_point_sweep_v),
+            "expected_lock_crossing": expected_lock_crossing(
+                raw,
+                sweep_center_v=float(trace.sweep_center_v),
+                sweep_amplitude_v=float(trace.sweep_amplitude_v),
+                lock_point_sweep_v=float(lock_point_sweep_v),
+                slope_rising=bool(preferred_slope_rising),
+                settings=settings,
+            ),
+        }
     context = {
+        **lock_point,
         "signal_type": settings.signal_type,
         "trace_role": "combined_error",
         "dual_channel": dual_channel,

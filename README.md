@@ -540,6 +540,8 @@ manual-lock records run the detector read-only on the copied sweep.
 | `discriminator_slope_v_per_mhz` | error plot-volts per MHz; **only** when the sidebands calibrate the sweep axis (PDH, known modulation frequency, sidebands resolved). `characterization.frequency_calibration` then holds `hz_per_sweep_v`. Otherwise `null`. |
 | `peak_to_peak_v` | lobe peak-to-peak around the carrier, plot volts |
 | `characterization.baseline_v`, `.feature_width_sweep_v` | median error away from the feature; separation of the two carrier lobe peaks. `null` when not measurable, with a note. |
+| `characterization.lock_point_sweep_v` | manual locks only: where the lock was engaged (the sweep center), sweep volts |
+| `characterization.expected_lock_crossing` | manual locks only: the crossing that lock should settle on, the nearest one to the lock point with the configured slope (`sweep_v`, `distance_from_lock_point_v`, `slope_rising`, `crossings_with_this_slope`); `null` if there is none. It can differ from `zero_crossing_sweep_v`, which is the detector's choice (the strongest crossing). |
 
 `characterization_status` is `ok`, `no_feature_detected` (not a resolvable
 discriminator signal), `not_applicable` (sweep paused or geometry unknown),

@@ -399,3 +399,61 @@ def test_a_rejected_lock_command_is_not_verified():
 
     assert postgres.rows[0]["verification_status"] == "not_attempted"
     assert session._pending_verification is None
+
+
+# ------------------------------------------- manual lock: where it settles
+
+
+def test_expected_lock_crossing_is_the_nearest_with_the_configured_slope():
+    from app.auto_lock_scan import AutoLockScanSettings
+    from app.lock_characterization import expected_lock_crossing
+
+    trace = _pdh_triplet()  # carrier rising at 0 V, sidebands falling at +/-0.3 V
+    settings = AutoLockScanSettings.from_mapping({})
+
+    def at(lock_point: float, rising: bool):
+        return expected_lock_crossing(
+            trace, sweep_center_v=0.0, sweep_amplitude_v=1.0,
+            lock_point_sweep_v=lock_point, slope_rising=rising, settings=settings,
+        )
+
+    carrier = at(0.02, True)
+    assert carrier["sweep_v"] == pytest.approx(0.0, abs=0.005)
+    assert carrier["crossings_with_this_slope"] == 1
+    # Slope set wrong: the lock goes to the nearest sideband, not the carrier.
+    sideband = at(0.1, False)
+    assert sideband["sweep_v"] == pytest.approx(0.3, abs=0.005)
+    assert sideband["distance_from_lock_point_v"] == pytest.approx(0.2, abs=0.005)
+    assert at(-0.1, False)["sweep_v"] == pytest.approx(-0.3, abs=0.005)
+    assert sideband["crossings_with_this_slope"] == 2
+
+
+def test_expected_lock_crossing_ignores_noise_on_a_flat_trace():
+    from app.auto_lock_scan import AutoLockScanSettings
+    from app.lock_characterization import expected_lock_crossing
+
+    noise = np.random.default_rng(0).normal(0.0, 1e-4, N)
+    assert expected_lock_crossing(
+        noise, sweep_center_v=0.0, sweep_amplitude_v=1.0, lock_point_sweep_v=0.0,
+        slope_rising=True, settings=AutoLockScanSettings.from_mapping({}),
+    ) is None
+
+
+def test_manual_lock_records_its_lock_point_and_expected_crossing():
+    from app.auto_lock_scan import AutoLockScanSettings
+    from app.lock_characterization import characterize_trace
+
+    result = characterize_trace(
+        _snapshot(_pdh_triplet()),
+        settings=AutoLockScanSettings.from_mapping({}),
+        preferred_slope_rising=False,
+        lock_point_sweep_v=0.1,
+    )
+    assert result["lock_point_sweep_v"] == 0.1
+    assert result["expected_lock_crossing"]["sweep_v"] == pytest.approx(0.3, abs=0.005)
+    # Without a lock point (auto-lock paths) neither field is added.
+    other = characterize_trace(
+        _snapshot(_pdh_triplet()), settings=AutoLockScanSettings.from_mapping({}),
+        preferred_slope_rising=True,
+    )
+    assert "lock_point_sweep_v" not in other and "expected_lock_crossing" not in other

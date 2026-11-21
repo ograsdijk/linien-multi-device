@@ -1541,7 +1541,22 @@ class DeviceSession:
                 None if params.get("dual_channel") is None
                 else bool(params.get("dual_channel"))
             ),
+            # A manual lock is engaged at the sweep center; record where, and
+            # the crossing it should settle on.
+            lock_point_sweep_v=self._manual_lock_point(acquisition),
         )
+
+    @staticmethod
+    def _manual_lock_point(acquisition: LockAcquisition) -> float | None:
+        if acquisition.lock_source != "manual_lock":
+            return None
+        center = acquisition.params.get("sweep_center")
+        if center is None and acquisition.trace is not None:
+            center = acquisition.trace.sweep_center_v
+        try:
+            return None if center is None else float(center)
+        except (TypeError, ValueError):
+            return None
 
     # ------------------------------------------------- lock verification
 
