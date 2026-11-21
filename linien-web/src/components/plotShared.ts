@@ -310,3 +310,45 @@ export const padYRange = (yMin: number, yMax: number): { yMin: number; yMax: num
   const pad = span * Y_RANGE_PAD_FRACTION;
   return { yMin: yMin - pad, yMax: yMax + pad };
 };
+
+type SeriesFlags = Partial<Record<SeriesKey, boolean>>;
+
+/**
+ * The y extent of the series actually drawn: shown for this mode, with data,
+ * and not switched off in the legend. `userShow` is keyed by uPlot series
+ * index (SERIES_INDEX); a missing entry means the user hasn't hidden it.
+ * Returns ±Infinity when nothing is drawn (padYRange then falls back).
+ */
+export const visibleYExtent = ({
+  stats,
+  desiredVisibility,
+  hasDataByKey,
+  userShow,
+  error1Visible,
+  error2Visible,
+}: {
+  stats: SeriesStats[];
+  desiredVisibility: SeriesFlags;
+  hasDataByKey: SeriesFlags;
+  userShow: Record<number, boolean>;
+  error1Visible: boolean;
+  error2Visible: boolean;
+}): { yMin: number; yMax: number } => {
+  let yMin = Infinity;
+  let yMax = -Infinity;
+  SERIES_KEYS.forEach((key, idx) => {
+    if (!desiredVisibility[key] || !hasDataByKey[key]) return;
+    if (key === 'signal_strength_a_upper' || key === 'signal_strength_a_lower') {
+      if (!error1Visible) return;
+    } else if (key === 'signal_strength_b_upper' || key === 'signal_strength_b_lower') {
+      if (!error2Visible) return;
+    } else if (userShow[SERIES_INDEX[key]] === false) {
+      return;
+    }
+    const s = stats[idx];
+    if (!s || !s.hasFinite) return;
+    if (s.min < yMin) yMin = s.min;
+    if (s.max > yMax) yMax = s.max;
+  });
+  return { yMin, yMax };
+};
