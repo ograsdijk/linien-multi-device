@@ -358,7 +358,7 @@ const V = (volts: number): string => `${Number(volts.toFixed(4))} V`;
  * the configured slope, so both are drawn. Auto-locks mark the crossing the
  * detector chose, which is where they were placed.
  */
-export const lockMarkers = (record: LockAcquisitionRecord): LockMarkers => {
+const sweepMarkers = (record: LockAcquisitionRecord): LockMarkers => {
   const characterization = (record.characterization ?? {}) as Record<string, unknown>;
   if (record.lock_source === 'manual_lock') {
     const lockPoint = num(characterization.lock_point_sweep_v) ?? num(record.sweep_center_v);
@@ -398,21 +398,59 @@ export const lockMarkers = (record: LockAcquisitionRecord): LockMarkers => {
   };
 };
 
-/** One line on what the board did after the lock command, or null if not recorded. */
-export const describePostLock = (postLock: PostLock | null | undefined): string | null => {
+export const CONTROL_COLOR = '#7F77DD';
+
+/**
+ * Where the laser actually locked: the control voltage on the first locked
+ * frame after the command, on the same axis as the sweep (in the locked
+ * state the control output is what the sweep drives while scanning). Only
+ * when the control and sweep use the same output.
+ */
+const controlMarkers = (record: LockAcquisitionRecord): LockMarkers | null => {
+  const postLock = record.post_lock;
   if (!postLock) return null;
-  const s = postLock.summary;
-  if (s.first_locked_at_s === null) {
-    return postLock.frames_seen === 0
-      ? 'No plot frames arrived after the lock command, so nothing was recorded.'
-      : `No frame showed the board locked within ${postLock.window_s} s of the command.`;
+  const params = (record.linien_config?.parameters ?? {}) as Record<string, unknown>;
+  const sweepChannel = num(params.sweep_channel);
+  const controlChannel = num(params.control_channel);
+  if (sweepChannel !== null && controlChannel !== null && sweepChannel !== controlChannel) {
+    return {
+      markers: [],
+      legend: '',
+      summary:
+        "The control and the sweep use different outputs, so the control voltage after the lock can't be shown on the sweep axis.",
+    };
   }
-  const parts = [`First locked frame ${Math.round(s.first_locked_at_s * 1000)} ms after the command`];
-  if (s.first_control_v !== null) parts.push(`control at ${Number(s.first_control_v.toFixed(4))} V`);
-  if (s.control_drift_v !== null)
-    parts.push(`moving ${Number((s.control_drift_v * 1000).toFixed(1))} mV over the next ${postLock.window_s} s`);
-  let line = parts.join(', ') + '.';
-  if (s.locked_fraction !== null && s.locked_fraction < 1)
-    line += ` Locked on ${Math.round(s.locked_fraction * 100)}% of the frames.`;
-  return line;
+  const first = num(postLock.summary.first_control_v);
+  if (first === null) {
+    return {
+      markers: [],
+      legend: '',
+      summary: `No frame showed the board locked within ${postLock.window_s} s of the lock command.`,
+    };
+  }
+  const last = num(postLock.summary.last_control_v);
+  const moved = last !== null && Math.abs(last - first) >= 0.0005;
+  const markers: LockMarkers['markers'] = [{ sweepV: first, color: CONTROL_COLOR, dashed: false }];
+  if (moved) markers.push({ sweepV: last as number, color: CONTROL_COLOR, dashed: true });
+  return {
+    markers,
+    legend: moved
+      ? `Solid purple line: the control voltage right after the lock, where the laser actually locked; dashed purple: ${postLock.window_s} s later.`
+      : 'Solid purple line: the control voltage right after the lock, where the laser actually locked.',
+    summary: moved
+      ? `Control after the lock: ${V(first)}, ${V(last as number)} after ${postLock.window_s} s.`
+      : `Control after the lock: ${V(first)}.`,
+  };
+};
+
+/** Every marker for a record's trace, with what they mean. */
+export const lockMarkers = (record: LockAcquisitionRecord): LockMarkers => {
+  const sweep = sweepMarkers(record);
+  const control = controlMarkers(record);
+  if (!control) return sweep;
+  return {
+    markers: [...sweep.markers, ...control.markers],
+    legend: [sweep.legend, control.legend].filter(Boolean).join(' '),
+    summary: [sweep.summary, control.summary].filter(Boolean).join(' ') || null,
+  };
 };

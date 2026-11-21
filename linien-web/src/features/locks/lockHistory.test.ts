@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 
 import {
   describeAttempt,
-  describePostLock,
   exportRecord,
   formatSetting,
   historyQuery,
@@ -151,38 +150,53 @@ describe('lockMarkers', () => {
   });
 });
 
-describe('describePostLock', () => {
-  const base = {
-    version: 1, window_s: 3, end_reason: 'window_elapsed', frames_seen: 30, frames: [], first_locked_frame: null,
-  };
-  it('says when the lock engaged and where the control went', () => {
-    expect(
-      describePostLock({
-        ...base,
-        summary: {
-          first_locked_at_s: 0.12, locked_fraction: 1, first_control_v: 0.2104,
-          last_control_v: 0.2159, control_drift_v: 0.0055, mean_error_std_v: 0.0004,
-        },
-      }),
-    ).toBe('First locked frame 120 ms after the command, control at 0.2104 V, moving 5.5 mV over the next 3 s.');
+describe('control marker', () => {
+  const postLock = (first: number | null, last: number | null) => ({
+    version: 1, window_s: 10, end_reason: 'window_elapsed', frames_seen: 100, frames: [], first_locked_frame: null,
+    summary: {
+      first_locked_at_s: first === null ? null : 0.1, locked_fraction: 1, first_control_v: first,
+      last_control_v: last, control_drift_v: null, mean_error_std_v: null,
+    },
   });
-  it('flags a lock that dropped, and one that never engaged', () => {
-    const dropped = describePostLock({
-      ...base,
-      summary: {
-        first_locked_at_s: 0.1, locked_fraction: 0.4, first_control_v: 0.2,
-        last_control_v: 0.9, control_drift_v: 0.7, mean_error_std_v: 0.01,
-      },
-    });
-    expect(dropped).toContain('Locked on 40% of the frames.');
-    const never = describePostLock({
-      ...base,
-      summary: {
-        first_locked_at_s: null, locked_fraction: 0, first_control_v: null,
-        last_control_v: null, control_drift_v: null, mean_error_std_v: null,
-      },
-    });
-    expect(never).toBe('No frame showed the board locked within 3 s of the command.');
-    expect(describePostLock(null)).toBeNull();
+  const record = (extra: Record<string, unknown>) =>
+    ({
+      lock_source: 'auto_lock_scan',
+      zero_crossing_sweep_v: 0.1062,
+      characterization: {},
+      linien_config: { parameters: { sweep_channel: 1, control_channel: 1 } },
+      ...extra,
+    }) as unknown as LockAcquisitionRecord;
+
+  it('marks where the control settled, and where it went if it moved', () => {
+    const result = lockMarkers(record({ post_lock: postLock(0.104, 0.1102) }));
+    expect(result.markers.map((m) => [m.sweepV, m.dashed])).toEqual([
+      [0.1062, true],
+      [0.104, false],
+      [0.1102, true],
+    ]);
+    expect(result.summary).toBe('Control after the lock: 0.104 V, 0.1102 V after 10 s.');
+  });
+
+  it('draws one line when the control held still', () => {
+    const result = lockMarkers(record({ post_lock: postLock(0.104, 0.1042) }));
+    expect(result.markers).toHaveLength(2);
+    expect(result.summary).toBe('Control after the lock: 0.104 V.');
+  });
+
+  it('skips it when the control and sweep use different outputs', () => {
+    const result = lockMarkers(
+      record({
+        post_lock: postLock(0.104, 0.104),
+        linien_config: { parameters: { sweep_channel: 1, control_channel: 0 } },
+      }),
+    );
+    expect(result.markers).toHaveLength(1);
+    expect(result.summary).toContain('different outputs');
+  });
+
+  it('says so when the board never showed locked', () => {
+    expect(lockMarkers(record({ post_lock: postLock(null, null) })).summary).toBe(
+      'No frame showed the board locked within 10 s of the lock command.',
+    );
   });
 });
