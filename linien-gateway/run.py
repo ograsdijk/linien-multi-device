@@ -13,7 +13,10 @@ if __name__ == "__main__":
         "app.main:app",
         host=get_api_host(),
         port=get_api_port(),
-        reload=True,
+        # No auto-reload: a git pull would restart the gateway mid-update and
+        # drop every Linien session, and the reloader's child process hides
+        # the real server from process supervision.
+        reload=False,
         app_dir=str(app_dir),
         # Enable WebSocket permessage-deflate. Compresses each frame
         # before transit. On the binary plot-frame path the win is

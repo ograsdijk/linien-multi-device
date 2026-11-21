@@ -23,6 +23,12 @@ import type {
   PsdTailResponse,
   RpTelemetry,
 } from './types';
+import type {
+  LockAcquisitionList,
+  LockAcquisitionRecord,
+  RestoreResult,
+  SettingsComparison,
+} from './features/locks/lockHistory';
 
 export type TelemetryServiceStatus = {
   installed: boolean;
@@ -309,6 +315,19 @@ export const api = {
     }>(
       `/devices/${key}/diagnostics/enable-persistent-log`,
       { method: 'POST' }
+    ),
+  listLockAcquisitions: (query: string) =>
+    request<LockAcquisitionList>(`/lock-acquisitions?${query}`),
+  getLockAcquisition: (id: string) =>
+    request<LockAcquisitionRecord>(`/lock-acquisitions/${encodeURIComponent(id)}`),
+  compareLockSettings: (key: string, id: string) =>
+    request<SettingsComparison>(
+      `/devices/${key}/lock-acquisitions/${encodeURIComponent(id)}/settings`
+    ),
+  restoreLockSettings: (key: string, id: string, names?: string[]) =>
+    request<RestoreResult>(
+      `/devices/${key}/lock-acquisitions/${encodeURIComponent(id)}/restore-settings`,
+      { method: 'POST', body: JSON.stringify(names ? { names } : {}) }
     ),
   postgresManualLockState: () =>
     request<PostgresManualLockState>('/postgres/manual-lock'),

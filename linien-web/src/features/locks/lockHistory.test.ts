@@ -1,0 +1,202 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  describeAttempt,
+  exportRecord,
+  formatSetting,
+  historyQuery,
+  lockMarkers,
+  orderSettings,
+  verificationDisplay,
+  type LockAcquisitionRecord,
+  type SettingRow,
+} from './lockHistory';
+
+describe('formatSetting', () => {
+  it('shows Linien raw values in the units the controls use', () => {
+    expect(formatSetting('modulation_frequency', 603979776)).toBe('18 MHz');
+    expect(formatSetting('modulation_frequency', 402653184)).toBe('12 MHz');
+    expect(formatSetting('modulation_amplitude', 4095.75)).toBe('1 Vpp');
+    expect(formatSetting('modulation_amplitude', 4914.9)).toBe('1.2 Vpp');
+    expect(formatSetting('demodulation_phase_a', 130)).toBe('130°');
+    expect(formatSetting('offset_a', 2.4573)).toBe('0.0003 V');
+    expect(formatSetting('filter_1_frequency_a', 10000)).toBe('10 kHz');
+    expect(formatSetting('filter_1_enabled_a', 1)).toBe('On');
+    expect(formatSetting('filter_automatic_a', 0)).toBe('Off');
+    expect(formatSetting('target_slope_rising', true)).toBe('On');
+    expect(formatSetting('p', 250)).toBe('250');
+    expect(formatSetting('p', null)).toBe('—');
+  });
+});
+
+describe('historyQuery', () => {
+  const base = { deviceKey: null, source: null, outcome: 'any' as const, range: 'all' as const };
+
+  it('asks for every device by default', () => {
+    expect(historyQuery(base, 1000, 50, 0)).toBe('limit=50&offset=0');
+  });
+
+  it('maps filters onto the API parameters', () => {
+    const query = new URLSearchParams(
+      historyQuery(
+        { deviceKey: 'abs', source: 'staged_autolock', outcome: 'failed', range: '24h' },
+        100_000,
+        50,
+        50,
+      ),
+    );
+    expect(query.get('device_key')).toBe('abs');
+    expect(query.get('lock_source')).toBe('staged_autolock');
+    expect(query.get('verification_status')).toBe('failed');
+    expect(query.get('since')).toBe(String(100_000 - 86_400));
+    expect(query.get('offset')).toBe('50');
+  });
+
+  it('filters rejected commands on the command status', () => {
+    const query = new URLSearchParams(historyQuery({ ...base, outcome: 'rejected' }, 0, 10, 0));
+    expect(query.get('lock_command_status')).toBe('rejected');
+    expect(query.get('verification_status')).toBeNull();
+  });
+});
+
+describe('verificationDisplay', () => {
+  it('includes how long verification took', () => {
+    expect(
+      verificationDisplay({
+        verification_status: 'verified',
+        lock_command_at: '2026-11-21T17:08:14.000Z',
+        verification_completed_at: '2026-11-21T17:08:15.200Z',
+      }),
+    ).toEqual({ label: 'Verified 1.2 s', tone: 'teal' });
+  });
+});
+
+describe('orderSettings', () => {
+  const row = (name: string): SettingRow => ({
+    name, at_lock: 1, now: 1, restorable: true, differs: false,
+  });
+
+  it('lists key settings first, and the rest only when asked', () => {
+    const rows = [row('sweep_speed'), row('p'), row('modulation_frequency')];
+    expect(orderSettings(rows, false).map((r) => r.name)).toEqual(['modulation_frequency', 'p']);
+    expect(orderSettings(rows, true).map((r) => r.name)).toEqual([
+      'modulation_frequency',
+      'p',
+      'sweep_speed',
+    ]);
+  });
+});
+
+describe('exportRecord and describeAttempt', () => {
+  const record = {
+    lock_acquisition_id: '2418afae-ee5c-488a-8f37-9de8988de1f2',
+    device_key: 'zgcbmduqgb',
+    laser_name: 'Cavity 1 Cs',
+    lock_source: 'auto_lock_scan',
+    attempt_started_at: 1795280894.524653,
+    lock_command_at: 1795280894.604742,
+    lock_command_status: 'accepted',
+    verification_status: 'unavailable',
+    verification_reason: 'lock_indicator_disabled',
+    failure_stage: null,
+    failure_reason: null,
+    trace_unavailable_reason: null,
+  } as unknown as LockAcquisitionRecord;
+
+  it('names the file after device, time and ID, and keeps the whole record', () => {
+    const { filename, json } = exportRecord(record);
+    expect(filename).toBe('lock_Cavity_1_Cs_2026-11-21T17-08-14_2418afae.json');
+    expect(JSON.parse(json).lock_acquisition_id).toBe(record.lock_acquisition_id);
+  });
+
+  it('says what happened in one line', () => {
+    expect(describeAttempt(record)).toBe(
+      "Lock command accepted 80 ms after start. The lock indicator is off for this device, so the lock couldn't be verified.",
+    );
+  });
+});
+
+describe('lockMarkers', () => {
+  const manual = {
+    lock_source: 'manual_lock',
+    sweep_center_v: 0.0825,
+    zero_crossing_sweep_v: 0.1062,
+    characterization: {
+      lock_point_sweep_v: 0.0825,
+      expected_lock_crossing: { sweep_v: 0.0597, distance_from_lock_point_v: -0.0228, slope_rising: false },
+    },
+  } as unknown as LockAcquisitionRecord;
+
+  it('marks the lock point of a manual lock and the crossing it should settle on', () => {
+    const result = lockMarkers(manual);
+    expect(result.markers.map((m) => [m.sweepV, m.dashed])).toEqual([
+      [0.0825, false],
+      [0.0597, true],
+    ]);
+    expect(result.summary).toBe(
+      'Engaged at 0.0825 V (the sweep center). With a falling slope it should settle on the crossing at 0.0597 V, 22.8 mV below.',
+    );
+  });
+
+  it('still marks the lock point on older manual records', () => {
+    const older = { ...manual, characterization: { status: 'ok' } } as unknown as LockAcquisitionRecord;
+    expect(lockMarkers(older).markers).toEqual([{ sweepV: 0.0825, color: expect.any(String), dashed: false }]);
+  });
+
+  it('marks the chosen crossing on an auto-lock', () => {
+    const auto = { ...manual, lock_source: 'auto_lock_scan' } as unknown as LockAcquisitionRecord;
+    expect(lockMarkers(auto).markers.map((m) => m.sweepV)).toEqual([0.1062]);
+    expect(lockMarkers(auto).summary).toBeNull();
+  });
+});
+
+describe('control marker', () => {
+  const postLock = (first: number | null, last: number | null) => ({
+    version: 1, window_s: 10, end_reason: 'window_elapsed', frames_seen: 100, frames: [], first_locked_frame: null,
+    summary: {
+      first_locked_at_s: first === null ? null : 0.1, locked_fraction: 1, first_control_v: first,
+      last_control_v: last, control_drift_v: null, mean_error_std_v: null,
+    },
+  });
+  const record = (extra: Record<string, unknown>) =>
+    ({
+      lock_source: 'auto_lock_scan',
+      zero_crossing_sweep_v: 0.1062,
+      characterization: {},
+      linien_config: { parameters: { sweep_channel: 1, control_channel: 1 } },
+      ...extra,
+    }) as unknown as LockAcquisitionRecord;
+
+  it('marks where the control settled, and where it went if it moved', () => {
+    const result = lockMarkers(record({ post_lock: postLock(0.104, 0.1102) }));
+    expect(result.markers.map((m) => [m.sweepV, m.dashed])).toEqual([
+      [0.1062, true],
+      [0.104, false],
+      [0.1102, true],
+    ]);
+    expect(result.summary).toBe('Control after the lock: 0.104 V, 0.1102 V after 10 s.');
+  });
+
+  it('draws one line when the control held still', () => {
+    const result = lockMarkers(record({ post_lock: postLock(0.104, 0.1042) }));
+    expect(result.markers).toHaveLength(2);
+    expect(result.summary).toBe('Control after the lock: 0.104 V.');
+  });
+
+  it('skips it when the control and sweep use different outputs', () => {
+    const result = lockMarkers(
+      record({
+        post_lock: postLock(0.104, 0.104),
+        linien_config: { parameters: { sweep_channel: 1, control_channel: 0 } },
+      }),
+    );
+    expect(result.markers).toHaveLength(1);
+    expect(result.summary).toContain('different outputs');
+  });
+
+  it('says so when the board never showed locked', () => {
+    expect(lockMarkers(record({ post_lock: postLock(null, null) })).summary).toBe(
+      'No frame showed the board locked within 10 s of the lock command.',
+    );
+  });
+});

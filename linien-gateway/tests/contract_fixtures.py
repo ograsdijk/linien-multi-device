@@ -58,6 +58,8 @@ _SIG_DIGITS = 10
 
 # Placeholders for the values that change every run.
 _TOKEN = "TOKEN"
+# A fresh UUID per attempt; the contract is that the key is present.
+_LOCK_ACQUISITION_ID = "LOCK_ACQUISITION_ID"
 _TIME_KEYS = {
     "expires_at": 0.0,
     "acquired_at": 0.0,
@@ -172,7 +174,9 @@ def _scrub(value: Any) -> Any:
         return {
             k: (_TIMING_DIAGNOSTIC_KEYS[k] if k in _TIMING_DIAGNOSTIC_KEYS
                 else _TIME_KEYS[k] if k in _TIME_KEYS and v is not None
-                else _TOKEN if k == "token" else _scrub(v))
+                else _TOKEN if k == "token"
+                else _LOCK_ACQUISITION_ID if k == "lock_acquisition_id" and v is not None
+                else _scrub(v))
             for k, v in value.items()
         }
     if isinstance(value, list):
@@ -201,8 +205,6 @@ def generate() -> dict[str, dict[str, Any]]:
             main, "_session_for_device", lambda device: session))
         stack.enter_context(mock.patch.object(main, "_trigger_and_acquire", _acquired))
         stack.enter_context(mock.patch.object(main, "_emit_log", lambda **k: None))
-        stack.enter_context(mock.patch.object(
-            main, "_enqueue_auto_lock_row", lambda *a, **k: None))
         client = TestClient(main.app)
         try:
             _drive(client, session, out)

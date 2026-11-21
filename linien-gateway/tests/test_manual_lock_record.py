@@ -19,9 +19,11 @@ PARAMS = {
 }
 
 
-def test_build_manual_lock_row_uses_control_channel_b_and_conversions():
+def test_build_manual_lock_row_uses_input_a_and_conversions():
+    # control_channel 1 is the control *output*; it must not pick input B.
     params = {
         "control_channel": 1,
+        "dual_channel": False,
         "modulation_frequency": 2 * MOD_HZ_UNIT,
         "modulation_amplitude": 0.5 * MOD_AMP_SCALE,
         "demodulation_phase_a": 10,
@@ -40,7 +42,8 @@ def test_build_manual_lock_row_uses_control_channel_b_and_conversions():
         lock_source="manual_lock",
         params=params,
         trace_y=[0.1, 0.2, 0.3],
-        monitor_trace_y=[-0.1, -0.2, -0.3],
+        secondary_trace_y=[-0.1, -0.2, -0.3],
+        secondary_trace_role="monitor",
     )
 
     assert row["laser_name"] == "Laser A"
@@ -48,17 +51,19 @@ def test_build_manual_lock_row_uses_control_channel_b_and_conversions():
     assert row["success"] is True
     assert row["modulation_frequency_hz"] == 2_000_000.0
     assert row["modulation_amplitude"] == 0.5
-    assert row["demod_phase_deg"] == 25
-    assert row["signal_offset_volts"] == 200 / OFFSET_SCALE
+    assert row["demod_phase_deg"] == 10
+    assert row["signal_offset_volts"] == 100 / OFFSET_SCALE
     assert row["pid_p"] == 1.1
     assert row["pid_i"] == 2.2
     assert row["pid_d"] == 3.3
     assert row["trace_x"] == [-1.0, 0.0, 1.0]
     assert row["trace_y"] == [0.1, 0.2, 0.3]
-    assert row["monitor_trace_y"] == [-0.1, -0.2, -0.3]
+    assert row["secondary_trace_y"] == [-0.1, -0.2, -0.3]
+    assert row["secondary_trace_role"] == "monitor"
     assert row["trace_x_units"] == "V"
+    assert row["trace_x_source"] == "reconstructed_from_sweep"
     assert row["trace_y_units"] == "V"
-    assert row["monitor_trace_y_units"] == "V"
+    assert row["secondary_trace_y_units"] == "V"
 
 
 def test_build_manual_lock_row_falls_back_to_device_key_and_index_trace_x():
@@ -68,14 +73,19 @@ def test_build_manual_lock_row_falls_back_to_device_key_and_index_trace_x():
         lock_source="auto_lock_scan",
         params={},
         trace_y=[1, None, "bad"],
-        monitor_trace_y=[2, 3],
+        secondary_trace_y=[2, 3],
+        secondary_trace_role="monitor",
     )
 
     assert row["laser_name"] == "device-key"
     assert row["lock_source"] == "auto_lock_scan"
+    # No geometry: the x axis is the sample index, and says so.
     assert row["trace_x"] == [0.0, 1.0, 2.0]
+    assert row["trace_x_units"] == "sample"
+    assert row["trace_x_source"] == "sample_index"
     assert len(row["trace_y"]) == 3
-    assert len(row["monitor_trace_y"]) == 3
+    # A second trace of another length is stored as measured, not padded.
+    assert row["secondary_trace_y"] == [2.0, 3.0]
 
 
 def _approach_report():
@@ -107,7 +117,6 @@ def test_the_sweep_is_recorded_as_columns_not_only_inside_trace_x():
         device_key="dev-1",
         params=PARAMS,
         trace_y=[0.0, 1.0],
-        monitor_trace_y=None,
     )
 
     assert row["sweep_center_v"] == PARAMS["sweep_center"]
@@ -118,3 +127,23 @@ def test_the_sweep_is_recorded_as_columns_not_only_inside_trace_x():
 
 
 
+
+
+def test_dual_channel_leaves_phase_and_offset_columns_empty():
+    params = {
+        **PARAMS,
+        "dual_channel": True,
+        "demodulation_phase_b": 25,
+        "offset_b": 200,
+    }
+    row = build_manual_lock_row(
+        device_name="Laser A",
+        device_key="laser-a",
+        lock_source="manual_lock",
+        params=params,
+        trace_y=[0.1, 0.2, 0.3],
+    )
+
+    assert row["demod_phase_deg"] is None
+    assert row["signal_offset_volts"] is None
+    assert row["modulation_frequency_hz"] == 2_000_000.0

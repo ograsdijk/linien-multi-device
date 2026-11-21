@@ -44,6 +44,7 @@ export type DeviceDetailModalProps = {
   onRequestShutdown: (device: Device) => void;
   onRequestReboot: (device: Device) => void;
   onRequestDiagnostics: (device: Device) => void;
+  onRequestLockHistory: (device: Device) => void;
   onTelemetryCommand: (key: string, command: TelemetryCommand) => Promise<void>;
   onStateUpdate?: (deviceKey: string, message: StreamMessage) => void;
 };
@@ -101,6 +102,7 @@ export function DeviceDetailModal({
   onRequestShutdown,
   onRequestReboot,
   onRequestDiagnostics,
+  onRequestLockHistory,
   onTelemetryCommand,
   onStateUpdate,
 }: DeviceDetailModalProps) {
@@ -312,6 +314,15 @@ export function DeviceDetailModal({
             title="Why did this board reset, or why did linien-server stop?"
           >
             Diagnostics
+          </Button>
+          <Button
+            size="xs"
+            variant="light"
+            color="gray"
+            onClick={() => onRequestLockHistory(device)}
+            title="Past lock attempts, their traces and settings"
+          >
+            Lock history
           </Button>
           <Menu shadow="md" position="bottom-start" withinPortal zIndex={500}>
             <Menu.Target>

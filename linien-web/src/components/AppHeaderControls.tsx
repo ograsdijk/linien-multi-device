@@ -14,6 +14,7 @@ import {
 import {
   IconDatabase,
   IconFileText,
+  IconHistory,
   IconMoonStars,
   IconSun,
 } from '@tabler/icons-react';
@@ -43,6 +44,7 @@ const formatTimestamp = (value: number | null | undefined) => {
 type AppHeaderControlsProps = {
   logsChipColor: string;
   onOpenLogs: () => void;
+  onOpenLockHistory: () => void;
   influxPopoverOpen: boolean;
   setInfluxPopoverOpen: (open: boolean) => void;
   influxChipColor: string;
@@ -111,6 +113,17 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
           onClick={props.onOpenLogs}
         >
           Logs
+        </Button>
+      </div>
+      <div style={{ order: 97 }}>
+        <Button
+          size="xs"
+          variant="light"
+          color="gray"
+          leftSection={<IconHistory size={14} />}
+          onClick={props.onOpenLockHistory}
+        >
+          Lock history
         </Button>
       </div>
       <div style={{ order: 2 }}>
@@ -454,6 +467,9 @@ export function AppHeaderControls(props: AppHeaderControlsProps) {
               <PasswordInput
                 label="Password"
                 value={props.postgresDraft.password}
+                placeholder={
+                  props.postgresDraft.password_set ? 'Stored (leave blank to keep)' : undefined
+                }
                 onChange={(event) => props.updatePostgresDraft('password', event.currentTarget.value)}
                 disabled={props.postgresBusy}
               />

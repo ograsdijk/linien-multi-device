@@ -117,20 +117,16 @@ def test_start_lock_does_not_fail_when_enqueue_raises(monkeypatch):
     assert result == {"ok": True}
 
 
-def test_start_lock_enqueues_manual_lock_source(monkeypatch):
+def test_start_lock_returns_the_acquisition_id_and_leaves_recording_to_the_session(
+    monkeypatch,
+):
+    """The session records the attempt (with the trace it copied before the
+    lock command); the endpoint only reports its ID and writes no row itself,
+    so one attempt can never be recorded twice."""
+
     class DummySession:
-        def __init__(self) -> None:
-            self.last_build_kwargs = None
-
         def start_lock(self):
-            return
-
-        def build_manual_lock_row(self, **kwargs):
-            self.last_build_kwargs = kwargs
-            return {"lock_source": kwargs.get("lock_source")}
-
-    class DummyDevice:
-        name = "dummy"
+            return "0b8c3f8e-2f0e-4d55-9a5c-6f1d9b2a7c01"
 
     class CapturingPostgres:
         def __init__(self) -> None:
@@ -143,15 +139,13 @@ def test_start_lock_enqueues_manual_lock_source(monkeypatch):
             self.rows.append(row)
             return True
 
-    session = DummySession()
     postgres = CapturingPostgres()
-    monkeypatch.setattr(main, "_get_session", lambda _key: session)
-    monkeypatch.setattr(main.device_store, "get_device", lambda _key: DummyDevice())
+    monkeypatch.setattr(main, "_get_session", lambda _key: DummySession())
     monkeypatch.setattr(main, "lock_result_postgres", postgres)
 
     result = main.start_lock("device-key")
-    assert result == {"ok": True}
-    assert session.last_build_kwargs is not None
-    assert session.last_build_kwargs["lock_source"] == "manual_lock"
-    assert postgres.rows
-    assert postgres.rows[-1]["lock_source"] == "manual_lock"
+    assert result == {
+        "ok": True,
+        "lock_acquisition_id": "0b8c3f8e-2f0e-4d55-9a5c-6f1d9b2a7c01",
+    }
+    assert postgres.rows == []
