@@ -20,19 +20,21 @@ const MONITOR_COLOR = '#888780';
 const LIVE_COLOR = '#D85A30';
 const MARKER_COLOR = '#D85A30';
 
-// A near-flat trace (a monitor sitting a few ADC steps from zero) would
-// otherwise fill the whole axis with quantization steps.
-const MIN_SPAN_V = 0.01;
-
-const paddedRange = (_u: uPlot, min: number, max: number): uPlot.Range.MinMax => {
-  if (!Number.isFinite(min) || !Number.isFinite(max)) return [-1, 1];
-  const span = max - min;
-  if (span < MIN_SPAN_V) {
+// Fit the data with a little padding, but never narrower than `minSpanV`.
+// The error signal gets a tiny floor (one ADC step is ~0.1 mV) so a small
+// PDH signal still fills the plot. The monitor gets 10 mV: a monitor sitting
+// a few ADC steps from zero would otherwise fill its axis with quantization
+// steps.
+const rangeWithFloor =
+  (minSpanV: number) =>
+  (_u: uPlot, min: number, max: number): uPlot.Range.MinMax => {
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return [-1, 1];
+    const span = Math.max(max - min, minSpanV);
     const mid = (min + max) / 2;
-    return [mid - MIN_SPAN_V / 2, mid + MIN_SPAN_V / 2];
-  }
-  return [min - span * 0.05, max + span * 0.05];
-};
+    return [mid - span * 0.55, mid + span * 0.55];
+  };
+const ERROR_RANGE = rangeWithFloor(0.0005);
+const MONITOR_RANGE = rangeWithFloor(0.01);
 
 const cssColor = (name: string, fallback: string): string => {
   if (typeof window === 'undefined') return fallback;
@@ -127,7 +129,7 @@ export function LockTracePlot({
         width: Math.max(container.clientWidth, 200),
         height,
         series,
-        scales: { x: { time: false }, y: { range: paddedRange }, mon: { range: paddedRange } },
+        scales: { x: { time: false }, y: { range: ERROR_RANGE }, mon: { range: MONITOR_RANGE } },
         axes: [
           { stroke: text, grid: { stroke: grid, width: 0.5 }, ticks: { stroke: grid, width: 0.5 } },
           axis('y'),
