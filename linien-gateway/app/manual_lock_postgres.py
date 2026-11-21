@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 PostgresEventCallback = Callable[[int, str, str, str, dict[str, Any]], None]
 
 DEFAULT_SCHEMA = "linien"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TABLE_NAME = "pdh_lock_results"
 VERSION_TABLE_NAME = "pdh_lock_schema"
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -133,7 +133,19 @@ TABLE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("slope_error_v_per_sweep_v", "DOUBLE PRECISION"),
     ("discriminator_slope_v_per_mhz", "DOUBLE PRECISION"),
     ("peak_to_peak_v", "DOUBLE PRECISION"),
+    # Schema version 2: the first seconds after an accepted lock command.
+    # The control voltage on the first locked frame, for convenient SQL, and
+    # the full capture (per-frame statistics, the first locked frame's time
+    # traces) in post_lock.
+    ("post_lock_control_v", "DOUBLE PRECISION"),
+    ("post_lock", "JSONB"),
 )
+# Additive upgrades from an older schema version to the next: run only on a
+# table whose columns are exactly that older version's, in one transaction
+# with the version bump. Anything else is still refused, never altered.
+SCHEMA_UPGRADES: dict[int, tuple[str, ...]] = {
+    1: ("post_lock_control_v", "post_lock"),
+}
 # Filled by the database, not by the writer.
 _DB_MANAGED = frozenset({"created_at", "updated_at"})
 INSERT_COLUMN_NAMES = tuple(
@@ -145,6 +157,17 @@ TIMESTAMP_COLUMNS = frozenset(
 )
 JSONB_COLUMNS = frozenset(name for name, sql in TABLE_COLUMNS if sql.startswith("JSONB"))
 EXPECTED_COLUMNS = frozenset(name for name, _sql in TABLE_COLUMNS)
+
+
+def columns_of_version(version: int) -> frozenset[str]:
+    """The table's columns at an older schema version."""
+    added_since = {
+        column
+        for from_version, columns in SCHEMA_UPGRADES.items()
+        if from_version >= version
+        for column in columns
+    }
+    return EXPECTED_COLUMNS - added_since
 
 
 def validate_schema_name(schema: str) -> str:
@@ -247,6 +270,7 @@ INCLUDE_GROUPS: dict[str, tuple[str, ...]] = {
     "traces": ("trace_x", "trace_y", "secondary_trace_y"),
     "config": ("linien_config",),
     "refinement": ("refinement",),
+    "post_lock": ("post_lock",),
 }
 ALL_INCLUDES = frozenset(INCLUDE_GROUPS)
 _OPTIONAL_COLUMNS = frozenset(
@@ -738,8 +762,10 @@ class LockResultPostgresService:
     def _apply_schema(self, cur: Any) -> None:
         """Create the schema on an empty database, or check an existing one.
 
-        Never alters an existing table: an unknown version or column set
-        raises SchemaMismatchError and nothing is written.
+        Never alters an existing table except by a known additive upgrade
+        (SCHEMA_UPGRADES) of a table that is exactly an older version: any
+        other version or column set raises SchemaMismatchError and nothing is
+        written.
         """
         schema = self._schema_name()
         statements = render_schema_statements(schema)
@@ -762,10 +788,7 @@ class LockResultPostgresService:
                 cur.execute(statement)
             cur.execute(insert_version)
         elif int(version_row[0]) != SCHEMA_VERSION:
-            raise SchemaMismatchError(
-                f"{schema}.{TABLE_NAME} is at schema version {version_row[0]}; "
-                f"this gateway writes version {SCHEMA_VERSION}."
-            )
+            self._upgrade_schema(cur, schema, int(version_row[0]), table_exists)
         elif not table_exists:
             cur.execute(create_table)
             for statement in indexes:
@@ -784,6 +807,45 @@ class LockResultPostgresService:
                 f"{SCHEMA_VERSION} (missing columns: {missing or 'none'}; "
                 f"unexpected columns: {extra or 'none'})."
             )
+
+    def _table_columns(self, cur: Any, schema: str) -> set[str]:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s",
+            (schema, TABLE_NAME),
+        )
+        return {str(row[0]) for row in (cur.fetchall() or [])}
+
+    def _upgrade_schema(
+        self, cur: Any, schema: str, version: int, table_exists: bool
+    ) -> None:
+        """Bring an older table up to SCHEMA_VERSION, one additive step at a time."""
+        mismatch = SchemaMismatchError(
+            f"{schema}.{TABLE_NAME} is at schema version {version}; "
+            f"this gateway writes version {SCHEMA_VERSION}."
+        )
+        if not table_exists or version > SCHEMA_VERSION or version not in SCHEMA_UPGRADES:
+            raise mismatch
+        found = self._table_columns(cur, schema)
+        if found != columns_of_version(version):
+            raise SchemaMismatchError(
+                f"{schema}.{TABLE_NAME} says schema version {version} but its "
+                "columns don't match it; refusing to upgrade it."
+            )
+        by_name = dict(TABLE_COLUMNS)
+        while version < SCHEMA_VERSION:
+            if version not in SCHEMA_UPGRADES:
+                raise mismatch
+            for column in SCHEMA_UPGRADES[version]:
+                cur.execute(
+                    f"ALTER TABLE {schema}.{TABLE_NAME} ADD COLUMN {column} {by_name[column]}"
+                )
+            version += 1
+        cur.execute(
+            f"UPDATE {schema}.{VERSION_TABLE_NAME} SET schema_version = %s",
+            (SCHEMA_VERSION,),
+        )
+        logger.info("Upgraded %s.%s to schema version %s", schema, TABLE_NAME, SCHEMA_VERSION)
 
     def _ensure_schema(self) -> None:
         if psycopg is None:

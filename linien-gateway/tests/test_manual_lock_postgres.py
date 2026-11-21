@@ -19,6 +19,8 @@ import app.manual_lock_postgres as mlp
 from app.lock_spool import LockRecordSpool
 from app.manual_lock_postgres import (
     EXPECTED_COLUMNS,
+    SCHEMA_VERSION,
+    columns_of_version,
     LockResultPostgresConfig,
     LockResultPostgresService,
     load_lock_result_postgres_config,
@@ -115,7 +117,11 @@ class _FakeCursor:
                     db.columns = set(EXPECTED_COLUMNS)
             elif text.startswith("INSERT INTO") and ".pdh_lock_schema" in text:
                 if db.version is None:
-                    db.version = 1
+                    db.version = int(text.split("VALUES (", 1)[1].split(")", 1)[0])
+            elif text.startswith("ALTER TABLE") and " ADD COLUMN " in text:
+                db.columns.add(text.split(" ADD COLUMN ", 1)[1].split()[0])
+            elif text.startswith("UPDATE") and ".pdh_lock_schema" in text:
+                db.version = int(params[0])
             elif text.startswith("INSERT INTO") and ".pdh_lock_results" in text:
                 assert "ON CONFLICT (lock_acquisition_id) DO UPDATE" in text
                 if db.on_upsert is not None:
@@ -216,7 +222,7 @@ def test_an_empty_database_gets_exactly_the_init_script_schema(tmp_path, monkeyp
     assert ok, detail
     for statement in render_schema_statements("linien"):
         assert statement.strip() in db.statements
-    assert db.version == 1
+    assert db.version == SCHEMA_VERSION
     assert service.get_state()["status"]["schema_ok"] is True
 
 
@@ -233,15 +239,23 @@ def test_the_schema_name_is_configurable(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "setup, message",
     [
-        (lambda db: setattr(db, "version", 2), "schema version 2"),
+        (lambda db: setattr(db, "version", 3), "schema version 3"),
         (lambda db: (setattr(db, "table_exists", True), db.columns.update({"id"})), "no schema version"),
         (
             lambda db: (
-                setattr(db, "version", 1),
+                setattr(db, "version", SCHEMA_VERSION),
                 setattr(db, "table_exists", True),
                 db.columns.update(EXPECTED_COLUMNS - {"linien_config"}),
             ),
             "missing columns: ['linien_config']",
+        ),
+        (
+            lambda db: (
+                setattr(db, "version", 1),
+                setattr(db, "table_exists", True),
+                db.columns.update(columns_of_version(1) - {"linien_config"}),
+            ),
+            "columns don't match it",
         ),
     ],
 )
@@ -543,3 +557,25 @@ def test_start_reports_an_unreachable_server(tmp_path, monkeypatch):
         assert service.get_state()["status"]["active"] is False
     finally:
         service.stop()
+
+
+def test_an_exact_version_1_table_is_upgraded_in_place(tmp_path, monkeypatch):
+    """The lab table predates the post-lock columns: add them, bump the version."""
+    db = FakeDatabase()
+    db.version = 1
+    db.table_exists = True
+    db.columns = set(columns_of_version(1))
+    service = _service(tmp_path, db, monkeypatch)
+
+    ok, detail = service.test_connection()
+
+    assert ok, detail
+    assert db.version == SCHEMA_VERSION
+    assert db.columns == set(EXPECTED_COLUMNS)
+    alters = [s for s in db.statements if s.startswith('ALTER')]
+    assert alters == [
+        'ALTER TABLE linien.pdh_lock_results ADD COLUMN post_lock_control_v DOUBLE PRECISION',
+        'ALTER TABLE linien.pdh_lock_results ADD COLUMN post_lock JSONB',
+    ]
+    assert not any(s.startswith('DROP') for s in db.statements)
+    assert service.get_state()['status']['schema_ok'] is True

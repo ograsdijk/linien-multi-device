@@ -457,3 +457,76 @@ def test_manual_lock_records_its_lock_point_and_expected_crossing():
         preferred_slope_rising=True,
     )
     assert "lock_point_sweep_v" not in other and "expected_lock_crossing" not in other
+
+
+# ------------------------------------------------- after the lock command
+
+
+def test_post_lock_capture_keeps_the_first_seconds_after_the_command():
+    from app.lock_acquisition import PostLockCapture
+
+    capture = PostLockCapture(commanded_at=100.0, window_s=3.0)
+    locked = {"control_mean_v": 0.21, "control_std_v": 0.01, "error_std_v": 0.002}
+    control = np.full(2048, 0.21)
+
+    assert capture.observe(99.9, lock=True, stats=locked) is False  # before the command
+    assert capture.observe(100.05, lock=False, stats={"control_mean_v": 9.9}) is False
+    assert capture.observe(100.2, lock=True, stats=locked, traces_v={"control": control}) is False
+    assert capture.observe(100.4, lock=True, stats={**locked, "control_mean_v": 0.25}) is False
+    assert capture.observe(103.5, lock=True, stats=locked) is True  # past the window
+
+    record = capture.to_record()
+    assert record["end_reason"] == "window_elapsed"
+    assert [f["t_s"] for f in record["frames"]] == pytest.approx([0.05, 0.2, 0.4])
+    # An unlocked frame carries no signal statistics.
+    assert record["frames"][0]["control_mean_v"] is None
+    summary = record["summary"]
+    assert summary["first_locked_at_s"] == pytest.approx(0.2)
+    assert summary["first_control_v"] == 0.21
+    assert summary["control_drift_v"] == pytest.approx(0.04)
+    assert summary["locked_fraction"] == pytest.approx(2 / 3)
+    first = record["first_locked_frame"]
+    assert first["t_s"] == pytest.approx(0.2)
+    assert len(first["control_v"]) == 512
+    assert first["control_v"][0] == pytest.approx(0.21)
+
+
+def test_an_accepted_lock_records_its_post_lock_signals():
+    from app.signal_stats import SignalStats
+
+    session, postgres = _session()
+    acquisition = session._open_acquisition("manual_lock")
+    acquisition.mark_lock_command(True, at=time.time())
+    session._begin_post_lock_capture(acquisition)
+
+    now = float(acquisition.lock_command_at)
+    to_plot = {
+        "control_signal": np.full(2048, 0.3 * ADC_SCALE),
+        "error_signal": np.zeros(2048),
+    }
+    stats = SignalStats(control_mean_v=0.3, control_std_v=0.001, error_std_v=0.0005)
+    with session._state_lock:
+        assert session._observe_post_lock(now + 0.1, True, stats, to_plot) is None
+        done = session._observe_post_lock(now + 5.0, True, stats, to_plot)
+    assert done is acquisition
+    session._finish_post_lock_capture(None, only=done)
+
+    row = postgres.rows[-1]
+    assert row["lock_acquisition_id"] == acquisition.lock_acquisition_id
+    assert row["post_lock_control_v"] == pytest.approx(0.3)
+    assert row["post_lock"]["first_locked_frame"]["control_v"][0] == pytest.approx(0.3)
+    assert row["post_lock"]["end_reason"] == "window_elapsed"
+    assert session._post_lock_capture is None
+
+
+def test_a_new_attempt_closes_the_previous_post_lock_capture():
+    session, postgres = _session()
+    first = session._open_acquisition("manual_lock")
+    first.mark_lock_command(True, at=time.time())
+    session._begin_post_lock_capture(first)
+
+    session._open_acquisition("manual_lock")
+
+    assert session._post_lock_capture is None
+    row = next(r for r in postgres.rows if r["lock_acquisition_id"] == first.lock_acquisition_id)
+    assert row["post_lock"]["end_reason"] == "superseded_by_new_attempt"

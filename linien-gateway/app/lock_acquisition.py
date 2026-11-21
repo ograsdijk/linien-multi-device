@@ -135,6 +135,8 @@ class LockAcquisition:
     verification_status: str = "not_attempted"
     verification_reason: str | None = None
     verification_completed_at: float | None = None
+    # The first seconds after an accepted lock command (PostLockCapture).
+    post_lock: dict[str, Any] | None = None
     # Path-specific facts about which trace was kept (e.g. the staged run's
     # selected frame), merged into the stored trace metadata.
     trace_context: dict[str, Any] = field(default_factory=dict)
@@ -278,6 +280,119 @@ class VerificationTracker:
         else:
             self.outcome = ("failed", "not_confirmed_within_timeout")
         return self.outcome
+
+
+# How long after an accepted lock command the signals are kept, and how much.
+POST_LOCK_WINDOW_S = 3.0
+POST_LOCK_MAX_FRAMES = 200
+# The first locked frame's time traces are kept at this many points.
+POST_LOCK_TRACE_POINTS = 512
+_POST_LOCK_STATS = (
+    "control_mean_v",
+    "control_std_v",
+    "error_std_v",
+    "error_mean_abs_v",
+    "monitor_mean_v",
+    "monitor_std_v",
+)
+
+
+def _downsample(values: Any, points: int) -> list[float | None] | None:
+    if values is None:
+        return None
+    try:
+        arr = np.asarray(values, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if arr.ndim != 1 or arr.size == 0:
+        return None
+    step = max(1, int(np.ceil(arr.size / points)))
+    return [None if not np.isfinite(v) else float(v) for v in arr[::step]]
+
+
+@dataclass
+class PostLockCapture:
+    """What the board did in the first seconds after an accepted lock command.
+
+    Fed once per plot frame (whether or not the lock indicator is on): the
+    lock flag and the frame's signal statistics, and the first locked frame's
+    control, error and monitor traces. Values are plot volts (ADC counts /
+    8192, Linien's full scale), so `control_mean_v` is the control output.
+    Ends after `window_s`, or early when superseded by another attempt.
+    """
+
+    commanded_at: float
+    window_s: float = POST_LOCK_WINDOW_S
+    max_frames: int = POST_LOCK_MAX_FRAMES
+    frames: list[dict[str, Any]] = field(default_factory=list)
+    first_locked_frame: dict[str, Any] | None = None
+    frames_seen: int = 0
+    end_reason: str | None = None
+
+    def observe(
+        self,
+        now: float,
+        *,
+        lock: bool,
+        stats: dict[str, Any] | None,
+        traces_v: dict[str, Any] | None = None,
+    ) -> bool:
+        """Record one frame; True once the capture is complete."""
+        if self.end_reason is not None:
+            return True
+        if now < self.commanded_at:
+            return False
+        t_s = now - self.commanded_at
+        if t_s > self.window_s:
+            self.end_reason = "window_elapsed"
+            return True
+        self.frames_seen += 1
+        if len(self.frames) < self.max_frames:
+            entry: dict[str, Any] = {"t_s": t_s, "lock": bool(lock)}
+            for name in _POST_LOCK_STATS:
+                entry[name] = (stats or {}).get(name) if lock else None
+            self.frames.append(entry)
+        if lock and self.first_locked_frame is None and traces_v:
+            self.first_locked_frame = {
+                "t_s": t_s,
+                **{
+                    f"{name}_v": _downsample(values, POST_LOCK_TRACE_POINTS)
+                    for name, values in traces_v.items()
+                },
+            }
+        return False
+
+    def finish(self, reason: str) -> None:
+        if self.end_reason is None:
+            self.end_reason = reason
+
+    def first_locked_control_v(self) -> float | None:
+        for entry in self.frames:
+            if entry["lock"] and entry.get("control_mean_v") is not None:
+                return float(entry["control_mean_v"])
+        return None
+
+    def to_record(self) -> dict[str, Any]:
+        locked = [entry for entry in self.frames if entry["lock"]]
+        controls = [e["control_mean_v"] for e in locked if e.get("control_mean_v") is not None]
+        errors = [e["error_std_v"] for e in locked if e.get("error_std_v") is not None]
+        return {
+            "version": 1,
+            "units": "plot volts (ADC counts / 8192); t_s from the lock command",
+            "window_s": self.window_s,
+            "end_reason": self.end_reason,
+            "frames_seen": self.frames_seen,
+            "summary": {
+                "first_locked_at_s": locked[0]["t_s"] if locked else None,
+                "locked_fraction": (len(locked) / len(self.frames)) if self.frames else None,
+                "first_control_v": controls[0] if controls else None,
+                "last_control_v": controls[-1] if controls else None,
+                "control_drift_v": (controls[-1] - controls[0]) if len(controls) > 1 else None,
+                "mean_error_std_v": (sum(errors) / len(errors)) if errors else None,
+            },
+            "frames": self.frames,
+            "first_locked_frame": self.first_locked_frame,
+        }
 
 
 _current: contextvars.ContextVar[LockAcquisition | None] = contextvars.ContextVar(

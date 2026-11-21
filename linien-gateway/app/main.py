@@ -2296,7 +2296,7 @@ def list_lock_acquisitions(
     lock_command_status: str | None = None,
     success: bool | None = None,
     include: str | None = Query(
-        None, description="Comma-separated extras: traces, config, refinement."
+        None, description="Comma-separated extras: traces, config, refinement, post_lock."
     ),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -2327,7 +2327,7 @@ def list_all_lock_acquisitions(
     lock_command_status: str | None = None,
     success: bool | None = None,
     include: str | None = Query(
-        None, description="Comma-separated extras: traces, config, refinement."
+        None, description="Comma-separated extras: traces, config, refinement, post_lock."
     ),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),

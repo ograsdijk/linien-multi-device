@@ -526,6 +526,24 @@ for convenient SQL. `demod_phase_deg` and `signal_offset_volts` are input A's in
 single-channel mode, and empty in dual-channel mode, where the error signal mixes both
 inputs (both channels' values are in `linien_config`).
 
+### After the lock
+
+For an accepted lock command, the gateway keeps the first 3 s of plot frames, whether
+or not the lock indicator is on, and adds them to the record when the window ends (or
+when another attempt starts on the device):
+
+- `post_lock_control_v`: the control voltage on the first locked frame, in plot volts
+  (ADC counts / 8192, Linien's full scale).
+- `post_lock` (JSON): per frame, `t_s` since the lock command, Linien's `lock` flag and
+  the frame's `control_mean_v`, `control_std_v`, `error_std_v`, `error_mean_abs_v`,
+  `monitor_mean_v`, `monitor_std_v` (null while unlocked); the first locked frame's
+  control, error and monitor time traces (`first_locked_frame`, 512 points); and a
+  `summary` (`first_locked_at_s`, `locked_fraction`, `first_control_v`,
+  `last_control_v`, `control_drift_v`, `mean_error_std_v`). `end_reason` says why the
+  capture ended (`window_elapsed`, `superseded_by_new_attempt`, `no_plot_frames`).
+
+`post_lock` is left out of lists unless `include=post_lock` is given.
+
 ### Trace characterization
 
 A diagnostic description of the stored trace, computed with the auto-lock detector's
@@ -572,11 +590,13 @@ cd linien-gateway
 python -c "from app.manual_lock_postgres import render_init_sql; open('../docker/postgres/postgres-init/01-init.sql','w',newline='\n').write(render_init_sql())"
 ```
 
-**The gateway never alters an existing table.** If it finds a table without a version
-row, a different `schema_version`, or a column set other than the one it writes, it
-reports `schema_ok: false` with the reason in the Postgres status, writes nothing, and
-keeps the records in the spool. A future schema change will ship an explicit migration
-keyed on `schema_version`.
+**The gateway never alters an existing table, except by a known additive upgrade.**
+The current schema is version 2. A version-1 table whose columns are exactly version 1's
+is upgraded in place on the gateway's first connection: the two post-lock columns are
+added and `schema_version` set to 2, in one transaction; existing rows are kept, with
+the new columns `NULL`. Any other case (no version row, an unknown `schema_version`, or
+a column set that doesn't match its version) is reported as `schema_ok: false` with the
+reason in the Postgres status; nothing is written, and the records wait in the spool.
 
 Earlier gateway versions defined a `public.pdh_lock_results` table with a different
 shape. The new writer neither reads nor touches it. If you have such a table and want
@@ -635,7 +655,7 @@ Read-only endpoints, useful to any client:
 - `GET /api/devices/{key}/lock-acquisitions`: newest attempt first. Filters: `since`,
   `until` (Unix seconds), `lock_source`, `verification_status`, `lock_command_status`,
   `success`; paging with `limit` (≤ 1000) and `offset`. Metadata only by default;
-  `include=traces,config,refinement` adds the large fields.
+  `include=traces,config,refinement,post_lock` adds the large fields.
 - `GET /api/lock-acquisitions/{lock_acquisition_id}`: one full record, with its
   configuration snapshot, traces and refinement history.
 

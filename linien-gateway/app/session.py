@@ -70,6 +70,7 @@ from .lock_acquisition import (
     SECONDARY_ROLE_MONITOR,
     LockAcquisition,
     TraceSnapshot,
+    PostLockCapture,
     VerificationTracker,
     acquisition_scope,
     attach_acquisition_id,
@@ -504,6 +505,7 @@ class DeviceSession:
         # The accepted lock whose verification is still open, fed by the plot
         # frame handler (guarded by _state_lock).
         self._pending_verification: tuple[LockAcquisition, VerificationTracker] | None = None
+        self._post_lock_capture: tuple[LockAcquisition, PostLockCapture] | None = None
         self._relock_action_lock = threading.Lock()
         # Serialises everything that drives the sweep center over time. A
         # refinement walk moves the actuator for seconds; interleaved runs would
@@ -1450,6 +1452,7 @@ class DeviceSession:
         # A new attempt ends any verification still open: whatever happens
         # next is about this attempt, not the previous one.
         self._resolve_pending_verification(("unavailable", "superseded_by_new_attempt"))
+        self._finish_post_lock_capture("superseded_by_new_attempt")
         try:
             acquisition.params = self._collect_manual_lock_params(
                 LOCK_RECORD_PARAM_NAMES
@@ -1511,6 +1514,7 @@ class DeviceSession:
             acquisition.characterization = self._characterize_acquisition(acquisition)
             if acquisition.lock_command_status == "accepted":
                 self._begin_verification(acquisition)
+                self._begin_post_lock_capture(acquisition)
             self._write_lock_result_to_postgres(
                 acquisition=acquisition, event_source=event_source
             )
@@ -1587,6 +1591,73 @@ class DeviceSession:
         )
         timer.daemon = True
         timer.start()
+
+    def _begin_post_lock_capture(self, acquisition: LockAcquisition) -> None:
+        """Keep the first seconds of signals after an accepted lock command."""
+        capture = PostLockCapture(commanded_at=float(acquisition.lock_command_at or time.time()))
+        with self._state_lock:
+            self._post_lock_capture = (acquisition, capture)
+        timer = threading.Timer(
+            capture.window_s + 2.0,
+            self._finish_post_lock_capture,
+            args=("window_elapsed",),
+            kwargs={"only": acquisition},
+        )
+        timer.daemon = True
+        timer.start()
+
+    def _observe_post_lock(
+        self, now: float, lock: bool, stats: Any, to_plot: Any
+    ) -> LockAcquisition | None:
+        """Feed one frame to the open post-lock capture. Caller holds
+        _state_lock; returns its acquisition once the capture is complete."""
+        pending = self._post_lock_capture
+        if pending is None:
+            return None
+        acquisition, capture = pending
+        traces = None
+        if lock and capture.first_locked_frame is None and isinstance(to_plot, dict):
+            traces = {}
+            for name, key in (
+                ("control", "control_signal"),
+                ("error", "error_signal"),
+                ("monitor", "monitor_signal"),
+            ):
+                values = to_plot.get(key)
+                if values is not None:
+                    try:
+                        traces[name] = np.asarray(values, dtype=float) / ADC_SCALE
+                    except (TypeError, ValueError):
+                        continue
+        done = capture.observe(
+            now,
+            lock=lock,
+            stats=asdict(stats) if dataclasses.is_dataclass(stats) else stats,
+            traces_v=traces,
+        )
+        return acquisition if done else None
+
+    def _finish_post_lock_capture(
+        self, reason: str | None, *, only: LockAcquisition | None = None
+    ) -> None:
+        """Close the open post-lock capture and update its record."""
+        with self._state_lock:
+            pending = self._post_lock_capture
+            if pending is None or (only is not None and pending[0] is not only):
+                return
+            self._post_lock_capture = None
+        acquisition, capture = pending
+        if reason is not None:
+            capture.finish(reason)
+        if not capture.frames_seen:
+            capture.finish("no_plot_frames")
+        acquisition.post_lock = capture.to_record()
+        try:
+            self._write_lock_result_to_postgres(
+                acquisition=acquisition, event_source="lock_post_lock"
+            )
+        except Exception:  # noqa: BLE001 - never break the frame handler
+            logger.warning("Recording post-lock signals failed", exc_info=True)
 
     def _verification_deadline(self, acquisition: LockAcquisition) -> None:
         with self._state_lock:
@@ -3159,11 +3230,16 @@ class DeviceSession:
             verification_done = self._observe_verification(
                 self.last_plot_timestamp, lock_value, indicator_state
             )
+            post_lock_done = self._observe_post_lock(
+                self.last_plot_timestamp, lock_value, signal_stats, to_plot
+            )
 
         # Recording the verification outcome enqueues a row; outside _state_lock.
         if verification_done is not None:
             acquisition_done, outcome = verification_done
             self._resolve_pending_verification(outcome, only=acquisition_done)
+        if post_lock_done is not None:
+            self._finish_post_lock_capture(None, only=post_lock_done)
 
         # Perform the auto-relock device I/O OUTSIDE _state_lock so status()
         # and snapshot reads don't stall during a (possibly multi-second)

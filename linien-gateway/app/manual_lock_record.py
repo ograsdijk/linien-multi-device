@@ -316,4 +316,8 @@ def build_acquisition_row(acquisition: "LockAcquisition") -> dict[str, Any]:
         "peak_to_peak_v",
     ):
         row[key] = _to_float(summary.get(key))
+    post_lock = acquisition.post_lock
+    row["post_lock"] = _json_safe(post_lock) if post_lock is not None else None
+    post_summary = (post_lock or {}).get("summary") if isinstance(post_lock, dict) else None
+    row["post_lock_control_v"] = _to_float((post_summary or {}).get("first_control_v"))
     return row
