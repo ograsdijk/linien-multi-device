@@ -391,7 +391,9 @@ export function LockHistoryModal({ opened, initialDeviceKey, devices, onClose }:
         {listError ? <Alert color="red">{listError}</Alert> : null}
 
         <Card withBorder padding={0}>
-          <ScrollArea h={260}>
+          {/* The whole window for the list until an attempt is picked; then it
+              makes room for the detail below. */}
+          <ScrollArea h={selectedId ? 260 : 'max(320px, calc(100vh - 300px))'}>
             <Table highlightOnHover stickyHeader verticalSpacing={6} fz="sm">
               <Table.Thead>
                 <Table.Tr>
@@ -480,6 +482,9 @@ export function LockHistoryModal({ opened, initialDeviceKey, devices, onClose }:
                   </Button>
                   <Button size="xs" variant="default" leftSection={<IconDownload size={14} />} onClick={downloadRecord}>
                     Export JSON
+                  </Button>
+                  <Button size="xs" variant="subtle" color="gray" onClick={() => setSelectedId(null)}>
+                    Back to list
                   </Button>
                 </Group>
               </Group>
