@@ -303,3 +303,66 @@ export const describeAttempt = (record: LockAcquisitionSummary): string => {
   }
   return parts.join(' ');
 };
+
+export const LOCK_POINT_COLOR = '#1D9E75';
+export const CROSSING_COLOR = '#D85A30';
+
+export type LockMarkers = {
+  markers: Array<{ sweepV: number; color: string; dashed: boolean }>;
+  // What the lines mean, for the note under the plot.
+  legend: string;
+  // Where the lock was engaged and where it should settle, when that is known.
+  summary: string | null;
+};
+
+const num = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+const mV = (volts: number): string => `${Number((Math.abs(volts) * 1000).toFixed(1))} mV`;
+const V = (volts: number): string => `${Number(volts.toFixed(4))} V`;
+
+/**
+ * Markers for a record's trace. A manual lock is engaged at the sweep center
+ * (its lock point) and the PID pulls the laser to the nearest crossing with
+ * the configured slope, so both are drawn. Auto-locks mark the crossing the
+ * detector chose, which is where they were placed.
+ */
+export const lockMarkers = (record: LockAcquisitionRecord): LockMarkers => {
+  const characterization = (record.characterization ?? {}) as Record<string, unknown>;
+  if (record.lock_source === 'manual_lock') {
+    const lockPoint = num(characterization.lock_point_sweep_v) ?? num(record.sweep_center_v);
+    const expected = characterization.expected_lock_crossing as
+      | { sweep_v?: unknown; distance_from_lock_point_v?: unknown; slope_rising?: unknown }
+      | null
+      | undefined;
+    const expectedV = num(expected?.sweep_v);
+    const markers: LockMarkers['markers'] = [];
+    if (lockPoint !== null) markers.push({ sweepV: lockPoint, color: LOCK_POINT_COLOR, dashed: false });
+    if (expectedV !== null) markers.push({ sweepV: expectedV, color: CROSSING_COLOR, dashed: true });
+    let summary: string | null = null;
+    if (lockPoint !== null) {
+      summary = `Engaged at ${V(lockPoint)} (the sweep center).`;
+      if (expectedV !== null) {
+        const slope = expected?.slope_rising ? 'rising' : 'falling';
+        const distance = num(expected?.distance_from_lock_point_v) ?? expectedV - lockPoint;
+        summary += ` With a ${slope} slope it should settle on the crossing at ${V(expectedV)}, ${mV(distance)} ${
+          distance < 0 ? 'below' : 'above'
+        }.`;
+      } else if ('expected_lock_crossing' in characterization) {
+        summary += ' No crossing with the configured slope was found near it.';
+      }
+    }
+    return {
+      markers,
+      legend:
+        'Solid green line: the lock point (sweep center). Dashed orange line: the nearest crossing with the configured slope, where the lock should settle.',
+      summary,
+    };
+  }
+  const target = num(record.zero_crossing_sweep_v);
+  return {
+    markers: target === null ? [] : [{ sweepV: target, color: CROSSING_COLOR, dashed: true }],
+    legend: 'Dashed orange line: the zero crossing the lock was placed on.',
+    summary: null,
+  };
+};

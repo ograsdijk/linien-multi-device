@@ -5,6 +5,7 @@ import {
   exportRecord,
   formatSetting,
   historyQuery,
+  lockMarkers,
   orderSettings,
   verificationDisplay,
   type LockAcquisitionRecord,
@@ -112,5 +113,39 @@ describe('exportRecord and describeAttempt', () => {
     expect(describeAttempt(record)).toBe(
       "Lock command accepted 80 ms after start. The lock indicator is off for this device, so the lock couldn't be verified.",
     );
+  });
+});
+
+describe('lockMarkers', () => {
+  const manual = {
+    lock_source: 'manual_lock',
+    sweep_center_v: 0.0825,
+    zero_crossing_sweep_v: 0.1062,
+    characterization: {
+      lock_point_sweep_v: 0.0825,
+      expected_lock_crossing: { sweep_v: 0.0597, distance_from_lock_point_v: -0.0228, slope_rising: false },
+    },
+  } as unknown as LockAcquisitionRecord;
+
+  it('marks the lock point of a manual lock and the crossing it should settle on', () => {
+    const result = lockMarkers(manual);
+    expect(result.markers.map((m) => [m.sweepV, m.dashed])).toEqual([
+      [0.0825, false],
+      [0.0597, true],
+    ]);
+    expect(result.summary).toBe(
+      'Engaged at 0.0825 V (the sweep center). With a falling slope it should settle on the crossing at 0.0597 V, 22.8 mV below.',
+    );
+  });
+
+  it('still marks the lock point on older manual records', () => {
+    const older = { ...manual, characterization: { status: 'ok' } } as unknown as LockAcquisitionRecord;
+    expect(lockMarkers(older).markers).toEqual([{ sweepV: 0.0825, color: expect.any(String), dashed: false }]);
+  });
+
+  it('marks the chosen crossing on an auto-lock', () => {
+    const auto = { ...manual, lock_source: 'auto_lock_scan' } as unknown as LockAcquisitionRecord;
+    expect(lockMarkers(auto).markers.map((m) => m.sweepV)).toEqual([0.1062]);
+    expect(lockMarkers(auto).summary).toBeNull();
   });
 });

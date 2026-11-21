@@ -4,6 +4,10 @@ import 'uplot/dist/uPlot.min.css';
 
 type Series = Array<number | null>;
 
+export type TraceMarker = { sweepV: number; color: string; dashed: boolean };
+
+const NO_MARKERS: TraceMarker[] = [];
+
 export type LockTracePlotProps = {
   x: Series;
   error: Series;
@@ -11,14 +15,14 @@ export type LockTracePlotProps = {
   monitorLabel?: string;
   // The board's current trace on the same sweep axis, for comparison.
   live?: { x: Series; y: Series } | null;
-  zeroCrossingV?: number | null;
+  // Vertical lines on the sweep axis (lock target, lock point, ...).
+  markers?: TraceMarker[];
   height?: number;
 };
 
 const ERROR_COLOR = '#378ADD';
 const MONITOR_COLOR = '#888780';
 const LIVE_COLOR = '#D85A30';
-const MARKER_COLOR = '#D85A30';
 
 // Fit the data with a little padding, but never narrower than `minSpanV`.
 // The error signal gets a tiny floor (one ADC step is ~0.1 mV) so a small
@@ -77,7 +81,7 @@ export function LockTracePlot({
   monitor,
   monitorLabel = 'Monitor',
   live,
-  zeroCrossingV,
+  markers = NO_MARKERS,
   height = 260,
 }: LockTracePlotProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -140,19 +144,20 @@ export function LockTracePlot({
         hooks: {
           draw: [
             (u) => {
-              if (zeroCrossingV === null || zeroCrossingV === undefined) return;
-              const px = u.valToPos(zeroCrossingV, 'x', true);
-              if (!Number.isFinite(px)) return;
-              const ctx = u.ctx;
-              ctx.save();
-              ctx.strokeStyle = MARKER_COLOR;
-              ctx.lineWidth = 1 * devicePixelRatio;
-              ctx.setLineDash([4 * devicePixelRatio, 4 * devicePixelRatio]);
-              ctx.beginPath();
-              ctx.moveTo(px, u.bbox.top);
-              ctx.lineTo(px, u.bbox.top + u.bbox.height);
-              ctx.stroke();
-              ctx.restore();
+              for (const marker of markers) {
+                const px = u.valToPos(marker.sweepV, 'x', true);
+                if (!Number.isFinite(px)) continue;
+                const ctx = u.ctx;
+                ctx.save();
+                ctx.strokeStyle = marker.color;
+                ctx.lineWidth = 1.5 * devicePixelRatio;
+                ctx.setLineDash(marker.dashed ? [4 * devicePixelRatio, 4 * devicePixelRatio] : []);
+                ctx.beginPath();
+                ctx.moveTo(px, u.bbox.top);
+                ctx.lineTo(px, u.bbox.top + u.bbox.height);
+                ctx.stroke();
+                ctx.restore();
+              }
             },
           ],
         },
@@ -169,7 +174,7 @@ export function LockTracePlot({
       observer.disconnect();
       plot.destroy();
     };
-  }, [x, error, monitor, monitorLabel, live, zeroCrossingV, height]);
+  }, [x, error, monitor, monitorLabel, live, markers, height]);
 
   return <div ref={containerRef} style={{ width: '100%' }} />;
 }

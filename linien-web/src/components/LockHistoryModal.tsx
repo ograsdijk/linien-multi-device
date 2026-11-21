@@ -28,6 +28,7 @@ import {
   exportRecord,
   formatSetting,
   historyQuery,
+  lockMarkers,
   orderSettings,
   verificationDisplay,
   type HistoryFilters,
@@ -298,6 +299,7 @@ export function LockHistoryModal({ opened, initialDeviceKey, devices, onClose }:
     [record],
   );
   const allRows = comparison?.parameters ?? savedRows;
+  const markers = useMemo(() => (record ? lockMarkers(record) : null), [record]);
   const settingRows = orderSettings(allRows, showAllSettings);
   const traceX = record?.trace_x ?? null;
   const traceY = record?.trace_y ?? null;
@@ -489,6 +491,7 @@ export function LockHistoryModal({ opened, initialDeviceKey, devices, onClose }:
                 </Group>
               </Group>
               <Text size="sm">{describeAttempt(record)}</Text>
+              {markers?.summary ? <Text size="sm">{markers.summary}</Text> : null}
 
               <SimpleGrid cols={{ base: 2, md: 4 }} spacing="xs">
                 {[
@@ -542,11 +545,11 @@ export function LockHistoryModal({ opened, initialDeviceKey, devices, onClose }:
                     monitor={record.secondary_trace_y ?? null}
                     monitorLabel={record.secondary_trace_role === 'monitor' ? 'Monitor' : 'Error B'}
                     live={live}
-                    zeroCrossingV={record.zero_crossing_sweep_v}
+                    markers={markers?.markers}
                   />
                   <Text size="xs" c="dimmed">
-                    Blue: error signal (left axis). Grey: monitor (right axis). Dashed orange line: the zero
-                    crossing the lock was placed on. Drag across the plot to zoom, double-click to reset.
+                    Blue: error signal (left axis). Grey: monitor (right axis). {markers?.legend} Drag across
+                    the plot to zoom, double-click to reset.
                   </Text>
                 </>
               ) : (
