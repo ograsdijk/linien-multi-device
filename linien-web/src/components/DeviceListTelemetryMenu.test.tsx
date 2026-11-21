@@ -37,6 +37,7 @@ const renderList = (statuses: Record<string, DeviceStatus | undefined>) => {
         onInstallTelemetryAll={noop}
         onStartTelemetryAll={onStartTelemetryAll}
         onRequestDiagnostics={vi.fn()}
+        onRequestLockHistory={vi.fn()}
       />
     </MantineProvider>
   );

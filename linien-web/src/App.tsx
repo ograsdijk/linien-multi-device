@@ -169,8 +169,16 @@ const DiagnosticsModal = lazy(async () => {
   return { default: module.DiagnosticsModal };
 });
 
+// Lazy: opened on demand, and it pulls in its own trace plot.
+const LockHistoryModal = lazy(async () => {
+  const module = await import('./components/LockHistoryModal');
+  return { default: module.LockHistoryModal };
+});
+
 export function App() {
   const [diagnosticsDevice, setDiagnosticsDevice] = useState<Device | null>(null);
+  // Open lock history: `deviceKey` null shows every device.
+  const [lockHistory, setLockHistory] = useState<{ deviceKey: string | null } | null>(null);
   const [overviewFps, setOverviewFps] = useState<number>(10);
   const [groupFps, setGroupFps] = useState<number>(() => {
     try {
@@ -609,6 +617,7 @@ export function App() {
           <AppHeaderControls
             logsChipColor={logsChipColor}
             onOpenLogs={() => setLogsOpen(true)}
+            onOpenLockHistory={() => setLockHistory({ deviceKey: null })}
             influxPopoverOpen={influxPopoverOpen}
             setInfluxPopoverOpen={setInfluxPopoverOpen}
             influxChipColor={influxChipColor}
@@ -726,6 +735,7 @@ export function App() {
             onInstallTelemetryAll={installTelemetryAll}
             onStartTelemetryAll={startTelemetryAll}
             onRequestDiagnostics={setDiagnosticsDevice}
+            onRequestLockHistory={(device) => setLockHistory({ deviceKey: device.key })}
             onStateUpdate={updateState}
             telemetryBusyKeys={telemetryBusyKeys}
           />
@@ -995,6 +1005,14 @@ export function App() {
           onClose={() => setDiagnosticsDevice(null)}
           appendUiErrorLog={appendUiErrorLog}
         />
+        {lockHistory ? (
+          <LockHistoryModal
+            opened
+            initialDeviceKey={lockHistory.deviceKey}
+            devices={orderedDevices}
+            onClose={() => setLockHistory(null)}
+          />
+        ) : null}
       </Suspense>
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
       </AppShell>

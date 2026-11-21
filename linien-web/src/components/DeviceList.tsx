@@ -100,6 +100,7 @@ type DeviceListProps = {
   onInstallTelemetryAll: (keys: string[]) => Promise<void>;
   onStartTelemetryAll: (keys: string[]) => Promise<void>;
   onRequestDiagnostics: (device: Device) => void;
+  onRequestLockHistory: (device: Device) => void;
   onStateUpdate?: (deviceKey: string, message: StreamMessage) => void;
   telemetryBusyKeys?: Record<string, boolean>;
 };
@@ -126,6 +127,7 @@ type DeviceRowProps = {
   onRequestShutdown: (device: Device) => void;
   onRequestReboot: (device: Device) => void;
   onRequestDiagnostics: (device: Device) => void;
+  onRequestLockHistory: (device: Device) => void;
   onTelemetryCommand: (key: string, command: TelemetryCommand) => Promise<void>;
   telemetryBusy: boolean;
 };
@@ -155,6 +157,7 @@ function DeviceRow({
   onRequestShutdown,
   onRequestReboot,
   onRequestDiagnostics,
+  onRequestLockHistory,
   onTelemetryCommand,
   telemetryBusy,
 }: DeviceRowProps) {
@@ -504,6 +507,15 @@ function DeviceRow({
               >
                 Diagnostics
               </Button>
+              <Button
+                size="xs"
+                variant="light"
+                color="gray"
+                onClick={() => onRequestLockHistory(device)}
+                title="Past lock attempts, their traces and settings"
+              >
+                Lock history
+              </Button>
             </Group>
             <ActionIcon
               size="sm"
@@ -550,6 +562,7 @@ export function DeviceList({
   onInstallTelemetryAll,
   onStartTelemetryAll,
   onRequestDiagnostics,
+  onRequestLockHistory,
   onStateUpdate,
   telemetryBusyKeys,
 }: DeviceListProps) {
@@ -904,6 +917,7 @@ export function DeviceList({
               onRequestShutdown={setShutdownDevice}
               onRequestReboot={setRebootDevice}
               onRequestDiagnostics={onRequestDiagnostics}
+              onRequestLockHistory={onRequestLockHistory}
               onTelemetryCommand={onTelemetryCommand}
               telemetryBusy={Boolean(telemetryBusyKeys?.[device.key])}
             />
@@ -947,6 +961,10 @@ export function DeviceList({
           onRequestDiagnostics={(target) => {
             setDetailKey(null);
             onRequestDiagnostics(target);
+          }}
+          onRequestLockHistory={(target) => {
+            setDetailKey(null);
+            onRequestLockHistory(target);
           }}
           onTelemetryCommand={onTelemetryCommand}
           onStateUpdate={onStateUpdate}
